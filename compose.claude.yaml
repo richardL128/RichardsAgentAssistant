@@ -1,0 +1,60 @@
+# Sandboxed Claude Code, kept in its own compose project so that `docker
+# compose up` for the application stack never starts an agent.
+#
+# The isolation guarantee lives entirely in this file: the only host path bound
+# into the container is this repository. Do not add bind mounts here, and never
+# mount /var/run/docker.sock — access to the Docker socket is equivalent to
+# root on the host and would defeat the whole arrangement.
+#
+# Usage: scripts/claude-sandbox.sh
+
+name: lifeagent-claude
+
+services:
+  claude:
+    image: lifeagent-claude-sandbox:local
+    build:
+      context: infra/claude-sandbox
+      dockerfile: Dockerfile
+    # uid/gid 1000 is the image's `node` user, which owns both /workspace's
+    # contents and the home volume. Claude Code also refuses
+    # --dangerously-skip-permissions when it is running as root.
+    user: "1000:1000"
+    init: true
+    stdin_open: true
+    tty: true
+    working_dir: /workspace
+    environment:
+      # Optional: set in your shell to skip interactive `claude /login`.
+      ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:-}
+      # Optional git identity for commits made inside the sandbox.
+      GIT_USER_NAME: ${GIT_USER_NAME:-}
+      GIT_USER_EMAIL: ${GIT_USER_EMAIL:-}
+      TERM: ${TERM:-xterm-256color}
+    volumes:
+      # The one and only host path the container can see.
+      - type: bind
+        source: .
+        target: /workspace
+      # Docker-managed volume, stored inside the Docker VM rather than on the
+      # host filesystem. Persists Claude Code credentials, session history and
+      # caches between runs.
+      - type: volume
+        source: claude_home
+        target: /home/node
+    tmpfs:
+      - /tmp:mode=1777,size=1g
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    pids_limit: 4096
+    # Lets the sandbox reach services running on the host (e.g. Ollama on
+    # 11434). Remove this line if you want the agent to see the internet but
+    # not your host's local ports.
+    extra_hosts:
+      - host.docker.internal:host-gateway
+
+volumes:
+  claude_home:
+    name: lifeagent_claude_home

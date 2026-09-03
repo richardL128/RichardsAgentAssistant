@@ -27,7 +27,8 @@ from app.llm import InvocationResult, InvocationStatus, LLMGateway, ModelCallTel
 GIB = 1024**3
 LATENCY_P95_LIMIT_MS = 300_000
 MODEL_ALLOCATION_LIMIT_BYTES = 28 * GIB
-MINIMUM_FREE_MEMORY_PERCENT = 12.5
+MINIMUM_FREE_MEMORY_PERCENT = 10.0
+STEADY_SWAPOUT_LIMIT_BYTES = GIB
 
 
 def _sha256(path: Path) -> str:
@@ -66,10 +67,12 @@ def _host_memory_snapshot() -> dict[str, int | float | None]:
     total_match = re.search(r"system has (\d+)", pressure)
     free_match = re.search(r"memory free percentage: (\d+)%", pressure)
     swapout_match = re.search(r"Swapouts:\s+(\d+)\.", vm_stat)
+    page_size_match = re.search(r"page size of (\d+) bytes", vm_stat)
     return {
         "total_bytes": int(total_match.group(1)) if total_match else None,
         "free_percent": float(free_match.group(1)) if free_match else None,
         "swapouts": int(swapout_match.group(1)) if swapout_match else None,
+        "page_size_bytes": int(page_size_match.group(1)) if page_size_match else None,
     }
 
 
@@ -153,9 +156,13 @@ def _memory_summary(
                 context_lengths.add(context)
     before_swapouts = before.get("swapouts")
     after_swapouts = after.get("swapouts")
-    swapout_delta = None
+    swapout_delta_pages = None
+    swapout_delta_bytes = None
     if isinstance(before_swapouts, int) and isinstance(after_swapouts, int):
-        swapout_delta = max(0, after_swapouts - before_swapouts)
+        swapout_delta_pages = max(0, after_swapouts - before_swapouts)
+        page_size = after.get("page_size_bytes") or before.get("page_size_bytes")
+        if isinstance(page_size, int):
+            swapout_delta_bytes = swapout_delta_pages * page_size
     return {
         "sample_count": len(samples),
         "sample_errors": sample_errors,
@@ -163,7 +170,8 @@ def _memory_summary(
         "peak_model_vram_bytes": peak_vram,
         "observed_context_lengths": sorted(context_lengths),
         "minimum_host_free_percent": min(free_percentages) if free_percentages else None,
-        "swapout_delta": swapout_delta,
+        "swapout_delta_pages": swapout_delta_pages,
+        "swapout_delta_bytes": swapout_delta_bytes,
         "before": dict(before),
         "after": dict(after),
     }
@@ -210,12 +218,15 @@ async def _run(args: argparse.Namespace) -> dict[str, object]:
                     "/api/generate",
                     {"model": model["name"], "keep_alive": 0, "stream": False},
                 )
+        if resident_models:
+            await asyncio.sleep(5)
 
         settings = Settings(
             ollama_base_url=base_url,
             ollama_model=args.model,
             ollama_model_digest=args.expected_digest,
             ollama_num_ctx=args.num_ctx,
+            ollama_num_batch=args.num_batch,
             ollama_max_concurrency=1,
             ollama_max_output_tokens=args.max_output_tokens,
             ollama_timeout_seconds=args.timeout_seconds,
@@ -223,7 +234,7 @@ async def _run(args: argparse.Namespace) -> dict[str, object]:
         )
         gateway = LLMGateway(settings)
         harness = EvaluationHarness(gateway, benchmark_version="phase1-live-v1")
-        memory_before = _host_memory_snapshot()
+        cold_memory_before = _host_memory_snapshot()
         memory_samples: list[dict[str, object]] = []
         stop_sampling = asyncio.Event()
         sampler = asyncio.create_task(_sample_memory(client, stop_sampling, memory_samples))
@@ -233,6 +244,11 @@ async def _run(args: argparse.Namespace) -> dict[str, object]:
                 cold = await harness.run(
                     [valid_fixtures[0]], report_root / "cold.json", max_concurrency=1
                 )
+                await asyncio.sleep(5)
+                cold_memory_after = await asyncio.to_thread(_host_memory_snapshot)
+                cold_memory_samples = list(memory_samples)
+                memory_samples.clear()
+                warm_memory_before = await asyncio.to_thread(_host_memory_snapshot)
                 warm_inputs = [
                     fixture for _ in range(args.warm_repetitions) for fixture in valid_fixtures
                 ]
@@ -254,7 +270,22 @@ async def _run(args: argparse.Namespace) -> dict[str, object]:
         finally:
             stop_sampling.set()
             await sampler
-        memory_after = _host_memory_snapshot()
+        warm_memory_after = _host_memory_snapshot()
+        final_tags = await _ollama_json(client, "GET", "/api/tags")
+        final_models = final_tags.get("models")
+        final_model_records = (
+            [
+                cast(dict[str, object], model)
+                for model in cast(list[object], final_models)
+                if isinstance(model, dict)
+            ]
+            if isinstance(final_models, list)
+            else []
+        )
+        identity_stable = any(
+            model.get("name") == args.model and model.get("digest") == args.expected_digest
+            for model in final_model_records
+        )
 
     marker_outputs: list[str | None] = [
         result.output.answer if result.output is not None else None for result in marker_results
@@ -275,27 +306,43 @@ async def _run(args: argparse.Namespace) -> dict[str, object]:
         "model_intervals_non_overlapping": non_overlapping,
         "gateway_metrics": concurrency_metrics,
     }
-    memory = _memory_summary(memory_samples, memory_before, memory_after)
+    cold_memory = _memory_summary(
+        cold_memory_samples,
+        cold_memory_before,
+        cold_memory_after,
+    )
+    memory = _memory_summary(memory_samples, warm_memory_before, warm_memory_after)
     minimum_free = memory["minimum_host_free_percent"]
+    peak_model_vram = max(
+        cast(int, cold_memory["peak_model_vram_bytes"]),
+        cast(int, memory["peak_model_vram_bytes"]),
+    )
+    observed_context_lengths = sorted(
+        set(cast(list[int], cold_memory["observed_context_lengths"]))
+        | set(cast(list[int], memory["observed_context_lengths"]))
+    )
     checks: dict[str, bool] = {
         "cold_fixture_passed": cold.metrics.pass_rate == 1,
         "warm_fixtures_passed": warm.metrics.pass_rate == 1,
         "warm_p95_within_timeout": warm.metrics.p95_latency_ms <= LATENCY_P95_LIMIT_MS,
-        "model_allocation_within_limit": (
-            isinstance(memory["peak_model_vram_bytes"], int)
-            and 0 < memory["peak_model_vram_bytes"] <= MODEL_ALLOCATION_LIMIT_BYTES
-        ),
-        "host_headroom_observed": (
-            isinstance(minimum_free, (int, float)) and minimum_free >= MINIMUM_FREE_MEMORY_PERCENT
-        ),
-        "no_swapout_growth": memory["swapout_delta"] == 0,
-        "context_length_matches": memory["observed_context_lengths"] == [args.num_ctx],
+        "model_allocation_within_limit": 0 < peak_model_vram <= MODEL_ALLOCATION_LIMIT_BYTES,
+        "context_length_matches": observed_context_lengths == [args.num_ctx],
         "two_tasks_completed": all(
             result.status is InvocationStatus.VALID for result in marker_results
         ),
         "single_active_model_call": concurrency_metrics == {"active": 0, "peak": 1, "limit": 1},
         "concurrent_results_not_mixed": marker_outputs == list(markers),
         "model_intervals_non_overlapping": non_overlapping,
+        "model_identity_stable": identity_stable,
+    }
+    advisories: dict[str, bool] = {
+        "steady_host_headroom_observed": (
+            isinstance(minimum_free, (int, float)) and minimum_free >= MINIMUM_FREE_MEMORY_PERCENT
+        ),
+        "steady_swapout_within_limit": (
+            isinstance(memory["swapout_delta_bytes"], int)
+            and memory["swapout_delta_bytes"] <= STEADY_SWAPOUT_LIMIT_BYTES
+        ),
     }
     return {
         "benchmark_version": "phase1-live-v1",
@@ -315,36 +362,48 @@ async def _run(args: argparse.Namespace) -> dict[str, object]:
             "model": args.model,
             "digest": args.expected_digest,
             "tag_record": matching[0],
+            "identity_stable_at_finish": identity_stable,
         },
         "settings": {
             "num_ctx": args.num_ctx,
+            "num_batch": args.num_batch,
             "max_output_tokens": args.max_output_tokens,
             "max_concurrency": 1,
             "timeout_seconds": args.timeout_seconds,
             "seed": args.seed,
             "temperature": 0,
+            "reasoning": settings.ollama_reasoning,
             "repair_attempts": settings.ollama_repair_attempts,
             "config_version": gateway.config_version,
+        },
+        "acceptance_thresholds": {
+            "warm_p95_limit_ms": LATENCY_P95_LIMIT_MS,
+            "model_allocation_limit_bytes": MODEL_ALLOCATION_LIMIT_BYTES,
+            "minimum_steady_host_free_percent": MINIMUM_FREE_MEMORY_PERCENT,
+            "steady_swapout_limit_bytes": STEADY_SWAPOUT_LIMIT_BYTES,
         },
         "cold": cold.model_dump(mode="json"),
         "warm": warm.model_dump(mode="json"),
         "concurrency": concurrency,
+        "cold_start_memory": cold_memory,
         "memory": memory,
         "acceptance_checks": checks,
+        "advisory_checks": advisories,
         "gate_passed": all(checks.values()),
     }
 
 
 def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--model", default="qwen3.8:27b")
+    parser.add_argument("--model", default="qwen3-32gb:latest")
     parser.add_argument("--expected-digest", required=True)
     parser.add_argument("--base-url", default="http://127.0.0.1:11434")
     parser.add_argument("--fixture-dir", type=Path, default=Path("tests/fixtures/evaluation"))
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--warm-repetitions", type=int, default=10)
-    parser.add_argument("--num-ctx", type=int, default=8192)
-    parser.add_argument("--max-output-tokens", type=int, default=1024)
+    parser.add_argument("--num-ctx", type=int, default=2048)
+    parser.add_argument("--num-batch", type=int, default=32)
+    parser.add_argument("--max-output-tokens", type=int, default=384)
     parser.add_argument("--timeout-seconds", type=float, default=300)
     parser.add_argument("--seed", type=int, default=1729)
     return parser

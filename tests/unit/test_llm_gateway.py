@@ -23,9 +23,17 @@ class FakeChatModel:
         self.responses = iter(responses)
         self.delay = delay
         self.prompts: list[str] = []
+        self.formats: list[dict[str, object]] = []
+        self.options: list[dict[str, object]] = []
 
-    async def ainvoke(self, prompt: str) -> object:
+    async def ainvoke(self, prompt: str, **kwargs: object) -> object:
         self.prompts.append(prompt)
+        response_format = kwargs.get("format")
+        assert isinstance(response_format, dict)
+        self.formats.append(response_format)
+        options = kwargs.get("options")
+        assert isinstance(options, dict)
+        self.options.append(options)
         if self.delay:
             await asyncio.sleep(self.delay)
         return next(self.responses)
@@ -54,6 +62,8 @@ async def test_valid_response_records_estimated_and_reported_telemetry() -> None
     assert result.telemetry[0].estimated_input_tokens >= 3
     assert result.telemetry[0].input_characters > len("four words")
     assert result.telemetry[0].estimated_output_tokens == 4
+    assert fake.formats[0]["title"] == "Answer"
+    assert fake.options[0]["num_batch"] == 32
 
 
 @pytest.mark.asyncio
@@ -78,9 +88,12 @@ async def test_terminal_invalid_response_is_deterministic() -> None:
 
     assert result.status is InvocationStatus.INVALID_OUTPUT
     assert result.error_code == "analysis_invalid_output"
-    assert result.error_diagnostic == "Model output did not match the requested JSON schema."
+    assert result.error_diagnostic == (
+        "Model output did not match the requested JSON schema. Response was not valid JSON."
+    )
     assert len(result.telemetry) == 2
     assert all(item.output_valid is False for item in result.telemetry)
+    assert all(item.error_code == "invalid_json" for item in result.telemetry)
 
 
 @pytest.mark.asyncio
@@ -117,7 +130,7 @@ async def test_semaphore_is_shared_across_gateway_instances() -> None:
         active = 0
         maximum = 0
 
-        async def ainvoke(self, prompt: str) -> object:
+        async def ainvoke(self, prompt: str, **kwargs: object) -> object:
             type(self).active += 1
             type(self).maximum = max(type(self).maximum, type(self).active)
             try:

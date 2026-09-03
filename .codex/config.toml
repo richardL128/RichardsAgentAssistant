@@ -8,8 +8,8 @@ approval_policy = "never"
 sandbox_mode = "workspace-write"
 
 [sandbox_workspace_write]
-writable_roots = ["/path/to/your/repo"]   # <-- replace with this repo's absolute path
-network_access = true                    # flip to true only if agents need net access
+writable_roots = ["/Users/richardliu/Desktop/LifeAgent"]
+network_access = true
 
 [agents]
 # Enable Codex's local background subagent workflows. This is true by default,

@@ -110,12 +110,57 @@ def test_domain_schemas_enforce_evidence_and_finance_boundary() -> None:
             course="HIST-201",
             title="Research brief",
             assessment_type="assignment",
+            due_date=None,
+            grade_weight_percent=None,
+            scope=None,
             ambiguous=True,
+            ambiguity_reason=None,
             citations=[],
+        )
+
+    with pytest.raises(ValidationError):
+        CodeFindingTriage(
+            finding_present=False,
+            severity="suggestion",
+            file="app/auth.py",
+            line=42,
+            confidence=0.8,
+            rationale="The candidate was dismissed.",
+            evidence="No changed behavior was found.",
+        )
+
+    with pytest.raises(ValidationError):
+        FinanceFactInference(
+            facts=[],
+            inferences=[
+                {
+                    "claim": "Buy shares after the filing.",
+                    "basis": [{"source": "filing", "locator": "page 4"}],
+                    "uncertainty": "The outlook could change.",
+                }
+            ],
+            thesis_impact="monitor",
+            counter_case="Revenue could decline.",
+        )
+
+    with pytest.raises(ValidationError):
+        AcademicExtraction(
+            course="HIST-201",
+            title="Research brief",
+            assessment_type="assignment",
+            due_date="2026-09-20",
+            grade_weight_percent=15,
+            scope=None,
+            ambiguous=True,
+            ambiguity_reason="Two source pages list conflicting dates.",
+            citations=[{"source": "outline", "locator": "page 3"}],
         )
 
     finding = CodeFindingTriage(
         finding_present=False,
+        severity=None,
+        file=None,
+        line=None,
         confidence=0.8,
         rationale="No actionable issue was substantiated.",
         evidence="The deterministic check found no changed behavior.",

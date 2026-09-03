@@ -1,5 +1,65 @@
-"""Database access and migration support."""
+"""Database access, models, repositories, and migration support."""
 
+from app.db.code_review import CodeReviewRepository, ReviewIntake, review_idempotency_key
+from app.db.models import (
+    AgentRun,
+    ApprovalRequest,
+    ApprovalState,
+    AuditEvent,
+    Base,
+    CodeRepository,
+    Delivery,
+    DeliveryStatus,
+    EvidenceClassification,
+    EvidenceRef,
+    HealthCheck,
+    HealthState,
+    RepositoryProfile,
+    ReviewedCommit,
+    ReviewFinding,
+    RunStatus,
+    RunStep,
+    StepStatus,
+    UIAcknowledgement,
+)
+from app.db.repositories import (
+    ApprovalRepository,
+    AuditRepository,
+    DeliveryRepository,
+    HealthRepository,
+    RunRepository,
+    UIAcknowledgementRepository,
+)
 from app.db.session import Database
 
-__all__ = ["Database"]
+__all__ = [
+    "AgentRun",
+    "ApprovalRepository",
+    "ApprovalRequest",
+    "ApprovalState",
+    "AuditEvent",
+    "AuditRepository",
+    "Base",
+    "CodeRepository",
+    "CodeReviewRepository",
+    "Database",
+    "Delivery",
+    "DeliveryRepository",
+    "DeliveryStatus",
+    "EvidenceClassification",
+    "EvidenceRef",
+    "HealthCheck",
+    "HealthRepository",
+    "HealthState",
+    "RepositoryProfile",
+    "ReviewFinding",
+    "ReviewIntake",
+    "ReviewedCommit",
+    "RunRepository",
+    "RunStatus",
+    "RunStep",
+    "StepStatus",
+    "UIAcknowledgement",
+    "UIAcknowledgementRepository",
+    "review_idempotency_key",
+]

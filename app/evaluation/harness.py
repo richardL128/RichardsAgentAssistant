@@ -35,10 +35,12 @@ class EvaluationRecord(BaseModel):
     status: InvocationStatus
     valid: bool
     assertions_passed: bool
+    assertion_failures: list[str]
     passed: bool
     latency_ms: float = Field(ge=0)
     telemetry: list[ModelCallTelemetry]
     error_code: str | None = None
+    error_diagnostic: str | None = None
 
 
 class BenchmarkMetrics(BaseModel):
@@ -143,6 +145,7 @@ class EvaluationHarness:
         started = time.perf_counter()
         telemetry: list[ModelCallTelemetry] = []
         assertions_passed = False
+        assertion_failures: list[str] = []
         try:
             response = self._gateway.invoke_structured(
                 prompt=fixture.prompt,
@@ -156,14 +159,18 @@ class EvaluationHarness:
             valid = result.status is InvocationStatus.VALID and self._validate_output_schema(
                 result, fixture
             )
-            assertions_passed = valid and self._matches_assertions(result, fixture)
+            if valid:
+                assertion_failures = self._assertion_failures(result, fixture)
+                assertions_passed = not assertion_failures
             status = result.status
             error_code = result.error_code
+            error_diagnostic = result.error_diagnostic
         except Exception:
             result = None
             valid = False
             status = InvocationStatus.FAILED
             error_code = "gateway_exception"
+            error_diagnostic = "Gateway evaluation raised an exception."
         measured_latency = (time.perf_counter() - started) * 1_000
         latency = sum(item.latency_ms for item in telemetry) if telemetry else measured_latency
         expected_status = InvocationStatus(fixture.expected_status)
@@ -185,10 +192,12 @@ class EvaluationHarness:
             status=status,
             valid=valid,
             assertions_passed=assertions_passed,
+            assertion_failures=assertion_failures,
             passed=passed,
             latency_ms=latency,
             telemetry=telemetry,
             error_code=error_code,
+            error_diagnostic=error_diagnostic,
         )
 
     @staticmethod
@@ -204,24 +213,26 @@ class EvaluationHarness:
         return True
 
     @staticmethod
-    def _matches_assertions(
+    def _assertion_failures(
         result: InvocationResult[BaseModel], fixture: EvaluationFixture
-    ) -> bool:
+    ) -> list[str]:
         if result.output is None:
-            return False
+            return ["output"]
         output = fixture.model_type.model_validate(result.output)
         payload = output.model_dump(mode="json")
+        failures: list[str] = []
         for path, expected in fixture.assertions.equals.items():
             if _value_at_path(payload, path) != expected:
-                return False
+                failures.append(path)
         for path, terms in fixture.assertions.contains.items():
             value = _value_at_path(payload, path)
             if not isinstance(value, str):
-                return False
+                failures.append(path)
+                continue
             lowered = value.casefold()
             if any(term.casefold() not in lowered for term in terms):
-                return False
-        return True
+                failures.append(path)
+        return sorted(set(failures))
 
 
 def _value_at_path(payload: object, path: str) -> object:

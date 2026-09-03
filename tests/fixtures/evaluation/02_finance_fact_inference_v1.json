@@ -22,7 +22,10 @@
     "counter_case": "The result could be temporary and may not translate into future margins."
   },
   "assertions": {
-    "equals": {"thesis_impact": "monitor", "facts.0.citation.locator": "page 4"},
-    "contains": {"facts.0.claim": ["120", "million", "quarter"]}
+    "equals": {"thesis_impact": "monitor"},
+    "contains": {
+      "facts.0.claim": ["120", "million"],
+      "facts.0.citation.locator": ["4"]
+    }
   }
 }

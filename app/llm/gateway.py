@@ -12,7 +12,7 @@ from typing import Any, TypeVar
 from uuid import UUID, uuid4
 
 from langchain_ollama import ChatOllama
-from pydantic import BaseModel
+from pydantic import BaseModel, ValidationError
 
 from app.core.config import Settings, get_settings
 from app.llm.contracts import InvocationResult, InvocationStatus, ModelCallTelemetry
@@ -74,11 +74,13 @@ class LLMGateway:
 
         telemetry: list[ModelCallTelemetry] = []
         raw_text = ""
+        validation_diagnostic = "Response was not valid JSON."
         for attempt in range(1, self.settings.ollama_repair_attempts + 2):
             outcome = await self._invoke_once(
                 request_id=request_id,
                 attempt=attempt,
                 prompt=call_prompt,
+                response_schema=response_model.model_json_schema(),
                 telemetry=telemetry,
             )
             if outcome.error_code is not None:
@@ -93,8 +95,26 @@ class LLMGateway:
             raw_text = outcome.raw_text
             try:
                 parsed = parse_model_json(raw_text, response_model)
-            except (ValueError, TypeError):
+            except json.JSONDecodeError:
                 parsed = None
+                validation_diagnostic = "Response was not valid JSON."
+                telemetry[-1].error_code = "invalid_json"
+            except ValidationError as exc:
+                parsed = None
+                locations = sorted(
+                    {
+                        ".".join(str(part) for part in error["loc"]) or "$"
+                        for error in exc.errors(include_input=False)
+                    }
+                )
+                validation_diagnostic = (
+                    "Response failed schema validation at " + ", ".join(locations) + "."
+                )
+                telemetry[-1].error_code = "schema_validation_failed"
+            except (TypeError, ValueError):
+                parsed = None
+                validation_diagnostic = "Response could not be validated."
+                telemetry[-1].error_code = "schema_validation_failed"
             if parsed is not None:
                 telemetry[-1].output_valid = True
                 return self._result(
@@ -112,7 +132,10 @@ class LLMGateway:
                         telemetry=telemetry,
                         raw_text=raw_text,
                         error_code="analysis_invalid_output",
-                        error_diagnostic="Model output did not match the requested JSON schema.",
+                        error_diagnostic=(
+                            "Model output did not match the requested JSON schema. "
+                            + validation_diagnostic
+                        ),
                     )
 
         return self._result(
@@ -121,7 +144,9 @@ class LLMGateway:
             telemetry=telemetry,
             raw_text=raw_text,
             error_code="analysis_invalid_output",
-            error_diagnostic="Model output did not match the requested JSON schema.",
+            error_diagnostic=(
+                "Model output did not match the requested JSON schema. " + validation_diagnostic
+            ),
         )
 
     async def _invoke_once(
@@ -130,6 +155,7 @@ class LLMGateway:
         request_id: UUID,
         attempt: int,
         prompt: str,
+        response_schema: dict[str, Any],
         telemetry: list[ModelCallTelemetry],
     ) -> _CallOutcome:
         started_at = datetime.now(UTC)
@@ -152,7 +178,8 @@ class LLMGateway:
                 _max_active_model_calls = max(_max_active_model_calls, _active_model_calls)
                 try:
                     response = await asyncio.wait_for(
-                        self._ainvoke(prompt), timeout=self.settings.ollama_timeout_seconds
+                        self._ainvoke(prompt, response_schema),
+                        timeout=self.settings.ollama_timeout_seconds,
                     )
                 finally:
                     model_finished_at = datetime.now(UTC)
@@ -201,11 +228,21 @@ class LLMGateway:
             error_diagnostic=error_diagnostic,
         )
 
-    async def _ainvoke(self, prompt: str) -> Any:
+    async def _ainvoke(self, prompt: str, response_schema: dict[str, Any]) -> Any:
         invoker = getattr(self._model, "ainvoke", None)
         if invoker is None or not callable(invoker):
             raise TypeError("injected chat model does not provide ainvoke")
-        result = invoker(prompt)
+        result = invoker(
+            prompt,
+            format=response_schema,
+            options={
+                "num_ctx": self.settings.ollama_num_ctx,
+                "num_batch": self.settings.ollama_num_batch,
+                "num_predict": self.settings.ollama_max_output_tokens,
+                "temperature": 0.0,
+                "seed": self.settings.ollama_seed,
+            },
+        )
         if inspect.isawaitable(result):
             return await result
         return result
@@ -218,6 +255,7 @@ class LLMGateway:
             num_predict=self.settings.ollama_max_output_tokens,
             temperature=0.0,
             seed=self.settings.ollama_seed,
+            reasoning=self.settings.ollama_reasoning,
             format="json",
             async_client_kwargs={"timeout": self.settings.ollama_timeout_seconds},
         )
@@ -233,12 +271,14 @@ class LLMGateway:
             "model_digest": self.settings.ollama_model_digest,
             "max_concurrency": self.settings.ollama_max_concurrency,
             "num_ctx": self.settings.ollama_num_ctx,
+            "num_batch": self.settings.ollama_num_batch,
             "max_output_tokens": self.settings.ollama_max_output_tokens,
             "timeout_seconds": self.settings.ollama_timeout_seconds,
             "max_input_tokens": self.settings.ollama_max_input_tokens,
             "repair_attempts": self.settings.ollama_repair_attempts,
             "temperature": 0.0,
             "seed": self.settings.ollama_seed,
+            "reasoning": self.settings.ollama_reasoning,
         }
         serialized = json.dumps(config, sort_keys=True, separators=(",", ":"))
         return hashlib.sha256(serialized.encode("utf-8")).hexdigest()

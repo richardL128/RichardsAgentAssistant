@@ -35,12 +35,21 @@ class HealthResponse(BaseModel):
     version: str
 
 
+class OllamaModelRecord(BaseModel):
+    """The identity fields needed to verify the configured local model."""
+
+    model_config = ConfigDict(extra="ignore")
+
+    name: str
+    digest: str
+
+
 class OllamaTagsResponse(BaseModel):
     """Minimal allowlisted shape from Ollama's non-secret tags endpoint."""
 
     model_config = ConfigDict(extra="ignore")
 
-    models: list[dict[str, object]] = Field(default_factory=lambda: list[dict[str, object]]())
+    models: list[OllamaModelRecord] = Field(default_factory=lambda: list[OllamaModelRecord]())
 
 
 def check_artifact_root(settings: Settings) -> HealthCheck:
@@ -69,7 +78,7 @@ def check_artifact_root(settings: Settings) -> HealthCheck:
         )
 
 
-def check_database(database: Database) -> tuple[HealthCheck, HealthCheck]:
+def check_database(database: Database) -> tuple[HealthCheck, ...]:
     connected, connection_detail = database.check_connection()
     connection_check = HealthCheck(
         name="database",
@@ -77,16 +86,48 @@ def check_database(database: Database) -> tuple[HealthCheck, HealthCheck]:
         diagnostic=connection_detail,
     )
     if not connected:
-        return connection_check, HealthCheck(
-            name="procrastinate",
-            state=HealthState.FAILED,
-            diagnostic="not checked: database unavailable",
+        return (
+            connection_check,
+            *(
+                HealthCheck(
+                    name=name,
+                    state=HealthState.FAILED,
+                    diagnostic="not checked: database unavailable",
+                )
+                for name in (
+                    "procrastinate",
+                    "shared_schema",
+                    "checkpoints",
+                    "code_review_schema",
+                )
+            ),
         )
     schema_ok, schema_detail = database.check_procrastinate_schema()
-    return connection_check, HealthCheck(
-        name="procrastinate",
-        state=HealthState.HEALTHY if schema_ok else HealthState.FAILED,
-        diagnostic=schema_detail,
+    shared_ok, shared_detail = database.check_shared_schema()
+    checkpoint_ok, checkpoint_detail = database.check_checkpoint_schema()
+    code_review_ok, code_review_detail = database.check_code_review_schema()
+    return (
+        connection_check,
+        HealthCheck(
+            name="procrastinate",
+            state=HealthState.HEALTHY if schema_ok else HealthState.FAILED,
+            diagnostic=schema_detail,
+        ),
+        HealthCheck(
+            name="shared_schema",
+            state=HealthState.HEALTHY if shared_ok else HealthState.FAILED,
+            diagnostic=shared_detail,
+        ),
+        HealthCheck(
+            name="checkpoints",
+            state=HealthState.HEALTHY if checkpoint_ok else HealthState.FAILED,
+            diagnostic=checkpoint_detail,
+        ),
+        HealthCheck(
+            name="code_review_schema",
+            state=HealthState.HEALTHY if code_review_ok else HealthState.FAILED,
+            diagnostic=code_review_detail,
+        ),
     )
 
 
@@ -106,10 +147,36 @@ async def check_ollama(settings: Settings, client: httpx.AsyncClient | None = No
         response.raise_for_status()
         payload = OllamaTagsResponse.model_validate(response.json())
         model_count = len(payload.models)
+        if settings.ollama_model_digest:
+            expected = next(
+                (model for model in payload.models if model.name == settings.ollama_model),
+                None,
+            )
+            if expected is None:
+                return HealthCheck(
+                    name="ollama",
+                    state=HealthState.ATTENTION,
+                    diagnostic=(
+                        "configured Ollama model is not installed; model features are degraded"
+                    ),
+                )
+            if expected.digest != settings.ollama_model_digest:
+                return HealthCheck(
+                    name="ollama",
+                    state=HealthState.ATTENTION,
+                    diagnostic=(
+                        "configured Ollama model digest does not match; model features are degraded"
+                    ),
+                )
         return HealthCheck(
             name="ollama",
             state=HealthState.HEALTHY,
-            diagnostic=(f"Ollama /api/tags responded ({model_count} model(s) advertised)"),
+            diagnostic=(
+                f"Ollama /api/tags responded ({model_count} model(s) advertised); "
+                "configured model identity verified"
+                if settings.ollama_model_digest
+                else f"Ollama /api/tags responded ({model_count} model(s) advertised)"
+            ),
         )
     except (httpx.HTTPError, ValidationError, ValueError, TypeError) as exc:
         return HealthCheck(

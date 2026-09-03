@@ -76,6 +76,61 @@ class Database:
         except (SQLAlchemyError, OSError) as exc:
             return False, self._error_detail(exc)
 
+    def check_shared_schema(self) -> tuple[bool, str]:
+        required = {
+            "agent_runs",
+            "approval_requests",
+            "audit_events",
+            "deliveries",
+            "evidence_refs",
+            "health_checks",
+            "run_steps",
+            "ui_acknowledgements",
+        }
+        return self._check_tables(required, "Phase 2 shared schema")
+
+    def check_checkpoint_schema(self) -> tuple[bool, str]:
+        required = {
+            "checkpoint_blobs",
+            "checkpoint_migrations",
+            "checkpoint_writes",
+            "checkpoints",
+        }
+        return self._check_tables(required, "LangGraph checkpoint schema")
+
+    def check_code_review_schema(self) -> tuple[bool, str]:
+        """Check the Phase 3 repository/review persistence tables."""
+
+        required = {
+            "project_profiles",
+            "repositories",
+            "review_findings",
+            "reviewed_commits",
+        }
+        return self._check_tables(required, "Phase 3 code-review schema")
+
+    def _check_tables(self, required: set[str], label: str) -> tuple[bool, str]:
+        try:
+            with self.connection() as connection:
+                if connection.dialect.name == "sqlite":
+                    rows = connection.execute(
+                        text("SELECT name FROM sqlite_master WHERE type = 'table'")
+                    )
+                    present = {str(row[0]) for row in rows}
+                else:
+                    rows = connection.execute(
+                        text(
+                            "SELECT tablename FROM pg_catalog.pg_tables WHERE schemaname = 'public'"
+                        )
+                    )
+                    present = {str(row[0]) for row in rows}
+            missing = sorted(required - present)
+            if missing:
+                return False, f"{label} is missing {len(missing)} required table(s)"
+            return True, f"{label} is present"
+        except (SQLAlchemyError, OSError) as exc:
+            return False, self._error_detail(exc)
+
     def dispose(self) -> None:
         if self._engine is not None:
             self._engine.dispose()
