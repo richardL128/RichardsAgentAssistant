@@ -1,0 +1,20 @@
+{
+  "fixture_id": "code-finding-triage-v1",
+  "domain": "code_review",
+  "prompt": "Triage this synthetic finding using only the supplied evidence. Changed file: app/auth.py. Changed line: 42. Diff evidence: the call authorize(request.user, account) was removed immediately before delete_account(account.id), and no replacement guard appears in the bounded context. A deterministic authorization scanner flags line 42. Return an actionable finding with the exact changed location; do not add unsupported facts.",
+  "response_model": "CodeFindingTriage",
+  "expected_status": "valid",
+  "expected_output": {
+    "finding_present": true,
+    "severity": "important",
+    "file": "app/auth.py",
+    "line": 42,
+    "confidence": 0.97,
+    "rationale": "The changed endpoint can reach the protected operation without the required authorization check.",
+    "evidence": "The scanner points to app/auth.py line 42 and the diff removes the guard before the operation."
+  },
+  "assertions": {
+    "equals": {"finding_present": true, "file": "app/auth.py", "line": 42},
+    "contains": {"evidence": ["app/auth.py", "42"]}
+  }
+}

@@ -1,0 +1,28 @@
+{
+  "fixture_id": "finance-fact-inference-v1",
+  "domain": "finance",
+  "prompt": "Using only this synthetic filing record, separate verified fact from cautious inference and give a counter-case. Filing fact: Example Issuer reported quarterly revenue of USD 120 million for the quarter ended 2026-06-30. Source: synthetic filing, page 4, https://example.test/filing. One quarter alone does not establish a durable trend. Do not recommend or direct any transaction.",
+  "response_model": "FinanceFactInference",
+  "expected_status": "valid",
+  "expected_output": {
+    "facts": [
+      {
+        "claim": "The issuer reported revenue of 120 million dollars for the quarter.",
+        "citation": {"source": "synthetic filing", "locator": "page 4", "url": "https://example.test/filing"}
+      }
+    ],
+    "inferences": [
+      {
+        "claim": "The reported result may support the existing growth thesis if the trend persists.",
+        "basis": [{"source": "synthetic filing", "locator": "page 4", "url": "https://example.test/filing"}],
+        "uncertainty": "One quarter does not establish a durable trend."
+      }
+    ],
+    "thesis_impact": "monitor",
+    "counter_case": "The result could be temporary and may not translate into future margins."
+  },
+  "assertions": {
+    "equals": {"thesis_impact": "monitor", "facts.0.citation.locator": "page 4"},
+    "contains": {"facts.0.claim": ["120", "million", "quarter"]}
+  }
+}
