@@ -21,8 +21,9 @@ def run_migrations_offline() -> None:
     """Run migrations without opening a database connection."""
 
     settings = get_settings()
+    database_url = config.attributes.get("database_url", settings.database_url)
     context.configure(
-        url=settings.database_url,
+        url=database_url,
         target_metadata=target_metadata,
         literal_binds=True,
         dialect_opts={"paramstyle": "named"},
@@ -35,10 +36,11 @@ def run_migrations_online() -> None:
     """Run migrations against the configured database."""
 
     settings = get_settings()
+    database_url = config.attributes.get("database_url", settings.database_url)
     section = config.get_section(config.config_ini_section, {}) or {}
     # Alembic's ConfigParser interpolates percent signs.  Passwords remain in
     # process memory only and are never printed by this module.
-    section["sqlalchemy.url"] = settings.database_url.replace("%", "%%")
+    section["sqlalchemy.url"] = str(database_url).replace("%", "%%")
     connectable = engine_from_config(
         section,
         prefix="sqlalchemy.",

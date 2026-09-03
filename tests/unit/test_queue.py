@@ -1,0 +1,196 @@
+from __future__ import annotations
+
+from datetime import UTC, datetime, time, timedelta
+from types import SimpleNamespace
+
+import httpx
+import pytest
+
+from app.core.config import Settings
+from app.core.errors import ErrorCode, authorization_error, transient_error
+from app.queue import tasks
+from app.queue.app import QUEUE_NAMES, create_procrastinate_app, postgres_conninfo
+from app.queue.idempotency import (
+    IdempotencyKeyError,
+    build_idempotency_key,
+    validate_idempotency_key,
+)
+from app.queue.periodic import TorontoPeriodicSchedule, stable_period_key
+from app.queue.retry import (
+    RetryClassification,
+    RetryPolicy,
+    TransientRetryStrategy,
+    classify_retry_error,
+)
+from app.queue.visibility import QueueJobMetadata, QueueVisibility, queue_visibility
+
+
+@pytest.mark.parametrize(
+    ("error", "expected"),
+    [
+        (TimeoutError("upstream timeout"), RetryClassification.TRANSIENT),
+        (httpx.ConnectError("connection reset"), RetryClassification.TRANSIENT),
+        (
+            httpx.HTTPStatusError("too many requests", request=None, response=httpx.Response(429)),
+            RetryClassification.TRANSIENT,
+        ),  # type: ignore[arg-type]
+        (
+            httpx.HTTPStatusError("server error", request=None, response=httpx.Response(503)),
+            RetryClassification.TRANSIENT,
+        ),  # type: ignore[arg-type]
+        (
+            httpx.HTTPStatusError("bad token", request=None, response=httpx.Response(401)),
+            RetryClassification.AUTHORIZATION,
+        ),  # type: ignore[arg-type]
+        (ValueError("invalid token"), RetryClassification.AUTHORIZATION),
+        (ValueError("schema validation failed"), RetryClassification.PERMANENT),
+        (
+            transient_error(ErrorCode.MODEL_TRANSIENT, "model unavailable"),
+            RetryClassification.TRANSIENT,
+        ),
+        (authorization_error(), RetryClassification.AUTHORIZATION),
+    ],
+)
+def test_retry_classification(error: BaseException, expected: RetryClassification) -> None:
+    assert classify_retry_error(error) is expected
+
+
+def test_retry_policy_delay_is_capped_and_jitter_is_injectable() -> None:
+    policy = RetryPolicy(
+        max_attempts=3,
+        base_delay_seconds=10,
+        max_delay_seconds=30,
+        jitter_ratio=0.2,
+        random_fn=lambda: 1.0,
+    )
+    assert policy.delay_seconds(0) == 12
+    assert policy.delay_seconds(1) == 24
+    assert policy.delay_seconds(2) == 30
+    assert policy.delay_seconds(9) == 30
+
+
+def test_procrastinate_strategy_only_retries_transient_and_honors_attempt_cap() -> None:
+    strategy = TransientRetryStrategy(
+        RetryPolicy(max_attempts=2, base_delay_seconds=1, jitter_ratio=0, random_fn=lambda: 0)
+    )
+    transient = strategy.get_retry_decision(
+        exception=TimeoutError(), job=SimpleNamespace(attempts=0)
+    )
+    assert transient is not None
+    assert transient.retry_at is not None
+    assert transient.retry_at - datetime.now(UTC) <= timedelta(seconds=2)
+    assert (
+        strategy.get_retry_decision(
+            exception=ValueError("invalid token"), job=SimpleNamespace(attempts=0)
+        )
+        is None
+    )
+    assert (
+        strategy.get_retry_decision(exception=TimeoutError(), job=SimpleNamespace(attempts=1))
+        is None
+    )
+
+
+def test_idempotency_keys_are_deterministic_and_validated() -> None:
+    first = build_idempotency_key("finance", "2026-09-02", "market-open")
+    assert first == "finance:2026-09-02:market-open:v1"
+    assert first == build_idempotency_key("finance", "2026-09-02", "market-open")
+    assert validate_idempotency_key("review:repo-id:sha") == "review:repo-id:sha"
+    for invalid in ("", "Finance:date:v1", "finance::v1", "finance:has space:v1"):
+        with pytest.raises(IdempotencyKeyError):
+            validate_idempotency_key(invalid)
+    with pytest.raises(IdempotencyKeyError):
+        build_idempotency_key("finance", "date", version="1")
+
+
+def test_periodic_schedule_skips_nonexistent_spring_time() -> None:
+    schedule = TorontoPeriodicSchedule(2, 30)
+    result = schedule.next_occurrence(datetime(2025, 3, 9, 0, 0, tzinfo=UTC))
+    assert result.local_time == datetime(2025, 3, 10, 2, 30, tzinfo=result.local_time.tzinfo)
+    assert result.scheduled_at == datetime(2025, 3, 10, 6, 30, tzinfo=UTC)
+
+
+def test_periodic_schedule_resolves_fall_back_once_and_key_uses_local_period() -> None:
+    schedule = TorontoPeriodicSchedule(1, 30)
+    result = schedule.next_occurrence(datetime(2025, 11, 2, 0, 0, tzinfo=UTC))
+    assert result.local_time.fold == 0
+    assert result.scheduled_at == datetime(2025, 11, 2, 5, 30, tzinfo=UTC)
+    assert stable_period_key("finance", result) == "finance:2025-11-02:0130:v1"
+
+
+def test_dynamic_schedule_matches_only_one_toronto_period() -> None:
+    schedule = TorontoPeriodicSchedule.from_time(time(1, 30))
+    first = datetime(2025, 11, 2, 5, 30, tzinfo=UTC).astimezone(schedule.zone)
+    repeated = datetime(2025, 11, 2, 6, 30, tzinfo=UTC).astimezone(schedule.zone)
+
+    assert schedule.matches(first)
+    assert not schedule.matches(repeated)
+
+
+def test_queue_visibility_uses_explicit_status_and_heartbeat() -> None:
+    now = datetime(2026, 9, 3, 12, 0, tzinfo=UTC)
+    assert queue_visibility(QueueJobMetadata(1, "pending")) is QueueVisibility.QUEUED
+    assert (
+        queue_visibility(QueueJobMetadata(2, "running", started_at=now), now=now)
+        is QueueVisibility.RUNNING
+    )
+    assert (
+        queue_visibility(
+            QueueJobMetadata(3, "running", heartbeat_at=now - timedelta(minutes=2)), now=now
+        )
+        is QueueVisibility.STALLED
+    )
+    assert queue_visibility(QueueJobMetadata(4, "retrying", attempts=1)) is QueueVisibility.RETRYING
+    assert (
+        queue_visibility(QueueJobMetadata(5, "failed", error_code="invalid_token"))
+        is QueueVisibility.FAILED
+    )
+    assert queue_visibility(QueueJobMetadata(6, "succeeded")) is QueueVisibility.SUCCEEDED
+    with pytest.raises(ValueError, match="timezone-aware"):
+        queue_visibility(
+            QueueJobMetadata(7, "running", started_at=datetime(2026, 9, 3)),  # noqa: DTZ001
+            now=now,
+        )
+
+
+def test_procrastinate_app_is_configured_without_opening_connections() -> None:
+    app = create_procrastinate_app(Settings(worker_concurrency=2))
+    assert app.worker_defaults["concurrency"] == 2
+    assert (
+        postgres_conninfo("postgresql+psycopg://u:p@db:5432/lifeagent")
+        == "postgresql://u:p@db:5432/lifeagent"
+    )
+    assert QUEUE_NAMES == ("code_review", "academic_planner", "finance")
+    assert {
+        tasks.code_review_task.queue,
+        tasks.academic_planner_task.queue,
+        tasks.finance_task.queue,
+    } == set(QUEUE_NAMES)
+
+
+def test_task_deferral_uses_global_model_lock_and_per_item_queueing_lock() -> None:
+    class FakeTask:
+        def __init__(self) -> None:
+            self.configuration: dict[str, str] = {}
+            self.arguments: dict[str, str] = {}
+
+        def configure(self, **kwargs: str) -> FakeTask:
+            self.configuration = kwargs
+            return self
+
+        def defer(self, **kwargs: str) -> int:
+            self.arguments = kwargs
+            return 42
+
+    task = FakeTask()
+    result = tasks.defer_idempotent(task, "run-id", "review:repo:sha")
+
+    assert result == 42
+    assert task.configuration == {
+        "lock": "ollama:exclusive",
+        "queueing_lock": "review:repo:sha",
+    }
+    assert task.arguments == {
+        "run_id": "run-id",
+        "idempotency_key": "review:repo:sha",
+    }

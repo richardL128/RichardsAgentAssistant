@@ -24,12 +24,17 @@ class Citation(EvaluationModel):
 
 
 class CodeFindingTriage(EvaluationModel):
-    """Schema for triaging one deterministic code-review finding."""
+    """Triage one code finding.
+
+    When ``finding_present`` is true, ``severity``, ``file``, and ``line`` must
+    all be non-null. When it is false, all three must be JSON null. Never mix a
+    dismissed finding with a retained severity or location.
+    """
 
     finding_present: bool
-    severity: Literal["block", "important", "suggestion"] | None = None
-    file: str | None = Field(default=None, max_length=500)
-    line: int | None = Field(default=None, ge=1)
+    severity: Literal["block", "important", "suggestion"] | None
+    file: str | None = Field(max_length=500)
+    line: int | None = Field(ge=1)
     confidence: float = Field(ge=0, le=1)
     rationale: str = Field(min_length=1, max_length=2_000)
     evidence: str = Field(min_length=1, max_length=2_000)
@@ -63,7 +68,11 @@ class FinanceInference(EvaluationModel):
 
 
 class FinanceFactInference(EvaluationModel):
-    """Fact-versus-inference output with no trading instruction surface."""
+    """Separate cited facts from labelled inferences without trade directives.
+
+    Inference claims, uncertainty, thesis impact, and counter-case must not use
+    buy, sell, short, or purchase as instructions.
+    """
 
     facts: list[FinanceFact] = Field(max_length=10)
     inferences: list[FinanceInference] = Field(max_length=10)
@@ -89,16 +98,25 @@ class FinanceFactInference(EvaluationModel):
 
 
 class AcademicExtraction(EvaluationModel):
-    """Extracted assessment facts, with ambiguity and page/block citations."""
+    """Extract assessment facts with page/block citations.
+
+    When the source contains conflicting due dates, set ``ambiguous`` true,
+    explain the conflict in ``ambiguity_reason``, and set ``due_date`` to JSON
+    null rather than choosing either date.
+    """
 
     course: str = Field(min_length=1, max_length=200)
     title: str = Field(min_length=1, max_length=300)
     assessment_type: Literal["assignment", "quiz", "midterm", "final", "event"]
-    due_date: date | None = None
-    grade_weight_percent: float | None = Field(default=None, ge=0, le=100)
-    scope: str | None = Field(default=None, max_length=1_000)
+    due_date: date | None
+    grade_weight_percent: float | None = Field(
+        ge=0,
+        le=100,
+        description="Copy an explicitly stated percentage; otherwise use JSON null.",
+    )
+    scope: str | None = Field(max_length=1_000)
     ambiguous: bool
-    ambiguity_reason: str | None = Field(default=None, max_length=1_000)
+    ambiguity_reason: str | None = Field(max_length=1_000)
     citations: list[Citation] = Field(max_length=10)
 
     @model_validator(mode="after")

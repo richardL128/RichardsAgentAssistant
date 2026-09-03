@@ -17,9 +17,12 @@ __pycache__/
 .coverage
 htmlcov/
 
-.artifacts/
-artifacts/
+/.artifacts/
+/artifacts/
 *.log
 
 .idea/
 .vscode/
+
+# Commit messages Claude drafts for Richard to commit; see CLAUDE.md.
+.claude/commit-message.txt
