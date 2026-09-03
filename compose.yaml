@@ -1,0 +1,125 @@
+name: lifeagent
+
+services:
+  postgres:
+    image: postgres:16.4-bookworm
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:-lifeagent}
+      POSTGRES_USER: ${POSTGRES_USER:-lifeagent}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-lifeagent-dev-only}
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test:
+        - CMD-SHELL
+        - pg_isready -U "$${POSTGRES_USER}" -d "$${POSTGRES_DB}"
+      interval: 5s
+      timeout: 5s
+      retries: 12
+      start_period: 5s
+    restart: unless-stopped
+
+  api:
+    image: lifeagent-app:local
+    build:
+      context: .
+      dockerfile: infra/Dockerfile
+    command: ["/usr/local/bin/lifeagent-run-api"]
+    environment: &app-environment
+      APP_ENVIRONMENT: ${APP_ENVIRONMENT:-development}
+      APP_TIMEZONE: ${APP_TIMEZONE:-America/Toronto}
+      DATABASE_URL: postgresql+psycopg://${POSTGRES_USER:-lifeagent}:${POSTGRES_PASSWORD:-lifeagent-dev-only}@postgres:5432/${POSTGRES_DB:-lifeagent}
+      DATABASE_CONNECT_TIMEOUT_SECONDS: ${DATABASE_CONNECT_TIMEOUT_SECONDS:-3}
+      ARTIFACT_ROOT: /var/lib/lifeagent/artifacts
+      ARTIFACT_RETENTION_DAYS: ${ARTIFACT_RETENTION_DAYS:-30}
+      OLLAMA_BASE_URL: ${OLLAMA_BASE_URL:-http://host.docker.internal:11434}
+      OLLAMA_MODEL: ${OLLAMA_MODEL:-qwen3.8:27b}
+      OLLAMA_MAX_CONCURRENCY: ${OLLAMA_MAX_CONCURRENCY:-1}
+      OLLAMA_NUM_CTX: ${OLLAMA_NUM_CTX:-8192}
+      OLLAMA_TIMEOUT_SECONDS: ${OLLAMA_TIMEOUT_SECONDS:-300}
+      OLLAMA_MAX_INPUT_TOKENS: ${OLLAMA_MAX_INPUT_TOKENS:-6000}
+      OLLAMA_MAX_OUTPUT_TOKENS: ${OLLAMA_MAX_OUTPUT_TOKENS:-1024}
+      OLLAMA_REPAIR_ATTEMPTS: ${OLLAMA_REPAIR_ATTEMPTS:-1}
+      OLLAMA_SEED: ${OLLAMA_SEED:-1729}
+      OLLAMA_MODEL_DIGEST: ${OLLAMA_MODEL_DIGEST:-}
+      EMBEDDING_MODEL: ${EMBEDDING_MODEL:-qwen3-embedding:0.6b}
+      RETRY_MAX_ATTEMPTS: ${RETRY_MAX_ATTEMPTS:-3}
+      CONNECTOR_TIMEOUT_SECONDS: ${CONNECTOR_TIMEOUT_SECONDS:-10}
+      REPOSITORY_ALLOWLIST: ${REPOSITORY_ALLOWLIST:-[]}
+      DISCORD_TARGET_CHANNELS: ${DISCORD_TARGET_CHANNELS:-[]}
+    volumes:
+      - artifacts:/var/lib/lifeagent/artifacts
+    ports:
+      - "127.0.0.1:${API_PORT:-8000}:8000"
+    extra_hosts:
+      - host.docker.internal:host-gateway
+    depends_on:
+      postgres:
+        condition: service_healthy
+    healthcheck:
+      test:
+        - CMD
+        - python
+        - -c
+        - >-
+          import urllib.request;
+          urllib.request.urlopen('http://127.0.0.1:8000/health/live', timeout=3)
+      interval: 10s
+      timeout: 5s
+      retries: 6
+      start_period: 10s
+    restart: unless-stopped
+
+  worker-code-review:
+    image: lifeagent-app:local
+    build:
+      context: .
+      dockerfile: infra/Dockerfile
+    command: ["/usr/local/bin/lifeagent-idle-worker", "code_review"]
+    environment: *app-environment
+    volumes:
+      - artifacts:/var/lib/lifeagent/artifacts
+    extra_hosts:
+      - host.docker.internal:host-gateway
+    depends_on:
+      postgres:
+        condition: service_healthy
+    restart: unless-stopped
+
+  worker-academic-planner:
+    image: lifeagent-app:local
+    build:
+      context: .
+      dockerfile: infra/Dockerfile
+    command: ["/usr/local/bin/lifeagent-idle-worker", "academic_planner"]
+    environment: *app-environment
+    volumes:
+      - artifacts:/var/lib/lifeagent/artifacts
+    extra_hosts:
+      - host.docker.internal:host-gateway
+    depends_on:
+      postgres:
+        condition: service_healthy
+    restart: unless-stopped
+
+  worker-finance:
+    image: lifeagent-app:local
+    build:
+      context: .
+      dockerfile: infra/Dockerfile
+    command: ["/usr/local/bin/lifeagent-idle-worker", "finance"]
+    environment: *app-environment
+    volumes:
+      - artifacts:/var/lib/lifeagent/artifacts
+    extra_hosts:
+      - host.docker.internal:host-gateway
+    depends_on:
+      postgres:
+        condition: service_healthy
+    restart: unless-stopped
+
+volumes:
+  postgres_data:
+    name: lifeagent_postgres_data
+  artifacts:
+    name: lifeagent_artifacts

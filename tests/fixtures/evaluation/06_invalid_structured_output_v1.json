@@ -1,0 +1,9 @@
+{
+  "fixture_id": "invalid-structured-output-v1",
+  "domain": "structured_output",
+  "prompt": "Return the structured answer and confidence, but this fixture simulates a schema-invalid response.",
+  "response_model": "StructuredSmokeOutput",
+  "expected_status": "invalid_output",
+  "expected_output": {"answer": "missing confidence"},
+  "assertions": {"equals": {}, "contains": {}}
+}

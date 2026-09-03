@@ -1,0 +1,22 @@
+{
+  "fixture_id": "academic-ambiguous-extraction-v1",
+  "domain": "academic",
+  "prompt": "Extract this synthetic outline record without resolving contradictions. Course HIST-201, Research brief, assignment, worth 15%. Scope: use two primary sources and one course reading. On page 3 the schedule says due 2026-10-10, while the assessment table on the same page says due 2026-10-17. Source: synthetic course outline, page 3, https://example.test/course-outline. Because the deadline conflicts, do not set a due date; mark it ambiguous and explain why.",
+  "response_model": "AcademicExtraction",
+  "expected_status": "valid",
+  "expected_output": {
+    "course": "HIST-201",
+    "title": "Research brief",
+    "assessment_type": "assignment",
+    "due_date": null,
+    "grade_weight_percent": 15,
+    "scope": "Use two primary sources and one course reading.",
+    "ambiguous": true,
+    "ambiguity_reason": "The outline lists two different due dates for the same assessment.",
+    "citations": [{"source": "synthetic course outline", "locator": "page 3", "url": "https://example.test/course-outline"}]
+  },
+  "assertions": {
+    "equals": {"course": "HIST-201", "title": "Research brief", "assessment_type": "assignment", "due_date": null, "grade_weight_percent": 15, "ambiguous": true, "citations.0.locator": "page 3"},
+    "contains": {"ambiguity_reason": ["due", "date"]}
+  }
+}

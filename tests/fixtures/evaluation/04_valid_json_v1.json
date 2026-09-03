@@ -1,0 +1,12 @@
+{
+  "fixture_id": "valid-json-v1",
+  "domain": "structured_output",
+  "prompt": "Return the exact answer text 'The fixture is valid JSON.' with confidence 0.99 in the requested structured schema.",
+  "response_model": "StructuredSmokeOutput",
+  "expected_status": "valid",
+  "expected_output": {"answer": "The fixture is valid JSON.", "confidence": 0.99},
+  "assertions": {
+    "equals": {"answer": "The fixture is valid JSON.", "confidence": 0.99},
+    "contains": {}
+  }
+}

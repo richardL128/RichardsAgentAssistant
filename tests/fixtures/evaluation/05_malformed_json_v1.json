@@ -1,0 +1,9 @@
+{
+  "fixture_id": "malformed-json-v1",
+  "domain": "structured_output",
+  "prompt": "Return valid JSON, but this fixture simulates an unparseable model response.",
+  "response_model": "StructuredSmokeOutput",
+  "expected_status": "invalid_output",
+  "expected_output": "{\"answer\": \"unterminated\",",
+  "assertions": {"equals": {}, "contains": {}}
+}
