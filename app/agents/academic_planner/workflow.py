@@ -50,7 +50,11 @@ class NotionAcademicWriter(Protocol):
     """Narrow write seam; only exact confirmed changes reach this protocol."""
 
     async def apply_confirmed_changes(
-        self, changes: Sequence[ProposedChange], *, proposal_id: uuid.UUID
+        self,
+        changes: Sequence[ProposedChange],
+        *,
+        proposal_id: uuid.UUID,
+        confirmation_event: str,
     ) -> None: ...
 
 
@@ -292,7 +296,11 @@ async def confirm_checkin_proposal(
         return {"status": "confirmation_required", "proposal_id": str(proposal_id)}
     if status != "ready":
         raise RuntimeError("academic proposal entered an unknown confirmation state")
-    await writer.apply_confirmed_changes(proposal.changes, proposal_id=proposal_id)
+    await writer.apply_confirmed_changes(
+        proposal.changes,
+        proposal_id=proposal_id,
+        confirmation_event=confirmation_event,
+    )
     store.mark_checkin_applied(proposal_id, confirmation_event)
     return {
         "status": "applied",

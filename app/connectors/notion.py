@@ -4,9 +4,9 @@ from __future__ import annotations
 
 import json
 import re
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from datetime import UTC, datetime
-from typing import TYPE_CHECKING, Any, Final, Literal, cast
+from typing import TYPE_CHECKING, Any, Final, Literal, Protocol, cast
 from urllib.parse import quote, urlsplit
 
 import httpx
@@ -133,6 +133,14 @@ class NotionWriteReceipt(BaseModel):
     property_id: str | None = None
 
 
+class PlannerProposedChange(Protocol):
+    """Minimal planner-change shape accepted by the concrete Notion writer."""
+
+    field: str
+    value: str
+    assessment_id: str | None
+
+
 def _secret(value: SecretStr | str) -> str:
     return value.get_secret_value() if isinstance(value, SecretStr) else value
 
@@ -208,6 +216,28 @@ def _attachments(value: Any) -> tuple[NotionAttachment, ...]:
     # Property names are useful fallback names for files without a title.
     walk(value)
     return tuple(found)
+
+
+def _notion_value_for_change(change: PlannerProposedChange) -> Any:
+    if change.field == "completed":
+        normalized = change.value.strip().casefold()
+        status = "Completed" if normalized in {"true", "done", "complete", "completed"} else "To Do"
+        return {"status": {"name": status}}
+    if change.field == "new_deadline":
+        return {"date": {"start": change.value.strip()}}
+    if change.field == "actual_minutes":
+        try:
+            minutes = int(change.value)
+        except ValueError:
+            raise permanent_error(
+                ErrorCode.INPUT_INVALID, "actual minutes must be an integer"
+            ) from None
+        if minutes < 0:
+            raise permanent_error(ErrorCode.INPUT_INVALID, "actual minutes must not be negative")
+        return {"number": minutes}
+    raise permanent_error(
+        ErrorCode.INPUT_INVALID, "planner change is not an allowlisted Notion write"
+    )
 
 
 class NotionConnector:
@@ -560,10 +590,79 @@ class NotionConnector:
 # Friendly name used by integrations that call all source adapters connectors.
 NotionAppConnector = NotionConnector
 
+
+class AcademicNotionWriter:
+    """Apply exactly confirmed planner changes to allowlisted Notion properties."""
+
+    _FIELD_TO_PROPERTY: Final[dict[str, tuple[DatabaseName, str]]] = {
+        "completed": ("assessments", "status"),
+        "new_deadline": ("assessments", "due"),
+        "actual_minutes": ("study_blocks", "actual_duration"),
+    }
+
+    def __init__(
+        self,
+        *,
+        connector: NotionConnector,
+        targets: Mapping[str, NotionPageTarget],
+        property_ids: Mapping[str, Mapping[str, str]],
+    ) -> None:
+        self._connector = connector
+        self._targets = dict(targets)
+        self._property_ids = NotionConnector.validate_property_mapping(property_ids)
+
+    async def apply_confirmed_changes(
+        self,
+        changes: Sequence[PlannerProposedChange],
+        *,
+        proposal_id: Any,
+        confirmation_event: str,
+    ) -> None:
+        """Patch each change only with the exact confirmation event attached."""
+
+        if not confirmation_event.strip():
+            raise permanent_error(ErrorCode.INPUT_INVALID, "confirmation event is required")
+        for change in changes:
+            target_key = change.assessment_id
+            if target_key is None:
+                raise permanent_error(
+                    ErrorCode.INPUT_INVALID, "Notion target is required for this change"
+                )
+            target = self._targets.get(target_key)
+            if target is None:
+                raise permanent_error(ErrorCode.INPUT_INVALID, "Notion target is not allowlisted")
+            database, property_name = self._database_property_for(change)
+            if target.database != database:
+                raise permanent_error(
+                    ErrorCode.INPUT_INVALID, "Notion target database does not match change"
+                )
+            property_id = self._property_ids[database][property_name]
+            await self._connector.apply_confirmed_change(
+                ConfirmedPropertyChange(
+                    proposal_id=str(proposal_id),
+                    confirmation_token=confirmation_event,
+                    page_id=target.page_id,
+                    database=database,
+                    property_id=property_id,
+                    value=_notion_value_for_change(change),
+                ),
+                confirmation_event=confirmation_event,
+            )
+
+    def _database_property_for(self, change: PlannerProposedChange) -> tuple[DatabaseName, str]:
+        mapped = self._FIELD_TO_PROPERTY.get(change.field)
+        if mapped is None:
+            raise permanent_error(
+                ErrorCode.INPUT_INVALID, "planner change is not an allowlisted Notion write"
+            )
+        return mapped
+
+
 __all__ = [
     "MAX_ATTACHMENT_BYTES",
     "NOTION_API_BASE_URL",
     "NOTION_API_VERSION",
+    "AcademicNotionWriter",
     "ConfirmedPropertyChange",
     "DatabaseName",
     "NotionAppConnector",
@@ -573,4 +672,5 @@ __all__ = [
     "NotionPage",
     "NotionPageBatch",
     "NotionWriteReceipt",
+    "PlannerProposedChange",
 ]

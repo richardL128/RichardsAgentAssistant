@@ -13,6 +13,7 @@ from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import UTC, date, datetime, timedelta
 from typing import Any, Literal, cast
+from zoneinfo import ZoneInfo
 
 from sqlalchemy import and_, delete, or_, select
 from sqlalchemy.exc import IntegrityError, NoResultFound
@@ -48,6 +49,7 @@ CommitmentKind = Literal[
 ]
 CHUNK_MAX_CHARS = 20_000
 _SHA256 = re.compile(r"^[0-9a-f]{64}$")
+_TORONTO = ZoneInfo("America/Toronto")
 
 
 @dataclass(frozen=True, slots=True)
@@ -960,10 +962,24 @@ class SQLAlchemyAcademicPlannerStore:
                     select(StudyBlock).where(StudyBlock.status.in_(["incomplete", "in_progress"]))
                 )
             )
+            linked_assessments = {
+                assessment.id: assessment.notion_id
+                for assessment in session.scalars(
+                    select(Assessment).where(
+                        Assessment.id.in_(
+                            {
+                                row.assessment_id
+                                for row in incomplete_rows
+                                if row.assessment_id is not None
+                            }
+                        )
+                    )
+                )
+            }
             incomplete = [
                 IncompleteBlock(
                     id=str(row.id),
-                    assessment_id=str(row.assessment_id),
+                    assessment_id=linked_assessments.get(row.assessment_id, str(row.assessment_id)),
                     title=row.title,
                     remaining_minutes=row.allocated_minutes,
                     original_due_at=None,
@@ -987,7 +1003,7 @@ class SQLAlchemyAcademicPlannerStore:
         )
 
     def save_daily_plan(self, plan: Any) -> None:
-        local_day = _aware_db(plan.created_at).date()
+        local_day = _aware_db(plan.created_at).astimezone(_TORONTO).date()
         with Session(self.engine) as session, session.begin():
             stored = AcademicRepository.upsert_study_plan(
                 session,
@@ -1021,7 +1037,11 @@ class SQLAlchemyAcademicPlannerStore:
         from app.agents.academic_planner.contracts import StudyBlock as PlannerBlock
 
         with Session(self.engine) as session:
-            plan = session.scalar(select(StudyPlan).order_by(StudyPlan.created_at.desc()).limit(1))
+            plan = session.scalar(
+                select(StudyPlan)
+                .order_by(StudyPlan.created_at.desc(), StudyPlan.starts_on.desc())
+                .limit(1)
+            )
             if plan is None:
                 return None
             rows = list(
@@ -1032,8 +1052,19 @@ class SQLAlchemyAcademicPlannerStore:
                 )
             )
             blocks: list[Any] = []
+            assessment_ids = {row.assessment_id for row in rows if row.assessment_id is not None}
+            assessment_notion_ids = {
+                assessment.id: assessment.notion_id
+                for assessment in session.scalars(
+                    select(Assessment).where(Assessment.id.in_(assessment_ids))
+                )
+            }
             for row in rows:
-                assessment_id = str(row.assessment_id) if row.assessment_id else row.block_key
+                assessment_id = (
+                    assessment_notion_ids.get(row.assessment_id, str(row.assessment_id))
+                    if row.assessment_id
+                    else row.block_key
+                )
                 blocks.append(
                     PlannerBlock(
                         id=row.block_key,

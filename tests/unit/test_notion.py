@@ -7,10 +7,13 @@ from datetime import UTC, datetime
 import httpx
 import pytest
 
+from app.agents.academic_planner.contracts import ProposedChange
 from app.connectors.notion import (
+    AcademicNotionWriter,
     ConfirmedPropertyChange,
     NotionAttachment,
     NotionConnector,
+    NotionPageTarget,
 )
 from app.core.errors import LifeAgentError
 
@@ -141,3 +144,66 @@ async def test_confirmed_change_writes_one_allowlisted_property() -> None:
     assert requests[0].method == "PATCH"
     assert requests[0].url.path == "/v1/pages/page-1"
     assert requests[0].content.decode().count("assessments-due") == 1
+
+
+@pytest.mark.asyncio
+async def test_academic_writer_maps_exact_confirmation_to_allowlisted_patch() -> None:
+    requests: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        return httpx.Response(
+            200, json={"id": "assignment-page-1", "url": "https://www.notion.so/page-1"}
+        )
+
+    properties = {
+        database: {name: f"{database}-{name}" for name in names}
+        for database, names in {
+            "courses": {"course", "term", "priority", "outline", "policy"},
+            "assessments": {
+                "course",
+                "type",
+                "due",
+                "grade_weight",
+                "instructions",
+                "rubric",
+                "scope",
+                "status",
+                "estimated_time",
+            },
+            "study_blocks": {
+                "assessment",
+                "planned_duration",
+                "actual_duration",
+                "completion_state",
+                "notes",
+            },
+        }.items()
+    }
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+        connector = NotionConnector(
+            token="secret", database_ids=IDS, property_ids=properties, client=client
+        )
+        writer = AcademicNotionWriter(
+            connector=connector,
+            targets={
+                "notion-assignment-1": NotionPageTarget(
+                    target_id="notion-assignment-1",
+                    page_id="assignment-page-1",
+                    database="assessments",
+                )
+            },
+            property_ids=properties,
+        )
+        await writer.apply_confirmed_changes(
+            (ProposedChange(field="completed", value="true", assessment_id="notion-assignment-1"),),
+            proposal_id="proposal-1",
+            confirmation_event="CONFIRM ACADEMIC proposal-1",
+        )
+
+    assert len(requests) == 1
+    assert requests[0].method == "PATCH"
+    assert requests[0].url.path == "/v1/pages/assignment-page-1"
+    body = requests[0].content.decode()
+    assert "assessments-status" in body
+    assert "Completed" in body

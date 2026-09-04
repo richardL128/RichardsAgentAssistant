@@ -82,8 +82,8 @@ class Writer:
     def __init__(self):
         self.calls = []
 
-    async def apply_confirmed_changes(self, changes, *, proposal_id):
-        self.calls.append((changes, proposal_id))
+    async def apply_confirmed_changes(self, changes, *, proposal_id, confirmation_event):
+        self.calls.append((changes, proposal_id, confirmation_event))
 
 
 class Model:

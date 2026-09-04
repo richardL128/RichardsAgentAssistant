@@ -82,13 +82,19 @@ async def academic_checkin(
 @router.post("/confirm/{proposal_id}", response_model=ConfirmationResponse)
 async def academic_confirmation(
     request: Request, proposal_id: UUID, payload: ConfirmationRequest
-) -> ConfirmationResponse:
+) -> ConfirmationResponse | JSONResponse:
     """Apply a proposal only after exact confirmation token matching."""
 
     store = getattr(request.app.state, "academic_store", None)
     writer = getattr(request.app.state, "notion_writer", None)
     if store is None or writer is None:
-        return ConfirmationResponse(status="not_found", proposal_id=proposal_id)
+        return JSONResponse(
+            status_code=503,
+            content={
+                "status": "unavailable",
+                "error_code": "notion_writer_unconfigured",
+            },
+        )
     result = await confirm_checkin_proposal(
         store=store,
         writer=writer,

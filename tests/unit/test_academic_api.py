@@ -40,7 +40,7 @@ class Writer:
     def __init__(self) -> None:
         self.calls = 0
 
-    async def apply_confirmed_changes(self, changes, *, proposal_id):
+    async def apply_confirmed_changes(self, changes, *, proposal_id, confirmation_event):
         self.calls += 1
 
 
