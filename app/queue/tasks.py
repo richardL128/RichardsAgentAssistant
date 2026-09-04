@@ -4,17 +4,31 @@ from __future__ import annotations
 
 import asyncio
 from collections.abc import Awaitable, Callable
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from typing import Any
 from uuid import UUID
 
+import httpx
 from procrastinate import JobContext
+from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from app.core.config import get_settings
+from app.db.models import HealthCheck as PersistedHealthCheck
 from app.db.models import RunStatus
 from app.db.repositories import RunRepository
 from app.db.session import Database
+from app.health.checks import (
+    HealthState,
+    check_artifact_root,
+    check_connector_configuration,
+    check_database,
+    check_ollama,
+    check_queue,
+)
+from app.health.evaluator import DeliveryStatus as HealthDeliveryStatus
+from app.health.evaluator import OperationalFacts, ProcessingStatus
+from app.health.service import evaluate_and_persist
 from app.queue.app import JOB_KINDS, default_retry_strategy, procrastinate_app
 from app.queue.execution import execute_recorded_attempt
 from app.queue.idempotency import validate_idempotency_key
@@ -264,6 +278,64 @@ async def finance_periodic(timestamp: int) -> dict[str, object]:
     )
 
 
+@procrastinate_app.periodic(cron="*/5 * * * *", periodic_id="shared-services-health")
+@procrastinate_app.task(name="lifeagent.health.shared_services", queue="code_review")
+async def shared_services_periodic(timestamp: int) -> dict[str, object]:
+    """Persist deterministic shared-service health without invoking an agent or model."""
+
+    evaluated_at = datetime.fromtimestamp(timestamp, UTC)
+    database_checks = await asyncio.to_thread(check_database, _database)
+    async with httpx.AsyncClient(
+        timeout=min(_settings.connector_timeout_seconds, 10.0)
+    ) as ollama_client:
+        ollama_check = await check_ollama(_settings, ollama_client)
+    checks = [
+        *database_checks,
+        await asyncio.to_thread(check_queue, _database),
+        await asyncio.to_thread(check_artifact_root, _settings),
+        check_connector_configuration(_settings),
+        ollama_check,
+    ]
+    states = {check.state for check in checks}
+    if HealthState.FAILED in states:
+        processing = ProcessingStatus.FAILED
+    elif HealthState.ATTENTION in states:
+        processing = ProcessingStatus.ATTENTION
+    else:
+        processing = ProcessingStatus.SUCCEEDED
+    exceptions = tuple(check for check in checks if check.state is not HealthState.HEALTHY)
+    diagnostic = (
+        ",".join(f"{check.name}={check.state.value}" for check in exceptions)
+        if exceptions
+        else f"all {len(checks)} shared-service probes are healthy"
+    )[:120]
+    with Session(_database.engine) as session, session.begin():
+        prior_success = session.scalar(
+            select(PersistedHealthCheck.last_success_at).where(
+                PersistedHealthCheck.check_name == "shared_services"
+            )
+        )
+        health = evaluate_and_persist(
+            session,
+            OperationalFacts(
+                component="shared_services",
+                processing=processing,
+                delivery=HealthDeliveryStatus.NOT_REQUIRED,
+                connector_authenticated=(
+                    next(check for check in checks if check.name == "connector_configuration").state
+                    is not HealthState.FAILED
+                ),
+                evaluated_at=evaluated_at,
+                last_success_at=(
+                    evaluated_at if processing is ProcessingStatus.SUCCEEDED else prior_success
+                ),
+                next_expected_at=evaluated_at + timedelta(minutes=5),
+                diagnostic_code=diagnostic,
+            ),
+        )
+    return {"status": health.state.value, "diagnostic": health.diagnostic}
+
+
 __all__ = [
     "academic_planner_task",
     "code_review_daily_task",
@@ -273,4 +345,5 @@ __all__ = [
     "defer_idempotent_async",
     "finance_task",
     "register_task_handler",
+    "shared_services_periodic",
 ]

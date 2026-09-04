@@ -8,6 +8,8 @@ from enum import StrEnum
 
 import httpx
 from pydantic import BaseModel, ConfigDict, Field, ValidationError
+from sqlalchemy import text
+from sqlalchemy.exc import SQLAlchemyError
 
 from app.core.config import Settings
 from app.db.session import Database
@@ -128,6 +130,83 @@ def check_database(database: Database) -> tuple[HealthCheck, ...]:
             state=HealthState.HEALTHY if code_review_ok else HealthState.FAILED,
             diagnostic=code_review_detail,
         ),
+    )
+
+
+def check_queue(database: Database) -> HealthCheck:
+    """Report queue depth and terminal failures without exposing job arguments."""
+
+    try:
+        with database.connection() as connection:
+            row = connection.execute(
+                text(
+                    "SELECT "
+                    "SUM(CASE WHEN status IN ('todo','doing','aborting') THEN 1 ELSE 0 END), "
+                    "SUM(CASE WHEN status IN ('failed','aborted') THEN 1 ELSE 0 END) "
+                    "FROM procrastinate_jobs"
+                )
+            ).one()
+        active = int(row[0] or 0)
+        failed = int(row[1] or 0)
+        return HealthCheck(
+            name="queue",
+            state=HealthState.ATTENTION if failed else HealthState.HEALTHY,
+            diagnostic=f"queue depth {active}; terminal failures {failed}",
+        )
+    except (SQLAlchemyError, OSError) as exc:
+        return HealthCheck(
+            name="queue",
+            state=HealthState.FAILED,
+            diagnostic=f"queue health unavailable ({exc.__class__.__name__})",
+        )
+
+
+def check_connector_configuration(settings: Settings) -> HealthCheck:
+    """Fail when a configured connector target lacks its matching credential set."""
+
+    missing: list[str] = []
+    discord_targets = (
+        *settings.discord_target_channels,
+        settings.discord_code_review_channel_id,
+        settings.discord_academic_channel_id,
+        settings.discord_finance_channel_id,
+    )
+    if any(discord_targets) and settings.discord_bot_token is None:
+        missing.append("discord")
+    notion_targets = (
+        settings.notion_courses_database_id,
+        settings.notion_assessments_database_id,
+        settings.notion_study_blocks_database_id,
+    )
+    if any(notion_targets) and settings.notion_token is None:
+        missing.append("notion")
+    github_parts = (
+        settings.github_app_id,
+        settings.github_installation_id,
+        settings.github_private_key,
+        settings.github_webhook_secret,
+    )
+    if any(value is not None for value in github_parts) and not all(
+        value is not None for value in github_parts
+    ):
+        missing.append("github")
+    if missing:
+        return HealthCheck(
+            name="connector_configuration",
+            state=HealthState.FAILED,
+            diagnostic=f"configured connector credential set is incomplete: {', '.join(missing)}",
+        )
+    configured = sum(
+        (
+            settings.discord_bot_token is not None,
+            settings.notion_token is not None,
+            settings.github_private_key is not None,
+        )
+    )
+    return HealthCheck(
+        name="connector_configuration",
+        state=HealthState.HEALTHY,
+        diagnostic=f"configured connector credential sets are internally consistent ({configured})",
     )
 
 

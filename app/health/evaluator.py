@@ -15,6 +15,7 @@ class ProcessingStatus(StrEnum):
     RUNNING = "running"
     WAITING_RETRY = "waiting_retry"
     WAITING_APPROVAL = "waiting_approval"
+    ATTENTION = "attention"
     SUCCEEDED = "succeeded"
     FAILED = "failed"
 
@@ -81,6 +82,8 @@ def evaluate_operational_health(facts: OperationalFacts) -> OperationalHealth:
         state, rule = HealthState.ATTENTION, "waiting_for_retry"
     elif facts.processing is ProcessingStatus.WAITING_APPROVAL:
         state, rule = HealthState.ATTENTION, "waiting_for_approval"
+    elif facts.processing is ProcessingStatus.ATTENTION:
+        state, rule = HealthState.ATTENTION, "processing_completed_with_attention"
     elif facts.delivery in {DeliveryStatus.INTENT, DeliveryStatus.UNCERTAIN}:
         state, rule = HealthState.ATTENTION, "delivery_incomplete"
     elif facts.processing in {ProcessingStatus.QUEUED, ProcessingStatus.RUNNING}:

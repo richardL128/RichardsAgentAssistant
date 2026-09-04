@@ -91,6 +91,13 @@ def test_retry_and_schedule_settings_validate_cross_field_boundaries() -> None:
             HealthState.ATTENTION,
         ),
         (
+            ProcessingStatus.ATTENTION,
+            DeliveryStatus.SUCCEEDED,
+            True,
+            False,
+            HealthState.ATTENTION,
+        ),
+        (
             ProcessingStatus.RUNNING,
             DeliveryStatus.INTENT,
             True,

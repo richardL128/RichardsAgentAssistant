@@ -18,6 +18,7 @@ from app.core.errors import (
 )
 from app.db.models import RunStatus, StepStatus
 from app.db.repositories import RunRepository, utc_now
+from app.health.service import evaluate_run_and_persist
 from app.queue.retry import RetryClassification, RetryPolicy
 
 
@@ -69,7 +70,11 @@ def _record_finished(
     run_status: RunStatus,
     diagnostic: str,
     error_code: str | None,
+    retry_attempt: int,
+    retry_limit: int,
 ) -> None:
+    from app.core.config import get_settings
+
     with Session(engine) as session, session.begin():
         RunRepository.update_step(
             session,
@@ -84,6 +89,41 @@ def _record_finished(
             run_status,
             error_code=error_code,
         )
+        evaluate_run_and_persist(
+            session,
+            run_id=run_id,
+            settings=get_settings(),
+            retry_attempt=retry_attempt,
+            retry_limit=retry_limit,
+        )
+
+
+def _result_status(
+    result: dict[str, object],
+    default: RunStatus,
+) -> tuple[StepStatus, RunStatus, str, str | None]:
+    status = str(result.get("status", ""))
+    error_code = result.get("error_code")
+    safe_error = str(error_code) if isinstance(error_code, str) and error_code else None
+    if status in {"failed", "cancelled"}:
+        return StepStatus.FAILED, RunStatus.FAILED, "attempt_failed", safe_error or status
+    if status in {"attention", "approval_required", "confirmation_required"}:
+        diagnostic = safe_error or status
+        return StepStatus.ATTENTION, RunStatus.ATTENTION, diagnostic, diagnostic
+    delivered = result.get("delivered")
+    delivery_count = result.get("delivery_count")
+    if (
+        delivered is False
+        or (isinstance(delivered, str) and delivered != "sent")
+        or delivery_count == 0
+    ):
+        return (
+            StepStatus.ATTENTION,
+            RunStatus.ATTENTION,
+            "delivery_not_completed",
+            "delivery_not_completed",
+        )
+    return StepStatus.SUCCEEDED, default, "attempt_succeeded", None
 
 
 async def execute_recorded_attempt(
@@ -118,17 +158,22 @@ async def execute_recorded_attempt(
             run_status=RunStatus.ATTENTION if will_retry else RunStatus.FAILED,
             diagnostic="retry_scheduled" if will_retry else "attempt_failed",
             error_code=error_code,
+            retry_attempt=attempt,
+            retry_limit=retry_policy.max_attempts,
         )
         raise _safe_exception(exc, classification) from None
+    step_status, run_status, diagnostic, error_code = _result_status(result, success_status)
     await asyncio.to_thread(
         _record_finished,
         engine,
         run_id=run_id,
         step_id=step_id,
-        step_status=StepStatus.SUCCEEDED,
-        run_status=success_status,
-        diagnostic="attempt_succeeded",
-        error_code=None,
+        step_status=step_status,
+        run_status=run_status,
+        diagnostic=diagnostic,
+        error_code=error_code,
+        retry_attempt=attempt,
+        retry_limit=retry_policy.max_attempts,
     )
     return result
 

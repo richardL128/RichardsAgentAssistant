@@ -10,7 +10,12 @@ from sqlalchemy import create_engine, text
 
 from app.core.config import Settings
 from app.db.session import Database
-from app.health.checks import HealthState, check_ollama, readiness
+from app.health.checks import (
+    HealthState,
+    check_connector_configuration,
+    check_ollama,
+    readiness,
+)
 
 
 def test_settings_diagnostics_redact_credentials(tmp_path: Path) -> None:
@@ -21,6 +26,8 @@ def test_settings_diagnostics_redact_credentials(tmp_path: Path) -> None:
         dvids_api_key="dvids-secret",
         eia_api_key="eia-secret",
         discord_finance_channel_id="123456789",
+        ops_console_username="ops-user-never-print",
+        ops_console_password="ops-password",
     )
 
     diagnostics = settings.safe_diagnostics()
@@ -29,10 +36,13 @@ def test_settings_diagnostics_redact_credentials(tmp_path: Path) -> None:
     assert "webhook-secret" not in str(diagnostics)
     assert "dvids-secret" not in str(diagnostics)
     assert "eia-secret" not in str(diagnostics)
+    assert "ops-password" not in str(diagnostics)
+    assert "ops-user-never-print" not in str(diagnostics)
     assert diagnostics["database"] == "postgresql+psycopg://example.test:5432/lifeagent"
     assert diagnostics["finance_source_allowlist_version"] == "finance-sources-2026.09"
     assert diagnostics["finance_source_credentials_configured"] == 2
     assert diagnostics["discord_finance_channel_configured"] is True
+    assert diagnostics["ops_console_auth_configured"] is True
 
 
 def test_empty_finance_credentials_are_normalized() -> None:
@@ -42,10 +52,28 @@ def test_empty_finance_credentials_are_normalized() -> None:
         alpha_vantage_api_key="",
         benzinga_api_token="",
         fmp_api_key="",
+        ops_console_username="",
+        ops_console_password="",
     )
 
     assert settings.finance_source_allowlist_version == "finance-sources-2026.09"
     assert settings.safe_diagnostics()["finance_source_credentials_configured"] == 0
+    assert settings.safe_diagnostics()["ops_console_auth_configured"] is False
+
+
+def test_connector_configuration_fails_when_a_target_has_no_credential() -> None:
+    incomplete = check_connector_configuration(Settings(discord_finance_channel_id="123456789"))
+    complete = check_connector_configuration(
+        Settings(
+            discord_finance_channel_id="123456789",
+            discord_bot_token="discord-secret",
+        )
+    )
+
+    assert incomplete.state is HealthState.FAILED
+    assert incomplete.diagnostic.endswith("discord")
+    assert complete.state is HealthState.HEALTHY
+    assert "discord-secret" not in complete.diagnostic
 
 
 def test_readiness_reports_all_phase0_dependencies(tmp_path: Path) -> None:

@@ -1,13 +1,18 @@
 from __future__ import annotations
 
 from datetime import UTC, datetime, time, timedelta
+from pathlib import Path
 from types import SimpleNamespace
 
 import httpx
 import pytest
+from sqlalchemy import create_engine
+from sqlalchemy.orm import Session
 
 from app.core.config import Settings
 from app.core.errors import ErrorCode, authorization_error, transient_error
+from app.db.models import HealthCheck as PersistedHealthCheck
+from app.health.checks import HealthCheck, HealthState
 from app.queue import tasks
 from app.queue.app import QUEUE_NAMES, create_procrastinate_app, postgres_conninfo
 from app.queue.idempotency import (
@@ -166,6 +171,46 @@ def test_procrastinate_app_is_configured_without_opening_connections() -> None:
         tasks.academic_planner_task.queue,
         tasks.finance_task.queue,
     } == set(QUEUE_NAMES)
+
+
+async def test_shared_services_periodic_persists_the_aggregate_health(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    engine = create_engine(f"sqlite+pysqlite:///{tmp_path / 'health.db'}")
+    PersistedHealthCheck.__table__.create(engine)
+    healthy = lambda name: HealthCheck(  # noqa: E731
+        name=name,
+        state=HealthState.HEALTHY,
+        diagnostic=f"{name} healthy",
+    )
+    monkeypatch.setattr(tasks, "_database", SimpleNamespace(engine=engine))
+    monkeypatch.setattr(tasks, "check_database", lambda _database: (healthy("database"),))
+    monkeypatch.setattr(tasks, "check_queue", lambda _database: healthy("queue"))
+    monkeypatch.setattr(tasks, "check_artifact_root", lambda _settings: healthy("artifacts"))
+    monkeypatch.setattr(
+        tasks,
+        "check_connector_configuration",
+        lambda _settings: healthy("connector_configuration"),
+    )
+
+    async def healthy_ollama(_settings: Settings, _client: httpx.AsyncClient) -> HealthCheck:
+        return healthy("ollama")
+
+    monkeypatch.setattr(tasks, "check_ollama", healthy_ollama)
+    timestamp = int(datetime(2026, 9, 4, 12, 0, tzinfo=UTC).timestamp())
+
+    try:
+        result = await tasks.shared_services_periodic.func(timestamp=timestamp)
+        with Session(engine) as session:
+            persisted = session.query(PersistedHealthCheck).one()
+    finally:
+        engine.dispose()
+
+    assert result["status"] == "healthy"
+    assert persisted.check_name == "shared_services"
+    assert persisted.state == "healthy"
+    assert persisted.next_due_at is not None
 
 
 def test_task_deferral_uses_global_model_lock_and_per_item_queueing_lock() -> None:

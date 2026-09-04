@@ -18,7 +18,15 @@ from testcontainers.community.postgres import PostgresContainer
 
 from app.core.errors import ErrorCode, LifeAgentError, authorization_error, transient_error
 from app.db.finance import FinanceApprovedSource, FinanceRepository
-from app.db.models import AgentRun, ApprovalState, AuditEvent, Delivery, RunStatus, RunStep
+from app.db.models import (
+    AgentRun,
+    ApprovalState,
+    AuditEvent,
+    Delivery,
+    HealthCheck,
+    RunStatus,
+    RunStep,
+)
 from app.db.repositories import (
     ApprovalRepository,
     AuditRepository,
@@ -351,6 +359,9 @@ async def test_transient_retries_record_attempts_but_invalid_token_does_not(
         auth_steps = list(session.scalars(select(RunStep).where(RunStep.run_id == auth_run_id)))
         transient_status = session.get(AgentRun, transient_run_id)
         auth_status = session.get(AgentRun, auth_run_id)
+        operational_health = session.scalar(
+            select(HealthCheck).where(HealthCheck.check_name == "integration")
+        )
 
     assert [step.attempt for step in transient_steps] == [1, 2]
     assert [step.status for step in transient_steps] == ["attention", "succeeded"]
@@ -360,6 +371,48 @@ async def test_transient_retries_record_attempts_but_invalid_token_does_not(
     assert auth_status is not None
     assert auth_status.status == RunStatus.FAILED
     assert auth_status.error_code == ErrorCode.AUTHORIZATION_INVALID.value
+    assert operational_health is not None
+    assert operational_health.state == "failed"
+    assert operational_health.rule == "connector_unauthenticated"
+
+
+async def test_finance_approval_gate_persists_attention_health(
+    postgres_engine: Engine,
+) -> None:
+    key = f"finance:{uuid.uuid4()}:v1"
+    with Session(postgres_engine) as session, session.begin():
+        run = RunRepository.create_or_get(
+            session,
+            idempotency_key=key,
+            agent_name="finance",
+            trigger="schedule",
+            schedule="finance-market-open",
+        )
+        run_id = run.id
+
+    async def approval_required() -> dict[str, object]:
+        return {"status": "approval_required", "delivered": False}
+
+    result = await execute_recorded_attempt(
+        approval_required,
+        engine=postgres_engine,
+        run_id=run_id,
+        node_name="queue.finance",
+        attempt=1,
+        retry_policy=RetryPolicy(max_attempts=3),
+    )
+
+    with Session(postgres_engine) as session:
+        run = session.get(AgentRun, run_id)
+        health = session.scalar(select(HealthCheck).where(HealthCheck.check_name == "finance"))
+
+    assert result["status"] == "approval_required"
+    assert run is not None
+    assert run.status == RunStatus.ATTENTION
+    assert health is not None
+    assert health.state == "attention"
+    assert health.rule == "waiting_for_approval"
+    assert health.next_due_at is not None
 
 
 def test_failed_and_stalled_jobs_are_visible_without_job_arguments(
