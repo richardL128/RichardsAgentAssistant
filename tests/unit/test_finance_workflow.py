@@ -15,12 +15,17 @@ from app.agents.finance.contracts import (
     QuantValue,
     SourceApproval,
     SourceDocument,
+    SourceFailure,
     SourceFetchResult,
     WatchlistItem,
 )
 from app.agents.finance.delivery import render_discord_briefing
 from app.agents.finance.normalization import normalize_documents
-from app.agents.finance.workflow import run_finance_briefing
+from app.agents.finance.workflow import (
+    configure_finance_runtime,
+    run_finance,
+    run_finance_briefing,
+)
 
 NOW = datetime(2026, 9, 4, 13, tzinfo=UTC)
 ALLOWLIST = "finance-sources-v1"
@@ -50,6 +55,7 @@ class Store:
         self.source_records = source_records
         self.payload = None
         self.entries = ()
+        self.health = []
 
     def load_approved_sources(self, *, allowlist_version):
         return self.source_records if allowlist_version == ALLOWLIST else ()
@@ -81,14 +87,43 @@ class Store:
     def append_thesis_events(self, entries):
         self.entries = tuple(entries)
 
+    def record_source_health(
+        self,
+        *,
+        source_id,
+        source_version,
+        status,
+        checked_at,
+        diagnostic=None,
+    ):
+        self.health.append(
+            {
+                "source_id": source_id,
+                "source_version": source_version,
+                "status": status,
+                "checked_at": checked_at,
+                "diagnostic": diagnostic,
+            }
+        )
+
 
 class Adapter:
-    def __init__(self, source_id: str) -> None:
+    def __init__(self, source_id: str, *, fail: bool = False) -> None:
         self.source_id = source_id
+        self.fail = fail
         self.calls = 0
 
     async def fetch(self, query):
         self.calls += 1
+        if self.fail:
+            return SourceFetchResult(
+                source_id=query.source_id,
+                failure=SourceFailure(
+                    source_id=query.source_id,
+                    error_code="connector_timeout",
+                    diagnostic="finance source request timed out",
+                ),
+            )
         return SourceFetchResult(
             source_id=query.source_id,
             documents=(
@@ -147,6 +182,7 @@ async def test_finance_run_stays_gated_without_approved_sources_and_does_not_del
     assert result["source_call_count"] == 0
     assert delivery.payloads == []
     assert all(adapter.calls == 0 for adapter in adapters.values())
+    assert store.health == []
 
 
 @pytest.mark.asyncio
@@ -182,6 +218,66 @@ async def test_finance_run_normalizes_dedupes_maps_exposure_and_updates_thesis_j
     assert "raw_body" not in rendered
     assert len(delivery.payloads) == 1
     assert delivery.payloads[0][1] == "finance:2026-09-04:market-open:v1"
+    assert len(store.health) == 8
+    assert {record["status"] for record in store.health} == {"healthy"}
+
+
+@pytest.mark.asyncio
+async def test_finance_run_records_failed_adapter_health_as_attention() -> None:
+    source_records = approvals()
+    store = Store(source_records)
+    adapters = {
+        source.source_id: Adapter(source.source_id, fail=source.source_id == "source8")
+        for source in source_records
+    }
+
+    result = await run_finance_briefing(
+        run_id=uuid4(),
+        store=store,
+        adapters=adapters,
+        allowlist_version=ALLOWLIST,
+        tickers=("ACME",),
+        themes=("earnings",),
+        now=NOW,
+    )
+
+    assert result["status"] == "attention"
+    assert result["source_failure_count"] == 1
+    statuses = {record["source_id"]: record["status"] for record in store.health}
+    assert statuses["source8"] == "attention"
+    assert set(statuses.values()) == {"healthy", "attention"}
+
+
+def test_importing_worker_registers_finance_handler() -> None:
+    import app.queue.worker  # noqa: F401
+    from app.agents.finance.workflow import run_finance
+    from app.queue import tasks
+
+    assert tasks._handlers.get("finance") is run_finance
+
+
+@pytest.mark.asyncio
+async def test_finance_worker_entry_uses_injected_runtime_and_stays_gated(monkeypatch) -> None:
+    from app.agents.finance import workflow
+
+    monkeypatch.setattr(workflow, "_runtime", None)
+    store = Store(approvals(approved=False))
+    adapters = {source.source_id: Adapter(source.source_id) for source in approvals()}
+    configure_finance_runtime(store, adapters, allowlist_version=ALLOWLIST)
+    run_id = uuid4()
+    key = "finance:2026-09-04:market-open:v1"
+
+    result = await run_finance(str(run_id), key)
+
+    assert result == {
+        "status": "approval_required",
+        "run_id": str(run_id),
+        "delivered": False,
+        "source_call_count": 0,
+        "diagnostic": "finance source approval gate is not satisfied",
+        "idempotency_key": key,
+    }
+    assert all(adapter.calls == 0 for adapter in adapters.values())
 
 
 def test_normalization_rejects_unlicensed_excerpt_and_stale_documents() -> None:

@@ -9,10 +9,12 @@ from fastapi import FastAPI
 
 from app import __version__
 from app.api.academic import router as academic_router
+from app.api.finance import router as finance_router
 from app.api.github import router as github_router
 from app.api.health import router as health_router
 from app.core.config import Settings, get_settings
 from app.db.academic import SQLAlchemyAcademicPlannerStore
+from app.db.finance import SQLAlchemyFinanceStore
 from app.db.session import Database
 from app.llm.gateway import LLMGateway
 from app.queue.app import procrastinate_app
@@ -51,6 +53,10 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         database.engine,
         confirmation_ttl_hours=app_settings.academic_confirmation_ttl_hours,
     )
+    app.state.finance_store = SQLAlchemyFinanceStore(
+        database.engine,
+        allowlist_version=app_settings.finance_source_allowlist_version,
+    )
     # The concrete Notion writer is injected only after scoped database,
     # property, and page-target mappings have been supplied.  Keeping it
     # absent makes confirmation fail closed while proposal capture remains
@@ -59,6 +65,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     app.include_router(health_router)
     app.include_router(github_router)
     app.include_router(academic_router)
+    app.include_router(finance_router)
     return app
 
 

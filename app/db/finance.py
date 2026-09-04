@@ -715,6 +715,25 @@ class SQLAlchemyFinanceStore:
         with Session(self._engine) as session, session.begin():
             FinanceRepository.append_thesis_events(session, entries)
 
+    def record_source_health(
+        self,
+        *,
+        source_id: str,
+        source_version: str,
+        status: str,
+        checked_at: datetime,
+        diagnostic: str | None = None,
+    ) -> None:
+        with Session(self._engine) as session, session.begin():
+            FinanceRepository.record_source_health(
+                session,
+                source_id=source_id,
+                source_version=source_version,
+                status=status,
+                checked_at=checked_at,
+                diagnostic=diagnostic,
+            )
+
     def list_source_records(self) -> tuple[FinanceSourceRecord, ...]:
         with Session(self._engine) as session:
             return FinanceRepository.list_source_records(
