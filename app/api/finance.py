@@ -35,6 +35,9 @@ class SourceRecordResponse(BaseModel):
     classification: str
     entitlement: str
     license_note: str
+    license_allows_excerpt: bool
+    excerpt_max_chars: int | None
+    excerpt_max_words: int | None
     source_version: str
     allowlist_version: str
     enabled: bool

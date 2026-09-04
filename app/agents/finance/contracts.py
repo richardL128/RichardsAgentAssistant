@@ -61,6 +61,10 @@ class SourceApproval(FinanceModel):
     allowlist_version: str = Field(min_length=1, max_length=128)
     license_note: str = Field(min_length=1, max_length=1_000)
     entitlement: str = Field(min_length=1, max_length=255)
+    classification: SourceClassification = SourceClassification.REPORTED
+    license_allows_excerpt: bool = False
+    excerpt_max_chars: int | None = Field(default=None, ge=1, le=500)
+    excerpt_max_words: int | None = Field(default=None, ge=1, le=500)
     enabled: bool = True
     approved_at: datetime | None = None
     approval_audit_id: UUID | None = None
@@ -69,6 +73,14 @@ class SourceApproval(FinanceModel):
     @classmethod
     def approved_at_aware(cls, value: datetime | None) -> datetime | None:
         return _aware(value) if value is not None else None
+
+    @model_validator(mode="after")
+    def excerpt_limits_require_permission(self) -> SourceApproval:
+        if not self.license_allows_excerpt and (
+            self.excerpt_max_chars is not None or self.excerpt_max_words is not None
+        ):
+            raise ValueError("excerpt limits require excerpt permission")
+        return self
 
     @property
     def gate_status(self) -> SourceStatus:

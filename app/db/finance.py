@@ -21,6 +21,7 @@ from sqlalchemy import (
     Float,
     ForeignKey,
     Index,
+    Integer,
     String,
     Text,
     UniqueConstraint,
@@ -94,6 +95,22 @@ class FinanceApprovedSource(Base):
         CheckConstraint("length(base_url) > 0", name="base_url_nonempty"),
         CheckConstraint("length(license_note) > 0", name="license_note_nonempty"),
         CheckConstraint("length(entitlement) > 0", name="entitlement_nonempty"),
+        CheckConstraint(
+            "classification IN ('primary','reported','secondary')",
+            name="classification_valid",
+        ),
+        CheckConstraint(
+            "license_allows_excerpt OR (excerpt_max_chars IS NULL AND excerpt_max_words IS NULL)",
+            name="excerpt_limits_require_permission",
+        ),
+        CheckConstraint(
+            "excerpt_max_chars IS NULL OR (excerpt_max_chars >= 1 AND excerpt_max_chars <= 500)",
+            name="excerpt_max_chars_valid",
+        ),
+        CheckConstraint(
+            "excerpt_max_words IS NULL OR (excerpt_max_words >= 1 AND excerpt_max_words <= 500)",
+            name="excerpt_max_words_valid",
+        ),
         Index("ix_finance_sources_allowlist_enabled", "allowlist_version", "enabled"),
     )
 
@@ -106,6 +123,9 @@ class FinanceApprovedSource(Base):
     license_note: Mapped[str] = mapped_column(String(1000), nullable=False)
     entitlement: Mapped[str] = mapped_column(String(255), nullable=False)
     classification: Mapped[str] = mapped_column(String(64), nullable=False, default="reported")
+    license_allows_excerpt: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+    excerpt_max_chars: Mapped[int | None] = mapped_column(Integer)
+    excerpt_max_words: Mapped[int | None] = mapped_column(Integer)
     enabled: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
     approved_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     approval_audit_id: Mapped[uuid.UUID | None] = mapped_column(
@@ -267,6 +287,9 @@ class FinanceSourceRecord:
     classification: str
     entitlement: str
     license_note: str
+    license_allows_excerpt: bool
+    excerpt_max_chars: int | None
+    excerpt_max_words: int | None
     source_version: str
     allowlist_version: str
     enabled: bool
@@ -298,6 +321,9 @@ class FinanceRepository:
         license_note: str,
         entitlement: str,
         classification: str = "reported",
+        license_allows_excerpt: bool = False,
+        excerpt_max_chars: int | None = None,
+        excerpt_max_words: int | None = None,
         enabled: bool = False,
         approved_at: datetime | None = None,
         approval_audit_id: uuid.UUID | None = None,
@@ -320,6 +346,9 @@ class FinanceRepository:
                 "license_note": license_note,
                 "entitlement": entitlement,
                 "classification": classification,
+                "license_allows_excerpt": license_allows_excerpt,
+                "excerpt_max_chars": excerpt_max_chars,
+                "excerpt_max_words": excerpt_max_words,
                 "enabled": enabled,
                 "approved_at": approved_at,
                 "approval_audit_id": approval_audit_id,
@@ -372,6 +401,10 @@ class FinanceRepository:
                     "allowlist_version": row.allowlist_version,
                     "license_note": row.license_note,
                     "entitlement": row.entitlement,
+                    "classification": row.classification,
+                    "license_allows_excerpt": row.license_allows_excerpt,
+                    "excerpt_max_chars": row.excerpt_max_chars,
+                    "excerpt_max_words": row.excerpt_max_words,
                     "enabled": row.enabled,
                     "approved_at": _db_utc(row.approved_at),
                     "approval_audit_id": row.approval_audit_id,
@@ -622,6 +655,9 @@ class FinanceRepository:
                     classification=source.classification,
                     entitlement=source.entitlement,
                     license_note=source.license_note,
+                    license_allows_excerpt=source.license_allows_excerpt,
+                    excerpt_max_chars=source.excerpt_max_chars,
+                    excerpt_max_words=source.excerpt_max_words,
                     source_version=source.source_version,
                     allowlist_version=source.allowlist_version,
                     enabled=source.enabled,

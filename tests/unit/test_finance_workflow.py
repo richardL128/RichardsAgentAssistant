@@ -211,8 +211,19 @@ def test_normalization_rejects_unlicensed_excerpt_and_stale_documents() -> None:
         tickers=("ACME",),
         themes=(),
     )
-    with pytest.raises(ValueError, match="freshness"):
-        normalize_documents((stale,), approved_sources=approvals(), now=NOW)
+    result = normalize_documents(
+        (stale,),
+        approved_sources=approvals(),
+        now=NOW,
+        include_diagnostics=True,
+    )
+    assert result.events == ()
+    assert len(result.diagnostics) == 1
+    assert result.diagnostics[0].reason == "stale_document"
+
+    unapproved = stale.model_copy(update={"source_id": "unknown-source"})
+    with pytest.raises(ValueError, match="not approved"):
+        normalize_documents((unapproved,), approved_sources=approvals(), now=NOW)
 
 
 def test_event_card_schema_rejects_trade_directives_and_uncited_numbers() -> None:

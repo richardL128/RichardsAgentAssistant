@@ -73,7 +73,12 @@ class Settings(BaseSettings):
     notion_courses_database_id: str | None = None
     notion_assessments_database_id: str | None = None
     notion_study_blocks_database_id: str | None = None
-    finance_source_allowlist_version: str | None = None
+    finance_source_allowlist_version: str = "finance-sources-2026.09"
+    dvids_api_key: SecretValue = None
+    eia_api_key: SecretValue = None
+    alpha_vantage_api_key: SecretValue = None
+    benzinga_api_token: SecretValue = None
+    fmp_api_key: SecretValue = None
     repository_allowlist_version: str | None = None
 
     retry_max_attempts: Annotated[int, Field(gt=0, le=20)] = 3
@@ -88,6 +93,7 @@ class Settings(BaseSettings):
     discord_target_channels: list[str] = Field(default_factory=list)
     discord_code_review_channel_id: str | None = None
     discord_academic_channel_id: str | None = None
+    discord_finance_channel_id: str | None = None
     github_webhook_max_body_bytes: Annotated[int, Field(gt=0, le=10_485_760)] = 1_048_576
     git_clone_timeout_seconds: Annotated[float, Field(gt=0, le=600)] = 60.0
     code_command_timeout_seconds: Annotated[float, Field(gt=0, le=1800)] = 120.0
@@ -119,6 +125,11 @@ class Settings(BaseSettings):
         "discord_bot_token",
         "discord_webhook_secret",
         "notion_token",
+        "dvids_api_key",
+        "eia_api_key",
+        "alpha_vantage_api_key",
+        "benzinga_api_token",
+        "fmp_api_key",
         mode="before",
     )
     @classmethod
@@ -131,10 +142,10 @@ class Settings(BaseSettings):
         return None if value == "" else value
 
     @field_validator(
-        "finance_source_allowlist_version",
         "repository_allowlist_version",
         "discord_code_review_channel_id",
         "discord_academic_channel_id",
+        "discord_finance_channel_id",
         "notion_courses_database_id",
         "notion_assessments_database_id",
         "notion_study_blocks_database_id",
@@ -160,6 +171,13 @@ class Settings(BaseSettings):
     def discovery_scope_is_present(cls, value: str) -> str:
         if not value.strip():
             raise ValueError("code_review_discovery_scope must not be empty")
+        return value
+
+    @field_validator("finance_source_allowlist_version")
+    @classmethod
+    def finance_allowlist_version_is_present(cls, value: str) -> str:
+        if not value.strip():
+            raise ValueError("finance source allowlist version must not be empty")
         return value
 
     @field_validator("ollama_model", "embedding_model")
@@ -215,7 +233,11 @@ class Settings(BaseSettings):
             raise ValueError("Discord target channels must be unique numeric IDs")
         return value
 
-    @field_validator("discord_code_review_channel_id", "discord_academic_channel_id")
+    @field_validator(
+        "discord_code_review_channel_id",
+        "discord_academic_channel_id",
+        "discord_finance_channel_id",
+    )
     @classmethod
     def discord_code_review_channel_is_id(cls, value: str | None) -> str | None:
         if value is not None and not value.isdigit():
@@ -271,6 +293,18 @@ class Settings(BaseSettings):
                 self.discord_code_review_channel_id is not None
             ),
             "discord_academic_channel_configured": self.discord_academic_channel_id is not None,
+            "discord_finance_channel_configured": self.discord_finance_channel_id is not None,
+            "finance_source_allowlist_version": self.finance_source_allowlist_version,
+            "finance_source_credentials_configured": sum(
+                value is not None
+                for value in (
+                    self.dvids_api_key,
+                    self.eia_api_key,
+                    self.alpha_vantage_api_key,
+                    self.benzinga_api_token,
+                    self.fmp_api_key,
+                )
+            ),
             "notion_database_count": sum(
                 value is not None
                 for value in (
