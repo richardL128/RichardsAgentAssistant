@@ -8,9 +8,11 @@ from contextlib import asynccontextmanager
 from fastapi import FastAPI
 
 from app import __version__
+from app.api.academic import router as academic_router
 from app.api.github import router as github_router
 from app.api.health import router as health_router
 from app.core.config import Settings, get_settings
+from app.db.academic import SQLAlchemyAcademicPlannerStore
 from app.db.session import Database
 from app.llm.gateway import LLMGateway
 from app.queue.app import procrastinate_app
@@ -45,8 +47,18 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     app.state.model_identity = gateway.model_identity
     app.state.model_config_version = gateway.config_version
     app.state.enqueue_code_review = enqueue_code_review
+    app.state.academic_store = SQLAlchemyAcademicPlannerStore(
+        database.engine,
+        confirmation_ttl_hours=app_settings.academic_confirmation_ttl_hours,
+    )
+    # The concrete Notion writer is injected only after scoped database,
+    # property, and page-target mappings have been supplied.  Keeping it
+    # absent makes confirmation fail closed while proposal capture remains
+    # available in a local deployment.
+    app.state.notion_writer = None
     app.include_router(health_router)
     app.include_router(github_router)
+    app.include_router(academic_router)
     return app
 
 
