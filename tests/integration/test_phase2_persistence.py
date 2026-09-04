@@ -17,6 +17,7 @@ from sqlalchemy.orm import Session
 from testcontainers.community.postgres import PostgresContainer
 
 from app.core.errors import ErrorCode, LifeAgentError, authorization_error, transient_error
+from app.db.finance import FinanceApprovedSource, FinanceRepository
 from app.db.models import AgentRun, ApprovalState, AuditEvent, Delivery, RunStatus, RunStep
 from app.db.repositories import (
     ApprovalRepository,
@@ -160,6 +161,62 @@ def test_audit_events_are_append_only(db_session: Session) -> None:
         _attempt_audit_delete(db_session, event.id)
 
     assert db_session.scalar(select(AuditEvent.result).where(AuditEvent.id == event.id)) == "ok"
+
+
+def test_phase6_finance_allowlist_is_seeded_disabled_and_audited(
+    db_session: Session,
+) -> None:
+    allowlist_version = "finance-sources-2026.09"
+    rows = tuple(
+        db_session.scalars(
+            select(FinanceApprovedSource)
+            .where(FinanceApprovedSource.allowlist_version == allowlist_version)
+            .order_by(FinanceApprovedSource.source_id)
+        )
+    )
+
+    assert {
+        row.source_id: (
+            row.source_version,
+            row.classification,
+            row.license_allows_excerpt,
+            row.excerpt_max_chars,
+            row.excerpt_max_words,
+        )
+        for row in rows
+    } == {
+        "alpha_vantage_news": ("news-sentiment-v1", "reported", True, 500, None),
+        "alpha_vantage_etf": ("etf-profile-v1", "secondary", False, None, None),
+        "benzinga_news": ("benzinga-news-v2", "reported", True, 500, None),
+        "breaking_defense": ("wp-rest-v2", "reported", True, 200, None),
+        "dvids": ("dvids-search-v1", "primary", True, 300, None),
+        "eia_open_data": ("eia-api-v2", "primary", True, None, None),
+        "federal_register_energy": (
+            "federal-register-api-v1",
+            "primary",
+            True,
+            500,
+            None,
+        ),
+        "fmp_etf": ("fmp-api-v3", "secondary", False, None, None),
+    }
+    assert all(not row.enabled for row in rows)
+    assert all(row.approved_at is None for row in rows)
+    assert all(row.approval_audit_id is None for row in rows)
+    assert (
+        FinanceRepository.source_approval_gate(
+            db_session,
+            allowlist_version=allowlist_version,
+        )
+        is False
+    )
+
+    audit_id = uuid.uuid5(uuid.NAMESPACE_URL, f"lifeagent:{allowlist_version}:recorded")
+    audit = db_session.get(AuditEvent, audit_id)
+    assert audit is not None
+    assert audit.actor == "richard"
+    assert audit.action == "record_finance_source_allowlist"
+    assert audit.target_id == allowlist_version
 
 
 def test_run_lifecycle_status_is_durable(db_session: Session) -> None:

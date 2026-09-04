@@ -55,6 +55,8 @@ def test_source_records_gate_and_read_only_metadata(engine) -> None:
                 license_note="Links permitted.",
                 entitlement="test subscription",
                 classification="primary" if index == 1 else "reported",
+                license_allows_excerpt=index != 1,
+                excerpt_max_chars=200 if index == 2 else None,
                 enabled=True,
                 approved_at=NOW,
                 approval_audit_id=audit_id,
@@ -75,7 +77,15 @@ def test_source_records_gate_and_read_only_metadata(engine) -> None:
     assert records[0].base_url == "https://source1.example"
     assert records[0].classification == "primary"
     assert records[0].entitlement == "test subscription"
+    assert records[0].license_allows_excerpt is False
+    assert records[1].license_allows_excerpt is True
+    assert records[1].excerpt_max_chars == 200
     assert records[0].health == "healthy"
+
+    approvals = store.load_approved_sources(allowlist_version=ALLOWLIST)
+    assert approvals[0].classification.value == "primary"
+    assert approvals[1].license_allows_excerpt is True
+    assert approvals[1].excerpt_max_chars == 200
 
 
 def test_source_gate_remains_disabled_without_audit_approval(engine) -> None:

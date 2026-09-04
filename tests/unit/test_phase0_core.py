@@ -18,13 +18,34 @@ def test_settings_diagnostics_redact_credentials(tmp_path: Path) -> None:
         database_url="postgresql+psycopg://user:password@example.test:5432/lifeagent",
         artifact_root=tmp_path,
         github_webhook_secret="webhook-secret",
+        dvids_api_key="dvids-secret",
+        eia_api_key="eia-secret",
+        discord_finance_channel_id="123456789",
     )
 
     diagnostics = settings.safe_diagnostics()
 
     assert "password" not in str(diagnostics)
     assert "webhook-secret" not in str(diagnostics)
+    assert "dvids-secret" not in str(diagnostics)
+    assert "eia-secret" not in str(diagnostics)
     assert diagnostics["database"] == "postgresql+psycopg://example.test:5432/lifeagent"
+    assert diagnostics["finance_source_allowlist_version"] == "finance-sources-2026.09"
+    assert diagnostics["finance_source_credentials_configured"] == 2
+    assert diagnostics["discord_finance_channel_configured"] is True
+
+
+def test_empty_finance_credentials_are_normalized() -> None:
+    settings = Settings(
+        dvids_api_key="",
+        eia_api_key="",
+        alpha_vantage_api_key="",
+        benzinga_api_token="",
+        fmp_api_key="",
+    )
+
+    assert settings.finance_source_allowlist_version == "finance-sources-2026.09"
+    assert settings.safe_diagnostics()["finance_source_credentials_configured"] == 0
 
 
 def test_readiness_reports_all_phase0_dependencies(tmp_path: Path) -> None:

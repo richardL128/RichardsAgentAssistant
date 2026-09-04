@@ -25,6 +25,9 @@ class Store:
                 classification="primary",
                 entitlement="test subscription",
                 license_note="Links permitted.",
+                license_allows_excerpt=True,
+                excerpt_max_chars=200,
+                excerpt_max_words=None,
                 source_version="v1",
                 allowlist_version="finance-sources-v1",
                 enabled=False,
@@ -63,6 +66,8 @@ def test_finance_sources_are_read_only_gate_metadata() -> None:
     assert body["sources"][0]["source_id"] == "source1"
     assert body["sources"][0]["base_url"] == "https://source1.example"
     assert body["sources"][0]["entitlement"] == "test subscription"
+    assert body["sources"][0]["license_allows_excerpt"] is True
+    assert body["sources"][0]["excerpt_max_chars"] == 200
     assert "raw" not in body["sources"][0]
 
 
