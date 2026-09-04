@@ -19,7 +19,7 @@ _HEADER_PATTERN = re.compile(
     r"[^\r\n]*"
 )
 _ASSIGNMENT_PATTERN = re.compile(
-    r"(?i)(?P<label>\b(?:authorization|proxy-authorization|cookie|set-cookie|"
+    r"(?i)(?P<label>\b(?:[a-z0-9]+[_-])*(?:authorization|proxy-authorization|cookie|set-cookie|"
     r"api[_ -]?key|access[_ -]?token|refresh[_ -]?token|"
     r"auth(?:entication)?[_ -]?token|token|secret|password|passwd|private[_ -]?key|"
     r"client[_ -]?secret)\b[\"']?\s*[:=]\s*)"

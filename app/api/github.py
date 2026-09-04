@@ -3,17 +3,19 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import re
 from collections.abc import Awaitable, Callable
 from datetime import UTC, datetime
-from typing import Literal
+from typing import Any, Literal, cast
 
 from fastapi import APIRouter, Request
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, ConfigDict
 from sqlalchemy.orm import Session
 
-from app.agents.code_review.contracts import PushEvent
+from app.agents.code_review.contracts import PushEvent, validate_repo_path
+from app.agents.code_review.risk import classify_risk
 from app.connectors.github import normalize_push_event, verify_webhook_signature
 from app.core.errors import ErrorCategory, LifeAgentError
 from app.db.code_review import CodeReviewRepository, ReviewIntake
@@ -52,7 +54,51 @@ class _PayloadTooLargeError(Exception):
     pass
 
 
-def _accept_push(request: Request, event: PushEvent) -> ReviewIntake:
+def _push_policy(
+    body: bytes, *, quick_scan_enabled: bool
+) -> tuple[Literal["push", "quick_scan"], Literal["high", "medium", "low"]]:
+    """Classify signed webhook path metadata without trusting it as source content."""
+
+    paths: set[str] = set()
+    try:
+        payload_value: Any = json.loads(body)
+    except (UnicodeDecodeError, json.JSONDecodeError):
+        return "push", "medium"
+    if not isinstance(payload_value, dict):
+        return "push", "medium"
+    payload = cast(dict[str, Any], payload_value)
+    commits_value = payload.get("commits", [])
+    if isinstance(commits_value, list):
+        commits = cast(list[Any], commits_value)
+        for commit_value in commits[:250]:
+            if not isinstance(commit_value, dict):
+                continue
+            commit = cast(dict[str, Any], commit_value)
+            for field in ("added", "modified", "removed"):
+                values_value = commit.get(field, [])
+                if not isinstance(values_value, list):
+                    continue
+                values = cast(list[Any], values_value)
+                for value in values[:500]:
+                    if not isinstance(value, str):
+                        continue
+                    try:
+                        paths.add(validate_repo_path(value))
+                    except ValueError:
+                        continue
+    risk, _ = classify_risk(sorted(paths))
+    if quick_scan_enabled and risk.value == "high":
+        return "quick_scan", "high"
+    return "push", risk.value
+
+
+def _accept_push(
+    request: Request,
+    event: PushEvent,
+    *,
+    trigger: Literal["push", "quick_scan"],
+    risk: Literal["high", "medium", "low"],
+) -> ReviewIntake:
     settings = request.app.state.settings
     with Session(request.app.state.database.engine) as session, session.begin():
         return CodeReviewRepository.accept_push(
@@ -61,6 +107,8 @@ def _accept_push(request: Request, event: PushEvent) -> ReviewIntake:
             allowlist_version=settings.repository_allowlist_version,
             model_version=request.app.state.model_identity,
             config_version=request.app.state.model_config_version,
+            trigger=trigger,
+            risk=risk,
         )
 
 
@@ -119,7 +167,16 @@ async def github_webhook(request: Request) -> GitHubWebhookResponse | JSONRespon
         # Deleted refs do not identify a commit that can be reviewed.
         if set(event.after_sha) == {"0"}:
             return GitHubWebhookResponse(status="ignored")
-        intake = await asyncio.to_thread(_accept_push, request, event)
+        trigger, risk = _push_policy(
+            body, quick_scan_enabled=settings.code_review_quick_scan_enabled
+        )
+        intake = await asyncio.to_thread(
+            _accept_push,
+            request,
+            event,
+            trigger=trigger,
+            risk=risk,
+        )
     except LifeAgentError as exc:
         status_code = 401 if exc.record.category is ErrorCategory.AUTHORIZATION else 400
         return JSONResponse(

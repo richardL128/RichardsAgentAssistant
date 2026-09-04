@@ -1,6 +1,6 @@
 name = "luna_worker"
 description = "Implementation-focused worker for a bounded, independently owned coding task."
-model = "gpt-5.6-luna"
+model = "gpt-5.5"
 model_reasoning_effort = "high"
 
 developer_instructions = """

@@ -1,0 +1,10 @@
+[
+  {
+    "source_id": "source1",
+    "external_id": "event-1",
+    "title": "ACME reports quarterly revenue growth",
+    "url": "https://source1.example/reports/event-1",
+    "tickers": ["ACME"],
+    "themes": ["earnings"]
+  }
+]

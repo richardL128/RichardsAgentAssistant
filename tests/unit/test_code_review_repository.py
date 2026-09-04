@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import subprocess
+import sys
 from pathlib import Path
 
 import pytest
@@ -107,8 +108,11 @@ def test_checkout_clone_or_checkout_failure_has_safe_code(tmp_path: Path) -> Non
         pass
     assert failure.value.diagnostic_code == "checkout_clone_failed"
 
-    with pytest.raises(RepositoryCheckoutError) as timeout, checkout_repository(
-        "acme/example", "0" * 40, allowlist={"acme/example"}, source=source, timeout_seconds=0
+    with (
+        pytest.raises(RepositoryCheckoutError) as timeout,
+        checkout_repository(
+            "acme/example", "0" * 40, allowlist={"acme/example"}, source=source, timeout_seconds=0
+        ),
     ):
         pass
     assert timeout.value.diagnostic_code == "checkout_timeout"
@@ -132,21 +136,27 @@ def test_packet_extracts_changed_lines_and_bounds(tmp_path: Path) -> None:
         assemble_review_packet("acme/example", base, head, source, max_patch_chars=1)
 
 
-def _fake_executable(tmp_path: Path, body: str, name: str = "fake-scanner") -> Path:
-    executable = tmp_path / name
-    executable.write_text(f"#!/usr/bin/python3\n{body}\n")
-    executable.chmod(0o755)
-    return executable
+def _fake_scanner(tmp_path: Path, body: str, name: str = "fake-scanner") -> tuple[str, str]:
+    """Return an (executable, script) pair for a stub scanner process.
+
+    The script is passed as an interpreter argument rather than made
+    executable: pytest's ``tmp_path`` can live on a ``noexec`` mount, and the
+    host is not guaranteed to have a system interpreter at a fixed path.
+    """
+
+    script = tmp_path / f"{name}.py"
+    script.write_text(f"{body}\n")
+    return sys.executable, str(script)
 
 
 def test_scanners_redact_gitleaks_and_isolate_timeout(tmp_path: Path) -> None:
     output = (
         '{"findings":[{"RuleID":"token","File":"app.py","StartLine":1,"Secret":"DO_NOT_LEAK"}]}'
     )
-    clean = _fake_executable(tmp_path, f"print({output!r})", "clean-scanner")
-    slow = _fake_executable(tmp_path, "import time; time.sleep(2)", "slow-scanner")
-    clean_spec = ScannerSpec(ScannerKind.GITLEAKS, str(clean), timeout_seconds=2)
-    slow_spec = ScannerSpec(ScannerKind.SEMGREP, str(slow), timeout_seconds=0.05)
+    clean_exe, clean_script = _fake_scanner(tmp_path, f"print({output!r})", "clean-scanner")
+    slow_exe, slow_script = _fake_scanner(tmp_path, "import time; time.sleep(2)", "slow-scanner")
+    clean_spec = ScannerSpec(ScannerKind.GITLEAKS, clean_exe, (clean_script,), timeout_seconds=2)
+    slow_spec = ScannerSpec(ScannerKind.SEMGREP, slow_exe, (slow_script,), timeout_seconds=0.05)
     runs = run_scanners([clean_spec, slow_spec], tmp_path, secrets=["DO_NOT_LEAK"])
     assert runs[0].status is ScannerStatus.FINDINGS
     assert "DO_NOT_LEAK" not in runs[0].model_dump_json()
@@ -155,8 +165,8 @@ def test_scanners_redact_gitleaks_and_isolate_timeout(tmp_path: Path) -> None:
 
 
 def test_native_commands_require_allowlist(tmp_path: Path) -> None:
-    executable = _fake_executable(tmp_path, "print('{}')")
-    spec = ScannerSpec(ScannerKind.NATIVE, str(executable), allowlisted_commands=frozenset())
+    executable, script = _fake_scanner(tmp_path, "print('{}')")
+    spec = ScannerSpec(ScannerKind.NATIVE, executable, (script,), allowlisted_commands=frozenset())
     result = run_scanner(spec, tmp_path)
     assert result.status is ScannerStatus.UNAVAILABLE
     assert result.diagnostic_code == "native_command_not_allowlisted"

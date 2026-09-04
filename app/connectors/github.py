@@ -14,7 +14,7 @@ import re
 from collections.abc import Callable, Iterable, Mapping
 from datetime import UTC, datetime, timedelta
 from typing import Any, Final, Literal, cast
-from urllib.parse import urlsplit
+from urllib.parse import quote, urlsplit
 
 import httpx
 import jwt
@@ -32,6 +32,7 @@ _REPOSITORY_PATTERN: Final[re.Pattern[str]] = re.compile(
 _SHA_PATTERN: Final[re.Pattern[str]] = re.compile(r"^(?:[0-9a-f]{40}|[0-9a-f]{64})$")
 _DELIVERY_PATTERN: Final[re.Pattern[str]] = re.compile(r"^[A-Za-z0-9._:-]{1,128}$")
 _REF_PATTERN: Final[re.Pattern[str]] = re.compile(r"^refs/heads/[A-Za-z0-9._/-]+$")
+_BRANCH_PATTERN: Final[re.Pattern[str]] = re.compile(r"^[A-Za-z0-9._/-]{1,255}$")
 
 
 class InstallationToken(BaseModel):
@@ -53,6 +54,17 @@ class RepositoryMetadata(BaseModel):
     default_branch: str = Field(min_length=1, max_length=255)
     private: bool
     visibility: str | None = None
+
+
+class RepositoryPage(BaseModel):
+    """One bounded page returned by the installation repository listing."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    repositories: list[RepositoryMetadata] = Field(max_length=100)
+    page: int = Field(ge=1)
+    per_page: int = Field(ge=1, le=100)
+    has_next: bool
 
 
 class CommitComparison(BaseModel):
@@ -332,6 +344,118 @@ class GitHubAppConnector:
             visibility=visibility,
         )
 
+    async def list_installation_repositories(
+        self, installation_id: int, *, page: int = 1, per_page: int = 100
+    ) -> RepositoryPage:
+        """List repositories visible to an installation, restricted to the allowlist.
+
+        The endpoint is intentionally the only account-scale listing exposed by
+        this adapter.  Repositories not in the configured allowlist are omitted
+        before they cross the connector boundary.
+        """
+
+        if installation_id <= 0:
+            raise permanent_error(ErrorCode.INPUT_INVALID, "GitHub installation ID is invalid")
+        if page < 1 or per_page < 1 or per_page > 100:
+            raise permanent_error(ErrorCode.INPUT_INVALID, "GitHub repository page is invalid")
+        token = await self.exchange_installation_token(installation_id)
+        response = await self._request(
+            "GET",
+            f"/installation/repositories?per_page={per_page}&page={page}",
+            headers={"Authorization": f"Bearer {token.token.get_secret_value()}"},
+        )
+        data = self._json_object(response, "GitHub installation repositories")
+        raw_repositories = data.get("repositories")
+        if not isinstance(raw_repositories, list):
+            raise transient_error(
+                ErrorCode.CONNECTOR_TRANSIENT,
+                "GitHub returned invalid installation repositories",
+            )
+        repository_values = cast(list[Any], raw_repositories)
+        repositories: list[RepositoryMetadata] = []
+        for raw in repository_values:
+            if not isinstance(raw, dict):
+                raise transient_error(
+                    ErrorCode.CONNECTOR_TRANSIENT,
+                    "GitHub returned invalid installation repositories",
+                )
+            value = cast(dict[str, Any], raw)
+            full_name = value.get("full_name")
+            if not isinstance(full_name, str):
+                raise transient_error(
+                    ErrorCode.CONNECTOR_TRANSIENT,
+                    "GitHub returned invalid installation repositories",
+                )
+            # The installation endpoint can see more repositories than the
+            # application is approved to process.  Filter those out here.
+            if full_name not in self._allowlist:
+                continue
+            clone_url = value.get("clone_url")
+            default_branch = value.get("default_branch")
+            private = value.get("private")
+            visibility = value.get("visibility")
+            if (
+                not isinstance(clone_url, str)
+                or not isinstance(default_branch, str)
+                or not isinstance(private, bool)
+                or (visibility is not None and not isinstance(visibility, str))
+            ):
+                raise transient_error(
+                    ErrorCode.CONNECTOR_TRANSIENT,
+                    "GitHub returned invalid installation repository metadata",
+                )
+            _validate_clone_url(clone_url)
+            try:
+                repositories.append(
+                    RepositoryMetadata(
+                        repository=full_name,
+                        clone_url=clone_url,
+                        default_branch=default_branch,
+                        private=private,
+                        visibility=visibility,
+                    )
+                )
+            except ValidationError:
+                raise transient_error(
+                    ErrorCode.CONNECTOR_TRANSIENT,
+                    "GitHub returned invalid installation repository metadata",
+                ) from None
+        try:
+            return RepositoryPage(
+                repositories=repositories,
+                page=page,
+                per_page=per_page,
+                has_next=len(repository_values) >= per_page,
+            )
+        except ValidationError:
+            raise transient_error(
+                ErrorCode.CONNECTOR_TRANSIENT,
+                "GitHub returned too many installation repositories",
+            ) from None
+
+    async def get_default_branch_sha(
+        self, repository: str, default_branch: str, installation_id: int
+    ) -> str:
+        """Resolve an exact SHA for a repository's default branch."""
+
+        repository = _validate_repository(repository, self._allowlist)
+        if not _BRANCH_PATTERN.fullmatch(default_branch) or ".." in default_branch:
+            raise permanent_error(ErrorCode.INPUT_INVALID, "GitHub default branch is invalid")
+        token = await self.exchange_installation_token(installation_id)
+        response = await self._request(
+            "GET",
+            f"/repos/{repository}/commits/{quote(default_branch, safe='A-Za-z0-9._/-')}",
+            headers={"Authorization": f"Bearer {token.token.get_secret_value()}"},
+        )
+        data = self._json_object(response, "GitHub default branch commit")
+        sha = data.get("sha")
+        if not isinstance(sha, str) or not _SHA_PATTERN.fullmatch(sha):
+            raise transient_error(
+                ErrorCode.CONNECTOR_TRANSIENT,
+                "GitHub returned an invalid default branch SHA",
+            )
+        return sha
+
     async def compare_commits(
         self,
         repository: str,
@@ -483,6 +607,7 @@ __all__ = [
     "GitHubAppConnector",
     "InstallationToken",
     "RepositoryMetadata",
+    "RepositoryPage",
     "normalize_push_event",
     "verify_webhook_signature",
 ]

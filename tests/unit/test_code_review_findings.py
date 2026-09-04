@@ -112,6 +112,7 @@ def test_attributable_findings_are_deduplicated_and_keep_evidence() -> None:
     result = validate_and_merge(
         _packet(),
         [FindingBatch(findings=[first, second], review_summary="review")],
+        include_scanner_findings=False,
     )
 
     assert len(result.findings) == 1
@@ -145,7 +146,9 @@ def test_vague_documentation_speculation_and_unknown_evidence_are_suppressed() -
             "evidence_refs": ["diff:docs/guide.md:10"],
         }
     )
-    unknown_proposal = _proposal().model_copy(update={"evidence_refs": ["not-in-packet"]})
+    unknown_proposal = _proposal(path="docs/guide.md").model_copy(
+        update={"evidence_refs": ["not-in-packet"]}
+    )
     result = validate_and_merge(
         _packet(docs_only=True),
         [FindingBatch(findings=[docs_proposal, unknown_proposal], review_summary="review")],

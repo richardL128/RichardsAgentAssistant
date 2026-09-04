@@ -70,6 +70,9 @@ class Settings(BaseSettings):
     discord_bot_token: SecretValue = None
     discord_webhook_secret: SecretValue = None
     notion_token: SecretValue = None
+    notion_courses_database_id: str | None = None
+    notion_assessments_database_id: str | None = None
+    notion_study_blocks_database_id: str | None = None
     finance_source_allowlist_version: str | None = None
     repository_allowlist_version: str | None = None
 
@@ -84,12 +87,28 @@ class Settings(BaseSettings):
     repository_allowlist: list[str] = Field(default_factory=list)
     discord_target_channels: list[str] = Field(default_factory=list)
     discord_code_review_channel_id: str | None = None
+    discord_academic_channel_id: str | None = None
     github_webhook_max_body_bytes: Annotated[int, Field(gt=0, le=10_485_760)] = 1_048_576
     git_clone_timeout_seconds: Annotated[float, Field(gt=0, le=600)] = 60.0
     code_command_timeout_seconds: Annotated[float, Field(gt=0, le=1800)] = 120.0
     code_command_output_bytes: Annotated[int, Field(gt=0, le=10_485_760)] = 262_144
     review_min_confidence: Annotated[float, Field(ge=0, le=1)] = 0.75
     code_review_schedule: time = time(hour=18)
+    # Phase 4 — account-scale ingestion and daily operation.
+    code_review_quick_scan_enabled: bool = True
+    code_review_catchup_enabled: bool = False
+    code_review_catchup_max_days: Annotated[int, Field(ge=0, le=30)] = 3
+    code_review_daily_max_commits: Annotated[int, Field(gt=0, le=500)] = 50
+    code_review_profile_refresh_days: Annotated[int, Field(gt=0, le=365)] = 30
+    code_review_discovery_scope: str = "github-installation"
+    github_discovery_page_size: Annotated[int, Field(gt=0, le=100)] = 50
+    github_min_call_interval_seconds: Annotated[float, Field(ge=0, le=60)] = 2.0
+    notion_attachment_max_bytes: Annotated[int, Field(gt=0, le=104_857_600)] = 25_165_824
+    academic_plan_horizon_days: Annotated[int, Field(ge=7, le=14)] = 14
+    academic_buffer_ratio: Annotated[float, Field(ge=0.05, le=0.5)] = 0.15
+    academic_default_block_minutes: Annotated[int, Field(ge=15, le=240)] = 60
+    academic_sync_lookback_days: Annotated[int, Field(ge=0, le=30)] = 2
+    academic_confirmation_ttl_hours: Annotated[int, Field(gt=0, le=168)] = 24
     academic_morning_schedule: time = time(hour=8)
     academic_end_of_day_schedule: time = time(hour=21)
     finance_market_open_schedule: time = time(hour=9)
@@ -115,6 +134,10 @@ class Settings(BaseSettings):
         "finance_source_allowlist_version",
         "repository_allowlist_version",
         "discord_code_review_channel_id",
+        "discord_academic_channel_id",
+        "notion_courses_database_id",
+        "notion_assessments_database_id",
+        "notion_study_blocks_database_id",
         mode="before",
     )
     @classmethod
@@ -130,6 +153,13 @@ class Settings(BaseSettings):
             ZoneInfo(value)
         except ZoneInfoNotFoundError as exc:
             raise ValueError(f"unknown IANA timezone: {value}") from exc
+        return value
+
+    @field_validator("code_review_discovery_scope")
+    @classmethod
+    def discovery_scope_is_present(cls, value: str) -> str:
+        if not value.strip():
+            raise ValueError("code_review_discovery_scope must not be empty")
         return value
 
     @field_validator("ollama_model", "embedding_model")
@@ -157,6 +187,15 @@ class Settings(BaseSettings):
             raise ValueError("retry base delay cannot exceed retry maximum delay")
         if self.repository_allowlist and not self.repository_allowlist_version:
             raise ValueError("a non-empty repository allowlist requires a version")
+        notion_databases = (
+            self.notion_courses_database_id,
+            self.notion_assessments_database_id,
+            self.notion_study_blocks_database_id,
+        )
+        if self.notion_token is not None and not all(notion_databases):
+            raise ValueError("a Notion token requires all three academic database IDs")
+        if any(notion_databases) and self.notion_token is None:
+            raise ValueError("academic Notion database IDs require a Notion token")
         return self
 
     @field_validator("repository_allowlist")
@@ -176,7 +215,7 @@ class Settings(BaseSettings):
             raise ValueError("Discord target channels must be unique numeric IDs")
         return value
 
-    @field_validator("discord_code_review_channel_id")
+    @field_validator("discord_code_review_channel_id", "discord_academic_channel_id")
     @classmethod
     def discord_code_review_channel_is_id(cls, value: str | None) -> str | None:
         if value is not None and not value.isdigit():
@@ -231,6 +270,15 @@ class Settings(BaseSettings):
             "discord_code_review_channel_configured": (
                 self.discord_code_review_channel_id is not None
             ),
+            "discord_academic_channel_configured": self.discord_academic_channel_id is not None,
+            "notion_database_count": sum(
+                value is not None
+                for value in (
+                    self.notion_courses_database_id,
+                    self.notion_assessments_database_id,
+                    self.notion_study_blocks_database_id,
+                )
+            ),
             "github_app_configured": all(
                 (
                     self.github_app_id is not None,
@@ -245,6 +293,20 @@ class Settings(BaseSettings):
             "code_command_output_bytes": self.code_command_output_bytes,
             "review_min_confidence": self.review_min_confidence,
             "code_review_schedule": self.code_review_schedule.isoformat(timespec="minutes"),
+            "code_review_quick_scan_enabled": self.code_review_quick_scan_enabled,
+            "code_review_catchup_enabled": self.code_review_catchup_enabled,
+            "code_review_catchup_max_days": self.code_review_catchup_max_days,
+            "code_review_daily_max_commits": self.code_review_daily_max_commits,
+            "code_review_profile_refresh_days": self.code_review_profile_refresh_days,
+            "code_review_discovery_scope": self.code_review_discovery_scope,
+            "github_discovery_page_size": self.github_discovery_page_size,
+            "github_min_call_interval_seconds": self.github_min_call_interval_seconds,
+            "notion_attachment_max_bytes": self.notion_attachment_max_bytes,
+            "academic_plan_horizon_days": self.academic_plan_horizon_days,
+            "academic_buffer_ratio": self.academic_buffer_ratio,
+            "academic_default_block_minutes": self.academic_default_block_minutes,
+            "academic_sync_lookback_days": self.academic_sync_lookback_days,
+            "academic_confirmation_ttl_hours": self.academic_confirmation_ttl_hours,
             "academic_morning_schedule": self.academic_morning_schedule.isoformat(
                 timespec="minutes"
             ),

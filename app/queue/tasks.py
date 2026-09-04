@@ -15,7 +15,7 @@ from app.core.config import get_settings
 from app.db.models import RunStatus
 from app.db.repositories import RunRepository
 from app.db.session import Database
-from app.queue.app import QUEUE_NAMES, default_retry_strategy, procrastinate_app
+from app.queue.app import JOB_KINDS, default_retry_strategy, procrastinate_app
 from app.queue.execution import execute_recorded_attempt
 from app.queue.idempotency import validate_idempotency_key
 from app.queue.periodic import PeriodicOccurrence, TorontoPeriodicSchedule, stable_period_key
@@ -26,26 +26,30 @@ _database = Database(get_settings())
 _MODEL_LOCK = "ollama:exclusive"
 
 
-def register_task_handler(task_name: str, handler: TaskHandler) -> None:
+def register_task_handler(job_kind: str, handler: TaskHandler) -> None:
     """Register a workflow handler during worker startup, not module import."""
 
-    if task_name not in QUEUE_NAMES:
-        raise ValueError(f"unknown queue task: {task_name}")
-    _handlers[task_name] = handler
+    if job_kind not in JOB_KINDS:
+        raise ValueError(f"unknown job kind: {job_kind}")
+    _handlers[job_kind] = handler
 
 
 async def _dispatch(
     context: JobContext,
-    task_name: str,
+    queue_name: str,
     run_id: str,
     idempotency_key: str,
+    kind: str = "",
 ) -> dict[str, Any]:
     if not run_id.strip():
         raise ValueError("run_id must not be empty")
     validate_idempotency_key(idempotency_key)
-    handler = _handlers.get(task_name)
+    job_kind = kind or queue_name
+    if JOB_KINDS.get(job_kind) != queue_name:
+        raise ValueError(f"job kind {job_kind} does not belong to queue {queue_name}")
+    handler = _handlers.get(job_kind)
     if handler is None:
-        raise RuntimeError(f"no handler registered for {task_name}")
+        raise RuntimeError(f"no handler registered for {job_kind}")
     parsed_run_id = UUID(run_id)
 
     async def operation() -> dict[str, object]:
@@ -55,14 +59,14 @@ async def _dispatch(
         operation,
         engine=_database.engine,
         run_id=parsed_run_id,
-        node_name=f"queue.{task_name}",
+        node_name=f"queue.{job_kind}",
         attempt=context.job.attempts + 1,
         retry_policy=default_retry_strategy.policy,
     )
     return {"status": "succeeded", "run_id": run_id}
 
 
-def defer_idempotent(task: Any, run_id: str, idempotency_key: str) -> Any:
+def defer_idempotent(task: Any, run_id: str, idempotency_key: str, kind: str = "") -> Any:
     """Defer a task with a per-work-item queueing lock.
 
     Procrastinate's decorator-level lock is static.  Callers should use this
@@ -75,21 +79,25 @@ def defer_idempotent(task: Any, run_id: str, idempotency_key: str) -> Any:
     if not run_id.strip():
         raise ValueError("run_id must not be empty")
     validate_idempotency_key(idempotency_key)
-    return task.configure(lock=_MODEL_LOCK, queueing_lock=idempotency_key).defer(
-        run_id=run_id,
-        idempotency_key=idempotency_key,
-    )
+    arguments: dict[str, str] = {"run_id": run_id, "idempotency_key": idempotency_key}
+    if kind:
+        arguments["kind"] = kind
+    return task.configure(lock=_MODEL_LOCK, queueing_lock=idempotency_key).defer(**arguments)
 
 
-async def defer_idempotent_async(task: Any, run_id: str, idempotency_key: str) -> Any:
+async def defer_idempotent_async(
+    task: Any, run_id: str, idempotency_key: str, kind: str = ""
+) -> Any:
     """Async form used by periodic deferrer tasks."""
 
     if not run_id.strip():
         raise ValueError("run_id must not be empty")
     validate_idempotency_key(idempotency_key)
+    arguments: dict[str, str] = {"run_id": run_id, "idempotency_key": idempotency_key}
+    if kind:
+        arguments["kind"] = kind
     return await task.configure(lock=_MODEL_LOCK, queueing_lock=idempotency_key).defer_async(
-        run_id=run_id,
-        idempotency_key=idempotency_key,
+        **arguments
     )
 
 
@@ -100,9 +108,37 @@ async def defer_idempotent_async(task: Any, run_id: str, idempotency_key: str) -
     pass_context=True,
 )
 async def code_review_task(
+    context: JobContext, run_id: str, idempotency_key: str, kind: str = ""
+) -> dict[str, Any]:
+    return await _dispatch(context, "code_review", run_id, idempotency_key, kind)
+
+
+@procrastinate_app.task(
+    name="lifeagent.code_review_daily",
+    queue="code_review",
+    retry=default_retry_strategy,
+    pass_context=True,
+)
+async def code_review_daily_task(
     context: JobContext, run_id: str, idempotency_key: str
 ) -> dict[str, Any]:
-    return await _dispatch(context, "code_review", run_id, idempotency_key)
+    """Run the one-per-Toronto-day report consolidation."""
+
+    return await _dispatch(context, "code_review", run_id, idempotency_key, "code_review_daily")
+
+
+@procrastinate_app.task(
+    name="lifeagent.code_review_ingest",
+    queue="code_review",
+    retry=default_retry_strategy,
+    pass_context=True,
+)
+async def code_review_ingest_task(
+    context: JobContext, run_id: str, idempotency_key: str
+) -> dict[str, Any]:
+    """Run one resumable repository-profile ingestion page."""
+
+    return await _dispatch(context, "code_review", run_id, idempotency_key, "code_review_ingest")
 
 
 @procrastinate_app.task(
@@ -112,9 +148,9 @@ async def code_review_task(
     pass_context=True,
 )
 async def academic_planner_task(
-    context: JobContext, run_id: str, idempotency_key: str
+    context: JobContext, run_id: str, idempotency_key: str, kind: str = ""
 ) -> dict[str, Any]:
-    return await _dispatch(context, "academic_planner", run_id, idempotency_key)
+    return await _dispatch(context, "academic_planner", run_id, idempotency_key, kind)
 
 
 @procrastinate_app.task(
@@ -123,12 +159,14 @@ async def academic_planner_task(
     retry=default_retry_strategy,
     pass_context=True,
 )
-async def finance_task(context: JobContext, run_id: str, idempotency_key: str) -> dict[str, Any]:
-    return await _dispatch(context, "finance", run_id, idempotency_key)
+async def finance_task(
+    context: JobContext, run_id: str, idempotency_key: str, kind: str = ""
+) -> dict[str, Any]:
+    return await _dispatch(context, "finance", run_id, idempotency_key, kind)
 
 
 def _create_scheduled_run(
-    task_name: str,
+    agent_name: str,
     key: str,
     schedule_name: str,
 ) -> tuple[UUID, str]:
@@ -136,7 +174,7 @@ def _create_scheduled_run(
         run = RunRepository.create_or_get(
             session,
             idempotency_key=key,
-            agent_name=task_name,
+            agent_name=agent_name,
             trigger="schedule",
             schedule=schedule_name,
         )
@@ -147,12 +185,12 @@ def _create_scheduled_run(
 async def _periodic_tick(
     *,
     timestamp: int,
-    task_name: str,
+    job_kind: str,
     schedule_name: str,
     schedule: TorontoPeriodicSchedule,
     task: Any,
 ) -> dict[str, object]:
-    if task_name not in _handlers:
+    if job_kind not in _handlers:
         return {"status": "disabled_no_handler"}
     scheduled_at = datetime.fromtimestamp(timestamp, UTC)
     local_time = scheduled_at.astimezone(schedule.zone)
@@ -162,13 +200,13 @@ async def _periodic_tick(
     key = stable_period_key(schedule_name, occurrence)
     run_id, status = await asyncio.to_thread(
         _create_scheduled_run,
-        task_name,
+        job_kind,
         key,
         schedule_name,
     )
     if status in {RunStatus.SUCCEEDED.value, RunStatus.CANCELLED.value}:
         return {"status": "already_complete", "run_id": str(run_id)}
-    job_id = await defer_idempotent_async(task, str(run_id), key)
+    job_id = await defer_idempotent_async(task, str(run_id), key, job_kind)
     return {"status": "enqueued", "run_id": str(run_id), "job_id": job_id}
 
 
@@ -180,10 +218,10 @@ _settings = get_settings()
 async def code_review_periodic(timestamp: int) -> dict[str, object]:
     return await _periodic_tick(
         timestamp=timestamp,
-        task_name="code_review",
+        job_kind="code_review_daily",
         schedule_name="code-review-daily",
         schedule=TorontoPeriodicSchedule.from_time(_settings.code_review_schedule),
-        task=code_review_task,
+        task=code_review_daily_task,
     )
 
 
@@ -192,7 +230,7 @@ async def code_review_periodic(timestamp: int) -> dict[str, object]:
 async def academic_morning_periodic(timestamp: int) -> dict[str, object]:
     return await _periodic_tick(
         timestamp=timestamp,
-        task_name="academic_planner",
+        job_kind="academic_planner",
         schedule_name="academic-morning",
         schedule=TorontoPeriodicSchedule.from_time(_settings.academic_morning_schedule),
         task=academic_planner_task,
@@ -204,7 +242,7 @@ async def academic_morning_periodic(timestamp: int) -> dict[str, object]:
 async def academic_eod_periodic(timestamp: int) -> dict[str, object]:
     return await _periodic_tick(
         timestamp=timestamp,
-        task_name="academic_planner",
+        job_kind="academic_planner",
         schedule_name="academic-end-of-day",
         schedule=TorontoPeriodicSchedule.from_time(_settings.academic_end_of_day_schedule),
         task=academic_planner_task,
@@ -216,7 +254,7 @@ async def academic_eod_periodic(timestamp: int) -> dict[str, object]:
 async def finance_periodic(timestamp: int) -> dict[str, object]:
     return await _periodic_tick(
         timestamp=timestamp,
-        task_name="finance",
+        job_kind="finance",
         schedule_name="finance-market-open",
         schedule=TorontoPeriodicSchedule.from_time(
             _settings.finance_market_open_schedule,
@@ -228,6 +266,8 @@ async def finance_periodic(timestamp: int) -> dict[str, object]:
 
 __all__ = [
     "academic_planner_task",
+    "code_review_daily_task",
+    "code_review_ingest_task",
     "code_review_task",
     "defer_idempotent",
     "defer_idempotent_async",

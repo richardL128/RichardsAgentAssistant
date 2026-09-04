@@ -15,6 +15,18 @@ from app.queue.retry import RetryPolicy, TransientRetryStrategy
 
 QUEUE_NAMES = ("code_review", "academic_planner", "finance")
 
+# A queue carries more than one kind of work: the code-review queue runs push
+# reviews, the nightly consolidation, and repository ingestion.  Handlers are
+# registered per job kind, and every kind names the queue it runs on so a job
+# can never be dispatched to a worker that does not serve it.
+JOB_KINDS: dict[str, str] = {
+    "code_review": "code_review",
+    "code_review_daily": "code_review",
+    "code_review_ingest": "code_review",
+    "academic_planner": "academic_planner",
+    "finance": "finance",
+}
+
 
 def postgres_conninfo(database_url: str) -> str:
     """Convert SQLAlchemy's psycopg URL to a psycopg-compatible conninfo URL."""
@@ -57,6 +69,7 @@ procrastinate_app = create_procrastinate_app(_settings)
 default_retry_strategy = create_retry_strategy(_settings)
 
 __all__ = [
+    "JOB_KINDS",
     "QUEUE_NAMES",
     "create_procrastinate_app",
     "create_retry_strategy",
