@@ -13,12 +13,14 @@ from app.agents.academic_planner.workflow import run_academic_planner
 from app.agents.code_review import discovery
 from app.agents.code_review.operations import run_code_review_daily
 from app.agents.code_review.workflow import run_code_review
+from app.agents.finance.workflow import run_finance
 from app.queue.app import procrastinate_app
 from app.queue.tasks import TaskHandler, register_task_handler
 
 register_task_handler("code_review", run_code_review)
 register_task_handler("code_review_daily", run_code_review_daily)
 register_task_handler("academic_planner", run_academic_planner)
+register_task_handler("finance", run_finance)
 
 # Repository discovery is supplied by the account-scale ingestion module when
 # enabled.  Importing it lazily keeps the worker boundary usable while a host
