@@ -21,7 +21,7 @@ BASE_SHA = "a" * 40
 HEAD_SHA = "b" * 40
 
 
-def _payload() -> bytes:
+def _payload(*, modified: list[str] | None = None) -> bytes:
     return json.dumps(
         {
             "ref": "refs/heads/main",
@@ -33,6 +33,7 @@ def _payload() -> bytes:
                 "default_branch": "main",
             },
             "installation": {"id": 12345},
+            "commits": [{"added": [], "modified": modified or [], "removed": []}],
         },
         separators=(",", ":"),
     ).encode()
@@ -138,3 +139,29 @@ async def test_unconfigured_endpoint_fails_closed(tmp_path: Path) -> None:
         response = await client.post("/webhooks/github", content=b"{}")
     assert response.status_code == 503
     assert response.json()["error_code"] == "github_not_configured"
+
+
+@pytest.mark.asyncio
+async def test_high_risk_push_is_durably_marked_for_quick_scan(tmp_path: Path) -> None:
+    settings = _settings(tmp_path)
+    app = create_app(settings)
+    Base.metadata.create_all(app.state.database.engine)
+
+    async def enqueue(_: str, __: str) -> int:
+        return 1
+
+    app.state.enqueue_code_review = enqueue
+    body = _payload(modified=["app/auth/session.py"])
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app), base_url="http://test"
+    ) as client:
+        response = await client.post(
+            "/webhooks/github", content=body, headers=_headers(body, "d-high")
+        )
+
+    assert response.status_code == 202
+    with Session(app.state.database.engine) as session:
+        commit = session.scalar(select(ReviewedCommit))
+        assert commit is not None
+        assert commit.trigger == "quick_scan"
+        assert commit.risk == "high"

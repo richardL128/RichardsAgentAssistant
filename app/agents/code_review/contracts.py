@@ -156,9 +156,7 @@ class ReviewPacket(ReviewModel):
     def packet_is_bounded(self) -> ReviewPacket:
         character_count = sum(len(file.patch) for file in self.files)
         character_count += sum(
-            len(finding.evidence)
-            for run in self.scanner_runs
-            for finding in run.findings
+            len(finding.evidence) for run in self.scanner_runs for finding in run.findings
         )
         if character_count > 120_000:
             raise ValueError("review packet exceeds the bounded character budget")

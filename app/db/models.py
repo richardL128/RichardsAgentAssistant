@@ -10,19 +10,22 @@ from __future__ import annotations
 
 import enum
 import uuid
-from datetime import UTC, datetime
+from datetime import UTC, date, datetime
+from typing import Any
 
 from sqlalchemy import (
     JSON,
     BigInteger,
     Boolean,
     CheckConstraint,
+    Date,
     DateTime,
     Float,
     ForeignKey,
     Index,
     MetaData,
     String,
+    Text,
     UniqueConstraint,
     text,
 )
@@ -332,7 +335,12 @@ class CodeRepository(TimestampMixin, Base):
     __tablename__ = "repositories"
     __table_args__ = (
         CheckConstraint("length(full_name) > 2", name="full_name_nonempty"),
+        CheckConstraint(
+            "profile_state IN ('unprofiled','profiling','profiled','failed')",
+            name="profile_state_valid",
+        ),
         Index("ix_repositories_enabled_name", "enabled", "full_name"),
+        Index("ix_repositories_profile_state", "profile_state", "full_name"),
     )
 
     id: Mapped[uuid.UUID] = mapped_column(primary_key=True, default=uuid.uuid4)
@@ -342,6 +350,12 @@ class CodeRepository(TimestampMixin, Base):
     installation_id: Mapped[int] = mapped_column(BigInteger, nullable=False)
     allowlist_version: Mapped[str] = mapped_column(String(128), nullable=False)
     enabled: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
+    discovery_version: Mapped[str | None] = mapped_column(String(128))
+    discovered_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    profile_state: Mapped[str] = mapped_column(String(32), nullable=False, default="unprofiled")
+    profiled_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    profile_error_code: Mapped[str | None] = mapped_column(String(128))
+    last_reviewed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
 
 
 class ReviewedCommit(TimestampMixin, Base):
@@ -353,7 +367,12 @@ class ReviewedCommit(TimestampMixin, Base):
             name="status_valid",
         ),
         CheckConstraint("risk IN ('high','medium','low')", name="risk_valid"),
+        CheckConstraint(
+            "trigger IN ('push','quick_scan','daily','catchup','manual')",
+            name="trigger_valid",
+        ),
         Index("ix_reviewed_commits_status_created", "status", "created_at"),
+        Index("ix_reviewed_commits_repo_created", "repository_id", "created_at"),
     )
 
     id: Mapped[uuid.UUID] = mapped_column(primary_key=True, default=uuid.uuid4)
@@ -368,6 +387,7 @@ class ReviewedCommit(TimestampMixin, Base):
     base_sha: Mapped[str] = mapped_column(String(64), nullable=False)
     head_sha: Mapped[str] = mapped_column(String(64), nullable=False)
     risk: Mapped[str] = mapped_column(String(16), nullable=False, default="medium")
+    trigger: Mapped[str] = mapped_column(String(32), nullable=False, default="push")
     status: Mapped[str] = mapped_column(String(32), nullable=False, default="queued")
     report_artifact_key: Mapped[str | None] = mapped_column(String(64))
     error_code: Mapped[str | None] = mapped_column(String(128))
@@ -431,24 +451,455 @@ class RepositoryProfile(TimestampMixin, Base):
     reviewed: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
 
 
+class RepositoryDiscoveryState(TimestampMixin, Base):
+    """Resumable cursor for account-scale repository discovery.
+
+    One row per discovery scope.  ``cursor``/``page`` record where the last
+    interrupted listing stopped so a restart continues instead of re-walking
+    the installation, and ``discovery_complete`` marks a finished sweep.
+    """
+
+    __tablename__ = "repository_discovery_state"
+    __table_args__ = (
+        UniqueConstraint("scope", name="uq_repository_discovery_state_scope"),
+        CheckConstraint("page >= 1", name="page_positive"),
+        CheckConstraint("discovered_count >= 0", name="discovered_count_nonnegative"),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(primary_key=True, default=uuid.uuid4)
+    scope: Mapped[str] = mapped_column(String(128), nullable=False)
+    discovery_version: Mapped[str] = mapped_column(String(128), nullable=False)
+    page: Mapped[int] = mapped_column(nullable=False, default=1)
+    cursor: Mapped[str | None] = mapped_column(String(512))
+    discovered_count: Mapped[int] = mapped_column(nullable=False, default=0)
+    discovery_complete: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+    last_full_name: Mapped[str | None] = mapped_column(String(201))
+    last_run_id: Mapped[uuid.UUID | None] = mapped_column(
+        ForeignKey("agent_runs.id", ondelete="SET NULL")
+    )
+    last_error_code: Mapped[str | None] = mapped_column(String(128))
+    completed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+
+
+class ReviewFindingDismissal(TimestampMixin, Base):
+    """A finding the user dismissed, with the reason it was dismissed.
+
+    Dismissals are keyed by repository and finding fingerprint so the same
+    defect stays suppressed across later commits, and the reason is retained
+    for review history rather than being discarded.
+    """
+
+    __tablename__ = "review_finding_dismissals"
+    __table_args__ = (
+        UniqueConstraint(
+            "repository_id",
+            "fingerprint",
+            name="uq_review_finding_dismissals_repo_fingerprint",
+        ),
+        CheckConstraint("length(reason_code) > 0", name="reason_code_nonempty"),
+        Index("ix_review_finding_dismissals_repo", "repository_id", "created_at"),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(primary_key=True, default=uuid.uuid4)
+    repository_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey("repositories.id", ondelete="CASCADE"), nullable=False
+    )
+    fingerprint: Mapped[str] = mapped_column(String(64), nullable=False)
+    reason_code: Mapped[str] = mapped_column(String(64), nullable=False)
+    reason: Mapped[str | None] = mapped_column(String(2000))
+    dismissed_by: Mapped[str] = mapped_column(String(255), nullable=False)
+    dismissed_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=text("CURRENT_TIMESTAMP")
+    )
+    run_id: Mapped[uuid.UUID | None] = mapped_column(
+        ForeignKey("agent_runs.id", ondelete="SET NULL")
+    )
+
+
+class DailyReviewReport(TimestampMixin, Base):
+    """One nightly consolidation of the day's reviews, keyed by Toronto date.
+
+    ``report_date`` is the local period date the consolidation covers, which is
+    what makes the nightly job idempotent across retries and restarts.
+    """
+
+    __tablename__ = "daily_review_reports"
+    __table_args__ = (
+        UniqueConstraint("report_date", name="uq_daily_review_reports_report_date"),
+        CheckConstraint(
+            "status IN ('running','succeeded','attention','failed')",
+            name="status_valid",
+        ),
+        CheckConstraint("commit_count >= 0", name="commit_count_nonnegative"),
+        CheckConstraint("repository_count >= 0", name="repository_count_nonnegative"),
+        Index("ix_daily_review_reports_date", "report_date"),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(primary_key=True, default=uuid.uuid4)
+    report_date: Mapped[date] = mapped_column(Date, nullable=False)
+    run_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey("agent_runs.id", ondelete="CASCADE"), nullable=False, unique=True
+    )
+    schedule_name: Mapped[str] = mapped_column(String(128), nullable=False)
+    status: Mapped[str] = mapped_column(String(32), nullable=False, default="running")
+    commit_count: Mapped[int] = mapped_column(nullable=False, default=0)
+    repository_count: Mapped[int] = mapped_column(nullable=False, default=0)
+    finding_counts: Mapped[dict[str, int]] = mapped_column(JSON, nullable=False, default=dict)
+    artifact_key: Mapped[str | None] = mapped_column(String(64))
+    delivery_id: Mapped[uuid.UUID | None] = mapped_column(
+        ForeignKey("deliveries.id", ondelete="SET NULL")
+    )
+    error_code: Mapped[str | None] = mapped_column(String(128))
+    generated_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+
+
+class Course(TimestampMixin, Base):
+    """One scoped course synchronized from the user's academic source."""
+
+    __tablename__ = "courses"
+    __table_args__ = (
+        UniqueConstraint("notion_id", name="uq_courses_notion_id"),
+        CheckConstraint("length(notion_id) > 0", name="notion_id_nonempty"),
+        CheckConstraint("priority >= 0 AND priority <= 100", name="priority_valid"),
+        Index("ix_courses_term_code", "term", "course_code"),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(primary_key=True, default=uuid.uuid4)
+    notion_id: Mapped[str] = mapped_column(String(255), nullable=False)
+    course_code: Mapped[str] = mapped_column(String(64), nullable=False)
+    title: Mapped[str] = mapped_column(String(255), nullable=False)
+    term: Mapped[str] = mapped_column(String(128), nullable=False)
+    timezone: Mapped[str] = mapped_column(String(64), nullable=False, default="America/Toronto")
+    priority: Mapped[int] = mapped_column(nullable=False, default=50)
+    active: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
+
+
+class Assessment(TimestampMixin, Base):
+    """A typed assessment fact with citation and uncertainty state."""
+
+    __tablename__ = "assessments"
+    __table_args__ = (
+        UniqueConstraint("notion_id", name="uq_assessments_notion_id"),
+        CheckConstraint("confidence >= 0 AND confidence <= 1", name="confidence_valid"),
+        CheckConstraint(
+            "fact_state IN ('unconfirmed','confirmed','ambiguous','rejected')",
+            name="fact_state_valid",
+        ),
+        CheckConstraint(
+            "grade_weight_percent IS NULL OR "
+            "(grade_weight_percent >= 0 AND grade_weight_percent <= 100)",
+            name="grade_weight_valid",
+        ),
+        CheckConstraint("source_page IS NULL OR source_page >= 1", name="source_page_positive"),
+        CheckConstraint("estimated_minutes > 0", name="estimated_minutes_positive"),
+        CheckConstraint("confidence_gap >= 0 AND confidence_gap <= 1", name="confidence_gap_valid"),
+        CheckConstraint("scope_size >= 0 AND scope_size <= 100", name="scope_size_valid"),
+        Index("ix_assessments_course_due", "course_id", "due_at"),
+        Index("ix_assessments_fact_state", "fact_state", "due_at"),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(primary_key=True, default=uuid.uuid4)
+    course_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey("courses.id", ondelete="CASCADE"), nullable=False
+    )
+    notion_id: Mapped[str] = mapped_column(String(255), nullable=False)
+    title: Mapped[str] = mapped_column(String(255), nullable=False)
+    assessment_type: Mapped[str] = mapped_column(String(64), nullable=False)
+    due_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    grade_weight_percent: Mapped[float | None] = mapped_column(Float)
+    estimated_minutes: Mapped[int] = mapped_column(nullable=False, default=60)
+    confidence_gap: Mapped[float] = mapped_column(Float, nullable=False, default=0.5)
+    scope_size: Mapped[float] = mapped_column(Float, nullable=False, default=0.0)
+    scope: Mapped[str | None] = mapped_column(String(4_000))
+    fact_state: Mapped[str] = mapped_column(String(32), nullable=False, default="unconfirmed")
+    confidence: Mapped[float] = mapped_column(Float, nullable=False, default=0.0)
+    ambiguity_reason: Mapped[str | None] = mapped_column(String(2_000))
+    source_page: Mapped[int | None] = mapped_column()
+    source_block: Mapped[str | None] = mapped_column(String(255))
+    source_url: Mapped[str | None] = mapped_column(String(1_000))
+    completed: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+
+
+class FixedCommitment(TimestampMixin, Base):
+    """A fixed class/event that the allocator must never move."""
+
+    __tablename__ = "fixed_commitments"
+    __table_args__ = (
+        UniqueConstraint("notion_id", name="uq_fixed_commitments_notion_id"),
+        CheckConstraint(
+            "fact_state IN ('unconfirmed','confirmed','ambiguous','rejected')",
+            name="fact_state_valid",
+        ),
+        CheckConstraint("source_page IS NULL OR source_page >= 1", name="source_page_positive"),
+        CheckConstraint("ends_at > starts_at", name="commitment_times_valid"),
+        Index("ix_fixed_commitments_time", "starts_at", "ends_at"),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(primary_key=True, default=uuid.uuid4)
+    course_id: Mapped[uuid.UUID | None] = mapped_column(
+        ForeignKey("courses.id", ondelete="SET NULL")
+    )
+    notion_id: Mapped[str] = mapped_column(String(255), nullable=False)
+    title: Mapped[str] = mapped_column(String(255), nullable=False)
+    commitment_type: Mapped[str] = mapped_column(String(64), nullable=False)
+    starts_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    ends_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    timezone: Mapped[str] = mapped_column(String(64), nullable=False)
+    fact_state: Mapped[str] = mapped_column(String(32), nullable=False, default="unconfirmed")
+    confidence: Mapped[float] = mapped_column(Float, nullable=False, default=0.0)
+    ambiguity_reason: Mapped[str | None] = mapped_column(String(2_000))
+    source_page: Mapped[int | None] = mapped_column()
+    source_block: Mapped[str | None] = mapped_column(String(255))
+    source_url: Mapped[str | None] = mapped_column(String(1_000))
+
+
+class PlanningPreference(TimestampMixin, Base):
+    """Versioned scheduling preferences; availability is structured JSON."""
+
+    __tablename__ = "planning_preferences"
+    __table_args__ = (
+        UniqueConstraint("scope", name="uq_planning_preferences_scope"),
+        CheckConstraint("daily_capacity_minutes > 0", name="daily_capacity_positive"),
+        CheckConstraint("buffer_minutes >= 0", name="buffer_nonnegative"),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(primary_key=True, default=uuid.uuid4)
+    scope: Mapped[str] = mapped_column(String(128), nullable=False)
+    timezone: Mapped[str] = mapped_column(String(64), nullable=False)
+    availability: Mapped[dict[str, Any]] = mapped_column(JSON, nullable=False, default=dict)
+    daily_capacity_minutes: Mapped[int] = mapped_column(nullable=False, default=240)
+    buffer_minutes: Mapped[int] = mapped_column(nullable=False, default=15)
+    sleep_schedule: Mapped[dict[str, Any]] = mapped_column(JSON, nullable=False, default=dict)
+    version: Mapped[str] = mapped_column(String(128), nullable=False, default="v1")
+
+
+class StudyPlan(TimestampMixin, Base):
+    """A deterministic plan window whose blocks are safely replayable."""
+
+    __tablename__ = "study_plans"
+    __table_args__ = (
+        UniqueConstraint("plan_key", name="uq_study_plans_plan_key"),
+        CheckConstraint("ends_on >= starts_on", name="study_plan_dates_valid"),
+        CheckConstraint("status IN ('draft','published','superseded')", name="status_valid"),
+        Index("ix_study_plans_window", "starts_on", "ends_on"),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(primary_key=True, default=uuid.uuid4)
+    plan_key: Mapped[str] = mapped_column(String(255), nullable=False)
+    starts_on: Mapped[date] = mapped_column(Date, nullable=False)
+    ends_on: Mapped[date] = mapped_column(Date, nullable=False)
+    timezone: Mapped[str] = mapped_column(String(64), nullable=False)
+    status: Mapped[str] = mapped_column(String(32), nullable=False, default="draft")
+    preference_version: Mapped[str | None] = mapped_column(String(128))
+
+
+class StudyBlock(TimestampMixin, Base):
+    """One allocated work block, including visible carry-forward lineage."""
+
+    __tablename__ = "study_blocks"
+    __table_args__ = (
+        UniqueConstraint("plan_id", "block_key", name="uq_study_blocks_plan_key"),
+        CheckConstraint("allocated_minutes > 0", name="allocated_minutes_positive"),
+        CheckConstraint("ends_at > starts_at", name="study_block_times_valid"),
+        CheckConstraint(
+            "status IN ('planned','in_progress','completed','incomplete','carried_forward')",
+            name="status_valid",
+        ),
+        Index("ix_study_blocks_plan_start", "plan_id", "starts_at"),
+        Index("ix_study_blocks_assessment", "assessment_id", "status"),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(primary_key=True, default=uuid.uuid4)
+    plan_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey("study_plans.id", ondelete="CASCADE"), nullable=False
+    )
+    block_key: Mapped[str] = mapped_column(String(255), nullable=False)
+    assessment_id: Mapped[uuid.UUID | None] = mapped_column(
+        ForeignKey("assessments.id", ondelete="SET NULL")
+    )
+    title: Mapped[str] = mapped_column(String(255), nullable=False)
+    starts_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    ends_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    allocated_minutes: Mapped[int] = mapped_column(nullable=False)
+    status: Mapped[str] = mapped_column(String(32), nullable=False, default="planned")
+    carry_forward_from_id: Mapped[uuid.UUID | None] = mapped_column(
+        ForeignKey("study_blocks.id", ondelete="SET NULL")
+    )
+    notes: Mapped[str | None] = mapped_column(String(2_000))
+
+
+class AcademicDocument(TimestampMixin, Base):
+    """Document metadata; raw bodies remain in the artifact store."""
+
+    __tablename__ = "academic_documents"
+    __table_args__ = (
+        UniqueConstraint("notion_id", "document_version", name="uq_academic_documents_version"),
+        CheckConstraint("length(content_hash) = 64", name="content_hash_length"),
+        Index("ix_academic_documents_course_version", "course_id", "document_version"),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(primary_key=True, default=uuid.uuid4)
+    course_id: Mapped[uuid.UUID | None] = mapped_column(
+        ForeignKey("courses.id", ondelete="SET NULL")
+    )
+    notion_id: Mapped[str] = mapped_column(String(255), nullable=False)
+    document_version: Mapped[str] = mapped_column(String(128), nullable=False)
+    title: Mapped[str] = mapped_column(String(500), nullable=False)
+    document_type: Mapped[str] = mapped_column(String(64), nullable=False)
+    source_url: Mapped[str | None] = mapped_column(String(1_000))
+    retrieved_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    artifact_key: Mapped[str] = mapped_column(String(64), nullable=False)
+    content_hash: Mapped[str] = mapped_column(String(64), nullable=False)
+    access_classification: Mapped[str] = mapped_column(
+        String(64), nullable=False, default="private"
+    )
+    extraction_status: Mapped[str] = mapped_column(String(32), nullable=False, default="pending")
+
+
+class AcademicDocumentChunk(TimestampMixin, Base):
+    """Bounded cited text suitable for PostgreSQL full-text retrieval."""
+
+    __tablename__ = "academic_document_chunks"
+    __table_args__ = (
+        UniqueConstraint("document_id", "ordinal", name="uq_academic_chunks_document_ordinal"),
+        CheckConstraint("ordinal >= 0", name="ordinal_nonnegative"),
+        CheckConstraint("source_page IS NULL OR source_page >= 1", name="source_page_positive"),
+        Index("ix_academic_chunks_document_page", "document_id", "source_page", "ordinal"),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(primary_key=True, default=uuid.uuid4)
+    document_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey("academic_documents.id", ondelete="CASCADE"), nullable=False
+    )
+    ordinal: Mapped[int] = mapped_column(nullable=False)
+    heading: Mapped[str | None] = mapped_column(String(500))
+    content: Mapped[str] = mapped_column(Text, nullable=False)
+    source_page: Mapped[int | None] = mapped_column()
+    source_block: Mapped[str | None] = mapped_column(String(255))
+    source_url: Mapped[str | None] = mapped_column(String(1_000))
+    token_count: Mapped[int | None] = mapped_column()
+    content_hash: Mapped[str] = mapped_column(String(64), nullable=False)
+    search_vector: Mapped[str | None] = mapped_column(Text)
+
+
+class AcademicSyncCursor(TimestampMixin, Base):
+    """Durable Notion delta cursor, keyed by integration/database scope."""
+
+    __tablename__ = "academic_sync_cursors"
+    __table_args__ = (UniqueConstraint("scope", name="uq_academic_sync_cursors_scope"),)
+
+    id: Mapped[uuid.UUID] = mapped_column(primary_key=True, default=uuid.uuid4)
+    scope: Mapped[str] = mapped_column(String(255), nullable=False)
+    source: Mapped[str] = mapped_column(String(64), nullable=False, default="notion")
+    cursor: Mapped[str | None] = mapped_column(String(512))
+    source_version: Mapped[str] = mapped_column(String(128), nullable=False)
+    last_synced_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    status: Mapped[str] = mapped_column(String(32), nullable=False, default="idle")
+    error_code: Mapped[str | None] = mapped_column(String(128))
+
+
+class AcademicCheckIn(TimestampMixin, Base):
+    """Redacted check-in metadata; message bodies belong in artifacts."""
+
+    __tablename__ = "academic_checkins"
+    __table_args__ = (
+        UniqueConstraint("idempotency_key", name="uq_academic_checkins_idempotency"),
+        UniqueConstraint("external_event_id", name="uq_academic_checkins_external_event"),
+        CheckConstraint(
+            "status IN ('received','questioned','planned','proposal_pending','completed','failed')",
+            name="status_valid",
+        ),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(primary_key=True, default=uuid.uuid4)
+    idempotency_key: Mapped[str] = mapped_column(String(512), nullable=False)
+    external_event_id: Mapped[str] = mapped_column(String(255), nullable=False)
+    channel: Mapped[str] = mapped_column(String(64), nullable=False)
+    received_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    content_artifact_key: Mapped[str | None] = mapped_column(String(64))
+    redacted_summary: Mapped[str | None] = mapped_column(String(2_000))
+    status: Mapped[str] = mapped_column(String(32), nullable=False, default="received")
+    plan_id: Mapped[uuid.UUID | None] = mapped_column(
+        ForeignKey("study_plans.id", ondelete="SET NULL")
+    )
+
+
+class AcademicProposedChange(TimestampMixin, Base):
+    """A pending Notion mutation which cannot apply without exact confirmation."""
+
+    __tablename__ = "academic_proposed_changes"
+    __table_args__ = (
+        UniqueConstraint("idempotency_key", name="uq_academic_proposals_idempotency"),
+        CheckConstraint(
+            "state IN ('pending','confirmed','applying','rejected','applied','expired')",
+            name="state_valid",
+        ),
+        Index("ix_academic_proposals_state", "state", "created_at"),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(primary_key=True, default=uuid.uuid4)
+    checkin_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey("academic_checkins.id", ondelete="CASCADE"), nullable=False
+    )
+    idempotency_key: Mapped[str] = mapped_column(String(512), nullable=False)
+    operation: Mapped[str] = mapped_column(String(128), nullable=False)
+    target_type: Mapped[str] = mapped_column(String(128), nullable=False)
+    target_id: Mapped[str] = mapped_column(String(255), nullable=False)
+    payload: Mapped[dict[str, Any]] = mapped_column(JSON, nullable=False, default=dict)
+    redacted_preview: Mapped[str] = mapped_column(String(4_000), nullable=False)
+    confirmation_token: Mapped[str] = mapped_column(String(255), nullable=False)
+    confirmation_event: Mapped[str | None] = mapped_column(String(255))
+    state: Mapped[str] = mapped_column(String(32), nullable=False, default="pending")
+    expires_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    applied_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+
+
+# Short aliases keep the storage contract convenient for document workers while
+# retaining explicit academic names for callers that prefer them.
+Document = AcademicDocument
+DocumentChunk = AcademicDocumentChunk
+SyncCursor = AcademicSyncCursor
+CheckIn = AcademicCheckIn
+ProposedChange = AcademicProposedChange
+
+
 __all__ = [
+    "AcademicCheckIn",
+    "AcademicDocument",
+    "AcademicDocumentChunk",
+    "AcademicProposedChange",
+    "AcademicSyncCursor",
     "AgentRun",
     "ApprovalRequest",
     "ApprovalState",
+    "Assessment",
     "AuditEvent",
     "Base",
+    "CheckIn",
     "CodeRepository",
+    "Course",
+    "DailyReviewReport",
     "Delivery",
     "DeliveryStatus",
+    "Document",
+    "DocumentChunk",
     "EvidenceClassification",
     "EvidenceRef",
+    "FixedCommitment",
     "HealthCheck",
     "HealthState",
+    "PlanningPreference",
+    "ProposedChange",
+    "RepositoryDiscoveryState",
     "RepositoryProfile",
     "ReviewFinding",
+    "ReviewFindingDismissal",
     "ReviewedCommit",
     "RunStatus",
     "RunStep",
     "StepStatus",
+    "StudyBlock",
+    "StudyPlan",
+    "SyncCursor",
     "UIAcknowledgement",
 ]

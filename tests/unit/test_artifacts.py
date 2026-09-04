@@ -18,6 +18,7 @@ def test_redacts_credentials_urls_private_markers_and_supplied_literals() -> Non
         "Authorization: Bearer bearer-value\n"
         "Cookie: session=session-value\n"
         "api_key=key-value password: pass-value\n"
+        'TEST_GITHUB_TOKEN = "fixture-token"\n'
         "https://user:password@example.test/private\n"
         '{"authorization": "Bearer json-secret", "password": "two words"}\n'
         "portfolio_id: portfolio-123\n"
@@ -31,6 +32,7 @@ def test_redacts_credentials_urls_private_markers_and_supplied_literals() -> Non
     assert "session-value" not in redacted
     assert "key-value" not in redacted
     assert "pass-value" not in redacted
+    assert "fixture-token" not in redacted
     assert "json-secret" not in redacted
     assert "two words" not in redacted
     assert "user:password@" not in redacted

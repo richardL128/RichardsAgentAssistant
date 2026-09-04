@@ -179,6 +179,60 @@ async def test_installation_exchange_and_fixed_read_urls() -> None:
 
 
 @pytest.mark.asyncio
+async def test_installation_listing_filters_allowlist_and_resolves_default_sha() -> None:
+    requests: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        if request.url.path == "/app/installations/12345/access_tokens":
+            return httpx.Response(
+                201, json={"token": "ghs-secret", "expires_at": "2026-09-03T18:00:00Z"}
+            )
+        if request.url.path == "/installation/repositories":
+            return httpx.Response(
+                200,
+                json={
+                    "repositories": [
+                        {
+                            "full_name": REPOSITORY,
+                            "clone_url": f"https://github.com/{REPOSITORY}.git",
+                            "default_branch": "main",
+                            "private": True,
+                            "visibility": "private",
+                        },
+                        {
+                            "full_name": "octo-org/not-approved",
+                            "clone_url": "https://github.com/octo-org/not-approved.git",
+                            "default_branch": "main",
+                            "private": False,
+                            "visibility": "public",
+                        },
+                    ]
+                },
+            )
+        if request.url.path == f"/repos/{REPOSITORY}/commits/main":
+            return httpx.Response(200, json={"sha": HEAD_SHA})
+        return httpx.Response(404)
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+        connector = GitHubAppConnector(
+            app_id=1,
+            private_key=_key(),
+            repository_allowlist={REPOSITORY},
+            client=client,
+            clock=lambda: NOW,
+        )
+        page = await connector.list_installation_repositories(12345, page=1, per_page=2)
+        sha = await connector.get_default_branch_sha(REPOSITORY, "main", 12345)
+
+    assert [item.repository for item in page.repositories] == [REPOSITORY]
+    assert page.has_next is True
+    assert sha == HEAD_SHA
+    assert requests[1].url.query == b"per_page=2&page=1"
+    assert requests[2].url.path == f"/repos/{REPOSITORY}/commits/main"
+
+
+@pytest.mark.asyncio
 async def test_auth_and_retryable_transport_statuses_are_standardized() -> None:
     async def check(response: httpx.Response | Exception) -> LifeAgentError:
         def handler(_: httpx.Request) -> httpx.Response:
@@ -215,6 +269,8 @@ def test_public_surface_has_no_write_or_arbitrary_request_operations() -> None:
         if not name.startswith("_") and callable(member)
     }
     assert public == {
+        "get_default_branch_sha",
+        "list_installation_repositories",
         "compare_commits",
         "create_app_jwt",
         "download_repository_archive",

@@ -14,7 +14,7 @@ case "$worker_name" in
 esac
 
 exec python -m procrastinate \
-  --app app.queue.app.procrastinate_app \
+  --app app.queue.worker.procrastinate_app \
   worker \
   --name "lifeagent-$worker_name" \
   --queues "$worker_name" \

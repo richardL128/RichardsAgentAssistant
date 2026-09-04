@@ -21,5 +21,12 @@ max_concurrent_threads_per_session = 3
 
 # Unnamed/background subagents inherit these defaults. An explicit model in a
 # spawn request or custom agent file intentionally takes precedence.
-default_subagent_model = "gpt-5.6-luna"
+#
+# Mid-tier executor model: the strong model stays on the orchestrator, where
+# mistakes compound and are not caught. Executors do bounded patches in a fixed
+# write scope, checked by ruff/pyright/pytest and the orchestrator's diff
+# review, so gpt-5.5 is enough and keeps ChatGPT-plan usage down. Drop to
+# gpt-5.4-mini for more headroom, or raise to gpt-5.6-luna if executor patch
+# quality is causing rework.
+default_subagent_model = "gpt-5.5"
 default_subagent_reasoning_effort = "high"

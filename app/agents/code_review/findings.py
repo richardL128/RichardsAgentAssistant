@@ -267,17 +267,19 @@ def _validate_actionability(proposal: FindingProposal, path: str) -> None:
     )
     if len(_WORD_RE.findall(text)) < 8 or not _ACTION_RE.search(text):
         raise FindingValidationError("finding text is vague or not actionable", code="vague")
-    if _VAGUE_RE.search(proposal.title or "") and not _ACTION_RE.search(proposal.explanation or ""):
-        raise FindingValidationError(
-            "finding title is speculative and lacks an actionable explanation",
-            code="speculative",
-        )
+    # The documentation-specific code is strictly more informative than the
+    # generic speculative one, so it is checked first when both would apply.
     suffix = path.rsplit("/", 1)[-1].lower()
     if any(suffix.endswith(extension) for extension in _DOC_SUFFIXES) and _SPECULATION_RE.search(
         text
     ):
         raise FindingValidationError(
             "documentation-only finding is speculative", code="documentation_speculation"
+        )
+    if _VAGUE_RE.search(proposal.title or "") and not _ACTION_RE.search(proposal.explanation or ""):
+        raise FindingValidationError(
+            "finding title is speculative and lacks an actionable explanation",
+            code="speculative",
         )
 
 
