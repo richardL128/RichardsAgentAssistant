@@ -13,6 +13,7 @@ from sqlalchemy.orm import Session
 from sqlalchemy.sql.elements import ColumnElement
 
 from app.core.redaction import redact_text
+from app.db.finance import FinanceRepository
 from app.db.models import (
     AgentRun,
     AuditEvent,
@@ -30,11 +31,13 @@ from app.operations.contracts import (
     ActivityDetail,
     ActivityItem,
     ActivityPage,
+    ApprovedSource,
     ConsoleState,
     DeliveryReceipt,
     EvidenceLink,
     ExternalLink,
     HealthCard,
+    SourceSettings,
     TimelineStep,
 )
 
@@ -49,7 +52,6 @@ _AGENT_CHECK_NAMES: Mapping[str, tuple[str, ...]] = {
     "code_review": ("code_review", "code-review"),
     "academic_planner": ("academic_planner", "academic-planner"),
 }
-_STATE_RANK = {"healthy": 0, "attention": 1, "failed": 2}
 
 
 def _aware(value: datetime | None) -> datetime | None:
@@ -85,9 +87,9 @@ def _console_state(status: str) -> ConsoleState:
 
 
 def _health_state(state: HealthState) -> ConsoleState:
-    if state is HealthState.HEALTHY:
+    if str(state) == HealthState.HEALTHY.value:
         return "healthy"
-    if state is HealthState.FAILED:
+    if str(state) == HealthState.FAILED.value:
         return "failed"
     return "attention"
 
@@ -111,20 +113,69 @@ class OperationsRepository:
     @staticmethod
     def health_cards(session: Session) -> tuple[HealthCard, ...]:
         checks = list(session.scalars(select(HealthCheck).order_by(HealthCheck.checked_at.desc())))
-        latest = {check.check_name: check for check in checks}
+        latest: dict[str, HealthCheck] = {}
+        for check in checks:
+            latest.setdefault(check.check_name, check)
         cards: list[HealthCard] = []
-        claimed: set[str] = set()
         for component, names in _AGENT_CHECK_NAMES.items():
             check = next((latest[name] for name in names if name in latest), None)
-            if check is not None:
-                claimed.add(check.check_name)
             cards.append(_card(component, check))
-        shared = [check for name, check in latest.items() if name not in claimed]
-        shared_check = (
-            max(shared, key=lambda item: _STATE_RANK[str(item.state)]) if shared else None
-        )
-        cards.append(_card("shared_services", shared_check))
+        cards.append(_card("shared_services", latest.get("shared_services")))
         return tuple(cards)
+
+    @staticmethod
+    def source_settings(
+        session: Session,
+        *,
+        allowlist_version: str,
+        schedule_configured: bool = True,
+    ) -> SourceSettings:
+        """Project the audited finance allowlist without calling another HTTP route."""
+
+        records = FinanceRepository.list_source_records(
+            session,
+            allowlist_version=allowlist_version,
+        )
+        approvals = FinanceRepository.load_approved_sources(
+            session,
+            allowlist_version=allowlist_version,
+        )
+        approval_complete = FinanceRepository.source_approval_gate(
+            session,
+            allowlist_version=allowlist_version,
+        )
+        enabled_count = sum(
+            source.enabled
+            and source.approved_at is not None
+            and source.approval_audit_id is not None
+            for source in approvals
+        )
+        if not records:
+            diagnostic = "No finance sources are recorded for this allowlist version"
+        elif len(records) != 8:
+            diagnostic = f"Finance allowlist has {len(records)} of 8 required sources"
+        elif not approval_complete:
+            diagnostic = f"Finance schedule is gated; {enabled_count} of 8 sources are approved"
+        elif not schedule_configured:
+            diagnostic = "Finance schedule is disabled by configuration"
+        else:
+            diagnostic = "Finance source approval is complete; the market-open schedule is enabled"
+        return SourceSettings(
+            allowlist_version=allowlist_version,
+            schedule_enabled=schedule_configured and approval_complete,
+            approval_complete=approval_complete,
+            sources=tuple(
+                ApprovedSource(
+                    slot=slot,
+                    name=record.name,
+                    hostname=urlsplit(record.base_url).hostname or "invalid-source-url",
+                    entitlement=record.entitlement,
+                    enabled=record.enabled,
+                )
+                for slot, record in enumerate(records, start=1)
+            ),
+            diagnostic=diagnostic,
+        )
 
     @staticmethod
     def activity(

@@ -70,6 +70,8 @@ class Settings(BaseSettings):
     discord_bot_token: SecretValue = None
     discord_webhook_secret: SecretValue = None
     notion_token: SecretValue = None
+    ops_console_username: SecretValue = None
+    ops_console_password: SecretValue = None
     notion_courses_database_id: str | None = None
     notion_assessments_database_id: str | None = None
     notion_study_blocks_database_id: str | None = None
@@ -125,6 +127,8 @@ class Settings(BaseSettings):
         "discord_bot_token",
         "discord_webhook_secret",
         "notion_token",
+        "ops_console_username",
+        "ops_console_password",
         "dvids_api_key",
         "eia_api_key",
         "alpha_vantage_api_key",
@@ -294,6 +298,9 @@ class Settings(BaseSettings):
             ),
             "discord_academic_channel_configured": self.discord_academic_channel_id is not None,
             "discord_finance_channel_configured": self.discord_finance_channel_id is not None,
+            "ops_console_auth_configured": (
+                self.ops_console_username is not None and self.ops_console_password is not None
+            ),
             "finance_source_allowlist_version": self.finance_source_allowlist_version,
             "finance_source_credentials_configured": sum(
                 value is not None

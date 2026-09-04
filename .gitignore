@@ -16,6 +16,7 @@ __pycache__/
 .pyright/
 .coverage
 htmlcov/
+/app/static/app.css
 
 /.artifacts/
 /artifacts/
@@ -24,5 +25,7 @@ htmlcov/
 .idea/
 .vscode/
 
-# Commit messages Claude drafts for Richard to commit; see CLAUDE.md.
-.claude/commit-message.txt
+# Local agent-harness state: Claude Code and Codex config, sandbox notes,
+# custom agent definitions, and session/handoff prompts. Not shared via git.
+.claude/
+.codex/
