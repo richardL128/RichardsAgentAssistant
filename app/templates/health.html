@@ -1,0 +1,50 @@
+{% extends "base.html" %}
+
+{% block title %}System Health | LifeAgent Operations{% endblock %}
+
+{% block content %}
+  <section class="ops-page-header" aria-labelledby="health-title">
+    <div>
+      <p class="ops-eyebrow">System health</p>
+      <h1 id="health-title">Agent and service status</h1>
+    </div>
+  </section>
+
+  {% if failed_cards %}
+    <section class="ops-alert ops-alert--failed" role="alert" aria-labelledby="failed-health-title">
+      <h2 id="failed-health-title">Failed components need attention</h2>
+      <ul>
+        {% for card in failed_cards %}
+          <li>{{ card.label }}: {{ card.diagnostic }}</li>
+        {% endfor %}
+      </ul>
+    </section>
+  {% endif %}
+
+  <section class="health-grid" aria-label="Operational health cards">
+    {% for card in cards %}
+      <article class="health-card health-card--{{ card.state }}" data-component="{{ card.component }}">
+        <header class="health-card__header">
+          <h2>{{ card.label }}</h2>
+          {% with state=card.state, label=card.state|title %}
+            {% include "partials/health_badge.html" %}
+          {% endwith %}
+        </header>
+
+        <dl class="health-card__facts">
+          <div>
+            <dt>Last successful run</dt>
+            <dd>{{ card.last_success_at | toronto_time }}</dd>
+          </div>
+          <div>
+            <dt>Next expected run</dt>
+            <dd>{{ card.next_expected_at | toronto_time }}</dd>
+          </div>
+        </dl>
+
+        <p class="health-card__diagnostic">{{ card.diagnostic }}</p>
+        <a class="health-card__activity-link" href="{{ card.activity_url }}">View matching activity</a>
+      </article>
+    {% endfor %}
+  </section>
+{% endblock %}

@@ -112,4 +112,135 @@
   .health-badge--failed .health-badge__icon {
     @apply border-red-700 bg-red-700 text-white;
   }
+
+  .ops-page-header {
+    @apply mb-6 flex flex-col gap-3 sm:flex-row sm:items-end sm:justify-between;
+  }
+
+  .ops-page-header h1 {
+    @apply mt-1 text-2xl font-semibold text-zinc-950;
+  }
+
+  .ops-eyebrow {
+    @apply text-sm font-medium uppercase tracking-wide text-zinc-500;
+  }
+
+  .ops-alert {
+    @apply mb-6 rounded-md border px-4 py-3 text-sm;
+  }
+
+  .ops-alert h2 {
+    @apply font-semibold;
+  }
+
+  .ops-alert ul {
+    @apply mt-2 list-disc space-y-1 pl-5;
+  }
+
+  .ops-alert--attention {
+    @apply border-amber-200 bg-amber-50 text-amber-950;
+  }
+
+  .ops-alert--failed {
+    @apply border-red-200 bg-red-50 text-red-950;
+  }
+
+  .health-grid {
+    @apply grid gap-4 md:grid-cols-2;
+  }
+
+  .health-card {
+    @apply rounded-lg border bg-white p-4 shadow-sm;
+  }
+
+  .health-card--healthy {
+    @apply border-emerald-200;
+  }
+
+  .health-card--attention {
+    @apply border-amber-200;
+  }
+
+  .health-card--failed {
+    @apply border-red-200;
+  }
+
+  .health-card__header {
+    @apply flex items-start justify-between gap-3;
+  }
+
+  .health-card__header h2 {
+    @apply text-lg font-semibold text-zinc-950;
+  }
+
+  .health-card__facts {
+    @apply mt-4 grid gap-3 text-sm sm:grid-cols-2;
+  }
+
+  .health-card__facts > div {
+    @apply rounded-md bg-zinc-50 p-3;
+  }
+
+  .health-card__facts dt {
+    @apply font-medium text-zinc-600;
+  }
+
+  .health-card__facts dd {
+    @apply mt-1 break-words font-semibold text-zinc-950;
+  }
+
+  .health-card__diagnostic {
+    @apply mt-4 break-words text-sm text-zinc-700;
+  }
+
+  .health-card__activity-link {
+    @apply mt-4 inline-block text-sm font-semibold;
+  }
+
+  .sources-summary,
+  .sources-table-region {
+    @apply mb-6 rounded-lg border border-zinc-200 bg-white p-4 shadow-sm;
+  }
+
+  .sources-summary > h2,
+  .sources-table-region > h2 {
+    @apply text-lg font-semibold text-zinc-950;
+  }
+
+  .table-scroll {
+    @apply mt-3 overflow-x-auto rounded-md;
+  }
+
+  .ops-table {
+    @apply min-w-full border-collapse text-left text-sm;
+  }
+
+  .ops-table caption {
+    @apply sr-only;
+  }
+
+  .ops-table th,
+  .ops-table td {
+    @apply border-b border-zinc-200 px-3 py-3 align-top;
+  }
+
+  .ops-table thead th {
+    @apply bg-zinc-100 font-semibold text-zinc-700;
+  }
+
+  .ops-table tbody th {
+    @apply font-semibold text-zinc-950;
+  }
+
+  .source-state {
+    @apply inline-flex rounded-full px-2.5 py-1 text-xs font-semibold;
+  }
+
+  .source-state--enabled {
+    @apply bg-emerald-100 text-emerald-900;
+  }
+
+  .source-state--disabled {
+    @apply bg-zinc-200 text-zinc-800;
+  }
 }

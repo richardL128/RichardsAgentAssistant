@@ -29,6 +29,7 @@ dev = [
   "pyright>=1.1.411,<1.2",
   "pytest>=9,<10",
   "pytest-asyncio>=1.4,<2",
+  "pytest-playwright>=0.7,<1",
   "respx>=0.22,<1",
   "ruff>=0.16,<0.17",
   "testcontainers[postgres]>=4.10,<5",

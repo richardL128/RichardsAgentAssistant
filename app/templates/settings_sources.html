@@ -1,0 +1,86 @@
+{% extends "base.html" %}
+
+{% block title %}Finance Sources | LifeAgent Operations{% endblock %}
+
+{% block content %}
+  {% set approval_state = "healthy" if settings.approval_complete else "attention" %}
+  {% set schedule_state = "healthy" if settings.schedule_enabled else "attention" %}
+
+  <section class="ops-page-header" aria-labelledby="sources-title">
+    <div>
+      <p class="ops-eyebrow">Finance sources</p>
+      <h1 id="sources-title">Approved source allowlist</h1>
+    </div>
+  </section>
+
+  <section class="ops-alert ops-alert--attention" aria-labelledby="sources-readonly-title">
+    <h2 id="sources-readonly-title">Read-only visibility</h2>
+    <p>
+      Source approval, enablement, vendor credentials, and contract changes happen
+      outside this UI. This page only displays the audited allowlist.
+    </p>
+  </section>
+
+  <section class="sources-summary" aria-labelledby="sources-summary-title">
+    <h2 id="sources-summary-title">Gate status</h2>
+    <dl class="health-card__facts">
+      <div>
+        <dt>Allowlist version</dt>
+        <dd>{{ settings.allowlist_version | default("Not recorded", true) }}</dd>
+      </div>
+      <div>
+        <dt>Approval gate</dt>
+        <dd>
+          {% with state=approval_state, label=("Complete" if settings.approval_complete else "Gated") %}
+            {% include "partials/health_badge.html" %}
+          {% endwith %}
+        </dd>
+      </div>
+      <div>
+        <dt>Finance schedule</dt>
+        <dd>
+          {% with state=schedule_state, label=("Enabled" if settings.schedule_enabled else "Disabled") %}
+            {% include "partials/health_badge.html" %}
+          {% endwith %}
+        </dd>
+      </div>
+    </dl>
+    <p class="health-card__diagnostic">{{ settings.diagnostic }}</p>
+  </section>
+
+  <section class="sources-table-region" aria-labelledby="sources-table-title">
+    <h2 id="sources-table-title">Allowlisted sources</h2>
+    <div class="table-scroll" tabindex="0">
+      <table class="ops-table">
+        <caption>Eight finance sources in the audited allowlist</caption>
+        <thead>
+          <tr>
+            <th scope="col">Slot</th>
+            <th scope="col">Source</th>
+            <th scope="col">Host</th>
+            <th scope="col">Entitlement</th>
+            <th scope="col">State</th>
+          </tr>
+        </thead>
+        <tbody>
+          {% for source in settings.sources %}
+            <tr>
+              <td>{{ source.slot }}</td>
+              <th scope="row">{{ source.name }}</th>
+              <td>{{ source.hostname }}</td>
+              <td>{{ source.entitlement }}</td>
+              <td>
+                <span
+                  class="source-state source-state--{{ 'enabled' if source.enabled else 'disabled' }}"
+                  aria-label="Source {{ source.slot }} is {{ 'enabled' if source.enabled else 'disabled' }}"
+                >
+                  {{ "Enabled" if source.enabled else "Disabled" }}
+                </span>
+              </td>
+            </tr>
+          {% endfor %}
+        </tbody>
+      </table>
+    </div>
+  </section>
+{% endblock %}
