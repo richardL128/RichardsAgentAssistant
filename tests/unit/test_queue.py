@@ -186,7 +186,11 @@ async def test_shared_services_periodic_persists_the_aggregate_health(
     )
     monkeypatch.setattr(tasks, "_database", SimpleNamespace(engine=engine))
     monkeypatch.setattr(tasks, "check_database", lambda _database: (healthy("database"),))
-    monkeypatch.setattr(tasks, "check_queue", lambda _database: healthy("queue"))
+    monkeypatch.setattr(
+        tasks,
+        "_check_queue_with_settings",
+        lambda _database, _settings, _now: healthy("queue"),
+    )
     monkeypatch.setattr(tasks, "check_artifact_root", lambda _settings: healthy("artifacts"))
     monkeypatch.setattr(
         tasks,

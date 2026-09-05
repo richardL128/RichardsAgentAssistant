@@ -16,7 +16,7 @@ from sqlalchemy.orm import Session
 
 from app.agents.finance.contracts import BriefingPayload
 from app.agents.finance.delivery import render_discord_briefing
-from app.core.config import Settings
+from app.core.config import DISCORD_API_BASE_URL, Settings
 from app.core.errors import (
     ErrorCategory,
     ErrorCode,
@@ -30,7 +30,6 @@ from app.db.models import Delivery, DeliveryStatus
 from app.db.repositories import DeliveryRepository, utc_now
 from app.health.checks import HealthState
 
-DISCORD_API_BASE_URL = "https://discord.com/api/v10"
 _DISCORD_CONTENT_LIMIT = 2_000
 
 
@@ -71,10 +70,12 @@ class DiscordFailureAlertAdapter:
         *,
         token: SecretStr,
         allowed_channel_ids: set[str],
+        base_url: str = DISCORD_API_BASE_URL,
         client: httpx.AsyncClient | None = None,
     ) -> None:
         self._token = token
         self._allowed_channel_ids = frozenset(allowed_channel_ids)
+        self._base_url = base_url.rstrip("/")
         self._client = client
 
     async def send(self, alert: FailureAlert) -> DiscordDeliveryReceipt:
@@ -83,7 +84,7 @@ class DiscordFailureAlertAdapter:
 
         owns_client = self._client is None
         client = self._client or httpx.AsyncClient(
-            base_url=DISCORD_API_BASE_URL,
+            base_url=self._base_url,
             timeout=httpx.Timeout(10.0),
         )
         content = (
@@ -203,10 +204,12 @@ class DiscordReviewSummaryAdapter:
         *,
         token: SecretStr,
         allowed_channel_ids: set[str],
+        base_url: str = DISCORD_API_BASE_URL,
         client: httpx.AsyncClient | None = None,
     ) -> None:
         self._token = token
         self._allowed_channel_ids = frozenset(allowed_channel_ids)
+        self._base_url = base_url.rstrip("/")
         self._client = client
 
     async def send(self, summary: ReviewSummary) -> DiscordDeliveryReceipt:
@@ -215,7 +218,7 @@ class DiscordReviewSummaryAdapter:
 
         owns_client = self._client is None
         client = self._client or httpx.AsyncClient(
-            base_url=DISCORD_API_BASE_URL,
+            base_url=self._base_url,
             timeout=httpx.Timeout(10.0),
         )
         try:
@@ -302,10 +305,12 @@ class DiscordDailyReviewAdapter:
         *,
         token: SecretStr,
         allowed_channel_ids: set[str],
+        base_url: str = DISCORD_API_BASE_URL,
         client: httpx.AsyncClient | None = None,
     ) -> None:
         self._token = token
         self._allowed_channel_ids = frozenset(allowed_channel_ids)
+        self._base_url = base_url.rstrip("/")
         self._client = client
 
     async def send(self, summary: DailyReviewSummary) -> DiscordDeliveryReceipt:
@@ -313,7 +318,7 @@ class DiscordDailyReviewAdapter:
             raise ValueError("Discord daily-review target is not allowlisted")
         owns_client = self._client is None
         client = self._client or httpx.AsyncClient(
-            base_url=DISCORD_API_BASE_URL,
+            base_url=self._base_url,
             timeout=httpx.Timeout(10.0),
         )
         try:
@@ -390,10 +395,12 @@ class DiscordAcademicPlannerAdapter:
         *,
         token: SecretStr,
         allowed_channel_ids: set[str],
+        base_url: str = DISCORD_API_BASE_URL,
         client: httpx.AsyncClient | None = None,
     ) -> None:
         self._token = token
         self._allowed_channel_ids = frozenset(allowed_channel_ids)
+        self._base_url = base_url.rstrip("/")
         self._client = client
 
     async def send(self, message: AcademicDiscordMessage) -> DiscordDeliveryReceipt:
@@ -401,7 +408,7 @@ class DiscordAcademicPlannerAdapter:
             raise ValueError("Discord academic target is not allowlisted")
         owns_client = self._client is None
         client = self._client or httpx.AsyncClient(
-            base_url=DISCORD_API_BASE_URL,
+            base_url=self._base_url,
             timeout=httpx.Timeout(10.0),
         )
         try:
@@ -537,10 +544,12 @@ class DiscordFinanceBriefingAdapter:
         *,
         token: SecretStr,
         allowed_channel_ids: set[str],
+        base_url: str = DISCORD_API_BASE_URL,
         client: httpx.AsyncClient | None = None,
     ) -> None:
         self._token = token
         self._allowed_channel_ids = frozenset(allowed_channel_ids)
+        self._base_url = base_url.rstrip("/")
         self._client = client
 
     async def send(self, message: FinanceDiscordBriefingMessage) -> DiscordDeliveryReceipt:
@@ -548,7 +557,7 @@ class DiscordFinanceBriefingAdapter:
             raise ValueError("Discord finance target is not allowlisted")
         owns_client = self._client is None
         client = self._client or httpx.AsyncClient(
-            base_url=DISCORD_API_BASE_URL,
+            base_url=self._base_url,
             timeout=httpx.Timeout(10.0),
         )
         try:
@@ -819,7 +828,25 @@ def _review_adapter_from_settings() -> DiscordReviewSummaryAdapter:
     allowed = set(settings.discord_target_channels)
     if settings.discord_code_review_channel_id is not None:
         allowed.add(settings.discord_code_review_channel_id)
-    return DiscordReviewSummaryAdapter(token=token, allowed_channel_ids=allowed)
+    return DiscordReviewSummaryAdapter(
+        token=token,
+        allowed_channel_ids=allowed,
+        base_url=settings.discord_api_url,
+    )
+
+
+def _failure_alert_adapter_from_settings(channel_id: str) -> DiscordFailureAlertAdapter:
+    settings = Settings()
+    token = settings.discord_bot_token
+    if token is None:
+        raise authorization_error("Discord bot token is not configured")
+    allowed = set(settings.discord_target_channels)
+    allowed.add(channel_id)
+    return DiscordFailureAlertAdapter(
+        token=token,
+        allowed_channel_ids=allowed,
+        base_url=settings.discord_api_url,
+    )
 
 
 def _finance_adapter_from_settings(channel_id: str) -> DiscordFinanceBriefingAdapter:
@@ -829,7 +856,11 @@ def _finance_adapter_from_settings(channel_id: str) -> DiscordFinanceBriefingAda
         raise authorization_error("Discord bot token is not configured")
     if settings.discord_finance_channel_id != channel_id:
         raise authorization_error("Discord finance channel is not configured")
-    return DiscordFinanceBriefingAdapter(token=token, allowed_channel_ids={channel_id})
+    return DiscordFinanceBriefingAdapter(
+        token=token,
+        allowed_channel_ids={channel_id},
+        base_url=settings.discord_api_url,
+    )
 
 
 def _validate_finance_idempotency_key(
@@ -935,6 +966,83 @@ async def deliver_review_summary(
     )
 
 
+async def deliver_failure_alert(
+    *,
+    engine: Engine,
+    run_id: UUID,
+    channel_id: str,
+    component: str,
+    state: HealthState,
+    error_code: ErrorCode,
+    attempt: int,
+    attempt_limit: int,
+    idempotency_key: str,
+    adapter: DiscordFailureAlertAdapter | None = None,
+) -> Delivery:
+    """Deliver one operational failure alert through a durable, idempotent intent."""
+
+    intent = await asyncio.to_thread(
+        _open_review_intent,
+        engine,
+        run_id=run_id,
+        target=channel_id,
+        key=idempotency_key,
+    )
+    if intent.already_delivered:
+        return intent.delivery
+    alert = FailureAlert(
+        delivery_id=intent.delivery.id,
+        run_id=run_id,
+        channel_id=channel_id,
+        component=component,
+        state=state,
+        error_code=error_code,
+        attempt=attempt,
+        attempt_limit=attempt_limit,
+    )
+    resolved_adapter = adapter or _failure_alert_adapter_from_settings(channel_id)
+    try:
+        receipt = await resolved_adapter.send(alert)
+    except LifeAgentError as exc:
+        status = (
+            DeliveryStatus.UNCERTAIN
+            if exc.record.category is ErrorCategory.TRANSIENT
+            else DeliveryStatus.FAILED
+        )
+        error = (
+            ErrorCode.DELIVERY_UNCERTAIN.value
+            if status is DeliveryStatus.UNCERTAIN
+            else exc.record.code.value
+        )
+        await asyncio.to_thread(
+            _record_review_attempt,
+            engine,
+            delivery_id=intent.delivery.id,
+            status=status,
+            external_url=None,
+            error_code=error,
+        )
+        raise
+    except ValueError:
+        await asyncio.to_thread(
+            _record_review_attempt,
+            engine,
+            delivery_id=intent.delivery.id,
+            status=DeliveryStatus.FAILED,
+            external_url=None,
+            error_code=ErrorCode.INPUT_INVALID.value,
+        )
+        raise
+    return await asyncio.to_thread(
+        _record_review_attempt,
+        engine,
+        delivery_id=intent.delivery.id,
+        status=DeliveryStatus.SENT,
+        external_url=receipt.permalink,
+        error_code=None,
+    )
+
+
 async def deliver_daily_review_report(
     *,
     engine: Engine,
@@ -972,6 +1080,7 @@ async def deliver_daily_review_report(
         adapter = DiscordDailyReviewAdapter(
             token=settings.discord_bot_token,
             allowed_channel_ids=allowed,
+            base_url=settings.discord_api_url,
         )
     try:
         receipt = await adapter.send(summary)
@@ -1031,6 +1140,7 @@ __all__ = [
     "ReviewSummary",
     "deliver_academic_message",
     "deliver_daily_review_report",
+    "deliver_failure_alert",
     "deliver_finance_briefing",
     "deliver_review_summary",
 ]

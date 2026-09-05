@@ -1,0 +1,26 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
+  "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>com.richard.lifeagent.backup</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>/Users/richardliu/Desktop/LifeAgent/scripts/backup_database.sh</string>
+  </array>
+  <key>StartCalendarInterval</key>
+  <dict>
+    <key>Hour</key>
+    <integer>3</integer>
+    <key>Minute</key>
+    <integer>0</integer>
+  </dict>
+  <key>StandardOutPath</key>
+  <string>/Users/richardliu/Library/Logs/lifeagent-backup.log</string>
+  <key>StandardErrorPath</key>
+  <string>/Users/richardliu/Library/Logs/lifeagent-backup.err.log</string>
+  <key>WorkingDirectory</key>
+  <string>/Users/richardliu/Desktop/LifeAgent</string>
+</dict>
+</plist>

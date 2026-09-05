@@ -9,7 +9,7 @@ from __future__ import annotations
 from datetime import time
 from functools import lru_cache
 from pathlib import Path
-from typing import Annotated, Any, Self
+from typing import Annotated, Any, Final, Self
 from urllib.parse import urlsplit, urlunsplit
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
@@ -18,6 +18,7 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 from sqlalchemy.engine import make_url
 
 SecretValue = SecretStr | None
+DISCORD_API_BASE_URL: Final[str] = "https://discord.com/api/v10"
 
 
 class Settings(BaseSettings):
@@ -60,6 +61,7 @@ class Settings(BaseSettings):
         "d039cde69ac1f5a43d5134182adfefa65bdb533362a625b936e6171a53296eb3"
     )
     embedding_model: str = "qwen3-embedding:0.6b"
+    discord_api_base_url: AnyHttpUrl = AnyHttpUrl(DISCORD_API_BASE_URL)
 
     # Connector settings are declared now so all deployment configuration has
     # one typed home, while later phases decide when to use each credential.
@@ -91,6 +93,7 @@ class Settings(BaseSettings):
     worker_concurrency: Annotated[int, Field(gt=0, le=32)] = 1
     queue_stalled_after_seconds: Annotated[int, Field(gt=0, le=86400)] = 120
     artifact_retention_days: Annotated[int, Field(gt=0)] = 30
+    artifact_retention_schedule: time = time(hour=3, minute=30)
     repository_allowlist: list[str] = Field(default_factory=list)
     discord_target_channels: list[str] = Field(default_factory=list)
     discord_code_review_channel_id: str | None = None
@@ -196,6 +199,7 @@ class Settings(BaseSettings):
         "academic_morning_schedule",
         "academic_end_of_day_schedule",
         "finance_market_open_schedule",
+        "artifact_retention_schedule",
     )
     @classmethod
     def schedule_is_minute_local_time(cls, value: time) -> time:
@@ -218,6 +222,10 @@ class Settings(BaseSettings):
             raise ValueError("a Notion token requires all three academic database IDs")
         if any(notion_databases) and self.notion_token is None:
             raise ValueError("academic Notion database IDs require a Notion token")
+        if self.discord_api_url != DISCORD_API_BASE_URL and self.app_environment != "acceptance":
+            raise ValueError(
+                "non-default Discord API URL is only allowed in acceptance environment"
+            )
         return self
 
     @field_validator("repository_allowlist")
@@ -254,6 +262,12 @@ class Settings(BaseSettings):
 
         return str(self.ollama_base_url).rstrip("/")
 
+    @property
+    def discord_api_url(self) -> str:
+        """Return the Discord API URL without a trailing slash."""
+
+        return str(self.discord_api_base_url).rstrip("/")
+
     def safe_diagnostics(self) -> dict[str, Any]:
         """Return settings suitable for logs or a health response.
 
@@ -282,6 +296,7 @@ class Settings(BaseSettings):
             "ollama_reasoning": self.ollama_reasoning,
             "ollama_model_digest": self.ollama_model_digest,
             "embedding_model": self.embedding_model,
+            "discord_api_base_url": self._safe_url(str(self.discord_api_base_url)),
             "retry_max_attempts": self.retry_max_attempts,
             "retry_base_delay_seconds": self.retry_base_delay_seconds,
             "retry_max_delay_seconds": self.retry_max_delay_seconds,
@@ -290,6 +305,9 @@ class Settings(BaseSettings):
             "worker_concurrency": self.worker_concurrency,
             "queue_stalled_after_seconds": self.queue_stalled_after_seconds,
             "artifact_retention_days": self.artifact_retention_days,
+            "artifact_retention_schedule": self.artifact_retention_schedule.isoformat(
+                timespec="minutes"
+            ),
             "repository_allowlist_count": len(self.repository_allowlist),
             "repository_allowlist_version": self.repository_allowlist_version,
             "discord_target_count": len(self.discord_target_channels),
