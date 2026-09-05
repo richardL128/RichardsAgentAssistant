@@ -17,6 +17,7 @@ __pycache__/
 .coverage
 htmlcov/
 /app/static/app.css
+/app/static/htmx.min.js
 
 /.artifacts/
 /artifacts/

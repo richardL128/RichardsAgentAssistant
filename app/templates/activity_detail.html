@@ -1,0 +1,129 @@
+{% extends "base.html" %}
+
+{% block title %}Run Detail - LifeAgent Operations{% endblock %}
+
+{% block content %}
+  <article class="space-y-6" aria-labelledby="run-detail-title">
+    <div>
+      <a class="text-sm font-semibold" href="/activity">Back to activity</a>
+      <div class="mt-3 flex flex-col gap-3 sm:flex-row sm:items-start sm:justify-between">
+        <div class="min-w-0">
+          <p class="text-sm font-medium uppercase tracking-wide text-zinc-500">Run detail</p>
+          <h1 id="run-detail-title" class="mt-1 break-words text-2xl font-semibold text-zinc-950">{{ detail.item.summary }}</h1>
+          <p class="mt-2 text-sm text-zinc-600">
+            <span class="font-semibold">{{ detail.item.agent }}</span>
+            <span aria-hidden="true">/</span>
+            <span>{{ detail.item.status }}</span>
+            <span aria-hidden="true">/</span>
+            <time datetime="{{ detail.item.timestamp.isoformat() }}">{{ detail.item.timestamp | toronto_time }}</time>
+          </p>
+          <p class="mt-1 break-all text-xs text-zinc-500">{{ detail.item.run_id }}</p>
+        </div>
+        {% set state = detail.item.severity %}
+        {% set label = detail.item.severity | capitalize %}
+        {% include "partials/health_badge.html" %}
+      </div>
+    </div>
+
+    {% if detail.item.unresolved %}
+      <section class="rounded-md border border-amber-200 bg-amber-50 p-4" aria-labelledby="detail-unresolved-title">
+        <h2 id="detail-unresolved-title" class="text-sm font-semibold text-amber-950">Unresolved item</h2>
+        <p class="mt-1 text-sm text-amber-950">{{ detail.item.unresolved }}</p>
+      </section>
+    {% endif %}
+
+    <section class="rounded-md border border-zinc-200 bg-white p-4" aria-labelledby="timeline-title">
+      <h2 id="timeline-title" class="text-lg font-semibold text-zinc-950">Processing timeline</h2>
+      {% if detail.timeline %}
+        <ol class="mt-3 divide-y divide-zinc-100">
+          {% for step in detail.timeline %}
+            <li class="grid gap-2 py-3 sm:grid-cols-[1fr_auto]">
+              <div>
+                <p class="font-semibold text-zinc-950">{{ step.name }}</p>
+                <p class="text-sm text-zinc-600">Attempt {{ step.attempt }} · {{ step.status }}</p>
+                {% if step.diagnostic %}
+                  <p class="mt-1 text-sm text-zinc-700">{{ step.diagnostic }}</p>
+                {% endif %}
+              </div>
+              <p class="text-sm text-zinc-600">
+                {% if step.started_at %}
+                  <time datetime="{{ step.started_at.isoformat() }}">{{ step.started_at | toronto_time }}</time>
+                {% else %}
+                  Not started
+                {% endif %}
+                {% if step.ended_at %}
+                  to <time datetime="{{ step.ended_at.isoformat() }}">{{ step.ended_at | toronto_time }}</time>
+                {% endif %}
+              </p>
+            </li>
+          {% endfor %}
+        </ol>
+      {% else %}
+        <p class="mt-2 text-sm text-zinc-600">No processing steps were recorded.</p>
+      {% endif %}
+    </section>
+
+    <section class="grid gap-4 md:grid-cols-2">
+      <div class="rounded-md border border-zinc-200 bg-white p-4">
+        <h2 class="text-lg font-semibold text-zinc-950">Evidence</h2>
+        {% if detail.evidence %}
+          <ul class="mt-3 space-y-3">
+            {% for evidence in detail.evidence %}
+              <li class="text-sm">
+                <a class="font-semibold" href="{{ evidence.url }}" rel="noopener noreferrer" target="_blank">{{ evidence.title }}</a>
+                <p class="mt-1 text-zinc-600">
+                  {{ evidence.claim_id }} · {{ evidence.classification }}
+                  {% if evidence.published_at %}
+                    · <time datetime="{{ evidence.published_at.isoformat() }}">{{ evidence.published_at | toronto_time }}</time>
+                  {% endif %}
+                </p>
+              </li>
+            {% endfor %}
+          </ul>
+        {% else %}
+          <p class="mt-2 text-sm text-zinc-600">No evidence references were recorded.</p>
+        {% endif %}
+      </div>
+
+      <div class="rounded-md border border-zinc-200 bg-white p-4">
+        <h2 class="text-lg font-semibold text-zinc-950">Deliveries</h2>
+        {% if detail.deliveries %}
+          <ul class="mt-3 space-y-3">
+            {% for delivery in detail.deliveries %}
+              <li class="text-sm">
+                <p class="font-semibold text-zinc-950">{{ delivery.channel }} · {{ delivery.status }}</p>
+                {% if delivery.sent_at %}
+                  <p class="mt-1 text-zinc-600"><time datetime="{{ delivery.sent_at.isoformat() }}">{{ delivery.sent_at | toronto_time }}</time></p>
+                {% endif %}
+                {% if delivery.link %}
+                  <a href="{{ delivery.link.url }}" rel="noopener noreferrer" target="_blank">{{ delivery.link.label }}</a>
+                {% endif %}
+                {% if delivery.error_code %}
+                  <p class="mt-1 text-red-800">{{ delivery.error_code }}</p>
+                {% endif %}
+              </li>
+            {% endfor %}
+          </ul>
+        {% else %}
+          <p class="mt-2 text-sm text-zinc-600">No delivery receipts were recorded.</p>
+        {% endif %}
+      </div>
+    </section>
+
+    {% if detail.warnings %}
+      <section class="rounded-md border border-red-200 bg-red-50 p-4" aria-labelledby="warnings-title">
+        <h2 id="warnings-title" class="text-lg font-semibold text-red-950">Warnings and errors</h2>
+        <ul class="mt-2 list-disc space-y-1 pl-5 text-sm text-red-950">
+          {% for warning in detail.warnings %}
+            <li>{{ warning }}</li>
+          {% endfor %}
+        </ul>
+      </section>
+    {% endif %}
+
+    <section class="rounded-md border border-zinc-200 bg-white p-4" aria-labelledby="raw-record-title">
+      <h2 id="raw-record-title" class="text-lg font-semibold text-zinc-950">Redacted raw record</h2>
+      <pre class="mt-3 overflow-x-auto rounded-md bg-zinc-950 p-4 text-sm text-zinc-50"><code>{{ detail.raw_record }}</code></pre>
+    </section>
+  </article>
+{% endblock %}

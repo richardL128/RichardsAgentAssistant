@@ -20,6 +20,7 @@ from app.api.finance import router as finance_router
 from app.api.github import router as github_router
 from app.api.health import router as health_router
 from app.api.operations import router as operations_router
+from app.api.pages import router as pages_router
 from app.core.config import Settings, get_settings
 from app.db.academic import SQLAlchemyAcademicPlannerStore
 from app.db.finance import SQLAlchemyFinanceStore
@@ -123,6 +124,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     app.include_router(academic_router)
     app.include_router(finance_router)
     app.include_router(operations_router)
+    app.include_router(pages_router)
     return app
 
 
