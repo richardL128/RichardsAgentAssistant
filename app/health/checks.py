@@ -4,15 +4,23 @@ from __future__ import annotations
 
 import asyncio
 import tempfile
+from collections.abc import Awaitable, Callable
+from datetime import UTC, datetime, timedelta
 from enum import StrEnum
 
 import httpx
 from pydantic import BaseModel, ConfigDict, Field, ValidationError
-from sqlalchemy import text
 from sqlalchemy.exc import SQLAlchemyError
 
+from app.connectors.github import GitHubAppConnector, InstallationToken
+from app.connectors.notion import NOTION_API_BASE_URL, NOTION_API_VERSION
 from app.core.config import Settings
+from app.core.errors import ErrorCategory, LifeAgentError
 from app.db.session import Database
+
+GITHUB_TOKEN_REFRESH_WINDOW = timedelta(minutes=1)
+
+GitHubTokenFetcher = Callable[[], Awaitable[InstallationToken]]
 
 
 class HealthState(StrEnum):
@@ -133,27 +141,45 @@ def check_database(database: Database) -> tuple[HealthCheck, ...]:
     )
 
 
-def check_queue(database: Database) -> HealthCheck:
+def check_queue(
+    database: Database,
+    *,
+    now: datetime | None = None,
+    stalled_after_seconds: int = 60,
+) -> HealthCheck:
     """Report queue depth and terminal failures without exposing job arguments."""
 
+    from app.queue.visibility import QueueVisibility, list_queue_jobs, queue_visibility
+
     try:
-        with database.connection() as connection:
-            row = connection.execute(
-                text(
-                    "SELECT "
-                    "SUM(CASE WHEN status IN ('todo','doing','aborting') THEN 1 ELSE 0 END), "
-                    "SUM(CASE WHEN status IN ('failed','aborted') THEN 1 ELSE 0 END) "
-                    "FROM procrastinate_jobs"
-                )
-            ).one()
-        active = int(row[0] or 0)
-        failed = int(row[1] or 0)
+        current = (now or datetime.now(UTC)).astimezone(UTC)
+        stalled_after = timedelta(seconds=stalled_after_seconds)
+        states = [
+            queue_visibility(record, now=current, stalled_after=stalled_after)
+            for record in list_queue_jobs(database.engine)
+        ]
+        active = sum(
+            state
+            in {
+                QueueVisibility.QUEUED,
+                QueueVisibility.RUNNING,
+                QueueVisibility.RETRYING,
+                QueueVisibility.STALLED,
+            }
+            for state in states
+        )
+        failed = states.count(QueueVisibility.FAILED)
+        stalled = states.count(QueueVisibility.STALLED)
+        retrying = states.count(QueueVisibility.RETRYING)
         return HealthCheck(
             name="queue",
-            state=HealthState.ATTENTION if failed else HealthState.HEALTHY,
-            diagnostic=f"queue depth {active}; terminal failures {failed}",
+            state=HealthState.ATTENTION if failed or stalled else HealthState.HEALTHY,
+            diagnostic=(
+                f"queue depth {active}; terminal failures {failed}; "
+                f"stalled workers {stalled}; retrying {retrying}"
+            ),
         )
-    except (SQLAlchemyError, OSError) as exc:
+    except (SQLAlchemyError, OSError, ValueError) as exc:
         return HealthCheck(
             name="queue",
             state=HealthState.FAILED,
@@ -268,6 +294,239 @@ async def check_ollama(settings: Settings, client: httpx.AsyncClient | None = No
     finally:
         if owns_client:
             await client.aclose()
+
+
+async def check_github_installation_token(
+    settings: Settings,
+    client: httpx.AsyncClient | None = None,
+    *,
+    token_fetcher: GitHubTokenFetcher | None = None,
+    now: datetime | None = None,
+) -> HealthCheck:
+    """Exchange a GitHub installation token and report only its expiry window."""
+
+    parts = (
+        settings.github_app_id,
+        settings.github_installation_id,
+        settings.github_private_key,
+        settings.github_webhook_secret,
+    )
+    if all(value is None for value in parts):
+        return HealthCheck(
+            name="github_installation_token",
+            state=HealthState.HEALTHY,
+            diagnostic="GitHub connector is not configured",
+        )
+    if not all(value is not None for value in parts):
+        return HealthCheck(
+            name="github_installation_token",
+            state=HealthState.FAILED,
+            diagnostic="GitHub connector credential set is incomplete",
+        )
+
+    current = (now or datetime.now(UTC)).astimezone(UTC)
+    owns_client = client is None and token_fetcher is None
+    if client is None and token_fetcher is None:
+        client = httpx.AsyncClient(timeout=httpx.Timeout(settings.connector_timeout_seconds))
+    try:
+        if token_fetcher is None:
+            assert settings.github_app_id is not None
+            assert settings.github_private_key is not None
+            assert settings.github_installation_id is not None
+            connector = GitHubAppConnector(
+                app_id=settings.github_app_id,
+                private_key=settings.github_private_key,
+                repository_allowlist=settings.repository_allowlist,
+                webhook_secret=settings.github_webhook_secret,
+                client=client,
+                timeout_seconds=settings.connector_timeout_seconds,
+                clock=lambda: current,
+            )
+            token = await connector.exchange_installation_token(settings.github_installation_id)
+        else:
+            token = await token_fetcher()
+        expiry = token.expires_at
+        if expiry is None:
+            return HealthCheck(
+                name="github_installation_token",
+                state=HealthState.ATTENTION,
+                diagnostic="GitHub installation token expiry was not returned",
+            )
+        expires_at = expiry.astimezone(UTC)
+        remaining = expires_at - current
+        minutes = max(0, int(remaining.total_seconds() // 60))
+        if remaining <= timedelta(0):
+            return HealthCheck(
+                name="github_installation_token",
+                state=HealthState.FAILED,
+                diagnostic="GitHub installation token is expired",
+            )
+        if remaining <= GITHUB_TOKEN_REFRESH_WINDOW:
+            return HealthCheck(
+                name="github_installation_token",
+                state=HealthState.ATTENTION,
+                diagnostic=(
+                    "GitHub installation token expires within the connector refresh window "
+                    f"({minutes} minute(s) remaining)"
+                ),
+            )
+        return HealthCheck(
+            name="github_installation_token",
+            state=HealthState.HEALTHY,
+            diagnostic=f"GitHub installation token expires in {minutes} minute(s)",
+        )
+    except LifeAgentError as exc:
+        return _connector_exception_check("github_installation_token", "GitHub", exc)
+    except (httpx.HTTPError, ValidationError, ValueError, TypeError) as exc:
+        return HealthCheck(
+            name="github_installation_token",
+            state=HealthState.ATTENTION,
+            diagnostic=f"GitHub token probe unavailable ({exc.__class__.__name__})",
+        )
+    finally:
+        if owns_client and client is not None:
+            await client.aclose()
+
+
+async def check_discord_authentication(
+    settings: Settings,
+    client: httpx.AsyncClient | None = None,
+) -> HealthCheck:
+    """Validate that the configured Discord bot token still authenticates."""
+
+    token = settings.discord_bot_token
+    if token is None:
+        return HealthCheck(
+            name="discord_authentication",
+            state=HealthState.HEALTHY,
+            diagnostic="Discord connector is not configured",
+        )
+    owns_client = client is None
+    if client is None:
+        client = httpx.AsyncClient(timeout=httpx.Timeout(settings.connector_timeout_seconds))
+    try:
+        response = await client.get(
+            f"{settings.discord_api_url}/users/@me",
+            headers={"Authorization": f"Bot {token.get_secret_value()}"},
+        )
+        return _authentication_response_check("discord_authentication", "Discord", response)
+    except httpx.TransportError as exc:
+        return HealthCheck(
+            name="discord_authentication",
+            state=HealthState.ATTENTION,
+            diagnostic=f"Discord authentication probe unavailable ({exc.__class__.__name__})",
+        )
+    finally:
+        if owns_client:
+            await client.aclose()
+
+
+async def check_notion_authentication(
+    settings: Settings,
+    client: httpx.AsyncClient | None = None,
+) -> HealthCheck:
+    """Validate that the configured Notion token still authenticates."""
+
+    token = settings.notion_token
+    if token is None:
+        return HealthCheck(
+            name="notion_authentication",
+            state=HealthState.HEALTHY,
+            diagnostic="Notion connector is not configured",
+        )
+    owns_client = client is None
+    if client is None:
+        client = httpx.AsyncClient(timeout=httpx.Timeout(settings.connector_timeout_seconds))
+    try:
+        response = await client.get(
+            f"{NOTION_API_BASE_URL}/users/me",
+            headers={
+                "Authorization": f"Bearer {token.get_secret_value()}",
+                "Notion-Version": NOTION_API_VERSION,
+            },
+        )
+        return _authentication_response_check("notion_authentication", "Notion", response)
+    except httpx.TransportError as exc:
+        return HealthCheck(
+            name="notion_authentication",
+            state=HealthState.ATTENTION,
+            diagnostic=f"Notion authentication probe unavailable ({exc.__class__.__name__})",
+        )
+    finally:
+        if owns_client:
+            await client.aclose()
+
+
+async def check_connector_liveness(
+    settings: Settings,
+    client: httpx.AsyncClient | None = None,
+    *,
+    github_token_fetcher: GitHubTokenFetcher | None = None,
+    now: datetime | None = None,
+) -> tuple[HealthCheck, ...]:
+    """Run live connector authentication probes with injectable network access."""
+
+    github = await check_github_installation_token(
+        settings,
+        client,
+        token_fetcher=github_token_fetcher,
+        now=now,
+    )
+    discord, notion = await asyncio.gather(
+        check_discord_authentication(settings, client),
+        check_notion_authentication(settings, client),
+    )
+    return (github, discord, notion)
+
+
+def _authentication_response_check(
+    name: str,
+    connector: str,
+    response: httpx.Response,
+) -> HealthCheck:
+    if response.status_code in {401, 403}:
+        return HealthCheck(
+            name=name,
+            state=HealthState.FAILED,
+            diagnostic=f"{connector} connector authentication is invalid",
+        )
+    if response.status_code == 429 or response.status_code >= 500:
+        return HealthCheck(
+            name=name,
+            state=HealthState.ATTENTION,
+            diagnostic=f"{connector} authentication endpoint is temporarily unavailable",
+        )
+    if response.status_code >= 400:
+        return HealthCheck(
+            name=name,
+            state=HealthState.ATTENTION,
+            diagnostic=f"{connector} authentication probe was rejected",
+        )
+    return HealthCheck(
+        name=name,
+        state=HealthState.HEALTHY,
+        diagnostic=f"{connector} connector token authenticated",
+    )
+
+
+def _connector_exception_check(name: str, connector: str, exc: LifeAgentError) -> HealthCheck:
+    if exc.record.category is ErrorCategory.AUTHORIZATION:
+        return HealthCheck(
+            name=name,
+            state=HealthState.FAILED,
+            diagnostic=f"{connector} connector authentication is invalid",
+        )
+    if exc.record.category is ErrorCategory.TRANSIENT:
+        return HealthCheck(
+            name=name,
+            state=HealthState.ATTENTION,
+            diagnostic=f"{connector} token probe unavailable ({exc.record.code.value})",
+        )
+    return HealthCheck(
+        name=name,
+        state=HealthState.ATTENTION,
+        diagnostic=f"{connector} token probe was rejected ({exc.record.code.value})",
+    )
 
 
 async def readiness(
