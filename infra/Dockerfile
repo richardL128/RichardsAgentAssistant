@@ -14,7 +14,8 @@ RUN npm install --no-save --ignore-scripts tailwindcss@3.4.17 \
       --config frontend/tailwind.config.js \
       --input frontend/src/input.css \
       --output app/static/app.css \
-      --minify
+      --minify \
+    && cp frontend/src/htmx.min.js app/static/htmx.min.js
 
 FROM python:3.12.8-slim-bookworm AS runtime
 
@@ -33,7 +34,7 @@ COPY pyproject.toml uv.lock alembic.ini ./
 RUN uv sync --frozen --no-dev --no-install-project
 
 COPY app ./app
-COPY --from=tailwind /build/app/static/app.css ./app/static/app.css
+COPY --from=tailwind /build/app/static ./app/static
 COPY infra/idle-worker.sh /usr/local/bin/lifeagent-idle-worker
 COPY infra/run-api.sh /usr/local/bin/lifeagent-run-api
 RUN chmod 0755 /usr/local/bin/lifeagent-idle-worker /usr/local/bin/lifeagent-run-api
