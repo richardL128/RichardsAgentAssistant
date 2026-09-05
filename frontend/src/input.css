@@ -1,3 +1,115 @@
 @tailwind base;
 @tailwind components;
 @tailwind utilities;
+
+@layer base {
+  :root {
+    color-scheme: light;
+  }
+
+  body {
+    @apply bg-zinc-50 text-zinc-950 antialiased;
+  }
+
+  a {
+    @apply text-blue-700 underline-offset-2;
+  }
+
+  a:hover {
+    @apply text-blue-900 underline;
+  }
+
+  :focus-visible {
+    @apply outline outline-2 outline-offset-2 outline-blue-700;
+  }
+}
+
+@layer components {
+  .ops-shell {
+    @apply min-h-screen bg-zinc-50 text-zinc-950;
+  }
+
+  .skip-link {
+    @apply sr-only focus:not-sr-only focus:fixed focus:left-4 focus:top-4 focus:z-50 focus:rounded-md focus:bg-white focus:px-3 focus:py-2 focus:text-sm focus:font-semibold focus:text-zinc-950 focus:shadow-lg focus:ring-2 focus:ring-blue-700;
+  }
+
+  .ops-header {
+    @apply border-b border-zinc-200 bg-white;
+  }
+
+  .ops-header__inner {
+    @apply mx-auto flex max-w-6xl flex-col gap-3 px-4 py-4 sm:flex-row sm:items-center sm:justify-between sm:px-6;
+  }
+
+  .ops-brand {
+    @apply flex w-fit items-center gap-3 no-underline;
+  }
+
+  .ops-brand__mark {
+    @apply grid size-9 place-items-center rounded-md bg-zinc-950 text-sm font-semibold text-white;
+  }
+
+  .ops-brand__title {
+    @apply block text-base font-semibold leading-5 text-zinc-950;
+  }
+
+  .ops-brand__subtitle {
+    @apply block text-xs font-medium uppercase tracking-wide text-zinc-500;
+  }
+
+  .ops-nav {
+    @apply flex w-full flex-wrap gap-1 rounded-md bg-zinc-100 p-1 sm:w-auto;
+  }
+
+  .ops-nav__link {
+    @apply flex-1 rounded px-3 py-2 text-center text-sm font-medium text-zinc-700 no-underline sm:flex-none;
+  }
+
+  .ops-nav__link:hover {
+    @apply bg-white text-zinc-950 no-underline;
+  }
+
+  .ops-nav__link:focus-visible {
+    @apply bg-white text-zinc-950;
+  }
+
+  .ops-nav__link.is-active {
+    @apply bg-white text-zinc-950 shadow-sm;
+  }
+
+  .ops-main {
+    @apply mx-auto w-full max-w-6xl px-4 py-6 sm:px-6;
+  }
+
+  .health-badge {
+    @apply inline-flex items-center gap-2 rounded-md border px-2.5 py-1 text-sm font-semibold;
+  }
+
+  .health-badge__icon {
+    @apply grid size-5 place-items-center rounded-full border text-xs leading-none;
+  }
+
+  .health-badge--healthy {
+    @apply border-emerald-700/30 bg-emerald-50 text-emerald-900;
+  }
+
+  .health-badge--healthy .health-badge__icon {
+    @apply border-emerald-700 bg-emerald-700 text-white;
+  }
+
+  .health-badge--attention {
+    @apply border-amber-700/30 bg-amber-50 text-amber-950;
+  }
+
+  .health-badge--attention .health-badge__icon {
+    @apply border-amber-700 bg-amber-700 text-white;
+  }
+
+  .health-badge--failed {
+    @apply border-red-700/30 bg-red-50 text-red-950;
+  }
+
+  .health-badge--failed .health-badge__icon {
+    @apply border-red-700 bg-red-700 text-white;
+  }
+}

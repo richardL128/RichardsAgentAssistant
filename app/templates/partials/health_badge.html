@@ -1,0 +1,7 @@
+{% set normalized_state = state if state in ["healthy", "attention", "failed"] else "attention" %}
+{% set state_labels = {"healthy": "Healthy", "attention": "Attention", "failed": "Failed"} %}
+{% set state_icons = {"healthy": "+", "attention": "!", "failed": "x"} %}
+<span class="health-badge health-badge--{{ normalized_state }}" data-state="{{ normalized_state }}">
+  <span class="health-badge__icon" aria-hidden="true">{{ state_icons[normalized_state] }}</span>
+  <span class="health-badge__label">{{ label | default(state_labels[normalized_state]) }}</span>
+</span>

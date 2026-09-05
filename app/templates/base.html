@@ -1,0 +1,33 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <meta name="htmx-config" content='{"allowEval": false, "allowScriptTags": false}'>
+    <title>{% block title %}LifeAgent Operations{% endblock %}</title>
+    <link rel="stylesheet" href="{% if request is defined %}{{ url_for('static', path='app.css') }}{% else %}/static/app.css{% endif %}">
+    <script src="{% if request is defined %}{{ url_for('static', path='htmx.min.js') }}{% else %}/static/htmx.min.js{% endif %}" defer></script>
+  </head>
+  <body class="ops-shell">
+    <a class="skip-link" href="#main-content">Skip to content</a>
+    <header class="ops-header">
+      <div class="ops-header__inner">
+        <a class="ops-brand" href="/" aria-label="LifeAgent operations home">
+          <span class="ops-brand__mark" aria-hidden="true">LA</span>
+          <span>
+            <span class="ops-brand__title">LifeAgent</span>
+            <span class="ops-brand__subtitle">Operations</span>
+          </span>
+        </a>
+        <nav class="ops-nav" aria-label="Primary">
+          <a class="ops-nav__link{% if active_page == 'health' %} is-active{% endif %}" href="/"{% if active_page == 'health' %} aria-current="page"{% endif %}>Health</a>
+          <a class="ops-nav__link{% if active_page == 'activity' %} is-active{% endif %}" href="/activity"{% if active_page == 'activity' %} aria-current="page"{% endif %}>Activity</a>
+          <a class="ops-nav__link{% if active_page == 'sources' %} is-active{% endif %}" href="/settings/sources"{% if active_page == 'sources' %} aria-current="page"{% endif %}>Sources</a>
+        </nav>
+      </div>
+    </header>
+    <main id="main-content" class="ops-main" tabindex="-1">
+      {% block content %}{% endblock %}
+    </main>
+  </body>
+</html>
