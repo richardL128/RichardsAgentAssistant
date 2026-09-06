@@ -31,4 +31,7 @@ htmlcov/
 .claude/
 .codex/
 
+# Local implementation prompts drafted for agent-assisted development.
+/prompts/
+
 /presentations/LifeAgent-Intern-Architecture.pptx

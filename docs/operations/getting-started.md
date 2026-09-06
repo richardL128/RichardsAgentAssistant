@@ -20,14 +20,21 @@ cp .env.example .env
 chmod 600 .env
 ```
 
-At minimum, set a non-default database password and operations-console
-credentials:
+At minimum, set the database identity, a non-default database password, and
+operations-console credentials:
 
 ```dotenv
+POSTGRES_DB=lifeagent
+POSTGRES_USER=lifeagent
 POSTGRES_PASSWORD=choose-a-local-password
 OPS_CONSOLE_USERNAME=admin
 OPS_CONSOLE_PASSWORD=choose-an-operations-password
 ```
+
+Set `POSTGRES_DB`, `POSTGRES_USER`, and `POSTGRES_PASSWORD` before the first
+`docker compose up`. The Postgres image reads those values only when it
+initializes an empty `postgres_data` volume; changing them later does not rename
+or re-password the already-created database automatically.
 
 Leave integrations blank until they are configured. Build and start the stack:
 
@@ -37,11 +44,29 @@ docker compose up -d --build
 docker compose ps
 ```
 
-Open `http://127.0.0.1:8000/` for the operations console. Check readiness with:
+Check readiness before opening the console:
 
 ```bash
 curl --fail http://127.0.0.1:8000/health/ready | jq .
 ```
+
+Then open `http://127.0.0.1:8000/` and sign in with
+`OPS_CONSOLE_USERNAME` and `OPS_CONSOLE_PASSWORD`. The console intentionally
+returns `503` when either value is blank.
+
+If the readiness curl cannot connect and `docker compose ps` shows the API
+restarting, inspect the logs:
+
+```bash
+docker compose logs --tail=120 api
+```
+
+If the logs show PostgreSQL authentication or missing-role errors after you
+changed `POSTGRES_USER`, `POSTGRES_DB`, or `POSTGRES_PASSWORD`, the existing
+`postgres_data` volume was initialized with older credentials. Either restore
+the original database values in `.env`, create the new role/database in
+PostgreSQL, or reset the local `postgres_data` volume if it contains no data you
+need to keep.
 
 The API container runs migrations automatically. The three workers are named
 `worker-code-review`, `worker-academic-planner`, and `worker-finance`.
@@ -110,40 +135,118 @@ docker compose up -d --force-recreate api worker-code-review worker-academic-pla
 
 ## 3. Configure Notion
 
-LifeAgent uses a Notion internal connection with the three database IDs below.
-It does not use a user's Notion password or browser cookie.
+LifeAgent uses a Notion internal connection. It does not use a user's Notion
+password or browser cookie.
+
+### Courses database configuration
+
+The academic planner accepts one top-level Courses database ID. Each course is
+a row/page in that database and owns one seeded inline Assessments database.
+Calendar views are presentation only: LifeAgent discovers and queries the
+underlying database and data source.
 
 1. Open the [Notion integrations page](https://www.notion.so/profile/integrations).
 2. Create an internal integration named `LifeAgent`.
-3. Grant read content. Grant update content only if confirmed planner changes
-   are intended to write back to Notion.
+3. Grant read content. Grant update content only if authorized Discord
+   clarification buttons should rename ambiguous assessment titles.
 4. Copy the integration token into `NOTION_TOKEN`.
-5. Open each Courses, Assessments, and Study Blocks database in Notion, choose
-   **Share**, and add the `LifeAgent` connection. The token alone does not grant
-   page access.
-6. Copy each database ID from its URL. It is the 32-character identifier before
-   any query string. Set:
+5. Open the top-level Courses database, choose **Share**, and add the
+   `LifeAgent` connection. The token alone does not grant page access.
+6. Copy the Courses database ID from its URL. It is the 32-character
+   identifier before any query string. Set:
 
 ```dotenv
 NOTION_TOKEN=secret-or-ntn-token
 NOTION_COURSES_DATABASE_ID=...
-NOTION_ASSESSMENTS_DATABASE_ID=...
-NOTION_STUDY_BLOCKS_DATABASE_ID=...
 ```
 
-The current application expects database IDs with these variable names; do not
-rename them to `*_DATA_SOURCE_ID` without changing the application code.
-Property mappings must also be supplied to the planner integration and should
-be matched by stable Notion property IDs, not just display names.
+`NOTION_ASSESSMENTS_DATABASE_ID` and `NOTION_STUDY_BLOCKS_DATABASE_ID` are
+accepted only as deprecated migration metadata. They are never queried and can
+be removed after confirming the Courses-only sync is healthy. Do not configure
+child calendar or data-source IDs; LifeAgent discovers them.
 
-Notion writes are confirmation-gated. A planner proposal must be explicitly
-confirmed before a page is changed. In the current app, the Notion writer is
-fail-closed unless it has been injected/configured, so a token by itself does
-not silently enable writes.
+LifeAgent uses Notion API version `2025-09-03`: it retrieves each database
+container to discover its physical data-source ID, then queries that data
+source. Cursors are scoped to those discovered physical sources so calendars
+cannot accidentally share pagination state.
+
+Configure the top-level Courses database with:
+
+| Property | Notion type | Requirement | Example or default |
+| --- | --- | --- | --- |
+| `Course Code` | Title | Required | `CSC301` |
+| `Term` | Select or text | Optional | `Fall 2026`; defaults to `unspecified` |
+| `Priority` | Number | Optional | `80`; defaults to `50` |
+
+Inside every course page, add one inline database named `Assessments`. Add a
+calendar view to that database and configure the view to use its `Date`
+property. The underlying database should contain:
+
+| Property | Notion type | Requirement | Purpose or default |
+| --- | --- | --- | --- |
+| `Name` | Title | Required | Calendar label, such as `Quiz 1` |
+| `Date` | Date | Required for scheduling | Due date or event time |
+| `Weight` | Number | Optional | Grade percentage; defaults to `0` |
+| `Estimated Minutes` | Number | Optional | Work estimate; uses the planner default when blank |
+| `Status` | Status | Optional | For example, `Not started` or `Completed` |
+
+`Assessments` is the name of the child database; `Name`, `Date`, and the other
+fields are properties inside it. LifeAgent will associate an event with its
+course from this parent-child structure, so the child calendar does not need a
+separate Course relation property.
+
+To keep new courses consistent, create a Courses database template:
+
+1. Open the menu next to the Courses database's **New** button and create a
+   template named `New Course`.
+2. In the template page body, create the inline `Assessments` database.
+3. Rename its title property to `Name`, add `Date`, and add any optional
+   properties from the table above.
+4. Add a calendar view and select `Date` as the calendar date.
+5. Create future course rows from this template.
+
+The integration discovers each nested Assessments database automatically;
+users do not copy an ID for every course. Discovery requires exactly one child
+named `Assessments` or `Assessment Calendar`, exactly one underlying data
+source, one `Name` title property, and one `Date` date property. Zero or
+multiple matches are reported as setup problems rather than guessed.
+
+Standalone `Quiz`, standalone `Assignment`, and the explicit spelling
+correction `Assigment` are classified deterministically. Labels such as
+`Homework`, `Paper`, and `Test` remain unknown. Unknown labels are persisted
+for Discord clarification and are not scheduled or sent to Qwen while pending.
+
+If the Courses database is absent, inaccessible, or not shared with the
+`LifeAgent` connection, the academic worker sends a Discord setup
+reminder instead of calling the model or attempting a Notion write. It will do
+the same when a course page is missing the seeded `Assessments` calendar or
+that calendar lacks its required `Name` title or `Date` date property. The
+message will direct the user back to this setup section and confirm that no
+Notion changes were made.
+
+Configuration reminders will be deduplicated so an unchanged problem produces
+at most one reminder per day. When only some course pages are misconfigured,
+the reminder will summarize those courses while correctly configured courses
+continue syncing. If Discord is unavailable, the same actionable, non-secret
+condition remains visible in persisted health. A successful discovery clears
+the active reminder condition.
+
+The morning planner runs this sync before loading facts. For setup recovery or
+an immediate refresh after fixing a template/share problem, run the same
+idempotent boundary manually:
+
+```bash
+curl --fail -X POST http://127.0.0.1:8000/academic/sync
+```
+
+The response contains bounded counts and diagnostic codes, never raw Notion
+response bodies. A `setup_required` response does not call Qwen, create a
+schedule, or attempt a Notion write.
 
 ## 4. Configure Discord
 
-Discord is used for allowlisted outbound briefings and alerts.
+Discord is used for allowlisted outbound briefings and alerts, plus an optional
+outbound Gateway connection for academic clarification buttons.
 
 1. Create an application in the [Discord Developer Portal](https://discord.com/developers/applications).
 2. Add a Bot user and copy its token into `DISCORD_BOT_TOKEN`.
@@ -158,13 +261,19 @@ Discord is used for allowlisted outbound briefings and alerts.
 ```dotenv
 DISCORD_BOT_TOKEN=...
 DISCORD_ACADEMIC_CHANNEL_ID=...
+DISCORD_ACADEMIC_AUTHORIZED_USER_IDS=[123456789012345678]
+DISCORD_ACADEMIC_GATEWAY_ENABLED=true
 DISCORD_FINANCE_CHANNEL_ID=...
 DISCORD_CODE_REVIEW_CHANNEL_ID=...
 ```
 
-The current Compose stack does not start a Discord Gateway listener. Discord
-delivery is outbound through the bot API. Planner check-ins are submitted to
-the LifeAgent API and produce a proposal:
+Only the listed Discord users can authorize a clarification. The Gateway is an
+outbound WebSocket connection and does not expose a public port. Button
+interactions do not require broad message collection or the privileged Message
+Content intent.
+
+Planner check-ins can also be submitted to the LifeAgent API and produce a
+separate confirmation-gated proposal:
 
 ```bash
 curl -H 'Content-Type: application/json' \
@@ -175,6 +284,13 @@ curl -H 'Content-Type: application/json' \
 Treat the returned proposal ID and confirmation event as sensitive workflow
 data. Do not enable broad message collection or grant unnecessary privileged
 intents.
+
+For an ambiguous assessment label, LifeAgent first persists the request and
+then sends `Quiz`, `Assignment`, and `Ignore` buttons. Quiz or Assignment shows
+and confirms one exact title, such as `Quiz — Chapter 4`. Before PATCHing,
+LifeAgent rechecks the stored title and edited timestamp, then changes only the
+discovered title property. A concurrent Notion edit cancels the write. Ignore
+records the decision and performs no write; repeated interactions are harmless.
 
 ## 5. Configure finance APIs
 

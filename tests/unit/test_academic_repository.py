@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from dataclasses import replace
 from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
 from uuid import UUID, uuid4
@@ -12,17 +13,25 @@ from sqlalchemy.orm import Session
 
 from app.db.academic import (
     AcademicRepository,
+    AssessmentSourceTrace,
+    ClarificationInput,
+    CourseCalendarInput,
     DocumentChunkInput,
     SourceCitation,
     SQLAlchemyAcademicPlannerStore,
 )
 from app.db.models import (
     AcademicCheckIn,
+    AcademicClarification,
+    AcademicCourseCalendar,
     AcademicDocumentChunk,
     AcademicProposedChange,
+    AcademicSetupReminder,
     AcademicSyncCursor,
     Assessment,
+    AuditEvent,
     Base,
+    Course,
     StudyBlock,
     StudyPlan,
 )
@@ -187,6 +196,366 @@ def test_document_versions_chunks_search_and_cursor_are_idempotent(engine) -> No
         assert session.scalar(select(func.count()).select_from(AcademicSyncCursor)) == 1
         row = session.get(Assessment, uuid4())
         assert row is None
+
+
+def test_course_calendar_and_source_scoped_assessment_reconciliation(engine) -> None:
+    course = _course(engine)
+    edited = datetime(2026, 9, 5, 14, tzinfo=UTC)
+    with Session(engine) as session, session.begin():
+        calendar = AcademicRepository.upsert_course_calendar(
+            session,
+            calendar=CourseCalendarInput(
+                course_id=course,
+                course_page_id="course-page-1",
+                child_database_id="child-db-1",
+                child_data_source_id="source-1",
+                title_property_id="title-prop",
+                title_property_name="Name",
+                date_property_id="date-prop",
+                date_property_name="Date",
+                last_discovered_at=edited,
+                last_synced_at=edited,
+            ),
+        )
+        first = AcademicRepository.upsert_assessment(
+            session,
+            notion_id="event-1",
+            course_id=course,
+            title="Chapter 4",
+            assessment_type="quiz",
+            due_at=edited + timedelta(days=1),
+            grade_weight_percent=None,
+            confidence=1,
+            fact_state="confirmed",
+            citation=SourceCitation(url="https://notion.test/page/event-1"),
+            trace=AssessmentSourceTrace(
+                source_id="source-1",
+                source_scope="notion:source-1",
+                notion_last_edited_at=edited,
+                title_property_id="title-prop",
+                label_source="explicit:quiz",
+                source_url="https://notion.test/page/event-1",
+            ),
+        )
+        second = AcademicRepository.upsert_assessment(
+            session,
+            notion_id="event-2",
+            course_id=course,
+            title="Essay",
+            assessment_type="assignment",
+            due_at=edited + timedelta(days=2),
+            grade_weight_percent=None,
+            confidence=1,
+            fact_state="confirmed",
+            citation=SourceCitation(),
+            trace=AssessmentSourceTrace(
+                source_id="source-1",
+                source_scope="notion:source-1",
+                notion_last_edited_at=edited,
+                title_property_id="title-prop",
+            ),
+        )
+        archived = AcademicRepository.reconcile_assessment_source(
+            session,
+            source_id="source-1",
+            seen_notion_ids=["event-1"],
+            synced_at=edited + timedelta(minutes=1),
+        )
+
+        assert calendar.discovery_status == "valid"
+        assert first.title_property_id == "title-prop"
+        assert archived == 1
+        assert second.archived is True
+        assert second.active is False
+
+    with Session(engine) as session:
+        assert session.scalar(select(func.count()).select_from(AcademicCourseCalendar)) == 1
+        active = session.scalar(select(Assessment).where(Assessment.notion_id == "event-1"))
+        assert active is not None
+        assert active.active is True
+
+
+def test_store_accepts_connector_aliases_for_calendar_and_assessment(engine) -> None:
+    store = SQLAlchemyAcademicPlannerStore(engine)
+    course = {
+        "course_id": "course-page-alias",
+        "course_code": "HIST-202",
+        "course_title": "Modern History",
+        "term": "2026-fall",
+        "assessments_database_id": "child-db-alias",
+        "assessments_source_id": "source-alias",
+        "title_property_id": "title-prop",
+        "date_property_id": "date-prop",
+    }
+    calendar_id = store.upsert_course_calendar(
+        course,
+        status="valid",
+        schema_fingerprint="schema-alias",
+    )
+    assessment_id = store.upsert_synced_assessment(
+        course,
+        {
+            "notion_id": "event-alias",
+            "title": "Chapter 5",
+            "due_at": "2026-09-07T15:00:00+00:00",
+            "assessments_source_id": "source-alias",
+            "title_property_id": "title-prop",
+            "notion_last_edited_at": "2026-09-06T12:00:00+00:00",
+        },
+        kind="quiz",
+        label_source="explicit:quiz",
+    )
+
+    assert UUID(calendar_id)
+    assert UUID(assessment_id)
+    with Session(engine) as session:
+        calendar = session.scalar(select(AcademicCourseCalendar))
+        assessment = session.scalar(select(Assessment).where(Assessment.notion_id == "event-alias"))
+        assert calendar is not None
+        assert calendar.child_database_id == "child-db-alias"
+        assert calendar.child_data_source_id == "source-alias"
+        course_row = session.scalar(select(Course).where(Course.notion_id == "course-page-alias"))
+        assert assessment is not None
+        assert course_row is not None
+        assert course_row.title == "Modern History"
+        assert assessment.source_id == "source-alias"
+        assert assessment.label_source == "explicit:quiz"
+
+
+def test_clarification_claims_ignore_and_write_states_are_replay_safe(engine) -> None:
+    course = _course(engine)
+    expected = datetime(2026, 9, 5, 15, tzinfo=UTC)
+    with Session(engine) as session, session.begin():
+        request = ClarificationInput(
+            course_id=course,
+            event_notion_id="event-ambiguous",
+            original_title="Chapter 4",
+            raw_label="assigment?",
+            quiz_preview_title="Quiz - Chapter 4",
+            assignment_preview_title="Assignment - Chapter 4",
+            expected_edited_at=expected,
+            expires_at=expected + timedelta(hours=24),
+            idempotency_key="clarification:event-ambiguous:v1",
+            title_property_id="title-prop",
+        )
+        row = AcademicRepository.create_or_get_clarification(session, request=request)
+        replay = AcademicRepository.create_or_get_clarification(
+            session,
+            request=replace(request, expires_at=request.expires_at + timedelta(days=1)),
+        )
+        assert replay.id == row.id
+        assert replay.expires_at == request.expires_at
+        AcademicRepository.mark_clarification_delivered(
+            session,
+            clarification_id=row.id,
+            delivery_id="discord-message-1",
+            delivered_at=expected + timedelta(minutes=1),
+        )
+        status, claimed = AcademicRepository.claim_clarification(
+            session,
+            clarification_id=row.id,
+            action="assignment",
+            actor_id=123456789,
+            now=expected + timedelta(minutes=2),
+        )
+        assert status == "ready"
+        assert claimed.write_status == "pending"
+        assert claimed.decision_user_id == 123456789
+        replay_status, _ = AcademicRepository.claim_clarification(
+            session,
+            clarification_id=row.id,
+            action="assignment",
+            actor_id=123456789,
+            now=expected + timedelta(minutes=3),
+        )
+        assert replay_status == "claimed"
+        AcademicRepository.mark_clarification_conflict(session, clarification_id=row.id)
+        assert (
+            AcademicRepository.claim_clarification(
+                session,
+                clarification_id=row.id,
+                action="assignment",
+                actor_id=123456789,
+                now=expected + timedelta(minutes=4),
+            )[0]
+            == "conflict"
+        )
+
+        ignore = AcademicRepository.create_or_get_clarification(
+            session,
+            request=ClarificationInput(
+                course_id=course,
+                event_notion_id="event-ignore",
+                original_title="Reading",
+                quiz_preview_title="Quiz - Reading",
+                assignment_preview_title="Assignment - Reading",
+                expected_edited_at=expected,
+                expires_at=expected + timedelta(hours=24),
+                idempotency_key="clarification:event-ignore:v1",
+            ),
+        )
+        ignore_status, ignored = AcademicRepository.claim_clarification(
+            session,
+            clarification_id=ignore.id,
+            action="ignore",
+            actor_id=123456789,
+            now=expected + timedelta(minutes=2),
+        )
+        assert ignore_status == "ignored"
+        assert ignored.write_status == "skipped"
+
+    with Session(engine) as session:
+        assert session.scalar(select(func.count()).select_from(AcademicClarification)) == 2
+        assert set(session.scalars(select(AuditEvent.result))) == {"conflict", "skipped"}
+
+
+def test_store_clarification_claim_returns_ready_once_then_claimed(engine) -> None:
+    store = SQLAlchemyAcademicPlannerStore(engine)
+    expected = datetime(2026, 9, 5, 15, tzinfo=UTC)
+    clarification_id = store.create_or_get_clarification(
+        event_notion_id="event-ready",
+        original_title="Chapter 7",
+        raw_label="unknown",
+        quiz_preview_title="Quiz - Chapter 7",
+        assignment_preview_title="Assignment - Chapter 7",
+        expected_edited_at=expected,
+        expires_at=expected + timedelta(hours=24),
+        idempotency_key="clarification:event-ready:v1",
+        title_property_id="title-prop",
+    )
+
+    first, first_row = store.claim_clarification(
+        clarification_id,
+        "quiz",
+        123456789,
+        now=expected + timedelta(minutes=1),
+    )
+    second, second_row = store.claim_clarification(
+        clarification_id,
+        "quiz",
+        123456789,
+        now=expected + timedelta(minutes=2),
+    )
+
+    assert first == "ready"
+    assert first_row["write_status"] == "pending"
+    assert second == "claimed"
+    assert second_row["decision"] == "quiz"
+
+
+def test_store_reads_and_expires_clarifications_without_secret_payloads(engine) -> None:
+    store = SQLAlchemyAcademicPlannerStore(engine)
+    expected = datetime(2026, 9, 5, 15, tzinfo=UTC)
+    clarification_id = store.create_or_get_clarification(
+        event_notion_id="event-store",
+        original_title="Chapter 6",
+        raw_label="unknown",
+        quiz_preview_title="Quiz - Chapter 6",
+        assignment_preview_title="Assignment - Chapter 6",
+        expected_edited_at=expected - timedelta(days=2),
+        expires_at=expected - timedelta(days=1),
+        idempotency_key="clarification:event-store:v1",
+        title_property_id="title-prop",
+    )
+
+    store.mark_clarification_delivered(
+        clarification_id,
+        delivery_id="discord-message-store",
+        delivered_at=expected - timedelta(days=1, minutes=1),
+    )
+    delivered = store.get_clarification(clarification_id)
+    assert delivered is not None
+    assert delivered["delivery_id"] == "discord-message-store"
+    assert delivered["delivered_at"] is not None
+    assert "unknown" not in str(delivered)
+
+    assert store.expire_clarifications(now=expected) == 1
+    expired = store.get_clarification(clarification_id)
+    assert expired is not None
+    assert expired["state"] == "expired"
+
+
+def test_clarification_expiry_reminders_and_health_snapshot(engine) -> None:
+    store = SQLAlchemyAcademicPlannerStore(engine)
+    course_id = _course(engine)
+    expected = datetime(2026, 9, 5, 15, tzinfo=UTC)
+    with Session(engine) as session, session.begin():
+        AcademicRepository.upsert_course_calendar(
+            session,
+            calendar=CourseCalendarInput(
+                course_id=course_id,
+                course_page_id="course-page-1",
+                child_database_id=None,
+                child_data_source_id=None,
+                discovery_status="missing",
+                diagnostic_code="missing_assessments_calendar",
+                diagnostic_fingerprint="schema-v1",
+            ),
+        )
+        expired = AcademicRepository.create_or_get_clarification(
+            session,
+            request=ClarificationInput(
+                course_id=course_id,
+                event_notion_id="event-expired",
+                original_title="Reading",
+                quiz_preview_title="Quiz - Reading",
+                assignment_preview_title="Assignment - Reading",
+                expected_edited_at=expected - timedelta(days=2),
+                expires_at=expected - timedelta(days=1),
+                idempotency_key="clarification:event-expired:v1",
+            ),
+        )
+        assert expired.state == "pending"
+        assert AcademicRepository.expire_clarifications(session, now=expected) == 1
+        reminder_day = date(2026, 9, 5)
+        assert AcademicRepository.setup_reminder_due(
+            session,
+            condition_code="missing_assessments_calendar",
+            fingerprint="schema-v1",
+            reminder_day=reminder_day,
+        )
+        AcademicRepository.record_setup_reminder(
+            session,
+            condition_code="missing_assessments_calendar",
+            fingerprint="schema-v1",
+            reminder_day=reminder_day,
+            affected_course_codes=["HIST-201"],
+            delivered_at=expected,
+            delivery_id="discord-reminder-1",
+        )
+        assert not AcademicRepository.setup_reminder_due(
+            session,
+            condition_code="missing_assessments_calendar",
+            fingerprint="schema-v1",
+            reminder_day=reminder_day,
+        )
+        AcademicRepository.record_setup_reminder(
+            session,
+            condition_code="inaccessible_courses_database",
+            fingerprint="schema-v2",
+            reminder_day=reminder_day,
+            error_code="discord_unavailable",
+        )
+        assert not AcademicRepository.setup_reminder_due(
+            session,
+            condition_code="inaccessible_courses_database",
+            fingerprint="schema-v2",
+            reminder_day=reminder_day,
+        )
+
+    snapshot = store.academic_notion_health()
+    assert snapshot["invalid_calendar_count"] == 1
+    assert snapshot["setup_reminder_count"] == 2
+    assert snapshot["pending_clarification_count"] == 0
+
+    assert store.clear_setup_reminders("missing_assessments_calendar", "schema-v1") == 1
+    with Session(engine) as session:
+        active_reminders = session.scalar(
+            select(func.count())
+            .select_from(AcademicSetupReminder)
+            .where(AcademicSetupReminder.state != "cleared")
+        )
+        assert active_reminders == 1
 
 
 def test_plan_replay_and_incomplete_carry_forward_are_visible(engine) -> None:

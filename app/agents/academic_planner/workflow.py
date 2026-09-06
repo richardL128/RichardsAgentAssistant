@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import re
 import uuid
 from collections.abc import Sequence
@@ -12,7 +13,6 @@ from zoneinfo import ZoneInfo
 from app.agents.academic_planner.allocator import allocate_plan
 from app.agents.academic_planner.contracts import (
     AmbiguousFact,
-    CheckinExtraction,
     CheckinProposal,
     DailyPlan,
     PlanCritique,
@@ -66,6 +66,12 @@ class PlannerModelGateway(Protocol):
     async def extract_checkin(self, reply: str) -> Sequence[ProposedChange]: ...
 
 
+class AcademicSynchronizer(Protocol):
+    """Pre-planning ingestion seam with a bounded, non-secret result."""
+
+    async def sync(self, *, now: datetime | None = None) -> Any: ...
+
+
 class LLMPlannerModel:
     """Adapter that keeps Qwen output advisory and schema-validated."""
 
@@ -73,10 +79,21 @@ class LLMPlannerModel:
         self._gateway = gateway
 
     async def breakdown(self, assessment: Any) -> WorkBreakdown:
+        payload = {
+            "assessment_id": assessment.id,
+            "course_code": assessment.course,
+            "title": assessment.title,
+            "assessment_type": assessment.assessment_type.value,
+            "due_at": assessment.due_at.isoformat(),
+            "estimated_minutes": assessment.estimated_minutes,
+            "weight_percent": assessment.weight_percent,
+            "scope_size": assessment.scope_size,
+        }
         result = await self._gateway.invoke_structured(
             prompt=(
                 "Propose a concise work breakdown for this assessment. "
-                "Do not change dates or calendar state.\n" + str(assessment.model_dump(mode="json"))
+                "Do not change dates or calendar state. The identifier is opaque.\n"
+                + json.dumps(payload, ensure_ascii=True, separators=(",", ":"), sort_keys=True)
             ),
             response_model=WorkBreakdown,
         )
@@ -90,22 +107,33 @@ class LLMPlannerModel:
         return result.output
 
     async def critique(self, plan: DailyPlan) -> PlanCritique:
+        payload = {
+            "plan_id": str(plan.plan_id),
+            "blocks": [
+                {
+                    "block_id": block.id,
+                    "assessment_id": block.assessment_id,
+                    "title": block.title,
+                    "start_at": block.start_at.isoformat(),
+                    "end_at": block.end_at.isoformat(),
+                    "carried_over": block.carried_over,
+                }
+                for block in plan.blocks
+            ],
+            "deferred_assessment_ids": list(plan.deferred_assessment_ids),
+        }
         result = await self._gateway.invoke_structured(
             prompt="Critique this candidate plan for conflicts and unrealistic load.\n"
-            + str(plan.model_dump(mode="json")),
+            + json.dumps(payload, ensure_ascii=True, separators=(",", ":"), sort_keys=True),
             response_model=PlanCritique,
         )
         return result.output or PlanCritique(acceptable=True, concerns=())
 
     async def extract_checkin(self, reply: str) -> Sequence[ProposedChange]:
-        result = await self._gateway.invoke_structured(
-            prompt=(
-                "Extract only explicitly reported academic progress or proposed "
-                "updates. Never infer completion from a planned block.\n" + reply
-            ),
-            response_model=CheckinExtraction,
-        )
-        return result.output.changes if result.output is not None else _fallback_extract(reply)
+        # Check-in replies may originate in a private Discord channel. Keep
+        # their content out of model prompts and accept only the conservative,
+        # explicit local grammar below.
+        return _fallback_extract(reply)
 
 
 class PlannerDelivery(Protocol):
@@ -156,6 +184,7 @@ def build_daily_plan(
 async def run_morning_plan(
     *,
     store: AcademicPlannerStore,
+    syncer: AcademicSynchronizer | None = None,
     delivery: PlannerDelivery | None = None,
     model: PlannerModelGateway | None = None,
     now: datetime | None = None,
@@ -168,6 +197,22 @@ async def run_morning_plan(
         raise ValueError("now must be timezone-aware")
     if not 7 <= horizon_days <= 14:
         raise ValueError("horizon_days must be between 7 and 14")
+    sync_result = await syncer.sync(now=current) if syncer is not None else None
+    sync_status = getattr(sync_result, "status", None)
+    if sync_result is not None and sync_status == "setup_required":
+        summary = (
+            sync_result.as_dict()
+            if callable(getattr(sync_result, "as_dict", None))
+            else {"status": "setup_required"}
+        )
+        return {
+            "status": "setup_required",
+            "sync": summary,
+            "block_count": 0,
+            "deferred_count": 0,
+            "ambiguous_count": 0,
+            "delivery_count": 0,
+        }
     facts = store.load_planner_facts(now=current, horizon_days=horizon_days)
     plan = build_daily_plan(facts, now=current)
     if model is not None:
@@ -191,7 +236,7 @@ async def run_morning_plan(
                 fact,
                 idempotency_key=f"academic-ambiguity:{fact.id}:v1",
             )
-    return {
+    result: dict[str, object] = {
         "status": "succeeded",
         "plan_id": str(plan.plan_id),
         "block_count": len(plan.blocks),
@@ -199,6 +244,9 @@ async def run_morning_plan(
         "ambiguous_count": len(plan.ambiguous_questions),
         "delivery_count": delivery_count,
     }
+    if sync_status is not None:
+        result["sync_status"] = sync_status
+    return result
 
 
 def _fallback_extract(reply: str) -> tuple[ProposedChange, ...]:
@@ -325,6 +373,7 @@ async def run_academic_planner(run_id: str, idempotency_key: str) -> dict[str, o
     else:
         result = await run_morning_plan(
             store=runtime.store,
+            syncer=runtime.syncer,
             delivery=runtime.delivery,
             model=runtime.model,
             horizon_days=runtime.horizon_days,
@@ -339,11 +388,13 @@ class _Runtime:
         store: AcademicPlannerStore,
         delivery: PlannerDelivery | None,
         model: PlannerModelGateway | None,
+        syncer: AcademicSynchronizer | None,
         horizon_days: int,
     ) -> None:
         self.store = store
         self.delivery = delivery
         self.model = model
+        self.syncer = syncer
         self.horizon_days = horizon_days
 
 
@@ -369,6 +420,7 @@ def _load_default_runtime(run_id: uuid.UUID) -> _Runtime:
 
     model = LLMPlannerModel(LLMGateway(settings))
     delivery = None
+    adapter = None
     channel_id = getattr(settings, "discord_academic_channel_id", None)
     if channel_id is None:
         channels = getattr(settings, "discord_target_channels", ())
@@ -390,13 +442,39 @@ def _load_default_runtime(run_id: uuid.UUID) -> _Runtime:
             channel_id=channel_id,
             adapter=adapter,
         )
+    store = cast(Any, store_factory)(
+        engine,
+        confirmation_ttl_hours=settings.academic_confirmation_ttl_hours,
+    )
+    from app.agents.academic_planner.sync import AcademicNotionSync
+    from app.connectors.notion import NotionConnector
+    from app.core.errors import LifeAgentError
+
+    connector = None
+    notion_setup_condition = "notion_configuration_missing"
+    if settings.notion_token is not None and settings.notion_courses_database_id is not None:
+        try:
+            connector = NotionConnector(
+                token=settings.notion_token,
+                courses_database_id=settings.notion_courses_database_id,
+                timeout_seconds=settings.connector_timeout_seconds,
+            )
+        except (LifeAgentError, ValueError):
+            notion_setup_condition = "notion_configuration_invalid"
+    syncer = AcademicNotionSync(
+        connector=connector,
+        store=store,
+        discord=adapter,
+        discord_channel_id=channel_id,
+        timezone=settings.app_timezone,
+        clarification_ttl_hours=settings.academic_confirmation_ttl_hours,
+        setup_condition_code=notion_setup_condition,
+    )
     return _Runtime(
-        cast(Any, store_factory)(
-            engine,
-            confirmation_ttl_hours=settings.academic_confirmation_ttl_hours,
-        ),
+        store,
         delivery,
         model,
+        syncer,
         settings.academic_plan_horizon_days,
     )
 
@@ -406,6 +484,7 @@ def configure_academic_runtime(
     *,
     delivery: PlannerDelivery | None = None,
     model: PlannerModelGateway | None = None,
+    syncer: AcademicSynchronizer | None = None,
     horizon_days: int = 7,
 ) -> None:
     """Inject host integrations for the worker process."""
@@ -413,11 +492,12 @@ def configure_academic_runtime(
     if not 7 <= horizon_days <= 14:
         raise ValueError("horizon_days must be between 7 and 14")
     global _runtime
-    _runtime = _Runtime(store, delivery, model, horizon_days)
+    _runtime = _Runtime(store, delivery, model, syncer, horizon_days)
 
 
 __all__ = [
     "AcademicPlannerStore",
+    "AcademicSynchronizer",
     "LLMPlannerModel",
     "NotionAcademicWriter",
     "PlannerDelivery",

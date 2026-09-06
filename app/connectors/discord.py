@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import re
 from collections.abc import Mapping
 from dataclasses import dataclass
 from datetime import date
@@ -31,6 +32,13 @@ from app.db.repositories import DeliveryRepository, utc_now
 from app.health.checks import HealthState
 
 _DISCORD_CONTENT_LIMIT = 2_000
+
+
+def _bounded_discord_content(content: str) -> str:
+    if len(content) <= _DISCORD_CONTENT_LIMIT:
+        return content
+    marker = "\n[truncated]"
+    return f"{content[: _DISCORD_CONTENT_LIMIT - len(marker)]}{marker}"
 
 
 class FailureAlert(BaseModel):
@@ -387,6 +395,87 @@ class AcademicDiscordMessage(BaseModel):
     content: str = Field(min_length=1, max_length=2_000)
 
 
+class AcademicClarificationMessage(BaseModel):
+    """Bounded assessment-type clarification with opaque button identifiers."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    delivery_id: UUID
+    clarification_id: UUID
+    channel_id: str = Field(pattern=r"^[0-9]{5,24}$")
+    current_title: str = Field(min_length=1, max_length=500)
+    quiz_title_preview: str = Field(min_length=1, max_length=500)
+    assignment_title_preview: str = Field(min_length=1, max_length=500)
+
+    def message_content(self) -> str:
+        content = (
+            "Please classify this Notion assessment before any title change.\n"
+            f"Current title: {self.current_title}\n"
+            f"Quiz preview: {self.quiz_title_preview}\n"
+            f"Assignment preview: {self.assignment_title_preview}"
+        )
+        return _bounded_discord_content(content)
+
+    def components(self) -> list[dict[str, object]]:
+        return [
+            {
+                "type": 1,
+                "components": [
+                    {
+                        "type": 2,
+                        "style": 1,
+                        "label": "Quiz",
+                        "custom_id": f"academic_clarify:{self.clarification_id}:quiz",
+                    },
+                    {
+                        "type": 2,
+                        "style": 1,
+                        "label": "Assignment",
+                        "custom_id": f"academic_clarify:{self.clarification_id}:assignment",
+                    },
+                    {
+                        "type": 2,
+                        "style": 2,
+                        "label": "Ignore",
+                        "custom_id": f"academic_clarify:{self.clarification_id}:ignore",
+                    },
+                ],
+            }
+        ]
+
+
+class AcademicSetupReminderMessage(BaseModel):
+    """Bounded setup diagnostic with no interactive components."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    delivery_id: UUID
+    channel_id: str = Field(pattern=r"^[0-9]{5,24}$")
+    condition: str = Field(min_length=1, max_length=120, pattern=r"^[A-Za-z0-9 ._:/()-]+$")
+    affected_course_codes: tuple[str, ...] = Field(default=(), max_length=10)
+
+    @field_validator("affected_course_codes")
+    @classmethod
+    def course_codes_are_bounded(cls, value: tuple[str, ...]) -> tuple[str, ...]:
+        for code in value:
+            if len(code) > 40 or not re.fullmatch(r"[A-Za-z0-9._ -]+", code):
+                raise ValueError("affected course codes must be bounded and non-secret")
+        return value
+
+    def message_content(self) -> str:
+        lines = [
+            f"LifeAgent academic setup needs attention: {self.condition}.",
+            (
+                "Please share/configure the Courses database and create course pages from "
+                "the New Course template."
+            ),
+            "No Notion changes were made.",
+        ]
+        if self.affected_course_codes:
+            lines.append("Affected courses: " + ", ".join(self.affected_course_codes))
+        return _bounded_discord_content("\n".join(lines))
+
+
 class DiscordAcademicPlannerAdapter:
     """Send planner/check-in messages with a persisted UUID nonce."""
 
@@ -459,6 +548,94 @@ class DiscordAcademicPlannerAdapter:
             raise transient_error(
                 ErrorCode.CONNECTOR_TRANSIENT,
                 "Discord academic transport is unavailable",
+            ) from None
+        finally:
+            if owns_client:
+                await client.aclose()
+
+    async def send_clarification(
+        self,
+        message: AcademicClarificationMessage,
+    ) -> DiscordDeliveryReceipt:
+        if message.channel_id not in self._allowed_channel_ids:
+            raise ValueError("Discord academic clarification target is not allowlisted")
+        owns_client = self._client is None
+        client = self._client or httpx.AsyncClient(
+            base_url=self._base_url,
+            timeout=httpx.Timeout(10.0),
+        )
+        try:
+            response = await client.post(
+                f"/channels/{message.channel_id}/messages",
+                headers={"Authorization": f"Bot {self._token.get_secret_value()}"},
+                json={
+                    "content": message.message_content(),
+                    "nonce": str(message.delivery_id),
+                    "enforce_nonce": True,
+                    "allowed_mentions": {"parse": []},
+                    "components": message.components(),
+                },
+            )
+            return _academic_receipt_from_response(
+                response,
+                channel_id=message.channel_id,
+                authorization_message="Discord academic clarification authorization is invalid",
+                transient_message=(
+                    "Discord academic clarification endpoint is temporarily unavailable"
+                ),
+                rejected_message="Discord rejected the academic clarification request",
+                invalid_receipt_message=(
+                    "Discord returned an invalid academic clarification receipt"
+                ),
+            )
+        except httpx.TransportError:
+            raise transient_error(
+                ErrorCode.CONNECTOR_TRANSIENT,
+                "Discord academic clarification transport is unavailable",
+            ) from None
+        finally:
+            if owns_client:
+                await client.aclose()
+
+    async def send_setup_reminder(
+        self,
+        message: AcademicSetupReminderMessage,
+    ) -> DiscordDeliveryReceipt:
+        if message.channel_id not in self._allowed_channel_ids:
+            raise ValueError("Discord academic setup reminder target is not allowlisted")
+        owns_client = self._client is None
+        client = self._client or httpx.AsyncClient(
+            base_url=self._base_url,
+            timeout=httpx.Timeout(10.0),
+        )
+        try:
+            response = await client.post(
+                f"/channels/{message.channel_id}/messages",
+                headers={"Authorization": f"Bot {self._token.get_secret_value()}"},
+                json={
+                    "content": message.message_content(),
+                    "nonce": str(message.delivery_id),
+                    "enforce_nonce": True,
+                    "allowed_mentions": {"parse": []},
+                    "components": [],
+                },
+            )
+            return _academic_receipt_from_response(
+                response,
+                channel_id=message.channel_id,
+                authorization_message="Discord academic setup reminder authorization is invalid",
+                transient_message=(
+                    "Discord academic setup reminder endpoint is temporarily unavailable"
+                ),
+                rejected_message="Discord rejected the academic setup reminder request",
+                invalid_receipt_message=(
+                    "Discord returned an invalid academic setup reminder receipt"
+                ),
+            )
+        except httpx.TransportError:
+            raise transient_error(
+                ErrorCode.CONNECTOR_TRANSIENT,
+                "Discord academic setup reminder transport is unavailable",
             ) from None
         finally:
             if owns_client:
@@ -820,6 +997,50 @@ def _record_review_attempt(
         return delivery
 
 
+def _academic_receipt_from_response(
+    response: httpx.Response,
+    *,
+    channel_id: str,
+    authorization_message: str,
+    transient_message: str,
+    rejected_message: str,
+    invalid_receipt_message: str,
+) -> DiscordDeliveryReceipt:
+    try:
+        response.raise_for_status()
+    except httpx.HTTPStatusError as exc:
+        if exc.response.status_code in {401, 403}:
+            raise authorization_error(authorization_message) from None
+        if exc.response.status_code == 429 or exc.response.status_code >= 500:
+            raise transient_error(
+                ErrorCode.CONNECTOR_TRANSIENT,
+                transient_message,
+            ) from None
+        raise permanent_error(
+            ErrorCode.INPUT_INVALID,
+            rejected_message,
+        ) from None
+    try:
+        payload = response.json()
+    except ValueError:
+        raise transient_error(
+            ErrorCode.CONNECTOR_TRANSIENT,
+            invalid_receipt_message,
+        ) from None
+    external_id = payload.get("id")
+    if not isinstance(external_id, str) or not external_id.isdigit():
+        raise transient_error(
+            ErrorCode.CONNECTOR_TRANSIENT,
+            invalid_receipt_message,
+        )
+    guild_id = payload.get("guild_id")
+    server = guild_id if isinstance(guild_id, str) and guild_id.isdigit() else "@me"
+    return DiscordDeliveryReceipt(
+        external_id=external_id,
+        permalink=f"https://discord.com/channels/{server}/{channel_id}/{external_id}",
+    )
+
+
 def _review_adapter_from_settings() -> DiscordReviewSummaryAdapter:
     settings = Settings()
     token = settings.discord_bot_token
@@ -1125,7 +1346,9 @@ async def deliver_daily_review_report(
 
 
 __all__ = [
+    "AcademicClarificationMessage",
     "AcademicDiscordMessage",
+    "AcademicSetupReminderMessage",
     "DailyReviewSummary",
     "DiscordAcademicPlannerAdapter",
     "DiscordAcademicPlannerDelivery",
