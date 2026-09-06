@@ -15,17 +15,21 @@ from datetime import UTC, date, datetime, timedelta
 from typing import Any, Literal, cast
 from zoneinfo import ZoneInfo
 
-from sqlalchemy import and_, delete, or_, select
+from sqlalchemy import and_, delete, func, or_, select
 from sqlalchemy.exc import IntegrityError, NoResultFound
 from sqlalchemy.orm import Session
 
 from app.db.models import (
     AcademicCheckIn,
+    AcademicClarification,
+    AcademicCourseCalendar,
     AcademicDocument,
     AcademicDocumentChunk,
     AcademicProposedChange,
+    AcademicSetupReminder,
     AcademicSyncCursor,
     Assessment,
+    AuditEvent,
     Course,
     FixedCommitment,
     PlanningPreference,
@@ -48,6 +52,7 @@ CommitmentKind = Literal[
     "event",
 ]
 CHUNK_MAX_CHARS = 20_000
+BOUNDED_TEXT_CHARS = 255
 _SHA256 = re.compile(r"^[0-9a-f]{64}$")
 _TORONTO = ZoneInfo("America/Toronto")
 
@@ -82,6 +87,56 @@ class DocumentChunkInput:
     heading: str | None = None
     token_count: int | None = None
     content_hash: str | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class CourseCalendarInput:
+    """Normalized discovered Notion Assessments source for one course page."""
+
+    course_id: uuid.UUID
+    course_page_id: str
+    child_database_id: str | None
+    child_data_source_id: str | None
+    title_property_id: str | None = None
+    title_property_name: str | None = None
+    date_property_id: str | None = None
+    date_property_name: str | None = None
+    discovery_status: str = "valid"
+    diagnostic_code: str | None = None
+    diagnostic_fingerprint: str | None = None
+    last_discovered_at: datetime | None = None
+    last_synced_at: datetime | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class AssessmentSourceTrace:
+    """Trace fields preserved for guarded title-only Notion writes."""
+
+    source_id: str
+    source_scope: str
+    notion_last_edited_at: datetime
+    title_property_id: str
+    label_source: str | None = None
+    source_url: str | None = None
+    active: bool = True
+    archived: bool = False
+
+
+@dataclass(frozen=True, slots=True)
+class ClarificationInput:
+    """Bounded durable Discord clarification request."""
+
+    event_notion_id: str
+    original_title: str
+    quiz_preview_title: str
+    assignment_preview_title: str
+    expected_edited_at: datetime
+    expires_at: datetime
+    idempotency_key: str
+    course_id: uuid.UUID | None = None
+    assessment_id: uuid.UUID | None = None
+    raw_label: str | None = None
+    title_property_id: str | None = None
 
 
 def _utc(value: datetime, field: str) -> datetime:
@@ -162,6 +217,51 @@ class AcademicRepository:
         )
 
     @staticmethod
+    def upsert_course_calendar(
+        session: Session,
+        *,
+        calendar: CourseCalendarInput,
+    ) -> AcademicCourseCalendar:
+        allowed_status = {"valid", "missing", "inaccessible", "malformed", "duplicate"}
+        if calendar.discovery_status not in allowed_status:
+            raise ValueError("invalid course calendar discovery status")
+        if not calendar.course_page_id.strip():
+            raise ValueError("course page identifier must not be empty")
+        if calendar.discovery_status == "valid" and (
+            not calendar.child_database_id or not calendar.child_data_source_id
+        ):
+            raise ValueError("valid course calendars require database and data-source identifiers")
+        values = {
+            "course_id": calendar.course_id,
+            "course_page_id": _bounded(calendar.course_page_id),
+            "child_database_id": _bounded_optional(calendar.child_database_id),
+            "child_data_source_id": _bounded_optional(calendar.child_data_source_id),
+            "title_property_id": _bounded_optional(calendar.title_property_id),
+            "title_property_name": _bounded_optional(calendar.title_property_name),
+            "date_property_id": _bounded_optional(calendar.date_property_id),
+            "date_property_name": _bounded_optional(calendar.date_property_name),
+            "discovery_status": calendar.discovery_status,
+            "diagnostic_code": _bounded_optional(calendar.diagnostic_code, 128),
+            "diagnostic_fingerprint": _bounded_optional(calendar.diagnostic_fingerprint, 128),
+            "last_discovered_at": (
+                _utc(calendar.last_discovered_at, "last_discovered_at")
+                if calendar.last_discovered_at is not None
+                else None
+            ),
+            "last_synced_at": (
+                _utc(calendar.last_synced_at, "last_synced_at")
+                if calendar.last_synced_at is not None
+                else None
+            ),
+        }
+        return _upsert(
+            session,
+            AcademicCourseCalendar,
+            [AcademicCourseCalendar.course_id == calendar.course_id],
+            values,
+        )
+
+    @staticmethod
     def upsert_assessment(
         session: Session,
         *,
@@ -180,6 +280,7 @@ class AcademicRepository:
         citation: SourceCitation,
         ambiguity_reason: str | None = None,
         completed: bool = False,
+        trace: AssessmentSourceTrace | None = None,
     ) -> Assessment:
         _validate_fact(confidence, fact_state)
         if due_at is not None:
@@ -205,7 +306,330 @@ class AcademicRepository:
             "completed": completed,
             **citation.values(),
         }
+        if trace is not None:
+            values.update(
+                {
+                    "source_id": _bounded(trace.source_id),
+                    "source_scope": _bounded(trace.source_scope),
+                    "notion_last_edited_at": _utc(
+                        trace.notion_last_edited_at, "notion_last_edited_at"
+                    ),
+                    "title_property_id": _bounded(trace.title_property_id),
+                    "label_source": _bounded_optional(trace.label_source),
+                    "source_url": trace.source_url or values["source_url"],
+                    "active": trace.active,
+                    "archived": trace.archived,
+                }
+            )
         return _upsert(session, Assessment, [Assessment.notion_id == notion_id], values)
+
+    @staticmethod
+    def reconcile_assessment_source(
+        session: Session,
+        *,
+        source_id: str,
+        seen_notion_ids: Iterable[str],
+        synced_at: datetime,
+    ) -> int:
+        if not source_id.strip():
+            raise ValueError("source_id must not be empty")
+        seen = {item for item in seen_notion_ids if item.strip()}
+        statement = select(Assessment).where(
+            Assessment.source_id == source_id,
+            Assessment.active.is_(True),
+        )
+        if seen:
+            statement = statement.where(Assessment.notion_id.not_in(seen))
+        rows = list(session.scalars(statement))
+        current = _utc(synced_at, "synced_at")
+        for row in rows:
+            row.active = False
+            row.archived = True
+            row.notion_last_edited_at = row.notion_last_edited_at or current
+        session.flush()
+        return len(rows)
+
+    @staticmethod
+    def create_or_get_clarification(
+        session: Session,
+        *,
+        request: ClarificationInput,
+    ) -> AcademicClarification:
+        if not request.event_notion_id.strip() or not request.idempotency_key.strip():
+            raise ValueError("clarification event and idempotency identifiers must not be empty")
+        expected = _utc(request.expected_edited_at, "expected_edited_at")
+        expires = _utc(request.expires_at, "expires_at")
+        if expires <= expected:
+            raise ValueError("clarification expiry must be after the expected edit timestamp")
+        existing = session.scalar(
+            select(AcademicClarification).where(
+                AcademicClarification.idempotency_key == request.idempotency_key
+            )
+        )
+        if existing is not None:
+            return existing
+        values = {
+            "course_id": request.course_id,
+            "assessment_id": request.assessment_id,
+            "event_notion_id": _bounded(request.event_notion_id),
+            "original_title": _bounded(request.original_title, 1_024),
+            "raw_label": _bounded_optional(request.raw_label, 1_024),
+            "quiz_preview_title": _bounded(request.quiz_preview_title, 1_024),
+            "assignment_preview_title": _bounded(request.assignment_preview_title, 1_024),
+            "expected_edited_at": expected,
+            "title_property_id": _bounded_optional(request.title_property_id),
+            "idempotency_key": request.idempotency_key,
+            "expires_at": expires,
+        }
+        return _upsert(
+            session,
+            AcademicClarification,
+            [AcademicClarification.idempotency_key == request.idempotency_key],
+            values,
+        )
+
+    @staticmethod
+    def mark_clarification_delivered(
+        session: Session,
+        *,
+        clarification_id: uuid.UUID,
+        delivery_id: str,
+        delivered_at: datetime,
+    ) -> AcademicClarification:
+        row = session.get(AcademicClarification, clarification_id)
+        if row is None:
+            raise NoResultFound(f"academic clarification {clarification_id} was not found")
+        if row.state in {"pending", "delivered"}:
+            row.state = "delivered"
+            row.delivery_id = _bounded(delivery_id)
+            row.delivered_at = _utc(delivered_at, "delivered_at")
+        session.flush()
+        return row
+
+    @staticmethod
+    def expire_clarifications(session: Session, *, now: datetime) -> int:
+        current = _utc(now, "now")
+        rows = list(
+            session.scalars(
+                select(AcademicClarification)
+                .where(
+                    AcademicClarification.state.in_(["pending", "delivered"]),
+                    AcademicClarification.expires_at <= current,
+                )
+                .with_for_update()
+            )
+        )
+        for row in rows:
+            row.state = "expired"
+        session.flush()
+        return len(rows)
+
+    @staticmethod
+    def claim_clarification(
+        session: Session,
+        *,
+        clarification_id: uuid.UUID,
+        action: Literal["quiz", "assignment", "ignore"],
+        actor_id: int,
+        now: datetime,
+    ) -> tuple[str, AcademicClarification]:
+        row = session.scalar(
+            select(AcademicClarification)
+            .where(AcademicClarification.id == clarification_id)
+            .with_for_update()
+        )
+        if row is None:
+            raise NoResultFound(f"academic clarification {clarification_id} was not found")
+        current = _utc(now, "now")
+        if row.state in {"applied", "conflict", "failed", "ignored", "expired"}:
+            return row.state, row
+        if _aware_db(row.expires_at) <= current:
+            row.state = "expired"
+            session.flush()
+            return "expired", row
+        if row.state == "claimed":
+            return "claimed", row
+        row.decision = action
+        row.decision_user_id = actor_id
+        row.decision_at = current
+        if action == "ignore":
+            row.state = "ignored"
+            row.write_status = "skipped"
+            _add_clarification_audit(session, row, result="skipped")
+            session.flush()
+            return "ignored", row
+        row.state = "claimed"
+        row.write_status = "pending"
+        session.flush()
+        return "ready", row
+
+    @staticmethod
+    def mark_clarification_applied(
+        session: Session,
+        *,
+        clarification_id: uuid.UUID,
+        applied_at: datetime,
+    ) -> AcademicClarification:
+        row = session.get(AcademicClarification, clarification_id)
+        if row is None:
+            raise NoResultFound(f"academic clarification {clarification_id} was not found")
+        if row.state == "applied":
+            return row
+        if row.state != "claimed" or row.decision not in {"quiz", "assignment"}:
+            raise ValueError("clarification must be claimed for a write before applying")
+        row.state = "applied"
+        row.write_status = "applied"
+        row.write_error_code = None
+        row.decision_at = row.decision_at or _utc(applied_at, "applied_at")
+        _add_clarification_audit(session, row, result="applied")
+        session.flush()
+        return row
+
+    @staticmethod
+    def mark_clarification_conflict(
+        session: Session,
+        *,
+        clarification_id: uuid.UUID,
+        error_code: str = "notion_precondition_failed",
+    ) -> AcademicClarification:
+        row = session.get(AcademicClarification, clarification_id)
+        if row is None:
+            raise NoResultFound(f"academic clarification {clarification_id} was not found")
+        row.state = "conflict"
+        row.write_status = "conflict"
+        row.write_error_code = _bounded(error_code, 128)
+        _add_clarification_audit(session, row, result="conflict")
+        session.flush()
+        return row
+
+    @staticmethod
+    def mark_clarification_failed(
+        session: Session,
+        *,
+        clarification_id: uuid.UUID,
+        error_code: str,
+    ) -> AcademicClarification:
+        row = session.get(AcademicClarification, clarification_id)
+        if row is None:
+            raise NoResultFound(f"academic clarification {clarification_id} was not found")
+        row.state = "failed"
+        row.write_status = "failed"
+        row.write_error_code = _bounded(error_code, 128)
+        _add_clarification_audit(session, row, result="failed")
+        session.flush()
+        return row
+
+    @staticmethod
+    def setup_reminder_due(
+        session: Session,
+        *,
+        condition_code: str,
+        fingerprint: str,
+        reminder_day: date,
+    ) -> bool:
+        row = session.scalar(
+            select(AcademicSetupReminder).where(
+                AcademicSetupReminder.condition == _bounded(condition_code, 128),
+                AcademicSetupReminder.schema_fingerprint == _bounded(fingerprint, 128),
+                AcademicSetupReminder.reminder_day == reminder_day,
+            )
+        )
+        return row is None
+
+    @staticmethod
+    def record_setup_reminder(
+        session: Session,
+        *,
+        condition_code: str,
+        fingerprint: str,
+        reminder_day: date,
+        affected_course_codes: Sequence[str] = (),
+        delivered_at: datetime | None = None,
+        delivery_id: str | None = None,
+        error_code: str | None = None,
+    ) -> AcademicSetupReminder:
+        state = "failed" if error_code else "delivered"
+        values = {
+            "condition": _bounded(condition_code, 128),
+            "schema_fingerprint": _bounded(fingerprint, 128),
+            "reminder_day": reminder_day,
+            "affected_course_codes": [_bounded(code, 64) for code in affected_course_codes[:20]],
+            "state": state,
+            "delivered_at": _utc(delivered_at, "delivered_at") if delivered_at else None,
+            "delivery_id": _bounded_optional(delivery_id),
+            "error_code": _bounded_optional(error_code, 128),
+        }
+        return _upsert(
+            session,
+            AcademicSetupReminder,
+            [
+                AcademicSetupReminder.condition == values["condition"],
+                AcademicSetupReminder.schema_fingerprint == values["schema_fingerprint"],
+                AcademicSetupReminder.reminder_day == reminder_day,
+            ],
+            values,
+        )
+
+    @staticmethod
+    def clear_setup_reminders(
+        session: Session,
+        *,
+        condition_code: str | None = None,
+        fingerprint: str | None = None,
+    ) -> int:
+        statement = select(AcademicSetupReminder).where(AcademicSetupReminder.state != "cleared")
+        if condition_code is not None:
+            statement = statement.where(
+                AcademicSetupReminder.condition == _bounded(condition_code, 128)
+            )
+        if fingerprint is not None:
+            statement = statement.where(
+                AcademicSetupReminder.schema_fingerprint == _bounded(fingerprint, 128)
+            )
+        rows = list(session.scalars(statement))
+        for row in rows:
+            row.state = "cleared"
+        session.flush()
+        return len(rows)
+
+    @staticmethod
+    def academic_notion_health(session: Session) -> dict[str, Any]:
+        calendars = list(session.scalars(select(AcademicCourseCalendar)))
+        invalid_calendars = sum(row.discovery_status != "valid" for row in calendars)
+        last_sync = max(
+            (row.last_synced_at for row in calendars if row.last_synced_at is not None),
+            default=None,
+        )
+        pending_clarifications = session.scalar(
+            select(func.count())
+            .select_from(AcademicClarification)
+            .where(AcademicClarification.state.in_(["pending", "delivered", "claimed"]))
+        )
+        write_failures = session.scalar(
+            select(func.count())
+            .select_from(AcademicClarification)
+            .where(AcademicClarification.write_status.in_(["conflict", "failed"]))
+        )
+        reminder_rows = list(
+            session.scalars(
+                select(AcademicSetupReminder).where(AcademicSetupReminder.state != "cleared")
+            )
+        )
+        active_assessments = session.scalar(
+            select(func.count()).select_from(Assessment).where(Assessment.active.is_(True))
+        )
+        return {
+            "course_count": session.scalar(select(func.count()).select_from(Course)) or 0,
+            "calendar_count": len(calendars),
+            "invalid_calendar_count": invalid_calendars,
+            "active_assessment_count": active_assessments or 0,
+            "pending_clarification_count": pending_clarifications or 0,
+            "write_failure_count": write_failures or 0,
+            "setup_reminder_count": len(reminder_rows),
+            "setup_condition_codes": sorted({row.condition for row in reminder_rows})[:10],
+            "last_sync_at": _aware_db(last_sync).isoformat() if last_sync is not None else None,
+            "migration": "0009_notion_course_calendars",
+        }
 
     @staticmethod
     def upsert_fixed_commitment(
@@ -729,7 +1153,7 @@ class SQLAlchemyAcademicPlannerStore:
             AcademicRepository.upsert_sync_cursor(
                 session,
                 scope=f"notion:{database}",
-                source_version="notion-v1",
+                source_version="notion-2025-09-03",
                 cursor=cursor,
                 last_synced_at=datetime.now(UTC),
             )
@@ -899,6 +1323,7 @@ class SQLAlchemyAcademicPlannerStore:
                             ),
                         ),
                         Assessment.course_id.in_(courses) if courses else Assessment.id.is_(None),
+                        Assessment.active.is_(True),
                     )
                     .order_by(Assessment.due_at, Assessment.notion_id)
                 )
@@ -1184,6 +1609,263 @@ class SQLAlchemyAcademicPlannerStore:
                 result="applied",
             )
 
+    def upsert_course_calendar(
+        self,
+        course: Any,
+        *,
+        status: str = "valid",
+        diagnostic_code: str | None = None,
+        schema_fingerprint: str | None = None,
+    ) -> str:
+        """Persist one discovered course Assessments calendar mapping."""
+
+        with Session(self.engine) as session, session.begin():
+            course_row = _resolve_course(session, course)
+            calendar = AcademicRepository.upsert_course_calendar(
+                session,
+                calendar=CourseCalendarInput(
+                    course_id=course_row.id,
+                    course_page_id=str(
+                        _field(course, "course_page_id", "page_id", "notion_id")
+                        or course_row.notion_id
+                    ),
+                    child_database_id=_field(
+                        course,
+                        "child_database_id",
+                        "assessments_database_id",
+                        "database_id",
+                        "calendar_database_id",
+                    ),
+                    child_data_source_id=_field(
+                        course,
+                        "child_data_source_id",
+                        "assessments_source_id",
+                        "data_source_id",
+                        "source_id",
+                    ),
+                    title_property_id=_field(course, "title_property_id"),
+                    title_property_name=_field(course, "title_property_name"),
+                    date_property_id=_field(course, "date_property_id"),
+                    date_property_name=_field(course, "date_property_name"),
+                    discovery_status=status,
+                    diagnostic_code=diagnostic_code,
+                    diagnostic_fingerprint=schema_fingerprint,
+                    last_discovered_at=datetime.now(UTC),
+                    last_synced_at=datetime.now(UTC)
+                    if status == "valid"
+                    else _field_datetime(course, "last_synced_at"),
+                ),
+            )
+            return str(calendar.id)
+
+    def upsert_synced_assessment(
+        self,
+        course: Any,
+        assessment: Any,
+        *,
+        kind: str,
+        label_source: str | None = None,
+    ) -> str:
+        """Persist one normalized assessment event and its Notion trace fields."""
+
+        with Session(self.engine) as session, session.begin():
+            course_row = _resolve_course(session, course)
+            due_at = _field_datetime(assessment, "due_at", "date", "start")
+            source_id = str(
+                _field(assessment, "source_id", "assessments_source_id", "data_source_id") or ""
+            )
+            title_property_id = str(_field(assessment, "title_property_id") or "")
+            edited_at = _field_datetime(assessment, "notion_last_edited_at", "last_edited_at")
+            trace = None
+            if source_id and title_property_id and edited_at is not None:
+                trace = AssessmentSourceTrace(
+                    source_id=source_id,
+                    source_scope=f"notion:{source_id}",
+                    notion_last_edited_at=edited_at,
+                    title_property_id=title_property_id,
+                    label_source=label_source,
+                    source_url=_field(assessment, "source_url", "url"),
+                    active=bool(
+                        _field(assessment, "active")
+                        if _field(assessment, "active") is not None
+                        else True
+                    ),
+                    archived=bool(_field(assessment, "archived") or False),
+                )
+            row = AcademicRepository.upsert_assessment(
+                session,
+                notion_id=str(_field(assessment, "notion_id", "page_id", "id")),
+                course_id=course_row.id,
+                title=str(_field(assessment, "title", "current_title") or "Untitled assessment"),
+                assessment_type=kind,
+                due_at=due_at,
+                grade_weight_percent=_field_number(assessment, "grade_weight_percent", "weight"),
+                estimated_minutes=int(_field_number(assessment, "estimated_minutes") or 60),
+                scope=_field(assessment, "scope"),
+                confidence=float(
+                    _field_number(assessment, "confidence") or (1.0 if due_at else 0.0)
+                ),
+                fact_state=_fact_state(_field(assessment, "fact_state"), due_at=due_at),
+                ambiguity_reason=_field(assessment, "ambiguity_reason"),
+                citation=SourceCitation(url=_field(assessment, "source_url", "url")),
+                completed=bool(_field(assessment, "completed") or False),
+                trace=trace,
+            )
+            return str(row.id)
+
+    def reconcile_assessment_source(
+        self,
+        source_id: str,
+        seen_ids: Iterable[str],
+        *,
+        synced_at: datetime | None = None,
+    ) -> int:
+        with Session(self.engine) as session, session.begin():
+            return AcademicRepository.reconcile_assessment_source(
+                session,
+                source_id=source_id,
+                seen_notion_ids=seen_ids,
+                synced_at=synced_at or datetime.now(UTC),
+            )
+
+    def create_or_get_clarification(self, **kwargs: Any) -> str:
+        with Session(self.engine) as session, session.begin():
+            request = ClarificationInput(
+                event_notion_id=str(kwargs["event_notion_id"]),
+                original_title=str(kwargs["original_title"]),
+                raw_label=kwargs.get("raw_label"),
+                quiz_preview_title=str(kwargs["quiz_preview_title"]),
+                assignment_preview_title=str(kwargs["assignment_preview_title"]),
+                expected_edited_at=_utc(kwargs["expected_edited_at"], "expected_edited_at"),
+                expires_at=_utc(kwargs["expires_at"], "expires_at"),
+                idempotency_key=str(kwargs["idempotency_key"]),
+                course_id=_uuid_optional(kwargs.get("course_id")),
+                assessment_id=_uuid_optional(kwargs.get("assessment_id")),
+                title_property_id=kwargs.get("title_property_id"),
+            )
+            return str(AcademicRepository.create_or_get_clarification(session, request=request).id)
+
+    def get_clarification(self, clarification_id: uuid.UUID | str) -> dict[str, Any] | None:
+        with Session(self.engine) as session:
+            row = session.get(AcademicClarification, uuid.UUID(str(clarification_id)))
+            return _clarification_public(row) if row is not None else None
+
+    def claim_clarification(
+        self,
+        clarification_id: uuid.UUID | str,
+        action: Literal["quiz", "assignment", "ignore"],
+        actor_id: int,
+        *,
+        now: datetime | None = None,
+    ) -> tuple[str, dict[str, Any]]:
+        with Session(self.engine) as session, session.begin():
+            status, row = AcademicRepository.claim_clarification(
+                session,
+                clarification_id=uuid.UUID(str(clarification_id)),
+                action=action,
+                actor_id=actor_id,
+                now=now or datetime.now(UTC),
+            )
+            return status, _clarification_public(row)
+
+    def expire_clarifications(self, *, now: datetime | None = None) -> int:
+        with Session(self.engine) as session, session.begin():
+            return AcademicRepository.expire_clarifications(
+                session,
+                now=now or datetime.now(UTC),
+            )
+
+    def mark_clarification_delivered(
+        self,
+        clarification_id: uuid.UUID | str,
+        *,
+        delivery_id: str,
+        delivered_at: datetime | None = None,
+    ) -> None:
+        with Session(self.engine) as session, session.begin():
+            AcademicRepository.mark_clarification_delivered(
+                session,
+                clarification_id=uuid.UUID(str(clarification_id)),
+                delivery_id=delivery_id,
+                delivered_at=delivered_at or datetime.now(UTC),
+            )
+
+    def mark_clarification_applied(
+        self, clarification_id: uuid.UUID | str, *, applied_at: datetime | None = None
+    ) -> None:
+        with Session(self.engine) as session, session.begin():
+            AcademicRepository.mark_clarification_applied(
+                session,
+                clarification_id=uuid.UUID(str(clarification_id)),
+                applied_at=applied_at or datetime.now(UTC),
+            )
+
+    def mark_clarification_conflict(
+        self, clarification_id: uuid.UUID | str, *, error_code: str = "notion_precondition_failed"
+    ) -> None:
+        with Session(self.engine) as session, session.begin():
+            AcademicRepository.mark_clarification_conflict(
+                session,
+                clarification_id=uuid.UUID(str(clarification_id)),
+                error_code=error_code,
+            )
+
+    def mark_clarification_failed(
+        self, clarification_id: uuid.UUID | str, *, error_code: str
+    ) -> None:
+        with Session(self.engine) as session, session.begin():
+            AcademicRepository.mark_clarification_failed(
+                session,
+                clarification_id=uuid.UUID(str(clarification_id)),
+                error_code=error_code,
+            )
+
+    def setup_reminder_due(self, condition_code: str, fingerprint: str, day: date) -> bool:
+        with Session(self.engine) as session:
+            return AcademicRepository.setup_reminder_due(
+                session,
+                condition_code=condition_code,
+                fingerprint=fingerprint,
+                reminder_day=day,
+            )
+
+    def record_setup_reminder(
+        self,
+        condition_code: str,
+        fingerprint: str,
+        day: date,
+        *,
+        affected_course_codes: Sequence[str] = (),
+        delivered_at: datetime | None = None,
+        delivery_id: str | None = None,
+        error_code: str | None = None,
+    ) -> None:
+        with Session(self.engine) as session, session.begin():
+            AcademicRepository.record_setup_reminder(
+                session,
+                condition_code=condition_code,
+                fingerprint=fingerprint,
+                reminder_day=day,
+                affected_course_codes=affected_course_codes,
+                delivered_at=delivered_at or datetime.now(UTC),
+                delivery_id=delivery_id,
+                error_code=error_code,
+            )
+
+    def clear_setup_reminders(
+        self, condition_code: str | None = None, fingerprint: str | None = None
+    ) -> int:
+        with Session(self.engine) as session, session.begin():
+            return AcademicRepository.clear_setup_reminders(
+                session,
+                condition_code=condition_code,
+                fingerprint=fingerprint,
+            )
+
+    def academic_notion_health(self) -> dict[str, Any]:
+        with Session(self.engine) as session:
+            return AcademicRepository.academic_notion_health(session)
+
     # Short aliases are useful to host workers that use the generic store API.
     def save(self, plan: Any) -> None:
         self.save_daily_plan(plan)
@@ -1323,4 +2005,148 @@ def _sha256(value: str) -> str:
     return hashlib.sha256(value.encode("utf-8")).hexdigest()
 
 
-__all__ = ["AcademicRepository", "DocumentChunkInput", "FactState", "SourceCitation"]
+def _bounded(value: str, limit: int = BOUNDED_TEXT_CHARS) -> str:
+    stripped = value.strip()
+    if not stripped:
+        raise ValueError("bounded text must not be empty")
+    return stripped[:limit]
+
+
+def _bounded_optional(value: str | None, limit: int = BOUNDED_TEXT_CHARS) -> str | None:
+    if value is None:
+        return None
+    stripped = value.strip()
+    return stripped[:limit] or None
+
+
+def _uuid_optional(value: Any) -> uuid.UUID | None:
+    return uuid.UUID(str(value)) if value is not None else None
+
+
+def _parse_uuid(value: Any) -> uuid.UUID | None:
+    try:
+        return uuid.UUID(str(value))
+    except (TypeError, ValueError, AttributeError):
+        return None
+
+
+def _field(value: Any, *names: str) -> Any:
+    for name in names:
+        if isinstance(value, Mapping) and name in value:
+            mapping = cast(Mapping[str, Any], value)
+            return mapping[name]
+        object_value = cast(object, value)
+        if hasattr(object_value, name):
+            return getattr(object_value, name)
+    return None
+
+
+def _field_number(value: Any, *names: str) -> float | None:
+    candidate = _field(value, *names)
+    if isinstance(candidate, (int, float)) and not isinstance(candidate, bool):
+        return float(candidate)
+    if isinstance(candidate, str):
+        try:
+            return float(candidate)
+        except ValueError:
+            return None
+    return None
+
+
+def _field_datetime(value: Any, *names: str) -> datetime | None:
+    candidate = _field(value, *names)
+    if isinstance(candidate, datetime):
+        return _utc(candidate, names[0])
+    if isinstance(candidate, str) and candidate.strip():
+        try:
+            return _utc(datetime.fromisoformat(candidate.replace("Z", "+00:00")), names[0])
+        except ValueError:
+            return None
+    return None
+
+
+def _fact_state(value: Any, *, due_at: datetime | None) -> FactState:
+    candidate = str(value or ("confirmed" if due_at else "ambiguous"))
+    if candidate not in {"unconfirmed", "confirmed", "ambiguous", "rejected"}:
+        return "ambiguous"
+    return cast(FactState, candidate)
+
+
+def _resolve_course(session: Session, value: Any) -> Course:
+    db_course_id = _parse_uuid(_field(value, "course_id", "id"))
+    if db_course_id is not None:
+        existing = session.get(Course, db_course_id)
+        if existing is not None:
+            return existing
+    notion_id = str(
+        _field(value, "notion_id", "page_id", "course_page_id", "course_id") or ""
+    ).strip()
+    if notion_id:
+        existing = session.scalar(select(Course).where(Course.notion_id == notion_id))
+        if existing is not None:
+            return existing
+    if not notion_id:
+        raise ValueError("course must include an id or Notion page id")
+    return AcademicRepository.upsert_course(
+        session,
+        notion_id=notion_id,
+        course_code=str(_field(value, "course_code", "code") or notion_id),
+        title=str(_field(value, "title", "course_title", "name") or notion_id),
+        term=str(_field(value, "term") or "unspecified"),
+        timezone=str(_field(value, "timezone") or "America/Toronto"),
+        priority=int(_field_number(value, "priority") or 50),
+        active=bool(_field(value, "active") if _field(value, "active") is not None else True),
+    )
+
+
+def _clarification_public(row: AcademicClarification) -> dict[str, Any]:
+    return {
+        "id": str(row.id),
+        "event_notion_id": row.event_notion_id,
+        "course_id": str(row.course_id) if row.course_id is not None else None,
+        "assessment_id": str(row.assessment_id) if row.assessment_id is not None else None,
+        "original_title": row.original_title,
+        "quiz_preview_title": row.quiz_preview_title,
+        "assignment_preview_title": row.assignment_preview_title,
+        "expected_edited_at": _aware_db(row.expected_edited_at).isoformat(),
+        "title_property_id": row.title_property_id,
+        "decision": row.decision,
+        "state": row.state,
+        "delivery_id": row.delivery_id,
+        "delivered_at": _aware_db(row.delivered_at).isoformat()
+        if row.delivered_at is not None
+        else None,
+        "write_status": row.write_status,
+        "expires_at": _aware_db(row.expires_at).isoformat(),
+    }
+
+
+def _add_clarification_audit(
+    session: Session,
+    row: AcademicClarification,
+    *,
+    result: Literal["applied", "conflict", "failed", "skipped"],
+) -> None:
+    """Append an allowlisted write result without Discord or Notion payload data."""
+
+    session.add(
+        AuditEvent(
+            actor="discord_authorized_user",
+            action="notion_title_rename",
+            target_type="notion_assessment",
+            target_id=row.event_notion_id,
+            result=result,
+        )
+    )
+
+
+__all__ = [
+    "AcademicRepository",
+    "AssessmentSourceTrace",
+    "ClarificationInput",
+    "CourseCalendarInput",
+    "DocumentChunkInput",
+    "FactState",
+    "SQLAlchemyAcademicPlannerStore",
+    "SourceCitation",
+]

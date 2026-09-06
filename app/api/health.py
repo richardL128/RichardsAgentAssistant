@@ -6,7 +6,12 @@ from fastapi import APIRouter, Request, Response
 from fastapi.responses import JSONResponse
 
 from app import __version__
-from app.health.checks import HealthResponse, HealthState, readiness
+from app.health.checks import (
+    HealthResponse,
+    HealthState,
+    check_academic_discord_gateway,
+    readiness,
+)
 
 router = APIRouter(prefix="/health", tags=["health"])
 
@@ -23,6 +28,16 @@ async def ready(request: Request) -> HealthResponse | Response:
         request.app.state.database,
         version=__version__,
     )
+    result.checks.append(
+        check_academic_discord_gateway(
+            request.app.state.settings,
+            getattr(request.app.state, "discord_academic_gateway_state", None),
+        )
+    )
+    if result.status is HealthState.HEALTHY and any(
+        check.state is HealthState.ATTENTION for check in result.checks
+    ):
+        result.status = HealthState.ATTENTION
     if result.status is HealthState.FAILED:
         return JSONResponse(status_code=503, content=result.model_dump(mode="json"))
     return result

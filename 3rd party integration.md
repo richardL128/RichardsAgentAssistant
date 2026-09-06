@@ -41,15 +41,13 @@ Use a separate local configuration entry for each connector. `.env.example` has 
 
 ```dotenv
 NOTION_TOKEN=
-NOTION_API_VERSION=
-NOTION_COURSES_DATA_SOURCE_ID=
-NOTION_ASSESSMENTS_DATA_SOURCE_ID=
-NOTION_STUDY_BLOCKS_DATA_SOURCE_ID=
+NOTION_COURSES_DATABASE_ID=
 
 DISCORD_APPLICATION_ID=
 DISCORD_PUBLIC_KEY=
 DISCORD_BOT_TOKEN=
-DISCORD_OWNER_USER_ID=
+DISCORD_ACADEMIC_AUTHORIZED_USER_IDS=[]
+DISCORD_ACADEMIC_GATEWAY_ENABLED=false
 DISCORD_PRIVATE_CHANNEL_ID=
 DISCORD_FINANCE_CHANNEL_ID=
 DISCORD_CODE_REVIEW_CHANNEL_ID=
@@ -82,20 +80,21 @@ Use a **Notion internal connection** for this personal, single-workspace system.
    - Read user information only if it is actually required for an audit display.
    - Update content, because confirmed planner updates create/edit Notion entries. Do not use the update capability until the confirmation workflow is shipped.
 3. Copy the internal integration token into the local secret store as `NOTION_TOKEN`.
-4. Create the three databases described in the architecture—Courses, Assessments, and Study/work blocks—or map the existing equivalents.
-5. For each of the three databases, open **Share** → **Add connections** and select `LifeAgent`. Also share every course-outline page or file page that the planner must read. Creating a token alone does not grant access to arbitrary workspace pages.
-6. Copy the data-source/database IDs into `NOTION_*_DATA_SOURCE_ID`. The initial sync command should print the IDs and detected property names, but not the token.
+4. Create one top-level Courses database. Each course row/page must contain one inline Assessments database created from the reviewed New Course template.
+5. On the top-level Courses database, open **Share** → **Add connections** and select `LifeAgent`. Creating a token alone does not grant access to arbitrary workspace pages.
+6. Copy only the top-level database ID into `NOTION_COURSES_DATABASE_ID`. LifeAgent discovers each underlying data-source ID and child Assessments database; do not put those discovered IDs in `.env`.
 7. Decide where uncertain facts and confirmations appear: use the private Discord channel by default. Do not create a hidden Notion “automation” database unless it is a deliberate, documented part of the student's workflow.
 
 ### Required database mapping
 
-Map properties by stable Notion property ID, not by display name alone, so a later rename does not corrupt data. The startup validation must verify the following mappings before enabling a sync.
+LifeAgent discovers property IDs from each physical data-source schema and
+requires the expected name and type before enabling that course.
 
 | LifeAgent concept | Notion database / expected data |
 | --- | --- |
-| Course | Courses: name, term, priority, course-outline page/file, assessment policy |
-| Assessment | Assessments: course relation, type, due/test time, grade weight, instructions, rubric, scope, status, estimated time |
-| Work block | Study/work blocks: assessment relation, planned/actual duration, completion state, notes |
+| Course | Courses: `Course Code` title; optional term and priority |
+| Assessment | Per-course inline Assessments: `Name` title, `Date` date; optional weight, status, and estimated minutes |
+| Work block | PostgreSQL planner state; no separately configured Notion database ID |
 
 Keep the Notion page URL and page ID for every imported object. Download an attached PDF during sync to the artifact store because Notion-hosted file URLs can expire; record the original attachment metadata and retrieval timestamp.
 
@@ -103,8 +102,8 @@ Keep the Notion page URL and page ID for every imported object. Download an atta
 
 **Read path**
 
-1. Query each configured data source for pages changed since the last successful cursor/watermark.
-2. Retrieve changed pages and child blocks; download explicitly allowlisted attachments.
+1. Retrieve the configured Courses database, discover its data source, and query course rows.
+2. Paginate each course page's children, discover exactly one seeded Assessments database and its physical data source, then query its event pages.
 3. Convert properties and blocks to a Pydantic `NotionAssessment`/`NotionCourse` record.
 4. Extract PDF/page text, retain page/block citations, and compare its source-version hash with the stored version.
 5. Upsert normalized records. Flag conflicting or ambiguous fields rather than guessing.
@@ -125,7 +124,7 @@ Never let an LLM send raw Notion patch JSON. The proposal contains a typed, whit
 
 ### Notion connection tests
 
-- `notion doctor` validates the token, three configured data-source IDs, required property IDs/types, and page sharing without displaying secret values.
+- The health check validates the token, one configured Courses database ID, discovered child sources, required property IDs/types, and page sharing without displaying secret values.
 - A fixture Course, Assessment, and Study block are imported with correct field mapping and canonical page URLs.
 - A PDF attachment produces text with page citations; a non-text PDF becomes an explicit OCR/confirmation case rather than fabricated text.
 - A proposed deadline update makes no Notion change before confirmation; after confirmation it changes exactly one target property and writes an audit event.

@@ -245,15 +245,19 @@ Daily plan, study blocks, carry-forward queue, Discord check-in
 
 ### Suggested Notion structure
 
-Use three linked databases rather than one overloaded calendar.
+Use one top-level Courses database. Each course row/page owns one seeded inline
+Assessments database; its calendar is only a view over those assessment pages.
 
-| Database | Essential fields |
+| Source | Essential fields |
 | --- | --- |
-| Courses | Course, priority ranking, course-outline PDF/page, term, assessment policy |
-| Assessments | Course, type, due/test time, grade weight, instructions, rubric, scope, status, estimated time |
-| Study/work blocks | Linked assessment, planned duration, actual duration, completion state, notes |
+| Courses | Course Code title, priority ranking, course-outline PDF/page, term, assessment policy |
+| Per-course Assessments | Name title, Date, optional weight, instructions, rubric, scope, status, estimated time |
+| PostgreSQL study/work blocks | Linked assessment, planned duration, actual duration, completion state, notes |
 
-An assessment can be an assignment, quiz, midterm, final, or attendance event. The Notion calendar displays assessments and study/work blocks.
+An assessment can be a deterministically confirmed quiz or assignment. Unknown
+labels wait for authorized Discord clarification. The Notion calendar displays
+the underlying assessment pages; LifeAgent stores generated study blocks in
+PostgreSQL rather than requiring a second Notion database ID.
 
 ### Ingestion flow
 

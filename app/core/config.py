@@ -99,6 +99,8 @@ class Settings(BaseSettings):
     discord_code_review_channel_id: str | None = None
     discord_academic_channel_id: str | None = None
     discord_finance_channel_id: str | None = None
+    discord_academic_authorized_user_ids: list[int] = Field(default_factory=lambda: list[int]())
+    discord_academic_gateway_enabled: bool = False
     github_webhook_max_body_bytes: Annotated[int, Field(gt=0, le=10_485_760)] = 1_048_576
     git_clone_timeout_seconds: Annotated[float, Field(gt=0, le=600)] = 60.0
     code_command_timeout_seconds: Annotated[float, Field(gt=0, le=1800)] = 120.0
@@ -173,6 +175,11 @@ class Settings(BaseSettings):
             raise ValueError(f"unknown IANA timezone: {value}") from exc
         return value
 
+    @field_validator("discord_academic_authorized_user_ids", mode="before")
+    @classmethod
+    def empty_authorized_user_list_is_empty(cls, value: Any) -> Any:
+        return [] if value == "" else value
+
     @field_validator("code_review_discovery_scope")
     @classmethod
     def discovery_scope_is_present(cls, value: str) -> str:
@@ -213,15 +220,6 @@ class Settings(BaseSettings):
             raise ValueError("retry base delay cannot exceed retry maximum delay")
         if self.repository_allowlist and not self.repository_allowlist_version:
             raise ValueError("a non-empty repository allowlist requires a version")
-        notion_databases = (
-            self.notion_courses_database_id,
-            self.notion_assessments_database_id,
-            self.notion_study_blocks_database_id,
-        )
-        if self.notion_token is not None and not all(notion_databases):
-            raise ValueError("a Notion token requires all three academic database IDs")
-        if any(notion_databases) and self.notion_token is None:
-            raise ValueError("academic Notion database IDs require a Notion token")
         if self.discord_api_url != DISCORD_API_BASE_URL and self.app_environment != "acceptance":
             raise ValueError(
                 "non-default Discord API URL is only allowed in acceptance environment"
@@ -254,6 +252,15 @@ class Settings(BaseSettings):
     def discord_code_review_channel_is_id(cls, value: str | None) -> str | None:
         if value is not None and not value.isdigit():
             raise ValueError("Discord code-review channel must be a numeric ID")
+        return value
+
+    @field_validator("discord_academic_authorized_user_ids")
+    @classmethod
+    def discord_authorized_users_are_positive(cls, value: list[int]) -> list[int]:
+        if len(value) != len(set(value)) or any(item <= 0 for item in value):
+            raise ValueError(
+                "Discord academic authorized user IDs must be unique positive integers"
+            )
         return value
 
     @property
@@ -316,6 +323,10 @@ class Settings(BaseSettings):
             ),
             "discord_academic_channel_configured": self.discord_academic_channel_id is not None,
             "discord_finance_channel_configured": self.discord_finance_channel_id is not None,
+            "discord_academic_authorized_user_count": len(
+                self.discord_academic_authorized_user_ids
+            ),
+            "discord_academic_gateway_enabled": self.discord_academic_gateway_enabled,
             "ops_console_auth_configured": (
                 self.ops_console_username is not None and self.ops_console_password is not None
             ),
@@ -334,6 +345,15 @@ class Settings(BaseSettings):
                 value is not None
                 for value in (
                     self.notion_courses_database_id,
+                    self.notion_assessments_database_id,
+                    self.notion_study_blocks_database_id,
+                )
+            ),
+            "notion_token_configured": self.notion_token is not None,
+            "notion_courses_database_configured": self.notion_courses_database_id is not None,
+            "notion_deprecated_database_metadata_count": sum(
+                value is not None
+                for value in (
                     self.notion_assessments_database_id,
                     self.notion_study_blocks_database_id,
                 )

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import re
 import tempfile
 from collections.abc import Awaitable, Callable
 from datetime import UTC, datetime, timedelta
@@ -19,6 +20,7 @@ from app.core.errors import ErrorCategory, LifeAgentError
 from app.db.session import Database
 
 GITHUB_TOKEN_REFRESH_WINDOW = timedelta(minutes=1)
+_NOTION_ID_PATTERN = re.compile(r"^[A-Za-z0-9_-]{1,128}$")
 
 GitHubTokenFetcher = Callable[[], Awaitable[InstallationToken]]
 
@@ -199,13 +201,6 @@ def check_connector_configuration(settings: Settings) -> HealthCheck:
     )
     if any(discord_targets) and settings.discord_bot_token is None:
         missing.append("discord")
-    notion_targets = (
-        settings.notion_courses_database_id,
-        settings.notion_assessments_database_id,
-        settings.notion_study_blocks_database_id,
-    )
-    if any(notion_targets) and settings.notion_token is None:
-        missing.append("notion")
     github_parts = (
         settings.github_app_id,
         settings.github_installation_id,
@@ -233,6 +228,107 @@ def check_connector_configuration(settings: Settings) -> HealthCheck:
         name="connector_configuration",
         state=HealthState.HEALTHY,
         diagnostic=f"configured connector credential sets are internally consistent ({configured})",
+    )
+
+
+def check_academic_notion_status(
+    settings: Settings,
+    database: Database | None = None,
+) -> HealthCheck:
+    """Report non-secret academic Notion setup and persisted sync state."""
+
+    token_configured = settings.notion_token is not None
+    courses_configured = settings.notion_courses_database_id is not None
+    if not token_configured or not courses_configured:
+        return HealthCheck(
+            name="academic_notion",
+            state=HealthState.ATTENTION,
+            diagnostic=(
+                "Academic Notion setup incomplete; "
+                f"token configured={token_configured}; "
+                f"courses database configured={courses_configured}; "
+                "no Notion changes were made"
+            ),
+        )
+    assert settings.notion_courses_database_id is not None
+    if _NOTION_ID_PATTERN.fullmatch(settings.notion_courses_database_id) is None:
+        return HealthCheck(
+            name="academic_notion",
+            state=HealthState.ATTENTION,
+            diagnostic="Academic Notion Courses database configuration is invalid",
+        )
+    if database is None:
+        return HealthCheck(
+            name="academic_notion",
+            state=HealthState.HEALTHY,
+            diagnostic="Academic Notion configuration is present; persisted sync state not checked",
+        )
+    try:
+        from app.db.academic import SQLAlchemyAcademicPlannerStore
+
+        snapshot = SQLAlchemyAcademicPlannerStore(database.engine).academic_notion_health()
+    except (SQLAlchemyError, OSError, ValueError) as exc:
+        return HealthCheck(
+            name="academic_notion",
+            state=HealthState.ATTENTION,
+            diagnostic=f"Academic Notion persistence unavailable ({exc.__class__.__name__})",
+        )
+    invalid = int(snapshot.get("invalid_calendar_count", 0))
+    pending = int(snapshot.get("pending_clarification_count", 0))
+    write_failures = int(snapshot.get("write_failure_count", 0))
+    reminders = int(snapshot.get("setup_reminder_count", 0))
+    setup_codes = snapshot.get("setup_condition_codes", [])
+    setup_summary = ",".join(str(code) for code in setup_codes) if setup_codes else "none"
+    state = (
+        HealthState.ATTENTION
+        if invalid or pending or write_failures or reminders
+        else HealthState.HEALTHY
+    )
+    return HealthCheck(
+        name="academic_notion",
+        state=state,
+        diagnostic=(
+            f"courses {snapshot.get('course_count', 0)}; "
+            f"calendars {snapshot.get('calendar_count', 0)}; "
+            f"invalid calendars {invalid}; "
+            f"active assessments {snapshot.get('active_assessment_count', 0)}; "
+            f"pending clarifications {pending}; "
+            f"write failures {write_failures}; "
+            f"setup reminders {reminders}; "
+            f"setup conditions {setup_summary}; "
+            f"last sync {snapshot.get('last_sync_at') or 'never'}; "
+            f"migration {snapshot.get('migration', 'unknown')}"
+        ),
+    )
+
+
+def check_academic_discord_gateway(settings: Settings, runtime_state: str | None) -> HealthCheck:
+    """Expose the configured clarification listener state without account details."""
+
+    if not settings.discord_academic_gateway_enabled:
+        return HealthCheck(
+            name="academic_discord_gateway",
+            state=HealthState.HEALTHY,
+            diagnostic="Academic Discord Gateway listener is disabled",
+        )
+    configured = (
+        settings.discord_bot_token is not None
+        and settings.discord_academic_channel_id is not None
+        and bool(settings.discord_academic_authorized_user_ids)
+        and settings.notion_token is not None
+        and settings.notion_courses_database_id is not None
+    )
+    if not configured or runtime_state == "setup_required":
+        return HealthCheck(
+            name="academic_discord_gateway",
+            state=HealthState.ATTENTION,
+            diagnostic="Academic Discord Gateway setup is incomplete",
+        )
+    state = runtime_state or "unknown"
+    return HealthCheck(
+        name="academic_discord_gateway",
+        state=HealthState.HEALTHY if state == "running" else HealthState.ATTENTION,
+        diagnostic=f"Academic Discord Gateway listener state: {state}",
     )
 
 
@@ -538,6 +634,7 @@ async def readiness(
 ) -> HealthResponse:
     db_checks = await asyncio.to_thread(check_database, database)
     checks = [*db_checks, check_artifact_root(settings)]
+    checks.append(check_academic_notion_status(settings, database))
     checks.append(await check_ollama(settings, ollama_client))
     states = {check.state for check in checks}
     if HealthState.FAILED in states:

@@ -596,6 +596,7 @@ class Assessment(TimestampMixin, Base):
         CheckConstraint("scope_size >= 0 AND scope_size <= 100", name="scope_size_valid"),
         Index("ix_assessments_course_due", "course_id", "due_at"),
         Index("ix_assessments_fact_state", "fact_state", "due_at"),
+        Index("ix_assessments_source_active", "source_id", "active"),
     )
 
     id: Mapped[uuid.UUID] = mapped_column(primary_key=True, default=uuid.uuid4)
@@ -618,6 +619,135 @@ class Assessment(TimestampMixin, Base):
     source_block: Mapped[str | None] = mapped_column(String(255))
     source_url: Mapped[str | None] = mapped_column(String(1_000))
     completed: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+    source_id: Mapped[str | None] = mapped_column(String(255))
+    source_scope: Mapped[str | None] = mapped_column(String(255))
+    notion_last_edited_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    title_property_id: Mapped[str | None] = mapped_column(String(255))
+    label_source: Mapped[str | None] = mapped_column(String(255))
+    active: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
+    archived: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+
+
+class AcademicCourseCalendar(TimestampMixin, Base):
+    """Discovered Assessments database/data-source mapping for one course page."""
+
+    __tablename__ = "academic_course_calendars"
+    __table_args__ = (
+        UniqueConstraint("course_id", name="uq_academic_course_calendars_course"),
+        UniqueConstraint("child_data_source_id", name="uq_academic_course_calendars_source"),
+        CheckConstraint("length(course_page_id) > 0", name="course_page_id_nonempty"),
+        CheckConstraint(
+            "child_database_id IS NULL OR length(child_database_id) > 0",
+            name="child_database_id_nonempty",
+        ),
+        CheckConstraint(
+            "child_data_source_id IS NULL OR length(child_data_source_id) > 0",
+            name="child_data_source_id_nonempty",
+        ),
+        CheckConstraint(
+            "discovery_status IN ('valid','missing','inaccessible','malformed','duplicate')",
+            name="discovery_status_valid",
+        ),
+        Index("ix_academic_course_calendars_status", "discovery_status", "last_synced_at"),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(primary_key=True, default=uuid.uuid4)
+    course_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey("courses.id", ondelete="CASCADE"), nullable=False
+    )
+    course_page_id: Mapped[str] = mapped_column(String(255), nullable=False)
+    child_database_id: Mapped[str | None] = mapped_column(String(255))
+    child_data_source_id: Mapped[str | None] = mapped_column(String(255))
+    title_property_id: Mapped[str | None] = mapped_column(String(255))
+    title_property_name: Mapped[str | None] = mapped_column(String(255))
+    date_property_id: Mapped[str | None] = mapped_column(String(255))
+    date_property_name: Mapped[str | None] = mapped_column(String(255))
+    discovery_status: Mapped[str] = mapped_column(String(32), nullable=False, default="valid")
+    diagnostic_code: Mapped[str | None] = mapped_column(String(128))
+    diagnostic_fingerprint: Mapped[str | None] = mapped_column(String(128))
+    last_discovered_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    last_synced_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+
+
+class AcademicClarification(TimestampMixin, Base):
+    """Durable Discord clarification state for ambiguous assessment labels."""
+
+    __tablename__ = "academic_clarifications"
+    __table_args__ = (
+        UniqueConstraint("idempotency_key", name="uq_academic_clarifications_idempotency"),
+        CheckConstraint("length(event_notion_id) > 0", name="event_notion_id_nonempty"),
+        CheckConstraint(
+            "state IN "
+            "('pending','delivered','claimed','ignored','applied','conflict','failed','expired')",
+            name="state_valid",
+        ),
+        CheckConstraint(
+            "decision IS NULL OR decision IN ('quiz','assignment','ignore')",
+            name="decision_valid",
+        ),
+        CheckConstraint(
+            "write_status IN ('none','skipped','pending','applied','conflict','failed')",
+            name="write_status_valid",
+        ),
+        Index("ix_academic_clarifications_state_expiry", "state", "expires_at"),
+        Index("ix_academic_clarifications_event", "event_notion_id", "expected_edited_at"),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(primary_key=True, default=uuid.uuid4)
+    course_id: Mapped[uuid.UUID | None] = mapped_column(
+        ForeignKey("courses.id", ondelete="SET NULL")
+    )
+    assessment_id: Mapped[uuid.UUID | None] = mapped_column(
+        ForeignKey("assessments.id", ondelete="SET NULL")
+    )
+    event_notion_id: Mapped[str] = mapped_column(String(255), nullable=False)
+    original_title: Mapped[str] = mapped_column(String(1_024), nullable=False)
+    raw_label: Mapped[str | None] = mapped_column(String(1_024))
+    quiz_preview_title: Mapped[str] = mapped_column(String(1_024), nullable=False)
+    assignment_preview_title: Mapped[str] = mapped_column(String(1_024), nullable=False)
+    expected_edited_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    title_property_id: Mapped[str | None] = mapped_column(String(255))
+    idempotency_key: Mapped[str] = mapped_column(String(512), nullable=False)
+    state: Mapped[str] = mapped_column(String(32), nullable=False, default="pending")
+    delivery_id: Mapped[str | None] = mapped_column(String(255))
+    delivered_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    decision: Mapped[str | None] = mapped_column(String(32))
+    decision_user_id: Mapped[int | None] = mapped_column(BigInteger)
+    decision_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    write_status: Mapped[str] = mapped_column(String(32), nullable=False, default="none")
+    write_error_code: Mapped[str | None] = mapped_column(String(128))
+    expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+
+
+class AcademicSetupReminder(TimestampMixin, Base):
+    """Once-per-day setup reminder delivery state keyed by condition fingerprint."""
+
+    __tablename__ = "academic_setup_reminders"
+    __table_args__ = (
+        UniqueConstraint(
+            "condition",
+            "schema_fingerprint",
+            "reminder_day",
+            name="uq_academic_setup_reminders_condition_day",
+        ),
+        CheckConstraint("length(condition) > 0", name="condition_nonempty"),
+        CheckConstraint("length(schema_fingerprint) > 0", name="schema_fingerprint_nonempty"),
+        CheckConstraint(
+            "state IN ('pending','delivered','failed','cleared')",
+            name="state_valid",
+        ),
+        Index("ix_academic_setup_reminders_condition", "condition", "state"),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(primary_key=True, default=uuid.uuid4)
+    condition: Mapped[str] = mapped_column(String(128), nullable=False)
+    schema_fingerprint: Mapped[str] = mapped_column(String(128), nullable=False)
+    reminder_day: Mapped[date] = mapped_column(Date, nullable=False)
+    affected_course_codes: Mapped[list[str]] = mapped_column(JSON, nullable=False, default=list)
+    state: Mapped[str] = mapped_column(String(32), nullable=False, default="pending")
+    delivered_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    delivery_id: Mapped[str | None] = mapped_column(String(255))
+    error_code: Mapped[str | None] = mapped_column(String(128))
 
 
 class FixedCommitment(TimestampMixin, Base):
@@ -865,9 +995,12 @@ ProposedChange = AcademicProposedChange
 
 __all__ = [
     "AcademicCheckIn",
+    "AcademicClarification",
+    "AcademicCourseCalendar",
     "AcademicDocument",
     "AcademicDocumentChunk",
     "AcademicProposedChange",
+    "AcademicSetupReminder",
     "AcademicSyncCursor",
     "AgentRun",
     "ApprovalRequest",

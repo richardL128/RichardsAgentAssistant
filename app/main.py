@@ -2,8 +2,9 @@
 
 from __future__ import annotations
 
+import asyncio
 from collections.abc import AsyncGenerator
-from contextlib import asynccontextmanager
+from contextlib import asynccontextmanager, suppress
 from datetime import UTC, datetime
 from pathlib import Path
 from zoneinfo import ZoneInfo
@@ -15,13 +16,18 @@ from starlette.middleware.base import BaseHTTPMiddleware, RequestResponseEndpoin
 from starlette.responses import Response
 
 from app import __version__
+from app.agents.academic_planner.sync import AcademicClarificationService, AcademicNotionSync
 from app.api.academic import router as academic_router
 from app.api.finance import router as finance_router
 from app.api.github import router as github_router
 from app.api.health import router as health_router
 from app.api.operations import router as operations_router
 from app.api.pages import router as pages_router
+from app.connectors.discord import DiscordAcademicPlannerAdapter
+from app.connectors.discord_gateway import DiscordGatewayListener
+from app.connectors.notion import NotionConnector
 from app.core.config import Settings, get_settings
+from app.core.errors import LifeAgentError
 from app.db.academic import SQLAlchemyAcademicPlannerStore
 from app.db.finance import SQLAlchemyFinanceStore
 from app.db.session import Database
@@ -82,12 +88,93 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     app_settings = settings or get_settings()
     database = Database(app_settings)
     gateway = LLMGateway(app_settings)
+    academic_store = SQLAlchemyAcademicPlannerStore(
+        database.engine,
+        confirmation_ttl_hours=app_settings.academic_confirmation_ttl_hours,
+    )
+    academic_channel = app_settings.discord_academic_channel_id
+    academic_discord = None
+    if app_settings.discord_bot_token is not None and academic_channel is not None:
+        academic_discord = DiscordAcademicPlannerAdapter(
+            token=app_settings.discord_bot_token,
+            allowed_channel_ids={academic_channel},
+            base_url=app_settings.discord_api_url,
+        )
+    notion_connector = None
+    notion_setup_condition = "notion_configuration_missing"
+    if (
+        app_settings.notion_token is not None
+        and app_settings.notion_courses_database_id is not None
+    ):
+        try:
+            notion_connector = NotionConnector(
+                token=app_settings.notion_token,
+                courses_database_id=app_settings.notion_courses_database_id,
+                timeout_seconds=app_settings.connector_timeout_seconds,
+            )
+        except (LifeAgentError, ValueError):
+            notion_setup_condition = "notion_configuration_invalid"
+    academic_syncer = AcademicNotionSync(
+        connector=notion_connector,
+        store=academic_store,
+        discord=academic_discord,
+        discord_channel_id=academic_channel,
+        timezone=app_settings.app_timezone,
+        clarification_ttl_hours=app_settings.academic_confirmation_ttl_hours,
+        setup_condition_code=notion_setup_condition,
+    )
+    clarification_service = (
+        AcademicClarificationService(
+            store=academic_store,
+            connector=notion_connector,
+            syncer=academic_syncer,
+        )
+        if notion_connector is not None
+        else None
+    )
+    gateway_listener = None
+    gateway_state = "disabled"
+    if app_settings.discord_academic_gateway_enabled:
+        gateway_state = "setup_required"
+        if (
+            app_settings.discord_bot_token is not None
+            and academic_channel is not None
+            and app_settings.discord_academic_authorized_user_ids
+            and clarification_service is not None
+        ):
+            gateway_listener = DiscordGatewayListener(
+                token=app_settings.discord_bot_token,
+                api_base_url=app_settings.discord_api_url,
+                allowed_channel_ids={academic_channel},
+                authorized_user_ids={
+                    str(item) for item in app_settings.discord_academic_authorized_user_ids
+                },
+                handler=clarification_service,
+            )
+            gateway_state = "starting"
 
     async def enqueue_code_review(run_id: str, idempotency_key: str) -> object:
         return await defer_idempotent_async(code_review_task, run_id, idempotency_key)
 
     @asynccontextmanager
-    async def lifespan(_: FastAPI) -> AsyncGenerator[None, None]:
+    async def lifespan(application: FastAPI) -> AsyncGenerator[None, None]:
+        gateway_task: asyncio.Task[None] | None = None
+        if gateway_listener is not None:
+            listener = gateway_listener
+            application.state.discord_academic_gateway_state = "running"
+
+            async def run_gateway() -> None:
+                try:
+                    await listener.run_forever()
+                except asyncio.CancelledError:
+                    raise
+                except Exception:
+                    application.state.discord_academic_gateway_state = "failed"
+
+            gateway_task = asyncio.create_task(
+                run_gateway(),
+                name="discord-academic-gateway",
+            )
         try:
             if use_global_queue:
                 async with procrastinate_app.open_async():
@@ -95,6 +182,11 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             else:
                 yield
         finally:
+            if gateway_task is not None:
+                gateway_task.cancel()
+                with suppress(asyncio.CancelledError):
+                    await gateway_task
+                application.state.discord_academic_gateway_state = "stopped"
             database.dispose()
 
     app = FastAPI(title=app_settings.app_name, version=__version__, lifespan=lifespan)
@@ -105,10 +197,9 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     app.state.model_identity = gateway.model_identity
     app.state.model_config_version = gateway.config_version
     app.state.enqueue_code_review = enqueue_code_review
-    app.state.academic_store = SQLAlchemyAcademicPlannerStore(
-        database.engine,
-        confirmation_ttl_hours=app_settings.academic_confirmation_ttl_hours,
-    )
+    app.state.academic_store = academic_store
+    app.state.academic_syncer = academic_syncer
+    app.state.discord_academic_gateway_state = gateway_state
     app.state.finance_store = SQLAlchemyFinanceStore(
         database.engine,
         allowlist_version=app_settings.finance_source_allowlist_version,

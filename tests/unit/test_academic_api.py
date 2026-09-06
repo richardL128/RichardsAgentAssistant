@@ -78,3 +78,39 @@ def test_exact_confirmation_is_the_only_write_path() -> None:
     assert result.json()["status"] == "applied"
     assert writer.calls == 1
     assert store.applied
+
+
+def test_manual_sync_uses_the_production_sync_boundary() -> None:
+    class Syncer:
+        calls = 0
+
+        async def sync(self):
+            self.calls += 1
+            return type(
+                "Result",
+                (),
+                {
+                    "as_dict": lambda self: {
+                        "status": "partial",
+                        "course_count": 2,
+                        "valid_course_count": 1,
+                        "assessment_count": 3,
+                        "archived_count": 1,
+                        "clarification_count": 1,
+                        "invalid_calendar_count": 1,
+                        "diagnostic_codes": ["assessment_calendar_missing"],
+                    }
+                },
+            )()
+
+    store, writer, syncer = Store(), Writer(), Syncer()
+    app = _app(store, writer)
+    app.state.academic_syncer = syncer
+
+    with TestClient(app) as client:
+        response = client.post("/academic/sync")
+
+    assert response.status_code == 200
+    assert response.json()["status"] == "partial"
+    assert response.json()["valid_course_count"] == 1
+    assert syncer.calls == 1

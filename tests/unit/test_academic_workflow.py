@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from datetime import UTC, datetime
+from types import SimpleNamespace
 
 import pytest
 
@@ -13,10 +14,12 @@ from app.agents.academic_planner.contracts import (
     ProposedChange,
 )
 from app.agents.academic_planner.workflow import (
+    LLMPlannerModel,
     build_daily_plan,
     confirm_checkin_proposal,
     create_checkin_proposal,
     run_end_of_day_checkin,
+    run_morning_plan,
 )
 
 
@@ -130,8 +133,6 @@ async def test_morning_plan_persists_deterministic_plan_and_critique() -> None:
     )
     delivery = Delivery()
     model = Model()
-    from app.agents.academic_planner.workflow import run_morning_plan
-
     result = await run_morning_plan(
         store=store, delivery=delivery, model=model, now=datetime(2026, 9, 3, 14, tzinfo=UTC)
     )
@@ -140,6 +141,37 @@ async def test_morning_plan_persists_deterministic_plan_and_critique() -> None:
     assert store.plan.critique is not None
     assert model.breakdowns == 1
     assert delivery.calls[0][0] == "morning"
+
+
+@pytest.mark.asyncio
+async def test_setup_failure_stops_before_facts_model_schedule_or_delivery() -> None:
+    class UnusedStore(Store):
+        def load_planner_facts(self, *, now, horizon_days):
+            raise AssertionError("planner facts must not load during a setup failure")
+
+    class SetupSync:
+        async def sync(self, *, now=None):
+            return SimpleNamespace(
+                status="setup_required",
+                as_dict=lambda: {
+                    "status": "setup_required",
+                    "diagnostic_codes": ["notion_configuration_missing"],
+                },
+            )
+
+    store, delivery, model = UnusedStore(), Delivery(), Model()
+    result = await run_morning_plan(
+        store=store,
+        syncer=SetupSync(),
+        delivery=delivery,
+        model=model,
+        now=datetime(2026, 9, 3, 14, tzinfo=UTC),
+    )
+
+    assert result["status"] == "setup_required"
+    assert store.plan is None
+    assert model.breakdowns == 0
+    assert delivery.calls == []
 
 
 @pytest.mark.asyncio
@@ -190,3 +222,56 @@ def test_plan_identity_uses_toronto_date_at_utc_boundary() -> None:
     plan = build_daily_plan(PlannerFacts(), now=datetime(2026, 9, 3, 3, 30, tzinfo=UTC))
     prior = build_daily_plan(PlannerFacts(), now=datetime(2026, 9, 2, 23, 30, tzinfo=UTC))
     assert plan.plan_id == prior.plan_id
+
+
+@pytest.mark.asyncio
+async def test_llm_prompts_use_only_bounded_normalized_planner_fields() -> None:
+    prompts: list[str] = []
+
+    class Gateway:
+        async def invoke_structured(self, *, prompt, response_model):
+            prompts.append(prompt)
+            if response_model is PlanCritique:
+                return SimpleNamespace(output=PlanCritique(acceptable=True, concerns=()))
+            return SimpleNamespace(output=None)
+
+    assessment = Assessment(
+        id="opaque-event-id",
+        course="CSC",
+        title="Essay",
+        assessment_type=AssessmentType.ASSIGNMENT,
+        due_at=datetime(2026, 9, 5, 20, tzinfo=UTC),
+        estimated_minutes=60,
+        weight_percent=20,
+        citations=("raw-notion-envelope-must-not-cross",),
+    )
+    model = LLMPlannerModel(Gateway())
+    await model.breakdown(assessment)
+    plan = build_daily_plan(
+        PlannerFacts(
+            assessments=(assessment,),
+            availability=(
+                AvailabilityWindow(
+                    start_at=datetime(2026, 9, 3, 14, tzinfo=UTC),
+                    end_at=datetime(2026, 9, 3, 18, tzinfo=UTC),
+                ),
+            ),
+        ),
+        now=datetime(2026, 9, 3, 14, tzinfo=UTC),
+    )
+    plan = plan.model_copy(
+        update={
+            "blocks": tuple(
+                block.model_copy(update={"rationale": "raw-notion-envelope-must-not-cross"})
+                for block in plan.blocks
+            )
+        }
+    )
+    await model.critique(plan)
+    changes = await model.extract_checkin("completed raw-notion-envelope-must-not-cross")
+
+    assert len(changes) == 1
+    assert len(prompts) == 2
+    assert all("raw-notion-envelope-must-not-cross" not in prompt for prompt in prompts)
+    assert '"assessment_id":"opaque-event-id"' in prompts[0]
+    assert '"deferred_assessment_ids"' in prompts[1]

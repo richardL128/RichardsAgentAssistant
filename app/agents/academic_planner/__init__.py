@@ -17,8 +17,14 @@ from app.agents.academic_planner.contracts import (
     StudyBlock,
     WorkBreakdown,
 )
+from app.agents.academic_planner.sync import (
+    AcademicClarificationService,
+    AcademicNotionSync,
+    AcademicNotionSyncResult,
+)
 from app.agents.academic_planner.workflow import (
     AcademicPlannerStore,
+    AcademicSynchronizer,
     NotionAcademicWriter,
     PlannerDelivery,
     PlannerModelGateway,
@@ -32,7 +38,11 @@ from app.agents.academic_planner.workflow import (
 )
 
 __all__ = [
+    "AcademicClarificationService",
+    "AcademicNotionSync",
+    "AcademicNotionSyncResult",
     "AcademicPlannerStore",
+    "AcademicSynchronizer",
     "AmbiguousFact",
     "Assessment",
     "AssessmentType",

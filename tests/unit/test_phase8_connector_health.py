@@ -51,8 +51,6 @@ def _notion_settings(**overrides: object) -> Settings:
     defaults: dict[str, object] = {
         "notion_token": "notion-secret",
         "notion_courses_database_id": "courses",
-        "notion_assessments_database_id": "assessments",
-        "notion_study_blocks_database_id": "study-blocks",
     }
     defaults.update(overrides)
     return Settings(**defaults)
@@ -281,12 +279,25 @@ def test_discord_authentication_server_error_is_attention() -> None:
 
 
 def test_notion_authentication_not_configured_is_healthy() -> None:
-    settings = Settings()
+    settings = Settings(notion_token="")
 
     result = asyncio.run(check_notion_authentication(settings))
 
     assert result.state is HealthState.HEALTHY
     assert "not configured" in result.diagnostic
+
+
+def test_notion_authentication_accepts_token_without_deprecated_database_ids() -> None:
+    settings = _notion_settings()
+
+    async def run() -> object:
+        transport = httpx.MockTransport(lambda request: httpx.Response(200, json={"id": "bot-id"}))
+        async with httpx.AsyncClient(transport=transport) as client:
+            return await check_notion_authentication(settings, client)
+
+    result = asyncio.run(run())
+
+    assert result.state is HealthState.HEALTHY
 
 
 def test_notion_authentication_success() -> None:

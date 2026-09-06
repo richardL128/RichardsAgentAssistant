@@ -48,6 +48,19 @@ class ConfirmationResponse(BaseModel):
     change_count: int | None = None
 
 
+class AcademicSyncResponse(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    status: Literal["succeeded", "partial", "setup_required"]
+    course_count: int
+    valid_course_count: int
+    assessment_count: int
+    archived_count: int
+    clarification_count: int
+    invalid_calendar_count: int
+    diagnostic_codes: list[str]
+
+
 @router.post("/checkin", response_model=CheckinResponse, status_code=202)
 async def academic_checkin(
     request: Request, payload: CheckinRequest
@@ -110,12 +123,28 @@ async def academic_confirmation(
     )
 
 
+@router.post("/sync", response_model=AcademicSyncResponse)
+async def academic_sync(request: Request) -> AcademicSyncResponse | JSONResponse:
+    """Run the same idempotent Notion sync used before morning planning."""
+
+    syncer = getattr(request.app.state, "academic_syncer", None)
+    if syncer is None:
+        return JSONResponse(
+            status_code=503,
+            content={"status": "unavailable", "error_code": "academic_sync_unavailable"},
+        )
+    result = await syncer.sync()
+    return AcademicSyncResponse.model_validate(result.as_dict())
+
+
 __all__ = [
+    "AcademicSyncResponse",
     "CheckinRequest",
     "CheckinResponse",
     "ConfirmationRequest",
     "ConfirmationResponse",
     "academic_checkin",
     "academic_confirmation",
+    "academic_sync",
     "router",
 ]
