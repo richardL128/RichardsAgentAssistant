@@ -6,6 +6,8 @@ root and that the stack uses the service names in `compose.yaml`:
 `postgres`, `api`, `worker-code-review`, `worker-academic-planner`, and
 `worker-finance`.
 
+For first-time setup, see [Getting started](../getting-started.md).
+
 For a quick console check, open `http://127.0.0.1:8000/` after the API is
 healthy. The shared-services card is backed by the persisted
 `health_checks.check_name = 'shared_services'` row. Agent cards are backed by

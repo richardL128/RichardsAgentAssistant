@@ -30,3 +30,5 @@ htmlcov/
 # custom agent definitions, and session/handoff prompts. Not shared via git.
 .claude/
 .codex/
+
+/presentations/LifeAgent-Intern-Architecture.pptx
