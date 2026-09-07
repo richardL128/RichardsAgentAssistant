@@ -33,6 +33,7 @@ htmlcov/
 
 # Local implementation prompts drafted for agent-assisted development.
 /prompts/
+/prompts-legacy/
 
 /presentations/LifeAgent-Intern-Architecture.pptx
 
