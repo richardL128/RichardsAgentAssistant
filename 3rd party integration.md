@@ -140,12 +140,12 @@ Create one Discord application with one bot user. The three agents share it, but
 
 Use the Discord **Gateway** for incoming private replies and the normal REST API for outbound messages. Gateway is a persistent connection from the local worker to Discord, so the Mac does not need to expose a public URL. This is preferable to an HTTP interaction endpoint for the first local deployment.
 
-The system needs inbound text only for the student's planner check-in/confirmation flow. Do not enable broad message collection. The gateway handler accepts messages only from `DISCORD_ACADEMIC_AUTHORIZED_USER_IDS` in exactly `DISCORD_ACADEMIC_CHANNEL_ID`; direct messages and every other channel are ignored. Keep `DISCORD_ACADEMIC_MESSAGE_CONTENT_ENABLED=false` for button-only or outbound-only deployments. Enable both that flag and Discord's privileged Message Content intent only when this narrow free-text reply flow is required.
+The system needs inbound text only for the student's planner check-in/confirmation flow. Do not enable broad message collection. The gateway handler accepts messages only from `DISCORD_ACADEMIC_AUTHORIZED_USER_IDS` in exactly `DISCORD_ACADEMIC_CHANNEL_ID`; direct messages and every other channel are ignored. When `DISCORD_APPLICATION_ID` is configured, natural-language requests must mention the bot; exact `confirm` and `reject` replies do not need another mention. Keep `DISCORD_ACADEMIC_MESSAGE_CONTENT_ENABLED=false` for button-only or outbound-only deployments. Enable both that flag and Discord's privileged Message Content intent only when this narrow free-text reply flow is required.
 
 ### User setup in Discord
 
 1. Create an application in the [Discord Developer Portal](https://discord.com/developers/applications), then add a Bot user.
-2. Copy the bot token into the secret store. The Application ID and Public Key are not runtime requirements for this Gateway-only flow; add them only if an HTTP interactions endpoint is implemented later. Rotate the token immediately if it is pasted into a terminal, chat, or repository by mistake.
+2. Copy the bot token into the secret store. Also copy the **Application ID** into `DISCORD_APPLICATION_ID`; LifeAgent uses it to recognize and remove `<@bot>` mentions before sending the request to Qwen. The Public Key is not required for this Gateway-only flow. Rotate the token immediately if it is pasted into a terminal, chat, or repository by mistake.
 3. In the Bot settings, enable only required gateway intents. Leave every privileged intent disabled for outbound-only or button-only testing. To receive the planner's inbound free-text check-ins, enable **Message Content Intent** in the portal and set `DISCORD_ACADEMIC_MESSAGE_CONTENT_ENABLED=true`; the listener then requests only Guild Messages and Message Content. Never enable Presence Intent or Server Members Intent.
 4. Create a private server category or private channels for Finance, Code Review, and Planner. Restrict visibility to the owner and bot. A private channel is more reliable than bot DMs, which can be disabled by user/server privacy settings.
 5. Invite the bot with the OAuth2 scope `bot`. The `applications.commands` scope is optional and is needed only if slash commands are implemented later; it is a scope, not a bot permission. Grant only these bot permissions: View Channel, Send Messages, Embed Links, and Read Message History. Add Attach Files only if the plan intentionally sends files. Never grant Administrator, Manage Server, Manage Roles, or broad moderation permissions.
@@ -159,11 +159,14 @@ Keep the public command surface small:
 | Input | Purpose | Allowed action |
 | --- | --- | --- |
 | Planner end-of-day reply in private channel | Report progress/new work | Creates a **proposed** planner/Notion change only. |
+| `<@bot> create ...; update ...; delete ...` | Ask Qwen to resolve one or more course-calendar operations | Runs bounded read-only course/assessment lookups and creates one ordered **proposal**. `delete` is shown and applied as Notion archive. |
 | `confirm <proposal-id>` | Confirm a displayed proposed change | Allows exactly that queued Notion patch. |
 | `reject <proposal-id>` | Decline a proposed change | Marks the proposal rejected; makes no external write. |
 | Optional `/status` | Read health summary | Reads LifeAgent data only. |
 
 Do not add commands to trade, publish GitHub comments, modify finance sources, run arbitrary jobs, or expose raw source material. Agent-sent messages must include the run/proposal ID and a concise source/deep link. Persist a delivery intent before the REST call, then persist the message ID and permalink receipt on success.
+
+The Qwen loop may call only the two read tools `search_courses` and `search_assessments` while resolving names. Its create, update, and archive calls are stored as one proposal and cannot reach Notion until the authorized user sends the exact `confirm <proposal-id>` shown by the bot. Course data-source IDs and assessment page IDs must come from the synchronized catalog; unknown or ambiguous names produce a question instead of a write.
 
 For later buttons/modals/slash commands, Discord interactions may be received by Gateway **or** HTTP webhook, but not both for the same application interaction flow. If an HTTP interaction endpoint is added later, it must be publicly reachable, verify Discord signatures, respond to the initial request quickly, and enqueue long work; it must not run model inference inline.
 

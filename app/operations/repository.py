@@ -4,7 +4,8 @@ from __future__ import annotations
 
 import math
 from collections.abc import Mapping
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
+from typing import Any
 from urllib.parse import urlsplit
 from uuid import UUID
 
@@ -13,7 +14,7 @@ from sqlalchemy.orm import Session
 from sqlalchemy.sql.elements import ColumnElement
 
 from app.core.redaction import redact_text
-from app.db.finance import FinanceRepository
+from app.db.finance import FinanceRepository, FinanceSourceRequestAudit
 from app.db.models import (
     AgentRun,
     AuditEvent,
@@ -37,6 +38,7 @@ from app.operations.contracts import (
     EvidenceLink,
     ExternalLink,
     HealthCard,
+    SourceEndpoint,
     SourceSettings,
     TimelineStep,
 )
@@ -94,6 +96,122 @@ def _health_state(state: HealthState) -> ConsoleState:
     return "attention"
 
 
+def _source_health_state(value: str | None) -> ConsoleState | None:
+    if value == "healthy":
+        return "healthy"
+    if value == "failed":
+        return "failed"
+    if value == "attention":
+        return "attention"
+    return None
+
+
+def _freshness_label(seconds: int) -> str:
+    delta = timedelta(seconds=seconds)
+    if delta < timedelta(hours=1):
+        return f"{seconds // 60} minutes"
+    if delta < timedelta(days=1):
+        return f"{seconds // 3600} hours"
+    return f"{seconds // 86400} days"
+
+
+def _scope_label(
+    *,
+    issuer_scope: tuple[str, ...],
+    cik_scope: tuple[str, ...],
+    ticker_scope: tuple[str, ...],
+) -> str:
+    parts: list[str] = []
+    if issuer_scope:
+        parts.append(f"issuers: {', '.join(issuer_scope)}")
+    if ticker_scope:
+        parts.append(f"tickers: {', '.join(ticker_scope)}")
+    if cik_scope:
+        parts.append(f"CIKs: {', '.join(cik_scope)}")
+    return "; ".join(parts) if parts else "global reviewed endpoint"
+
+
+def _excerpt_label(allowed: bool, max_chars: int | None) -> str:
+    if not allowed:
+        return "no excerpts"
+    if max_chars is None:
+        return "metadata/numeric excerpts only"
+    return f"short excerpts up to {max_chars} chars"
+
+
+def _source_endpoint(
+    endpoint: Any,
+    cache_state: Any | None,
+    latest_audit: FinanceSourceRequestAudit | None,
+    *,
+    source_health: str | None,
+    now: datetime,
+) -> SourceEndpoint:
+    last_retrieved_at = _aware(
+        cache_state.last_retrieved_at if cache_state is not None else None
+    )
+    last_not_modified_at = _aware(
+        cache_state.last_not_modified_at if cache_state is not None else None
+    )
+    latest_contact = max(
+        (value for value in (last_retrieved_at, last_not_modified_at) if value is not None),
+        default=None,
+    )
+    freshness = timedelta(seconds=endpoint.expected_freshness_seconds)
+    if not endpoint.enabled:
+        health: ConsoleState = "attention"
+        diagnostic = "Endpoint is disabled in the reviewed registry."
+    elif latest_audit is not None and latest_audit.outcome == "failed":
+        health = "failed"
+        diagnostic = (
+            "Latest request failed: "
+            f"{_safe_text(latest_audit.error_code, fallback='unknown endpoint error')}."
+        )
+    elif source_health == "failed":
+        health = "failed"
+        diagnostic = (
+            "Latest logical source health is failed; inspect worker logs for endpoint detail."
+        )
+    elif latest_contact is None:
+        health = "attention"
+        diagnostic = "No successful retrieval or conditional 304 has been recorded."
+    elif now - latest_contact > freshness:
+        health = "attention"
+        label = _freshness_label(endpoint.expected_freshness_seconds)
+        diagnostic = f"Endpoint freshness exceeds expected {label}."
+    elif source_health == "attention":
+        health = "attention"
+        diagnostic = "Logical source health needs attention."
+    else:
+        health = "healthy"
+        diagnostic = "Endpoint is within the expected freshness window."
+    return SourceEndpoint(
+        endpoint_id=endpoint.endpoint_id,
+        host=endpoint.host,
+        transport=endpoint.transport_kind,
+        parser=endpoint.parser_kind,
+        registry_version=endpoint.registry_version,
+        enabled=endpoint.enabled,
+        expected_freshness_seconds=endpoint.expected_freshness_seconds,
+        expected_freshness_label=_freshness_label(endpoint.expected_freshness_seconds),
+        request_ceiling=endpoint.request_ceiling,
+        scope_label=_scope_label(
+            issuer_scope=endpoint.issuer_scope,
+            cik_scope=endpoint.cik_scope,
+            ticker_scope=endpoint.ticker_scope,
+        ),
+        excerpt_label=_excerpt_label(endpoint.excerpt_allowed, endpoint.excerpt_max_chars),
+        retention_note=_safe_text(endpoint.retention_note),
+        health=health,
+        diagnostic=diagnostic,
+        last_retrieved_at=last_retrieved_at,
+        last_not_modified_at=last_not_modified_at,
+        watermark_published_at=_aware(
+            cache_state.watermark_published_at if cache_state is not None else None
+        ),
+    )
+
+
 def _evidence_link(reference: EvidenceRef) -> EvidenceLink | None:
     safe_link = _safe_link("evidence", reference.url)
     if safe_link is None:
@@ -140,6 +258,44 @@ class OperationsRepository:
             session,
             allowlist_version=allowlist_version,
         )
+        approved_by_source = {
+            source.source_id: (
+                source.enabled
+                and source.approved_at is not None
+                and source.approval_audit_id is not None
+            )
+            for source in approvals
+        }
+        source_health_by_id = {record.source_id: record.health for record in records}
+        endpoint_records = FinanceRepository.list_source_endpoints(
+            session,
+            allowlist_version=allowlist_version,
+        )
+        latest_audits: dict[tuple[str, str], FinanceSourceRequestAudit] = {}
+        for audit in session.scalars(
+            select(FinanceSourceRequestAudit)
+            .where(FinanceSourceRequestAudit.allowlist_version == allowlist_version)
+            .order_by(FinanceSourceRequestAudit.requested_at.desc())
+        ):
+            latest_audits.setdefault((audit.source_id, audit.endpoint_id), audit)
+        endpoints_by_source: dict[str, list[SourceEndpoint]] = {}
+        now = datetime.now(UTC)
+        for endpoint in endpoint_records:
+            cache_state = FinanceRepository.load_source_cache_state(
+                session,
+                allowlist_version=allowlist_version,
+                source_id=endpoint.source_id,
+                endpoint_id=endpoint.endpoint_id,
+            )
+            endpoints_by_source.setdefault(endpoint.source_id, []).append(
+                _source_endpoint(
+                    endpoint,
+                    cache_state,
+                    latest_audits.get((endpoint.source_id, endpoint.endpoint_id)),
+                    source_health=source_health_by_id.get(endpoint.source_id),
+                    now=now,
+                )
+            )
         approval_complete = FinanceRepository.source_approval_gate(
             session,
             allowlist_version=allowlist_version,
@@ -167,10 +323,19 @@ class OperationsRepository:
             sources=tuple(
                 ApprovedSource(
                     slot=slot,
+                    source_id=record.source_id,
                     name=record.name,
                     hostname=urlsplit(record.base_url).hostname or "invalid-source-url",
+                    classification=record.classification,
+                    source_version=record.source_version,
                     entitlement=record.entitlement,
                     enabled=record.enabled,
+                    approved=approved_by_source.get(record.source_id, False),
+                    approved_at=_aware(record.approved_at),
+                    health=_source_health_state(record.health),
+                    health_checked_at=_aware(record.health_checked_at),
+                    endpoint_count=len(endpoints_by_source.get(record.source_id, ())),
+                    endpoints=tuple(endpoints_by_source.get(record.source_id, ())),
                 )
                 for slot, record in enumerate(records, start=1)
             ),

@@ -11,6 +11,7 @@ from app.main import create_app
 
 def test_main_mounts_academic_proposals_and_confirmation_fails_closed(tmp_path: Path) -> None:
     settings = Settings(
+        _env_file=None,
         database_url=f"sqlite+pysqlite:///{tmp_path / 'academic-main.db'}",
         artifact_root=tmp_path / "artifacts",
         notion_token="",
@@ -50,6 +51,7 @@ def test_main_mounts_academic_proposals_and_confirmation_fails_closed(tmp_path: 
 
 def test_main_wires_free_text_without_requiring_notion_mapping(tmp_path: Path) -> None:
     settings = Settings(
+        _env_file=None,
         database_url=f"sqlite+pysqlite:///{tmp_path / 'academic-gateway.db'}",
         artifact_root=tmp_path / "artifacts",
         discord_bot_token="test-token",
@@ -70,6 +72,7 @@ def test_invalid_courses_database_id_is_setup_condition_not_startup_crash(
     tmp_path: Path,
 ) -> None:
     settings = Settings(
+        _env_file=None,
         database_url=f"sqlite+pysqlite:///{tmp_path / 'invalid-notion.db'}",
         artifact_root=tmp_path / "artifacts",
         notion_token="notion-secret",
@@ -84,3 +87,18 @@ def test_invalid_courses_database_id_is_setup_condition_not_startup_crash(
     assert response.status_code == 200
     assert response.json()["status"] == "setup_required"
     assert response.json()["diagnostic_codes"] == ["notion_configuration_invalid"]
+
+
+def test_valid_notion_configuration_wires_discovered_calendar_writer(tmp_path: Path) -> None:
+    settings = Settings(
+        _env_file=None,
+        database_url=f"sqlite+pysqlite:///{tmp_path / 'academic-writer.db'}",
+        artifact_root=tmp_path / "artifacts",
+        notion_token="notion-secret",
+        notion_courses_database_id="coursesDatabase123",
+    )
+
+    app = create_app(settings)
+
+    assert app.state.notion_writer is not None
+    app.state.database.dispose()

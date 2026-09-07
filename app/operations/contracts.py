@@ -113,14 +113,45 @@ class AcknowledgementResult(BaseModel):
     acknowledged_at: datetime
 
 
+class SourceEndpoint(BaseModel):
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    endpoint_id: str
+    host: str
+    transport: str
+    parser: str
+    registry_version: str
+    enabled: bool
+    expected_freshness_seconds: int = Field(gt=0)
+    expected_freshness_label: str
+    request_ceiling: int = Field(gt=0)
+    scope_label: str
+    excerpt_label: str
+    retention_note: str
+    health: ConsoleState
+    diagnostic: str
+    last_retrieved_at: datetime | None = None
+    last_not_modified_at: datetime | None = None
+    watermark_published_at: datetime | None = None
+
+
 class ApprovedSource(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True)
 
     slot: int = Field(ge=1, le=8)
+    source_id: str | None = None
     name: str
     hostname: str
+    classification: str | None = None
+    source_version: str | None = None
     entitlement: str
     enabled: bool
+    approved: bool = False
+    approved_at: datetime | None = None
+    health: ConsoleState | None = None
+    health_checked_at: datetime | None = None
+    endpoint_count: int = Field(default=0, ge=0)
+    endpoints: tuple[SourceEndpoint, ...] = ()
 
 
 class SourceSettings(BaseModel):
@@ -151,6 +182,7 @@ __all__ = [
     "EvidenceLink",
     "ExternalLink",
     "HealthCard",
+    "SourceEndpoint",
     "SourceSettings",
     "TimelineStep",
 ]

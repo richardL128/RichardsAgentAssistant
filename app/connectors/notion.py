@@ -5,7 +5,7 @@ from __future__ import annotations
 import json
 import re
 from collections.abc import AsyncIterator, Mapping, Sequence
-from datetime import UTC, datetime
+from datetime import UTC, date, datetime
 from typing import Any, Final, Literal, Protocol, cast
 from urllib.parse import quote, urlsplit
 
@@ -298,6 +298,18 @@ def _validate_page_id(value: str) -> str:
     return value
 
 
+def _validate_property_reference(value: str, label: str) -> str:
+    if not value or value != value.strip() or len(value) > 128:
+        raise permanent_error(ErrorCode.INPUT_INVALID, f"Notion {label} is invalid")
+    return value
+
+
+def _validate_proposal_id(value: str) -> str:
+    if not value or value != value.strip() or len(value) > 255:
+        raise permanent_error(ErrorCode.INPUT_INVALID, "Notion proposal ID is invalid")
+    return value
+
+
 def _validate_attachment_url(value: str) -> str:
     parsed = urlsplit(value)
     hostname = (parsed.hostname or "").casefold().rstrip(".")
@@ -364,6 +376,44 @@ def _date_value(value: Any) -> NotionDateValue | None:
 
 def _title_segments(title: str) -> list[dict[str, Any]]:
     return [{"type": "text", "text": {"content": title}}]
+
+
+def _validate_title_text(value: str) -> str:
+    if not value.strip():
+        raise permanent_error(ErrorCode.INPUT_INVALID, "Notion title must not be empty")
+    if len(value) > 1_024:
+        raise permanent_error(ErrorCode.INPUT_INVALID, "Notion title is too large")
+    return value
+
+
+def _validate_expected_title(value: str) -> str:
+    if len(value) > 1_024:
+        raise permanent_error(ErrorCode.INPUT_INVALID, "Notion expected title is too large")
+    return value
+
+
+def _notion_date_start(value: datetime | str) -> str:
+    if isinstance(value, datetime):
+        if value.tzinfo is None or value.utcoffset() is None:
+            raise permanent_error(ErrorCode.INPUT_INVALID, "Notion due date must be timezone-aware")
+        return value.astimezone(UTC).isoformat().replace("+00:00", "Z")
+    raw = value.strip()
+    if not raw or len(raw) > 128:
+        raise permanent_error(ErrorCode.INPUT_INVALID, "Notion due date is invalid")
+    try:
+        if "T" in raw:
+            parsed = datetime.fromisoformat(raw.replace("Z", "+00:00"))
+            if parsed.tzinfo is None or parsed.utcoffset() is None:
+                raise ValueError
+            return parsed.astimezone(UTC).isoformat().replace("+00:00", "Z")
+        date.fromisoformat(raw)
+        return raw
+    except ValueError:
+        raise permanent_error(ErrorCode.INPUT_INVALID, "Notion due date is invalid") from None
+
+
+def _date_property_value(value: datetime | str) -> dict[str, Any]:
+    return {"date": {"start": _notion_date_start(value)}}
 
 
 def _property_id(name: str, value: Mapping[str, Any]) -> str:
@@ -830,6 +880,154 @@ class NotionConnector:
             url=data.get("url") if isinstance(data.get("url"), str) else None,
             property_id=title_property_id,
         )
+
+    async def create_assessment_page(
+        self,
+        *,
+        proposal_id: str,
+        data_source_id: str,
+        title_property_id: str,
+        date_property_id: str,
+        title: str,
+        due: datetime | str,
+    ) -> NotionWriteReceipt:
+        """Create one assessment page under a discovered Notion data source."""
+
+        receipt_id = _validate_proposal_id(proposal_id)
+        source_id = _validate_id(data_source_id, "data source ID")
+        title_id = _validate_property_reference(title_property_id, "title property")
+        date_id = _validate_property_reference(date_property_id, "date property")
+        response = await self._request(
+            "POST",
+            "/pages",
+            json_body={
+                "parent": {"type": "data_source_id", "data_source_id": source_id},
+                "properties": {
+                    title_id: {"title": _title_segments(_validate_title_text(title))},
+                    date_id: _date_property_value(due),
+                },
+            },
+        )
+        data = self._json_object(response, "Notion page create")
+        page_id_value = data.get("id")
+        if not isinstance(page_id_value, str):
+            raise transient_error(
+                ErrorCode.CONNECTOR_TRANSIENT, "Notion returned invalid page receipt"
+            )
+        return NotionWriteReceipt(
+            proposal_id=receipt_id,
+            page_id=_validate_page_id(page_id_value),
+            url=data.get("url") if isinstance(data.get("url"), str) else None,
+        )
+
+    async def guarded_update_assessment_page(
+        self,
+        *,
+        proposal_id: str,
+        page_id: str,
+        title_property_id: str,
+        date_property_id: str,
+        expected_title: str,
+        expected_last_edited_at: datetime,
+        title: str | None = None,
+        due: datetime | str | None = None,
+    ) -> NotionWriteReceipt:
+        """Patch only discovered assessment title/date fields when the page is unchanged."""
+
+        receipt_id = _validate_proposal_id(proposal_id)
+        title_id = _validate_property_reference(title_property_id, "title property")
+        date_id = _validate_property_reference(date_property_id, "date property")
+        if title is None and due is None:
+            raise permanent_error(
+                ErrorCode.INPUT_INVALID, "Notion assessment update requires a title or due date"
+            )
+        current = await self._guarded_assessment_precondition(
+            page_id=page_id,
+            title_property_id=title_id,
+            expected_title=expected_title,
+            expected_last_edited_at=expected_last_edited_at,
+        )
+        properties: dict[str, Any] = {}
+        if title is not None:
+            properties[title_id] = {"title": _title_segments(_validate_title_text(title))}
+        if due is not None:
+            properties[date_id] = _date_property_value(due)
+        response = await self._request(
+            "PATCH",
+            f"/pages/{quote(current.page_id, safe='')}",
+            json_body={"properties": properties},
+        )
+        data = self._json_object(response, "Notion page update")
+        patched_id = data.get("id")
+        if not isinstance(patched_id, str):
+            raise transient_error(
+                ErrorCode.CONNECTOR_TRANSIENT, "Notion returned invalid page receipt"
+            )
+        return NotionWriteReceipt(
+            proposal_id=receipt_id,
+            page_id=_validate_page_id(patched_id),
+            url=data.get("url") if isinstance(data.get("url"), str) else None,
+        )
+
+    async def guarded_archive_assessment_page(
+        self,
+        *,
+        proposal_id: str,
+        page_id: str,
+        title_property_id: str,
+        expected_title: str,
+        expected_last_edited_at: datetime,
+    ) -> NotionWriteReceipt:
+        """Archive one unchanged assessment page; delete requests map to this method."""
+
+        receipt_id = _validate_proposal_id(proposal_id)
+        title_id = _validate_property_reference(title_property_id, "title property")
+        current = await self._guarded_assessment_precondition(
+            page_id=page_id,
+            title_property_id=title_id,
+            expected_title=expected_title,
+            expected_last_edited_at=expected_last_edited_at,
+        )
+        response = await self._request(
+            "PATCH",
+            f"/pages/{quote(current.page_id, safe='')}",
+            json_body={"archived": True},
+        )
+        data = self._json_object(response, "Notion page archive")
+        patched_id = data.get("id")
+        if not isinstance(patched_id, str):
+            raise transient_error(
+                ErrorCode.CONNECTOR_TRANSIENT, "Notion returned invalid page receipt"
+            )
+        return NotionWriteReceipt(
+            proposal_id=receipt_id,
+            page_id=_validate_page_id(patched_id),
+            url=data.get("url") if isinstance(data.get("url"), str) else None,
+        )
+
+    async def _guarded_assessment_precondition(
+        self,
+        *,
+        page_id: str,
+        title_property_id: str,
+        expected_title: str,
+        expected_last_edited_at: datetime,
+    ) -> NotionTitlePrecondition:
+        expected = expected_last_edited_at
+        if expected.tzinfo is None or expected.utcoffset() is None:
+            raise permanent_error(
+                ErrorCode.INPUT_INVALID, "Notion edited timestamp must be timezone-aware"
+            )
+        expected_title_value = _validate_expected_title(expected_title)
+        current = await self.retrieve_title_precondition(page_id, title_property_id)
+        if (
+            current.current_title != expected_title_value
+            or current.last_edited_at != expected.astimezone(UTC)
+            or current.archived
+            or current.in_trash
+        ):
+            raise NotionWriteConflict(current=current)
+        return current
 
     async def query_database(
         self,

@@ -9,7 +9,7 @@ from __future__ import annotations
 from datetime import time
 from functools import lru_cache
 from pathlib import Path
-from typing import Annotated, Any, Final, Self
+from typing import Annotated, Any, Final, Literal, Self
 from urllib.parse import urlsplit, urlunsplit
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
@@ -61,6 +61,8 @@ class Settings(BaseSettings):
         "d039cde69ac1f5a43d5134182adfefa65bdb533362a625b936e6171a53296eb3"
     )
     embedding_model: str = "qwen3-embedding:0.6b"
+    embedding_model_digest: str | None = None
+    embedding_timeout_seconds: Annotated[float, Field(gt=0, le=300)] = 30.0
     discord_api_base_url: AnyHttpUrl = AnyHttpUrl(DISCORD_API_BASE_URL)
 
     # Connector settings are declared now so all deployment configuration has
@@ -77,7 +79,9 @@ class Settings(BaseSettings):
     notion_courses_database_id: str | None = None
     notion_assessments_database_id: str | None = None
     notion_study_blocks_database_id: str | None = None
-    finance_source_allowlist_version: str = "finance-sources-2026.09"
+    finance_source_allowlist_version: str = "finance-sources-2026.09-v2"
+    finance_eia_mode: Literal["bulk", "api"] = "bulk"
+    sec_user_agent: str = "LifeAgent/0.1 contact@example.com"
     dvids_api_key: SecretValue = None
     eia_api_key: SecretValue = None
     alpha_vantage_api_key: SecretValue = None
@@ -99,6 +103,7 @@ class Settings(BaseSettings):
     discord_code_review_channel_id: str | None = None
     discord_academic_channel_id: str | None = None
     discord_finance_channel_id: str | None = None
+    discord_application_id: str | None = None
     discord_academic_authorized_user_ids: list[int] = Field(default_factory=lambda: list[int]())
     discord_academic_gateway_enabled: bool = False
     discord_academic_message_content_enabled: bool = False
@@ -121,11 +126,23 @@ class Settings(BaseSettings):
     academic_plan_horizon_days: Annotated[int, Field(ge=7, le=14)] = 14
     academic_buffer_ratio: Annotated[float, Field(ge=0.05, le=0.5)] = 0.15
     academic_default_block_minutes: Annotated[int, Field(ge=15, le=240)] = 60
+    academic_memory_enabled: bool = True
+    academic_memory_default_practice_minutes: Annotated[int, Field(ge=5, le=180)] = 30
+    academic_memory_snooze_after_missed_checkins: Annotated[int, Field(ge=1, le=30)] = 2
+    academic_memory_delete_after_missed_checkins: Annotated[int, Field(ge=1, le=30)] = 5
     academic_sync_lookback_days: Annotated[int, Field(ge=0, le=30)] = 2
     academic_confirmation_ttl_hours: Annotated[int, Field(gt=0, le=168)] = 24
     academic_morning_schedule: time = time(hour=8)
     academic_end_of_day_schedule: time = time(hour=21)
     finance_market_open_schedule: time = time(hour=9)
+    finance_feed_poll_minutes: Annotated[int, Field(ge=5, le=10)] = 10
+    finance_federal_register_poll_minutes: Annotated[int, Field(ge=15, le=1440)] = 60
+    finance_eia_bulk_poll_minutes: Annotated[int, Field(ge=60, le=1440)] = 720
+    finance_eia_api_poll_minutes: Annotated[int, Field(ge=5, le=1440)] = 60
+    finance_etf_poll_minutes: Annotated[int, Field(ge=60, le=2880)] = 1440
+    finance_cold_start_backfill_hours: Annotated[int, Field(ge=1, le=168)] = 24
+    finance_registry_max_fanout: Annotated[int, Field(ge=1, le=100)] = 20
+    finance_bulk_max_payload_bytes: Annotated[int, Field(ge=1_048_576, le=268_435_456)] = 67_108_864
 
     @field_validator(
         "github_private_key",
@@ -156,9 +173,11 @@ class Settings(BaseSettings):
         "discord_code_review_channel_id",
         "discord_academic_channel_id",
         "discord_finance_channel_id",
+        "discord_application_id",
         "notion_courses_database_id",
         "notion_assessments_database_id",
         "notion_study_blocks_database_id",
+        "embedding_model_digest",
         mode="before",
     )
     @classmethod
@@ -195,6 +214,13 @@ class Settings(BaseSettings):
             raise ValueError("finance source allowlist version must not be empty")
         return value
 
+    @field_validator("sec_user_agent")
+    @classmethod
+    def sec_user_agent_is_descriptive(cls, value: str) -> str:
+        if "/" not in value or "@" not in value or len(value) < 12:
+            raise ValueError("SEC user agent must identify the application and a contact")
+        return value
+
     @field_validator("ollama_model", "embedding_model")
     @classmethod
     def model_name_is_present(cls, value: str) -> str:
@@ -225,6 +251,13 @@ class Settings(BaseSettings):
             raise ValueError(
                 "non-default Discord API URL is only allowed in acceptance environment"
             )
+        if self.finance_eia_mode == "api" and self.eia_api_key is None:
+            raise ValueError("FINANCE_EIA_MODE=api requires EIA_API_KEY")
+        if (
+            self.academic_memory_snooze_after_missed_checkins
+            > self.academic_memory_delete_after_missed_checkins
+        ):
+            raise ValueError("academic memory snooze threshold cannot exceed delete threshold")
         return self
 
     @field_validator("repository_allowlist")
@@ -248,11 +281,12 @@ class Settings(BaseSettings):
         "discord_code_review_channel_id",
         "discord_academic_channel_id",
         "discord_finance_channel_id",
+        "discord_application_id",
     )
     @classmethod
-    def discord_code_review_channel_is_id(cls, value: str | None) -> str | None:
+    def discord_identifier_is_numeric(cls, value: str | None) -> str | None:
         if value is not None and not value.isdigit():
-            raise ValueError("Discord code-review channel must be a numeric ID")
+            raise ValueError("Discord channel/application identifiers must be numeric IDs")
         return value
 
     @field_validator("discord_academic_authorized_user_ids")
@@ -304,6 +338,8 @@ class Settings(BaseSettings):
             "ollama_reasoning": self.ollama_reasoning,
             "ollama_model_digest": self.ollama_model_digest,
             "embedding_model": self.embedding_model,
+            "embedding_model_digest": self.embedding_model_digest,
+            "embedding_timeout_seconds": self.embedding_timeout_seconds,
             "discord_api_base_url": self._safe_url(str(self.discord_api_base_url)),
             "retry_max_attempts": self.retry_max_attempts,
             "retry_base_delay_seconds": self.retry_base_delay_seconds,
@@ -324,6 +360,7 @@ class Settings(BaseSettings):
             ),
             "discord_academic_channel_configured": self.discord_academic_channel_id is not None,
             "discord_finance_channel_configured": self.discord_finance_channel_id is not None,
+            "discord_application_id_configured": self.discord_application_id is not None,
             "discord_academic_authorized_user_count": len(
                 self.discord_academic_authorized_user_ids
             ),
@@ -335,6 +372,16 @@ class Settings(BaseSettings):
                 self.ops_console_username is not None and self.ops_console_password is not None
             ),
             "finance_source_allowlist_version": self.finance_source_allowlist_version,
+            "finance_eia_mode": self.finance_eia_mode,
+            "sec_user_agent_configured": bool(self.sec_user_agent),
+            "finance_feed_poll_minutes": self.finance_feed_poll_minutes,
+            "finance_federal_register_poll_minutes": (self.finance_federal_register_poll_minutes),
+            "finance_eia_bulk_poll_minutes": self.finance_eia_bulk_poll_minutes,
+            "finance_eia_api_poll_minutes": self.finance_eia_api_poll_minutes,
+            "finance_etf_poll_minutes": self.finance_etf_poll_minutes,
+            "finance_cold_start_backfill_hours": self.finance_cold_start_backfill_hours,
+            "finance_registry_max_fanout": self.finance_registry_max_fanout,
+            "finance_bulk_max_payload_bytes": self.finance_bulk_max_payload_bytes,
             "finance_source_credentials_configured": sum(
                 value is not None
                 for value in (
@@ -388,6 +435,16 @@ class Settings(BaseSettings):
             "academic_plan_horizon_days": self.academic_plan_horizon_days,
             "academic_buffer_ratio": self.academic_buffer_ratio,
             "academic_default_block_minutes": self.academic_default_block_minutes,
+            "academic_memory_enabled": self.academic_memory_enabled,
+            "academic_memory_default_practice_minutes": (
+                self.academic_memory_default_practice_minutes
+            ),
+            "academic_memory_snooze_after_missed_checkins": (
+                self.academic_memory_snooze_after_missed_checkins
+            ),
+            "academic_memory_delete_after_missed_checkins": (
+                self.academic_memory_delete_after_missed_checkins
+            ),
             "academic_sync_lookback_days": self.academic_sync_lookback_days,
             "academic_confirmation_ttl_hours": self.academic_confirmation_ttl_hours,
             "academic_morning_schedule": self.academic_morning_schedule.isoformat(

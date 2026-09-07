@@ -20,6 +20,7 @@ from sqlalchemy import (
     DateTime,
     Float,
     ForeignKey,
+    ForeignKeyConstraint,
     Index,
     Integer,
     String,
@@ -210,6 +211,174 @@ class FinanceETFExposure(Base):
     weight_percent: Mapped[float] = mapped_column(Float, nullable=False)
     source_id: Mapped[str] = mapped_column(String(64), nullable=False)
     as_of: Mapped[date] = mapped_column(Date, nullable=False)
+    source_url: Mapped[str | None] = mapped_column(String(2048))
+    retrieved_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+
+
+class FinanceSourceEndpoint(Base):
+    __tablename__ = "finance_source_endpoints"
+    __table_args__ = (
+        ForeignKeyConstraint(
+            ["source_id", "allowlist_version"],
+            [
+                "finance_approved_sources.source_id",
+                "finance_approved_sources.allowlist_version",
+            ],
+            ondelete="CASCADE",
+            name="fk_finance_source_endpoints_source_allowlist",
+        ),
+        UniqueConstraint(
+            "allowlist_version",
+            "source_id",
+            "endpoint_id",
+            name="uq_finance_source_endpoints_allowlist_source_endpoint",
+        ),
+        CheckConstraint("length(allowlist_version) > 0", name="allowlist_version_nonempty"),
+        CheckConstraint("length(source_id) > 0", name="source_id_nonempty"),
+        CheckConstraint("length(endpoint_id) > 0", name="endpoint_id_nonempty"),
+        CheckConstraint("length(base_url) > 0", name="base_url_nonempty"),
+        CheckConstraint("length(host) > 0", name="host_nonempty"),
+        CheckConstraint(
+            "transport_kind IN ('json_http','rss_atom','bulk_file')",
+            name="transport_kind_valid",
+        ),
+        CheckConstraint(
+            "parser_kind IN ('json','rss','atom','csv','xls','xlsx')",
+            name="parser_kind_valid",
+        ),
+        CheckConstraint("length(registry_version) > 0", name="registry_version_nonempty"),
+        CheckConstraint("expected_freshness_seconds > 0", name="expected_freshness_positive"),
+        CheckConstraint("request_ceiling > 0", name="request_ceiling_positive"),
+        CheckConstraint("length(license_note) > 0", name="license_note_nonempty"),
+        CheckConstraint("length(retention_note) > 0", name="retention_note_nonempty"),
+        CheckConstraint(
+            "excerpt_allowed OR excerpt_max_chars IS NULL",
+            name="endpoint_excerpt_limit_requires_permission",
+        ),
+        CheckConstraint(
+            "excerpt_max_chars IS NULL OR (excerpt_max_chars >= 1 AND excerpt_max_chars <= 500)",
+            name="endpoint_excerpt_max_chars_valid",
+        ),
+        Index(
+            "ix_finance_source_endpoints_allowlist_source",
+            "allowlist_version",
+            "source_id",
+            "enabled",
+        ),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(primary_key=True, default=uuid.uuid4)
+    allowlist_version: Mapped[str] = mapped_column(String(128), nullable=False)
+    source_id: Mapped[str] = mapped_column(String(64), nullable=False)
+    endpoint_id: Mapped[str] = mapped_column(String(128), nullable=False)
+    base_url: Mapped[str] = mapped_column(String(2048), nullable=False)
+    host: Mapped[str] = mapped_column(String(255), nullable=False)
+    transport_kind: Mapped[str] = mapped_column(String(32), nullable=False)
+    parser_kind: Mapped[str] = mapped_column(String(32), nullable=False)
+    registry_version: Mapped[str] = mapped_column(String(128), nullable=False)
+    enabled: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
+    expected_freshness_seconds: Mapped[int] = mapped_column(Integer, nullable=False)
+    request_ceiling: Mapped[int] = mapped_column(Integer, nullable=False)
+    license_note: Mapped[str] = mapped_column(String(1000), nullable=False)
+    retention_note: Mapped[str] = mapped_column(String(1000), nullable=False)
+    excerpt_allowed: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+    excerpt_max_chars: Mapped[int | None] = mapped_column(Integer)
+    issuer_scope: Mapped[list[str]] = mapped_column(JSON, nullable=False, default=list)
+    cik_scope: Mapped[list[str]] = mapped_column(JSON, nullable=False, default=list)
+    ticker_scope: Mapped[list[str]] = mapped_column(JSON, nullable=False, default=list)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, default=lambda: datetime.now(UTC)
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, default=lambda: datetime.now(UTC)
+    )
+
+
+class FinanceSourceCacheState(Base):
+    __tablename__ = "finance_source_cache_state"
+    __table_args__ = (
+        ForeignKeyConstraint(
+            ["allowlist_version", "source_id", "endpoint_id"],
+            [
+                "finance_source_endpoints.allowlist_version",
+                "finance_source_endpoints.source_id",
+                "finance_source_endpoints.endpoint_id",
+            ],
+            ondelete="CASCADE",
+            name="fk_finance_source_cache_state_endpoint",
+        ),
+        UniqueConstraint(
+            "allowlist_version",
+            "source_id",
+            "endpoint_id",
+            name="uq_finance_source_cache_state_endpoint",
+        ),
+        CheckConstraint("length(allowlist_version) > 0", name="allowlist_version_nonempty"),
+        CheckConstraint("length(source_id) > 0", name="source_id_nonempty"),
+        CheckConstraint("length(endpoint_id) > 0", name="endpoint_id_nonempty"),
+        Index(
+            "ix_finance_source_cache_state_watermark",
+            "allowlist_version",
+            "source_id",
+            "watermark_published_at",
+        ),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(primary_key=True, default=uuid.uuid4)
+    allowlist_version: Mapped[str] = mapped_column(String(128), nullable=False)
+    source_id: Mapped[str] = mapped_column(String(64), nullable=False)
+    endpoint_id: Mapped[str] = mapped_column(String(128), nullable=False)
+    etag: Mapped[str | None] = mapped_column(String(512))
+    last_modified: Mapped[str | None] = mapped_column(String(512))
+    watermark_external_id: Mapped[str | None] = mapped_column(String(512))
+    watermark_published_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    cached_artifact_key: Mapped[str | None] = mapped_column(String(512))
+    payload_sha256: Mapped[str | None] = mapped_column(String(64))
+    last_retrieved_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    last_not_modified_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, default=lambda: datetime.now(UTC)
+    )
+
+
+class FinanceSourceRequestAudit(Base):
+    __tablename__ = "finance_source_request_audits"
+    __table_args__ = (
+        ForeignKeyConstraint(
+            ["allowlist_version", "source_id", "endpoint_id"],
+            [
+                "finance_source_endpoints.allowlist_version",
+                "finance_source_endpoints.source_id",
+                "finance_source_endpoints.endpoint_id",
+            ],
+            ondelete="RESTRICT",
+            name="fk_finance_source_request_audits_endpoint",
+        ),
+        CheckConstraint(
+            "outcome IN ('succeeded','not_modified','failed')",
+            name="outcome_valid",
+        ),
+        Index(
+            "ix_finance_source_request_audits_endpoint_time",
+            "allowlist_version",
+            "source_id",
+            "endpoint_id",
+            "requested_at",
+        ),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(primary_key=True, default=uuid.uuid4)
+    allowlist_version: Mapped[str] = mapped_column(String(128), nullable=False)
+    source_id: Mapped[str] = mapped_column(String(64), nullable=False)
+    endpoint_id: Mapped[str] = mapped_column(String(128), nullable=False)
+    requested_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    status_code: Mapped[int | None] = mapped_column(Integer)
+    outcome: Mapped[str] = mapped_column(String(32), nullable=False)
+    error_code: Mapped[str | None] = mapped_column(String(128))
+    not_modified: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, default=lambda: datetime.now(UTC)
+    )
 
 
 class FinanceInvestmentThesis(Base):
@@ -296,6 +465,44 @@ class FinanceSourceRecord:
     approved_at: datetime | None
     health: str | None
     health_checked_at: datetime | None
+
+
+@dataclass(frozen=True, slots=True)
+class FinanceSourceEndpointRecord:
+    allowlist_version: str
+    source_id: str
+    endpoint_id: str
+    base_url: str
+    host: str
+    transport_kind: str
+    parser_kind: str
+    registry_version: str
+    enabled: bool
+    expected_freshness_seconds: int
+    request_ceiling: int
+    license_note: str
+    retention_note: str
+    excerpt_allowed: bool
+    excerpt_max_chars: int | None
+    issuer_scope: tuple[str, ...]
+    cik_scope: tuple[str, ...]
+    ticker_scope: tuple[str, ...]
+
+
+@dataclass(frozen=True, slots=True)
+class FinanceSourceCacheStateRecord:
+    allowlist_version: str
+    source_id: str
+    endpoint_id: str
+    etag: str | None
+    last_modified: str | None
+    watermark_external_id: str | None
+    watermark_published_at: datetime | None
+    cached_artifact_key: str | None
+    payload_sha256: str | None
+    last_retrieved_at: datetime | None
+    last_not_modified_at: datetime | None
+    updated_at: datetime
 
 
 @dataclass(frozen=True, slots=True)
@@ -513,7 +720,11 @@ class FinanceRepository:
         weight_percent: float,
         source_id: str,
         as_of: date,
+        source_url: str | None = None,
+        retrieved_at: datetime | None = None,
     ) -> FinanceETFExposure:
+        if retrieved_at is not None:
+            retrieved_at = _utc(retrieved_at, "retrieved_at")
         return _upsert(
             session,
             FinanceETFExposure,
@@ -528,8 +739,232 @@ class FinanceRepository:
                 "weight_percent": weight_percent,
                 "source_id": source_id,
                 "as_of": as_of,
+                "source_url": source_url,
+                "retrieved_at": retrieved_at,
             },
         )
+
+    @staticmethod
+    def upsert_etf_exposures(
+        session: Session, exposures: Sequence[ETFExposure]
+    ) -> tuple[FinanceETFExposure, ...]:
+        return tuple(
+            FinanceRepository.upsert_etf_exposure(
+                session,
+                etf_symbol=exposure.etf_symbol,
+                underlying_symbol=exposure.underlying_symbol,
+                weight_percent=exposure.weight_percent,
+                source_id=exposure.source_id,
+                as_of=exposure.as_of,
+                source_url=str(exposure.source_url) if exposure.source_url is not None else None,
+                retrieved_at=exposure.retrieved_at,
+            )
+            for exposure in exposures
+        )
+
+    @staticmethod
+    def upsert_source_endpoint(
+        session: Session,
+        *,
+        allowlist_version: str,
+        source_id: str,
+        endpoint_id: str,
+        base_url: str,
+        host: str,
+        transport_kind: str,
+        parser_kind: str,
+        registry_version: str,
+        expected_freshness_seconds: int,
+        request_ceiling: int,
+        license_note: str,
+        retention_note: str,
+        enabled: bool = True,
+        excerpt_allowed: bool = False,
+        excerpt_max_chars: int | None = None,
+        issuer_scope: Sequence[str] = (),
+        cik_scope: Sequence[str] = (),
+        ticker_scope: Sequence[str] = (),
+    ) -> FinanceSourceEndpoint:
+        return _upsert(
+            session,
+            FinanceSourceEndpoint,
+            [
+                FinanceSourceEndpoint.allowlist_version == allowlist_version,
+                FinanceSourceEndpoint.source_id == source_id,
+                FinanceSourceEndpoint.endpoint_id == endpoint_id,
+            ],
+            {
+                "allowlist_version": allowlist_version,
+                "source_id": source_id,
+                "endpoint_id": endpoint_id,
+                "base_url": base_url,
+                "host": host,
+                "transport_kind": transport_kind,
+                "parser_kind": parser_kind,
+                "registry_version": registry_version,
+                "enabled": enabled,
+                "expected_freshness_seconds": expected_freshness_seconds,
+                "request_ceiling": request_ceiling,
+                "license_note": license_note,
+                "retention_note": retention_note,
+                "excerpt_allowed": excerpt_allowed,
+                "excerpt_max_chars": excerpt_max_chars,
+                "issuer_scope": list(issuer_scope),
+                "cik_scope": list(cik_scope),
+                "ticker_scope": list(ticker_scope),
+                "updated_at": datetime.now(UTC),
+            },
+        )
+
+    @staticmethod
+    def list_source_endpoints(
+        session: Session,
+        *,
+        allowlist_version: str,
+        source_id: str | None = None,
+        enabled_only: bool = False,
+    ) -> tuple[FinanceSourceEndpointRecord, ...]:
+        statement = select(FinanceSourceEndpoint).where(
+            FinanceSourceEndpoint.allowlist_version == allowlist_version
+        )
+        if source_id is not None:
+            statement = statement.where(FinanceSourceEndpoint.source_id == source_id)
+        if enabled_only:
+            statement = statement.where(FinanceSourceEndpoint.enabled.is_(True))
+        statement = statement.order_by(
+            FinanceSourceEndpoint.source_id,
+            FinanceSourceEndpoint.endpoint_id,
+        )
+        return tuple(
+            FinanceSourceEndpointRecord(
+                allowlist_version=row.allowlist_version,
+                source_id=row.source_id,
+                endpoint_id=row.endpoint_id,
+                base_url=row.base_url,
+                host=row.host,
+                transport_kind=row.transport_kind,
+                parser_kind=row.parser_kind,
+                registry_version=row.registry_version,
+                enabled=row.enabled,
+                expected_freshness_seconds=row.expected_freshness_seconds,
+                request_ceiling=row.request_ceiling,
+                license_note=row.license_note,
+                retention_note=row.retention_note,
+                excerpt_allowed=row.excerpt_allowed,
+                excerpt_max_chars=row.excerpt_max_chars,
+                issuer_scope=tuple(row.issuer_scope),
+                cik_scope=tuple(row.cik_scope),
+                ticker_scope=tuple(row.ticker_scope),
+            )
+            for row in session.scalars(statement)
+        )
+
+    @staticmethod
+    def load_source_cache_state(
+        session: Session,
+        *,
+        allowlist_version: str,
+        source_id: str,
+        endpoint_id: str,
+    ) -> FinanceSourceCacheStateRecord | None:
+        row = session.scalar(
+            select(FinanceSourceCacheState).where(
+                FinanceSourceCacheState.allowlist_version == allowlist_version,
+                FinanceSourceCacheState.source_id == source_id,
+                FinanceSourceCacheState.endpoint_id == endpoint_id,
+            )
+        )
+        if row is None:
+            return None
+        return FinanceSourceCacheStateRecord(
+            allowlist_version=row.allowlist_version,
+            source_id=row.source_id,
+            endpoint_id=row.endpoint_id,
+            etag=row.etag,
+            last_modified=row.last_modified,
+            watermark_external_id=row.watermark_external_id,
+            watermark_published_at=_db_utc(row.watermark_published_at),
+            cached_artifact_key=row.cached_artifact_key,
+            payload_sha256=row.payload_sha256,
+            last_retrieved_at=_db_utc(row.last_retrieved_at),
+            last_not_modified_at=_db_utc(row.last_not_modified_at),
+            updated_at=_db_utc(row.updated_at) or row.updated_at,
+        )
+
+    @staticmethod
+    def save_source_cache_state(
+        session: Session,
+        *,
+        allowlist_version: str,
+        source_id: str,
+        endpoint_id: str,
+        etag: str | None = None,
+        last_modified: str | None = None,
+        watermark_external_id: str | None = None,
+        watermark_published_at: datetime | None = None,
+        cached_artifact_key: str | None = None,
+        payload_sha256: str | None = None,
+        last_retrieved_at: datetime | None = None,
+        last_not_modified_at: datetime | None = None,
+    ) -> FinanceSourceCacheState:
+        if watermark_published_at is not None:
+            watermark_published_at = _utc(watermark_published_at, "watermark_published_at")
+        if last_retrieved_at is not None:
+            last_retrieved_at = _utc(last_retrieved_at, "last_retrieved_at")
+        if last_not_modified_at is not None:
+            last_not_modified_at = _utc(last_not_modified_at, "last_not_modified_at")
+        return _upsert(
+            session,
+            FinanceSourceCacheState,
+            [
+                FinanceSourceCacheState.allowlist_version == allowlist_version,
+                FinanceSourceCacheState.source_id == source_id,
+                FinanceSourceCacheState.endpoint_id == endpoint_id,
+            ],
+            {
+                "allowlist_version": allowlist_version,
+                "source_id": source_id,
+                "endpoint_id": endpoint_id,
+                "etag": etag,
+                "last_modified": last_modified,
+                "watermark_external_id": watermark_external_id,
+                "watermark_published_at": watermark_published_at,
+                "cached_artifact_key": cached_artifact_key,
+                "payload_sha256": payload_sha256,
+                "last_retrieved_at": last_retrieved_at,
+                "last_not_modified_at": last_not_modified_at,
+                "updated_at": datetime.now(UTC),
+            },
+        )
+
+    @staticmethod
+    def record_source_request_audit(
+        session: Session,
+        *,
+        allowlist_version: str,
+        source_id: str,
+        endpoint_id: str,
+        requested_at: datetime,
+        status_code: int | None,
+        error_code: str | None,
+        not_modified: bool,
+    ) -> FinanceSourceRequestAudit:
+        outcome = "failed" if error_code is not None else (
+            "not_modified" if not_modified else "succeeded"
+        )
+        record = FinanceSourceRequestAudit(
+            allowlist_version=allowlist_version,
+            source_id=source_id,
+            endpoint_id=endpoint_id,
+            requested_at=_utc(requested_at, "requested_at"),
+            status_code=status_code,
+            outcome=outcome,
+            error_code=error_code,
+            not_modified=not_modified,
+        )
+        session.add(record)
+        session.flush()
+        return record
 
     @staticmethod
     def load_portfolio_snapshot(session: Session) -> PortfolioSnapshot:
@@ -562,12 +997,16 @@ class FinanceRepository:
             )
         )
         etf_exposures = tuple(
-            ETFExposure(
-                etf_symbol=row.etf_symbol,
-                underlying_symbol=row.underlying_symbol,
-                weight_percent=row.weight_percent,
-                source_id=row.source_id,
-                as_of=row.as_of,
+            ETFExposure.model_validate(
+                {
+                    "etf_symbol": row.etf_symbol,
+                    "underlying_symbol": row.underlying_symbol,
+                    "weight_percent": row.weight_percent,
+                    "source_id": row.source_id,
+                    "as_of": row.as_of,
+                    "source_url": row.source_url,
+                    "retrieved_at": _db_utc(row.retrieved_at),
+                }
             )
             for row in session.scalars(
                 select(FinanceETFExposure).order_by(
@@ -715,6 +1154,10 @@ class SQLAlchemyFinanceStore:
         with Session(self._engine) as session, session.begin():
             FinanceRepository.append_thesis_events(session, entries)
 
+    def upsert_etf_exposures(self, exposures: Sequence[ETFExposure]) -> None:
+        with Session(self._engine) as session, session.begin():
+            FinanceRepository.upsert_etf_exposures(session, exposures)
+
     def record_source_health(
         self,
         *,
@@ -740,6 +1183,80 @@ class SQLAlchemyFinanceStore:
                 session, allowlist_version=self._allowlist_version
             )
 
+    def list_source_endpoints(
+        self, *, source_id: str | None = None, enabled_only: bool = False
+    ) -> tuple[FinanceSourceEndpointRecord, ...]:
+        with Session(self._engine) as session:
+            return FinanceRepository.list_source_endpoints(
+                session,
+                allowlist_version=self._allowlist_version,
+                source_id=source_id,
+                enabled_only=enabled_only,
+            )
+
+    def load_source_cache_state(
+        self, *, source_id: str, endpoint_id: str
+    ) -> FinanceSourceCacheStateRecord | None:
+        with Session(self._engine) as session:
+            return FinanceRepository.load_source_cache_state(
+                session,
+                allowlist_version=self._allowlist_version,
+                source_id=source_id,
+                endpoint_id=endpoint_id,
+            )
+
+    def save_source_cache_state(
+        self,
+        *,
+        source_id: str,
+        endpoint_id: str,
+        etag: str | None = None,
+        last_modified: str | None = None,
+        watermark_external_id: str | None = None,
+        watermark_published_at: datetime | None = None,
+        cached_artifact_key: str | None = None,
+        payload_sha256: str | None = None,
+        last_retrieved_at: datetime | None = None,
+        last_not_modified_at: datetime | None = None,
+    ) -> None:
+        with Session(self._engine) as session, session.begin():
+            FinanceRepository.save_source_cache_state(
+                session,
+                allowlist_version=self._allowlist_version,
+                source_id=source_id,
+                endpoint_id=endpoint_id,
+                etag=etag,
+                last_modified=last_modified,
+                watermark_external_id=watermark_external_id,
+                watermark_published_at=watermark_published_at,
+                cached_artifact_key=cached_artifact_key,
+                payload_sha256=payload_sha256,
+                last_retrieved_at=last_retrieved_at,
+                last_not_modified_at=last_not_modified_at,
+            )
+
+    def record_source_request_audit(
+        self,
+        *,
+        source_id: str,
+        endpoint_id: str,
+        requested_at: datetime,
+        status_code: int | None,
+        error_code: str | None,
+        not_modified: bool,
+    ) -> None:
+        with Session(self._engine) as session, session.begin():
+            FinanceRepository.record_source_request_audit(
+                session,
+                allowlist_version=self._allowlist_version,
+                source_id=source_id,
+                endpoint_id=endpoint_id,
+                requested_at=requested_at,
+                status_code=status_code,
+                error_code=error_code,
+                not_modified=not_modified,
+            )
+
     def list_run_filter_metadata(self, *, limit: int = 100) -> tuple[FinanceRunFilterMetadata, ...]:
         with Session(self._engine) as session:
             return FinanceRepository.list_run_filter_metadata(session, limit=limit)
@@ -759,8 +1276,13 @@ __all__ = [
     "FinanceInvestmentThesis",
     "FinanceRepository",
     "FinanceRunFilterMetadata",
+    "FinanceSourceCacheState",
+    "FinanceSourceCacheStateRecord",
+    "FinanceSourceEndpoint",
+    "FinanceSourceEndpointRecord",
     "FinanceSourceHealth",
     "FinanceSourceRecord",
+    "FinanceSourceRequestAudit",
     "FinanceThesisEvent",
     "FinanceWatchlistEntry",
     "SQLAlchemyFinanceStore",

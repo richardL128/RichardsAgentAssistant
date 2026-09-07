@@ -18,6 +18,8 @@
     <p>
       Source approval, enablement, vendor credentials, and contract changes happen
       outside this UI. This page only displays the audited allowlist.
+      Hosts, transport metadata, freshness, and endpoint diagnostics are shown
+      without rendering credential-bearing URLs or secrets.
     </p>
   </section>
 
@@ -56,26 +58,75 @@
         <thead>
           <tr>
             <th scope="col">Slot</th>
+            <th scope="col">ID</th>
             <th scope="col">Source</th>
             <th scope="col">Host</th>
+            <th scope="col">Class</th>
             <th scope="col">Entitlement</th>
-            <th scope="col">State</th>
+            <th scope="col">Approval</th>
+            <th scope="col">Health</th>
+            <th scope="col">Reviewed endpoints</th>
           </tr>
         </thead>
         <tbody>
           {% for source in settings.sources %}
             <tr>
               <td>{{ source.slot }}</td>
+              <td>{{ source.source_id | default("not recorded", true) }}</td>
               <th scope="row">{{ source.name }}</th>
               <td>{{ source.hostname }}</td>
+              <td>{{ source.classification | default("not recorded", true) }}</td>
               <td>{{ source.entitlement }}</td>
               <td>
                 <span
                   class="source-state source-state--{{ 'enabled' if source.enabled else 'disabled' }}"
-                  aria-label="Source {{ source.slot }} is {{ 'enabled' if source.enabled else 'disabled' }}"
+                  aria-label="Source {{ source.slot }} is {{ 'approved' if source.approved else 'gated' }}"
                 >
+                  {{ "Approved" if source.approved else "Gated" }}
+                </span>
+                <span class="ops-muted">
                   {{ "Enabled" if source.enabled else "Disabled" }}
                 </span>
+              </td>
+              <td>
+                {% if source.health %}
+                  {% with state=source.health, label=source.health | title %}
+                    {% include "partials/health_badge.html" %}
+                  {% endwith %}
+                {% else %}
+                  <span class="ops-muted">No health</span>
+                {% endif %}
+                {% if source.health_checked_at %}
+                  <span class="ops-muted">{{ source.health_checked_at }}</span>
+                {% endif %}
+              </td>
+              <td>
+                {% if source.endpoints %}
+                  <ul class="source-endpoints" aria-label="{{ source.name }} reviewed endpoints">
+                    {% for endpoint in source.endpoints %}
+                      <li>
+                        <span class="source-endpoint__id">{{ endpoint.endpoint_id }}</span>
+                        <span class="ops-muted">
+                          {{ endpoint.host }} &middot; {{ endpoint.transport }}/{{ endpoint.parser }} &middot;
+                          {{ endpoint.expected_freshness_label }} freshness &middot;
+                          max {{ endpoint.request_ceiling }} request{{ "" if endpoint.request_ceiling == 1 else "s" }}
+                        </span>
+                        {% with state=endpoint.health, label=endpoint.health | title %}
+                          {% include "partials/health_badge.html" %}
+                        {% endwith %}
+                        <span class="ops-muted">
+                          {{ endpoint.diagnostic }}
+                          Scope: {{ endpoint.scope_label }}.
+                          Registry: {{ endpoint.registry_version }}.
+                          Retention: {{ endpoint.retention_note }}.
+                          {{ endpoint.excerpt_label }}.
+                        </span>
+                      </li>
+                    {% endfor %}
+                  </ul>
+                {% else %}
+                  <span class="ops-muted">No endpoint registry rows</span>
+                {% endif %}
               </td>
             </tr>
           {% endfor %}

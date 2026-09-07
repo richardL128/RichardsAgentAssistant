@@ -1,0 +1,12 @@
+{
+  "cik": "0000936468",
+  "name": "Lockheed Martin Corporation",
+  "filings": {
+    "recent": {
+      "accessionNumber": ["0000936468-26-000120", "0000936468-26-000119"],
+      "form": ["8-K", "4"],
+      "filingDate": ["2026-09-04", "2026-09-03"],
+      "primaryDocument": ["lmt-20260904.htm", "xslF345X05/wk-form4_1757000000.xml"]
+    }
+  }
+}

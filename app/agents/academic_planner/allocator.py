@@ -10,10 +10,12 @@ from app.agents.academic_planner.contracts import (
     Assessment,
     AvailabilityWindow,
     PlannerFacts,
+    PracticeNeed,
     StudyBlock,
 )
 
 _BLOCK_NAMESPACE = uuid.UUID("f70c1eb0-0c58-4f2a-9cb8-2f1ad390d2fb")
+_PRACTICE_BLOCK_NAMESPACE = uuid.UUID("03eb4fc1-7d0d-46cb-99e8-260c48094e04")
 
 
 def _aware(value: datetime, name: str = "timestamp") -> datetime:
@@ -83,6 +85,22 @@ def allocate_plan(
     carried over.
     """
 
+    blocks, _deferred_practice = allocate_plan_with_deferred(facts, now=now)
+    return blocks
+
+
+def allocate_plan_with_deferred(
+    facts: PlannerFacts,
+    *,
+    now: datetime,
+) -> tuple[tuple[StudyBlock, ...], tuple[str, ...]]:
+    """Allocate assessment work plus one separate block per active practice need.
+
+    Practice is placed first so an explicit learning focus is guaranteed a
+    visible block whenever a large enough availability window exists. A
+    practice block never replaces or relabels an assessment block.
+    """
+
     current = _aware(now, "now")
     horizon_end = current + timedelta(days=facts.horizon_days)
     fixed: list[tuple[datetime, datetime]] = []
@@ -117,6 +135,28 @@ def allocate_plan(
     )
     placed: list[StudyBlock] = []
     occupied = list(fixed)
+    deferred_practice: list[str] = []
+    for need in sorted(
+        facts.practice_needs,
+        key=lambda item: (item.next_review_at, item.course_code or "", item.topic),
+    ):
+        block = _place_practice_need(
+            need,
+            windows=windows,
+            occupied=occupied,
+            current=current,
+            horizon_end=horizon_end,
+        )
+        if block is None:
+            deferred_practice.append(need.focus_id or _practice_identity(need))
+            continue
+        placed.append(block)
+        occupied.append(
+            (
+                block.start_at - timedelta(minutes=facts.buffer_minutes),
+                block.end_at + timedelta(minutes=facts.buffer_minutes),
+            )
+        )
     for assessment in candidates:
         remaining = incomplete.get(assessment.id)
         minutes_left = (
@@ -167,7 +207,56 @@ def allocate_plan(
             if minutes_left <= 0:
                 break
     placed.sort(key=lambda block: (block.start_at, -block.priority_score, block.id))
-    return tuple(placed)
+    return tuple(placed), tuple(deferred_practice)
 
 
-__all__ = ["allocate_plan", "priority_score"]
+def _place_practice_need(
+    need: PracticeNeed,
+    *,
+    windows: tuple[AvailabilityWindow, ...],
+    occupied: list[tuple[datetime, datetime]],
+    current: datetime,
+    horizon_end: datetime,
+) -> StudyBlock | None:
+    deadline = min(need.next_review_at, horizon_end)
+    if deadline <= current:
+        return None
+    duration = timedelta(minutes=need.target_minutes)
+    for window in sorted(windows, key=lambda value: value.start_at):
+        cursor = max(window.start_at, current)
+        cursor += timedelta(minutes=(15 - cursor.minute % 15) % 15)
+        while cursor + duration <= min(window.end_at, deadline):
+            end = cursor + duration
+            if not _overlaps(cursor, end, occupied):
+                identity = _practice_identity(need)
+                block_id = uuid.uuid5(
+                    _PRACTICE_BLOCK_NAMESPACE,
+                    f"{identity}:{cursor.isoformat()}:{end.isoformat()}",
+                )
+                course = f"{need.course_code} " if need.course_code else ""
+                return StudyBlock(
+                    id=str(block_id),
+                    assessment_id=need.assessment_id or f"learning-focus:{identity}",
+                    learning_focus_id=need.focus_id,
+                    block_kind="practice",
+                    title=f"Practice {course}{need.topic}".strip(),
+                    start_at=cursor,
+                    end_at=end,
+                    carried_over=False,
+                    priority_score=0,
+                    rationale=need.rationale,
+                )
+            cursor += timedelta(minutes=15)
+    return None
+
+
+def _practice_identity(need: PracticeNeed) -> str:
+    return need.focus_id or ":".join(
+        (
+            need.course_id or need.course_code or "unscoped",
+            need.topic.casefold(),
+        )
+    )
+
+
+__all__ = ["allocate_plan", "allocate_plan_with_deferred", "priority_score"]

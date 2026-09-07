@@ -80,6 +80,9 @@ class Delivery:
     async def send_confirmation(self, proposal, *, idempotency_key):
         self.calls.append(("confirmation", idempotency_key))
 
+    async def send_focus_reviews(self, reviews, *, idempotency_key):
+        self.calls.append(("focus_reviews", idempotency_key, tuple(reviews)))
+
 
 class Writer:
     def __init__(self):
@@ -216,6 +219,41 @@ async def test_end_of_day_checkin_has_explicit_send_path() -> None:
     )
     assert result["status"] == "sent"
     assert delivery.calls == [("checkin", "academic-eod")]
+
+
+@pytest.mark.asyncio
+async def test_end_of_day_checkin_advances_and_delivers_focus_review_lifecycle() -> None:
+    class FocusStore(Store):
+        def prepare_learning_focus_checkin(self, **kwargs):
+            assert kwargs["snooze_after_missed"] == 2
+            assert kwargs["delete_after_reminders"] == 5
+            assert kwargs["next_review_at"] == datetime(2026, 9, 9, 1, tzinfo=UTC)
+            return (
+                {
+                    "focus_id": "focus-recursion",
+                    "course_code": "ECE 250",
+                    "topic": "recursion",
+                    "kind": "review",
+                    "reminder_count": 0,
+                },
+            )
+
+    delivery = Delivery()
+    result = await run_end_of_day_checkin(
+        plan=None,
+        delivery=delivery,
+        store=FocusStore(),
+        idempotency_key="academic-eod-2026-09-07",
+        now=datetime(2026, 9, 8, 1, tzinfo=UTC),
+    )
+
+    assert result["focus_review_count"] == 1
+    assert result["focus_deleted_count"] == 0
+    assert delivery.calls[0] == ("checkin", "academic-eod-2026-09-07")
+    assert delivery.calls[1][0:2] == (
+        "focus_reviews",
+        "academic-eod-2026-09-07:learning-focus",
+    )
 
 
 def test_plan_identity_uses_toronto_date_at_utc_boundary() -> None:

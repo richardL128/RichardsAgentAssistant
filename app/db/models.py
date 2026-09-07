@@ -13,6 +13,7 @@ import uuid
 from datetime import UTC, date, datetime
 from typing import Any
 
+from pgvector.sqlalchemy import Vector
 from sqlalchemy import (
     JSON,
     BigInteger,
@@ -356,6 +357,7 @@ class CodeRepository(TimestampMixin, Base):
     profiled_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     profile_error_code: Mapped[str | None] = mapped_column(String(128))
     last_reviewed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    last_review_prompted_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
 
 
 class ReviewedCommit(TimestampMixin, Base):
@@ -750,6 +752,168 @@ class AcademicSetupReminder(TimestampMixin, Base):
     error_code: Mapped[str | None] = mapped_column(String(128))
 
 
+class AcademicDiscourseSession(TimestampMixin, Base):
+    """Durable multi-turn academic discourse state keyed by Discord event."""
+
+    __tablename__ = "academic_discourse_sessions"
+    __table_args__ = (
+        UniqueConstraint("external_event_id", name="uq_academic_discourse_external_event"),
+        CheckConstraint("length(external_event_id) > 0", name="external_event_id_nonempty"),
+        CheckConstraint("channel = 'discord'", name="channel_discord_only"),
+        CheckConstraint("state IN ('open','completed','expired')", name="state_valid"),
+        CheckConstraint("missed_review_count >= 0", name="missed_review_count_nonnegative"),
+        CheckConstraint("reminder_count >= 0", name="reminder_count_nonnegative"),
+        Index("ix_academic_discourse_state_expiry", "state", "expires_at"),
+        Index("ix_academic_discourse_last_turn", "state", "last_turn_at"),
+        Index(
+            "ix_academic_discourse_discord_owner",
+            "discord_channel_id",
+            "discord_user_id",
+            "state",
+        ),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(primary_key=True, default=uuid.uuid4)
+    external_event_id: Mapped[str] = mapped_column(String(255), nullable=False)
+    channel: Mapped[str] = mapped_column(String(64), nullable=False, default="discord")
+    discord_channel_id: Mapped[str | None] = mapped_column(String(24))
+    discord_user_id: Mapped[str | None] = mapped_column(String(24))
+    session_kind: Mapped[str] = mapped_column(String(64), nullable=False, default="learning_focus")
+    state: Mapped[str] = mapped_column(String(32), nullable=False, default="open")
+    partial_state: Mapped[dict[str, Any]] = mapped_column(JSON, nullable=False, default=dict)
+    missed_review_count: Mapped[int] = mapped_column(nullable=False, default=0)
+    reminder_count: Mapped[int] = mapped_column(nullable=False, default=0)
+    started_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    last_turn_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    completed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    expires_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+
+
+class AcademicLearningFocus(TimestampMixin, Base):
+    """A user-confirmed academic struggle that should shape practice planning."""
+
+    __tablename__ = "academic_learning_focuses"
+    __table_args__ = (
+        UniqueConstraint("source_external_event_id", name="uq_academic_focus_source_event"),
+        CheckConstraint("length(topic) > 0", name="topic_nonempty"),
+        CheckConstraint("status IN ('active','snoozed')", name="status_valid"),
+        CheckConstraint("reinforcement_count >= 1", name="reinforcement_count_positive"),
+        CheckConstraint("missed_review_count >= 0", name="missed_review_count_nonnegative"),
+        CheckConstraint("reminder_count >= 0", name="reminder_count_nonnegative"),
+        CheckConstraint(
+            "practice_minutes IS NULL OR practice_minutes > 0",
+            name="practice_minutes_positive",
+        ),
+        Index("ix_academic_focus_status_review", "status", "next_review_at"),
+        Index("ix_academic_focus_course_status", "course_id", "status"),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(primary_key=True, default=uuid.uuid4)
+    course_id: Mapped[uuid.UUID | None] = mapped_column(
+        ForeignKey("courses.id", ondelete="SET NULL")
+    )
+    assessment_id: Mapped[uuid.UUID | None] = mapped_column(
+        ForeignKey("assessments.id", ondelete="SET NULL")
+    )
+    course_code: Mapped[str | None] = mapped_column(String(64))
+    topic: Mapped[str] = mapped_column(String(255), nullable=False)
+    status: Mapped[str] = mapped_column(String(32), nullable=False, default="active")
+    source_session_id: Mapped[uuid.UUID | None] = mapped_column(
+        ForeignKey("academic_discourse_sessions.id", ondelete="SET NULL")
+    )
+    source_external_event_id: Mapped[str | None] = mapped_column(String(255))
+    reinforcement_count: Mapped[int] = mapped_column(nullable=False, default=1)
+    next_review_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    practice_due_on: Mapped[date | None] = mapped_column(Date)
+    practice_minutes: Mapped[int | None] = mapped_column()
+    last_reviewed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    last_review_prompted_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True)
+    )
+    last_reinforced_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    missed_review_count: Mapped[int] = mapped_column(nullable=False, default=0)
+    reminder_count: Mapped[int] = mapped_column(nullable=False, default=0)
+    last_reminded_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    snoozed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+
+
+class AcademicDiscourseTurn(TimestampMixin, Base):
+    """Idempotency metadata for one Discord message in a discourse session."""
+
+    __tablename__ = "academic_discourse_turns"
+    __table_args__ = (
+        UniqueConstraint("external_event_id", name="uq_academic_discourse_turn_event"),
+        Index("ix_academic_discourse_turn_session", "session_id", "received_at"),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(primary_key=True, default=uuid.uuid4)
+    session_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey("academic_discourse_sessions.id", ondelete="CASCADE"), nullable=False
+    )
+    external_event_id: Mapped[str] = mapped_column(String(255), nullable=False)
+    received_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+
+
+class AcademicLearningFocusEvent(TimestampMixin, Base):
+    """Append-only lifecycle events for a focus until the focus is hard-deleted."""
+
+    __tablename__ = "academic_learning_focus_events"
+    __table_args__ = (
+        UniqueConstraint("external_event_id", name="uq_academic_focus_events_external_event"),
+        CheckConstraint("length(event_type) > 0", name="event_type_nonempty"),
+        CheckConstraint("actor IS NULL OR length(actor) > 0", name="actor_nonempty"),
+        Index("ix_academic_focus_events_focus_time", "focus_id", "occurred_at"),
+        Index("ix_academic_focus_events_session", "session_id", "occurred_at"),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(primary_key=True, default=uuid.uuid4)
+    focus_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey("academic_learning_focuses.id", ondelete="CASCADE"), nullable=False
+    )
+    session_id: Mapped[uuid.UUID | None] = mapped_column(
+        ForeignKey("academic_discourse_sessions.id", ondelete="SET NULL")
+    )
+    external_event_id: Mapped[str | None] = mapped_column(String(255))
+    event_type: Mapped[str] = mapped_column(String(64), nullable=False)
+    actor: Mapped[str | None] = mapped_column(String(255))
+    occurred_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    payload: Mapped[dict[str, Any]] = mapped_column(JSON, nullable=False, default=dict)
+
+
+class AcademicReflectionMemory(TimestampMixin, Base):
+    """Raw reflection text plus optional embedding data for academic retrieval."""
+
+    __tablename__ = "academic_reflection_memories"
+    __table_args__ = (
+        UniqueConstraint("external_event_id", name="uq_academic_reflection_external_event"),
+        CheckConstraint("length(raw_text) > 0", name="raw_text_nonempty"),
+        CheckConstraint(
+            "embedding_dimensions IS NULL OR embedding_dimensions > 0",
+            name="embedding_dimensions_positive",
+        ),
+        Index("ix_academic_reflections_focus_time", "focus_id", "recorded_at"),
+        Index("ix_academic_reflections_session", "session_id", "recorded_at"),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(primary_key=True, default=uuid.uuid4)
+    focus_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey("academic_learning_focuses.id", ondelete="CASCADE"), nullable=False
+    )
+    session_id: Mapped[uuid.UUID | None] = mapped_column(
+        ForeignKey("academic_discourse_sessions.id", ondelete="SET NULL")
+    )
+    external_event_id: Mapped[str | None] = mapped_column(String(255))
+    raw_text: Mapped[str] = mapped_column(Text, nullable=False)
+    redacted_summary: Mapped[str | None] = mapped_column(String(2_000))
+    embedding: Mapped[list[float] | None] = mapped_column(
+        Vector().with_variant(JSON, "sqlite")
+    )
+    embedding_model: Mapped[str | None] = mapped_column(String(255))
+    embedding_dimensions: Mapped[int | None] = mapped_column()
+    embedding_metadata: Mapped[dict[str, Any]] = mapped_column(JSON, nullable=False, default=dict)
+    recorded_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+
+
 class FixedCommitment(TimestampMixin, Base):
     """A fixed class/event that the allocator must never move."""
 
@@ -835,8 +999,13 @@ class StudyBlock(TimestampMixin, Base):
             "status IN ('planned','in_progress','completed','incomplete','carried_forward')",
             name="status_valid",
         ),
+        CheckConstraint(
+            "block_kind IN ('assessment','practice')",
+            name="block_kind_valid",
+        ),
         Index("ix_study_blocks_plan_start", "plan_id", "starts_at"),
         Index("ix_study_blocks_assessment", "assessment_id", "status"),
+        Index("ix_study_blocks_learning_focus", "learning_focus_id", "status"),
     )
 
     id: Mapped[uuid.UUID] = mapped_column(primary_key=True, default=uuid.uuid4)
@@ -847,6 +1016,10 @@ class StudyBlock(TimestampMixin, Base):
     assessment_id: Mapped[uuid.UUID | None] = mapped_column(
         ForeignKey("assessments.id", ondelete="SET NULL")
     )
+    learning_focus_id: Mapped[uuid.UUID | None] = mapped_column(
+        ForeignKey("academic_learning_focuses.id", ondelete="SET NULL")
+    )
+    block_kind: Mapped[str] = mapped_column(String(32), nullable=False, default="assessment")
     title: Mapped[str] = mapped_column(String(255), nullable=False)
     starts_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
     ends_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
@@ -997,9 +1170,14 @@ __all__ = [
     "AcademicCheckIn",
     "AcademicClarification",
     "AcademicCourseCalendar",
+    "AcademicDiscourseSession",
+    "AcademicDiscourseTurn",
     "AcademicDocument",
     "AcademicDocumentChunk",
+    "AcademicLearningFocus",
+    "AcademicLearningFocusEvent",
     "AcademicProposedChange",
+    "AcademicReflectionMemory",
     "AcademicSetupReminder",
     "AcademicSyncCursor",
     "AgentRun",

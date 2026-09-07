@@ -43,7 +43,7 @@ def test_settings_diagnostics_redact_credentials(tmp_path: Path) -> None:
     assert "ops-password" not in str(diagnostics)
     assert "ops-user-never-print" not in str(diagnostics)
     assert diagnostics["database"] == "postgresql+psycopg://example.test:5432/lifeagent"
-    assert diagnostics["finance_source_allowlist_version"] == "finance-sources-2026.09"
+    assert diagnostics["finance_source_allowlist_version"] == "finance-sources-2026.09-v2"
     assert diagnostics["finance_source_credentials_configured"] == 2
     assert diagnostics["discord_finance_channel_configured"] is True
     assert diagnostics["notion_token_configured"] is False
@@ -66,7 +66,7 @@ def test_empty_finance_credentials_are_normalized() -> None:
         ops_console_password="",
     )
 
-    assert settings.finance_source_allowlist_version == "finance-sources-2026.09"
+    assert settings.finance_source_allowlist_version == "finance-sources-2026.09-v2"
     assert settings.safe_diagnostics()["finance_source_credentials_configured"] == 0
     assert settings.safe_diagnostics()["ops_console_auth_configured"] is False
 

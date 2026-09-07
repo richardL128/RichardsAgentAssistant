@@ -23,6 +23,19 @@
 - For a small, single-file, or tightly coupled change, work in the main thread
   instead of delegating merely for its own sake.
 
+## Architecture replacement policy
+
+- When implementing a replacement architecture, make the new architecture the
+  sole configured and documented default.
+- Do not retain or introduce the superseded architecture as a backup, fallback,
+  rollback path, or alternate runtime path unless the user explicitly requests
+  that compatibility for the task.
+- Preserve immutable migration and audit history when required. Historical
+  records do not imply that the old architecture should remain executable or
+  configured.
+- If the user explicitly requires temporary legacy compatibility, keep it
+  isolated, label it as exceptional, and never make it the default.
+
 ## Frontend
 
 For work under `frontend/`, also follow `frontend/AGENTS.md`; its more specific

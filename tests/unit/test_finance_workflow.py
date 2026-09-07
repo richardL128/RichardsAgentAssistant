@@ -15,7 +15,9 @@ from app.agents.finance.contracts import (
     QuantValue,
     SourceApproval,
     SourceDocument,
+    SourceEndpointFailure,
     SourceFailure,
+    SourceFetchMetadata,
     SourceFetchResult,
     WatchlistItem,
 )
@@ -56,6 +58,8 @@ class Store:
         self.payload = None
         self.entries = ()
         self.health = []
+        self.etf_exposures = ()
+        self.request_audits = []
 
     def load_approved_sources(self, *, allowlist_version):
         return self.source_records if allowlist_version == ALLOWLIST else ()
@@ -86,6 +90,12 @@ class Store:
 
     def append_thesis_events(self, entries):
         self.entries = tuple(entries)
+
+    def upsert_etf_exposures(self, exposures):
+        self.etf_exposures = tuple(exposures)
+
+    def record_source_request_audit(self, **audit):
+        self.request_audits.append(audit)
 
     def record_source_health(
         self,
@@ -150,6 +160,27 @@ class Adapter:
                     ),
                 ),
             ),
+        )
+
+
+class PartialRegistryAdapter(Adapter):
+    async def fetch(self, query):
+        result = await super().fetch(query)
+        return result.model_copy(
+            update={
+                "metadata": SourceFetchMetadata(
+                    transport="registry",
+                    request_count=2,
+                    endpoint_count=2,
+                    endpoint_failures=(
+                        SourceEndpointFailure(
+                            endpoint_id="issuer-missing",
+                            error_code="connector_timeout",
+                            diagnostic="reviewed issuer endpoint timed out",
+                        ),
+                    ),
+                )
+            }
         )
 
 
@@ -246,6 +277,39 @@ async def test_finance_run_records_failed_adapter_health_as_attention() -> None:
     statuses = {record["source_id"]: record["status"] for record in store.health}
     assert statuses["source8"] == "attention"
     assert set(statuses.values()) == {"healthy", "attention"}
+
+
+@pytest.mark.asyncio
+async def test_partial_registry_failure_stays_one_logical_call_and_marks_attention() -> None:
+    source_records = approvals()
+    store = Store(source_records)
+    adapters = {
+        source.source_id: (
+            PartialRegistryAdapter(source.source_id)
+            if source.source_id == "source8"
+            else Adapter(source.source_id)
+        )
+        for source in source_records
+    }
+
+    result = await run_finance_briefing(
+        run_id=uuid4(),
+        store=store,
+        adapters=adapters,
+        allowlist_version=ALLOWLIST,
+        tickers=("ACME",),
+        themes=("earnings",),
+        now=NOW,
+    )
+
+    assert result["status"] == "attention"
+    assert result["source_call_count"] == 8
+    assert result["source_request_count"] == 2
+    assert result["source_failure_count"] == 1
+    assert sum(adapter.calls for adapter in adapters.values()) == 8
+    health = {record["source_id"]: record for record in store.health}
+    assert health["source8"]["status"] == "attention"
+    assert "reviewed finance endpoints failed" in health["source8"]["diagnostic"]
 
 
 def test_importing_worker_registers_finance_handler() -> None:

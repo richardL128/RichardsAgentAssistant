@@ -2,7 +2,11 @@ from __future__ import annotations
 
 from datetime import UTC, datetime, timedelta
 
-from app.agents.academic_planner.allocator import allocate_plan, priority_score
+from app.agents.academic_planner.allocator import (
+    allocate_plan,
+    allocate_plan_with_deferred,
+    priority_score,
+)
 from app.agents.academic_planner.contracts import (
     Assessment,
     AssessmentType,
@@ -10,6 +14,7 @@ from app.agents.academic_planner.contracts import (
     FixedCommitment,
     IncompleteBlock,
     PlannerFacts,
+    PracticeNeed,
 )
 
 
@@ -101,3 +106,59 @@ def test_dst_timestamp_inputs_are_normalized_and_allocatable() -> None:
         ),
     )
     assert allocate_plan(facts, now=datetime(2025, 3, 9, 1, 30, tzinfo=UTC))
+
+
+def test_active_focus_gets_a_separate_practice_block_before_assessment_work() -> None:
+    now = datetime(2025, 3, 9, 14, tzinfo=UTC)
+    facts = PlannerFacts(
+        assessments=(_assessment(),),
+        practice_needs=(
+            PracticeNeed(
+                focus_id="focus-recursion",
+                course_code="ECE 250",
+                topic="recursion",
+                target_minutes=30,
+                next_review_at=now + timedelta(hours=6),
+                source_action="reinforce_focus",
+                rationale="The user explicitly reported difficulty with recursion.",
+            ),
+        ),
+        availability=(AvailabilityWindow(start_at=now, end_at=now + timedelta(hours=4)),),
+        buffer_minutes=15,
+    )
+
+    blocks, deferred = allocate_plan_with_deferred(facts, now=now)
+
+    practice = [block for block in blocks if block.block_kind == "practice"]
+    assessment = [block for block in blocks if block.block_kind == "assessment"]
+    assert len(practice) == 1
+    assert practice[0].learning_focus_id == "focus-recursion"
+    assert practice[0].title == "Practice ECE 250 recursion"
+    assert practice[0].end_at - practice[0].start_at == timedelta(minutes=30)
+    assert assessment
+    assert practice[0].end_at + timedelta(minutes=15) <= assessment[0].start_at
+    assert deferred == ()
+
+
+def test_unschedulable_practice_focus_is_reported_as_deferred() -> None:
+    now = datetime(2025, 3, 9, 14, tzinfo=UTC)
+    facts = PlannerFacts(
+        practice_needs=(
+            PracticeNeed(
+                focus_id="focus-recursion",
+                topic="recursion",
+                target_minutes=60,
+                next_review_at=now + timedelta(hours=1),
+                source_action="reinforce_focus",
+                rationale="The user explicitly reported difficulty with recursion.",
+            ),
+        ),
+        availability=(
+            AvailabilityWindow(start_at=now, end_at=now + timedelta(minutes=30)),
+        ),
+    )
+
+    blocks, deferred = allocate_plan_with_deferred(facts, now=now)
+
+    assert blocks == ()
+    assert deferred == ("focus-recursion",)
