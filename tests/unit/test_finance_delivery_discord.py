@@ -177,7 +177,7 @@ async def test_finance_briefing_posts_rendered_content_once_and_records_sent(
     assert request.url.path == f"/api/v10/channels/{CHANNEL_ID}/messages"
     assert request.headers["Authorization"] == f"Bot {TOKEN}"
     body = json.loads(request.content)
-    assert body["nonce"] == str(first.id)
+    assert body["nonce"] == first.id.hex[:25]
     assert body["enforce_nonce"] is True
     assert body["allowed_mentions"] == {"parse": []}
     assert "LifeAgent finance briefing succeeded" in body["content"]

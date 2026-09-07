@@ -1,4 +1,4 @@
-"""Local-friendly Discord Gateway listener for academic clarification buttons."""
+"""Local-friendly Discord Gateway listener for academic Discord events."""
 
 from __future__ import annotations
 
@@ -8,11 +8,12 @@ import json
 import re
 from collections.abc import Awaitable, Callable, Mapping
 from contextlib import suppress
+from datetime import UTC, datetime
 from typing import Any, Literal, Protocol, cast
 from uuid import UUID
 
 import httpx
-from pydantic import BaseModel, ConfigDict, Field, SecretStr
+from pydantic import BaseModel, ConfigDict, Field, SecretStr, field_validator
 
 DiscordClarificationAction = Literal["quiz", "assignment", "ignore"]
 DiscordInteractionStatus = Literal[
@@ -32,6 +33,11 @@ _CUSTOM_ID_PATTERN = re.compile(
 )
 _DISCORD_MESSAGE_COMPONENT_TYPE = 3
 _DISCORD_INTERACTION_CALLBACK_DEFERRED_UPDATE = 6
+_DISCORD_INTENT_GUILD_MESSAGES = 1 << 9
+_DISCORD_INTENT_MESSAGE_CONTENT = 1 << 15
+_DISCORD_MESSAGE_CONTENT_INTENTS = _DISCORD_INTENT_GUILD_MESSAGES | _DISCORD_INTENT_MESSAGE_CONTENT
+_DISCORD_MESSAGE_CONTENT_LIMIT = 2_000
+_DISCORD_INTENT_CLOSE_CODES = {4013, 4014}
 
 
 class DiscordClarificationInteraction(BaseModel):
@@ -54,11 +60,53 @@ class DiscordClarificationCallbackResult(BaseModel):
     status: DiscordInteractionStatus
 
 
+class DiscordAcademicMessageCreate(BaseModel):
+    """Sanitized authorized Discord message facts for academic check-in handling."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    message_id: str = Field(pattern=r"^[0-9]{5,24}$")
+    channel_id: str = Field(pattern=r"^[0-9]{5,24}$")
+    author_id: str = Field(pattern=r"^[0-9]{5,24}$")
+    timestamp: datetime
+    content: SecretStr = Field(repr=False)
+
+    @field_validator("timestamp")
+    @classmethod
+    def timestamp_is_aware_utc(cls, value: datetime) -> datetime:
+        if value.tzinfo is None or value.utcoffset() is None:
+            raise ValueError("Discord message timestamp must be timezone-aware")
+        return value.astimezone(UTC)
+
+    @field_validator("content")
+    @classmethod
+    def content_is_bounded(cls, value: SecretStr) -> SecretStr:
+        content = value.get_secret_value()
+        if not content or len(content) > _DISCORD_MESSAGE_CONTENT_LIMIT:
+            raise ValueError("Discord message content must be present and bounded")
+        return value
+
+
+class DiscordMessageCallbackResult(BaseModel):
+    """Bounded callback result safe to log or persist by callers."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    status: DiscordInteractionStatus
+
+
 class DiscordClarificationHandler(Protocol):
     async def __call__(
         self,
         interaction: DiscordClarificationInteraction,
     ) -> DiscordClarificationCallbackResult: ...
+
+
+class DiscordMessageHandler(Protocol):
+    async def __call__(
+        self,
+        message: DiscordAcademicMessageCreate,
+    ) -> DiscordMessageCallbackResult: ...
 
 
 class DiscordGatewayHttpClient(Protocol):
@@ -96,6 +144,14 @@ class DiscordGatewayReconnectError(RuntimeError):
 DiscordGatewayReconnect = DiscordGatewayReconnectError
 
 
+class DiscordGatewayConfigurationError(RuntimeError):
+    """Safe terminal diagnostic for a Gateway configuration mismatch."""
+
+    def __init__(self, diagnostic: str) -> None:
+        self.diagnostic = diagnostic
+        super().__init__(diagnostic)
+
+
 class DiscordGatewayListener:
     """Connect to Discord Gateway and dispatch academic clarification interactions."""
 
@@ -107,23 +163,54 @@ class DiscordGatewayListener:
         allowed_channel_ids: set[str],
         authorized_user_ids: set[str],
         handler: DiscordClarificationHandler,
+        message_content_enabled: bool = False,
+        message_handler: DiscordMessageHandler | None = None,
         http_client: DiscordGatewayHttpClient | None = None,
         websocket_connect: DiscordGatewayConnect | None = None,
         sleep: DiscordGatewaySleep = asyncio.sleep,
         max_seen_interactions: int = 1_024,
+        max_seen_messages: int = 1_024,
     ) -> None:
         self._token = token
         self._api_base_url = api_base_url.rstrip("/")
         self._allowed_channel_ids = frozenset(allowed_channel_ids)
         self._authorized_user_ids = frozenset(authorized_user_ids)
         self._handler = handler
+        self._message_handler = message_handler
+        self._message_content_enabled = message_content_enabled
         self._http_client = http_client
         self._websocket_connect = websocket_connect or _default_websocket_connect
         self._sleep = sleep
         self._max_seen_interactions = max_seen_interactions
+        self._max_seen_messages = max_seen_messages
         self._seen_interactions: list[str] = []
+        self._seen_messages: list[str] = []
+        self._inflight_messages: set[str] = set()
+        self._message_tasks: set[asyncio.Task[DiscordMessageCallbackResult]] = set()
         self._sequence: int | None = None
         self._session_id: str | None = None
+        self._last_diagnostic: str | None = None
+
+    @property
+    def identity_intents(self) -> int:
+        """Return the exact Gateway intents this listener will request."""
+
+        if not self._message_content_enabled:
+            return 0
+        return _DISCORD_MESSAGE_CONTENT_INTENTS
+
+    @property
+    def last_diagnostic(self) -> str | None:
+        """Return the latest non-secret Gateway diagnostic, if any."""
+
+        return self._last_diagnostic
+
+    async def drain_message_tasks(self) -> None:
+        """Wait for scheduled message callbacks and consume their bounded results."""
+
+        if not self._message_tasks:
+            return
+        await asyncio.gather(*tuple(self._message_tasks), return_exceptions=True)
 
     async def run_forever(self, *, max_attempts: int | None = None) -> None:
         attempts = 0
@@ -142,7 +229,15 @@ class DiscordGatewayListener:
         heartbeat_task: asyncio.Task[None] | None = None
         try:
             while True:
-                payload = _decode_gateway_payload(await websocket.recv())
+                try:
+                    raw_message = await websocket.recv()
+                except Exception as exc:
+                    diagnostic = self._close_diagnostic(exc)
+                    if diagnostic is not None:
+                        self._last_diagnostic = diagnostic
+                        raise DiscordGatewayConfigurationError(diagnostic) from None
+                    raise
+                payload = _decode_gateway_payload(raw_message)
                 op = _int_value(payload.get("op"))
                 if op == 10:
                     interval = _heartbeat_interval_seconds(payload)
@@ -170,7 +265,10 @@ class DiscordGatewayListener:
         self,
         payload: Mapping[str, object],
     ) -> DiscordInteractionStatus:
-        if payload.get("t") != "INTERACTION_CREATE":
+        event_type = payload.get("t")
+        if event_type == "MESSAGE_CREATE":
+            return await self._handle_message_create(payload)
+        if event_type != "INTERACTION_CREATE":
             return "ignored"
         data = _mapping_value(payload.get("d"))
         if data is None or _int_value(data.get("type")) != _DISCORD_MESSAGE_COMPONENT_TYPE:
@@ -197,6 +295,32 @@ class DiscordGatewayListener:
         except Exception:
             return "failed"
         return result.status
+
+    async def _handle_message_create(
+        self,
+        payload: Mapping[str, object],
+    ) -> DiscordInteractionStatus:
+        if not self._message_content_enabled or self._message_handler is None:
+            return "ignored"
+        data = _mapping_value(payload.get("d"))
+        if data is None:
+            return "invalid"
+        parsed = normalize_academic_message(
+            data,
+            allowed_channel_ids=self._allowed_channel_ids,
+            authorized_user_ids=self._authorized_user_ids,
+        )
+        if parsed is None:
+            return _message_rejection_status(
+                data,
+                self._allowed_channel_ids,
+                self._authorized_user_ids,
+            )
+        if parsed.message_id in self._seen_messages or parsed.message_id in self._inflight_messages:
+            return "duplicate"
+        self._inflight_messages.add(parsed.message_id)
+        self._schedule_message(parsed)
+        return "handled"
 
     async def _gateway_url(self) -> str:
         owns_client = self._http_client is None
@@ -238,7 +362,7 @@ class DiscordGatewayListener:
                     "op": 2,
                     "d": {
                         "token": token,
-                        "intents": 0,
+                        "intents": self.identity_intents,
                         "properties": {
                             "os": "linux",
                             "browser": "lifeagent",
@@ -292,6 +416,62 @@ class DiscordGatewayListener:
         if len(self._seen_interactions) > self._max_seen_interactions:
             del self._seen_interactions[0]
 
+    def _remember_message(self, message_id: str) -> None:
+        self._seen_messages.append(message_id)
+        if len(self._seen_messages) > self._max_seen_messages:
+            del self._seen_messages[0]
+
+    def _close_diagnostic(self, exc: Exception) -> str | None:
+        code = getattr(exc, "code", None)
+        if code not in _DISCORD_INTENT_CLOSE_CODES:
+            return None
+        if self._message_content_enabled:
+            return (
+                "Discord Gateway rejected the configured message intents; enable the "
+                "Message Content Intent in the Discord Developer Portal or disable "
+                "academic free-text Discord check-ins."
+            )
+        return "Discord Gateway rejected the configured intents; check the Discord Gateway setup."
+
+    def _schedule_message(self, message: DiscordAcademicMessageCreate) -> None:
+        handler = self._message_handler
+        if handler is None:
+            return
+        task = asyncio.create_task(
+            self._run_message_handler(handler, message),
+            name=f"discord-academic-message-{message.message_id}",
+        )
+        self._message_tasks.add(task)
+        task.add_done_callback(
+            lambda completed: self._message_task_done(message.message_id, completed)
+        )
+
+    def _message_task_done(
+        self,
+        message_id: str,
+        task: asyncio.Task[DiscordMessageCallbackResult],
+    ) -> None:
+        self._message_tasks.discard(task)
+        self._inflight_messages.discard(message_id)
+        if task.cancelled():
+            return
+        try:
+            result = task.result()
+        except Exception:
+            return
+        if result.status in {"handled", "duplicate"}:
+            self._remember_message(message_id)
+
+    @staticmethod
+    async def _run_message_handler(
+        handler: DiscordMessageHandler,
+        message: DiscordAcademicMessageCreate,
+    ) -> DiscordMessageCallbackResult:
+        try:
+            return await handler(message)
+        except Exception:
+            return DiscordMessageCallbackResult(status="failed")
+
 
 def parse_clarification_custom_id(
     custom_id: str,
@@ -334,6 +514,41 @@ def normalize_clarification_interaction(
     )
 
 
+def normalize_academic_message(
+    data: Mapping[str, object],
+    *,
+    allowed_channel_ids: frozenset[str] | set[str],
+    authorized_user_ids: frozenset[str] | set[str],
+) -> DiscordAcademicMessageCreate | None:
+    channel_id = _str_value(data.get("channel_id"))
+    author = _mapping_value(data.get("author"))
+    author_id = _str_value(author.get("id")) if author is not None else None
+    author_is_bot = bool(author.get("bot")) if author is not None else False
+    message_id = _str_value(data.get("id"))
+    if channel_id is None or author_id is None or message_id is None:
+        return None
+    if (
+        author_is_bot
+        or channel_id not in allowed_channel_ids
+        or author_id not in authorized_user_ids
+    ):
+        return None
+
+    timestamp = _parse_discord_timestamp(_str_value(data.get("timestamp")))
+    content = _str_value(data.get("content"))
+    if timestamp is None or content is None:
+        return None
+    if not content or len(content) > _DISCORD_MESSAGE_CONTENT_LIMIT:
+        return None
+    return DiscordAcademicMessageCreate(
+        message_id=message_id,
+        channel_id=channel_id,
+        author_id=author_id,
+        timestamp=timestamp,
+        content=SecretStr(content),
+    )
+
+
 async def _default_websocket_connect(url: str) -> DiscordGatewayWebSocket:
     websockets: Any = importlib.import_module("websockets")
     return cast(DiscordGatewayWebSocket, await websockets.connect(url))
@@ -373,6 +588,22 @@ def _rejection_status(
     return "invalid"
 
 
+def _message_rejection_status(
+    data: Mapping[str, object],
+    allowed_channel_ids: frozenset[str],
+    authorized_user_ids: frozenset[str],
+) -> DiscordInteractionStatus:
+    channel_id = _str_value(data.get("channel_id"))
+    author = _mapping_value(data.get("author"))
+    author_id = _str_value(author.get("id")) if author is not None else None
+    author_is_bot = bool(author.get("bot")) if author is not None else False
+    if author_is_bot:
+        return "ignored"
+    if channel_id not in allowed_channel_ids or author_id not in authorized_user_ids:
+        return "unauthorized"
+    return "invalid"
+
+
 def _custom_id(data: Mapping[str, object]) -> str | None:
     interaction_data = _mapping_value(data.get("data"))
     if interaction_data is None:
@@ -408,11 +639,25 @@ def _int_value(value: object) -> int | None:
     return None
 
 
+def _parse_discord_timestamp(value: str | None) -> datetime | None:
+    if value is None:
+        return None
+    try:
+        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    if parsed.tzinfo is None or parsed.utcoffset() is None:
+        return None
+    return parsed.astimezone(UTC)
+
+
 __all__ = [
+    "DiscordAcademicMessageCreate",
     "DiscordClarificationAction",
     "DiscordClarificationCallbackResult",
     "DiscordClarificationHandler",
     "DiscordClarificationInteraction",
+    "DiscordGatewayConfigurationError",
     "DiscordGatewayConnect",
     "DiscordGatewayHttpClient",
     "DiscordGatewayListener",
@@ -421,6 +666,9 @@ __all__ = [
     "DiscordGatewaySleep",
     "DiscordGatewayWebSocket",
     "DiscordInteractionStatus",
+    "DiscordMessageCallbackResult",
+    "DiscordMessageHandler",
+    "normalize_academic_message",
     "normalize_clarification_interaction",
     "parse_clarification_custom_id",
 ]

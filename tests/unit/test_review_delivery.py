@@ -129,7 +129,7 @@ async def test_first_delivery_posts_once_and_records_sent(engine: Engine, run_id
     request = handler.requests[0]
     assert request.url.path == f"/api/v10/channels/{CHANNEL_ID}/messages"
     body = json.loads(request.content)
-    assert body["nonce"] == str(delivery.id)
+    assert body["nonce"] == delivery.id.hex[:25]
     assert body["enforce_nonce"] is True
     assert body["allowed_mentions"] == {"parse": []}
     assert TOKEN not in request.content.decode()

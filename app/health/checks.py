@@ -303,9 +303,18 @@ def check_academic_notion_status(
 
 
 def check_academic_discord_gateway(settings: Settings, runtime_state: str | None) -> HealthCheck:
-    """Expose the configured clarification listener state without account details."""
+    """Expose Gateway/message-content setup without account or credential details."""
 
     if not settings.discord_academic_gateway_enabled:
+        if settings.discord_academic_message_content_enabled:
+            return HealthCheck(
+                name="academic_discord_gateway",
+                state=HealthState.ATTENTION,
+                diagnostic=(
+                    "Academic Discord free-text is enabled but the Gateway listener is disabled; "
+                    "enable the Gateway or disable free-text"
+                ),
+            )
         return HealthCheck(
             name="academic_discord_gateway",
             state=HealthState.HEALTHY,
@@ -315,8 +324,6 @@ def check_academic_discord_gateway(settings: Settings, runtime_state: str | None
         settings.discord_bot_token is not None
         and settings.discord_academic_channel_id is not None
         and bool(settings.discord_academic_authorized_user_ids)
-        and settings.notion_token is not None
-        and settings.notion_courses_database_id is not None
     )
     if not configured or runtime_state == "setup_required":
         return HealthCheck(
@@ -325,6 +332,15 @@ def check_academic_discord_gateway(settings: Settings, runtime_state: str | None
             diagnostic="Academic Discord Gateway setup is incomplete",
         )
     state = runtime_state or "unknown"
+    if state == "message_content_intent_unavailable":
+        return HealthCheck(
+            name="academic_discord_gateway",
+            state=HealthState.FAILED,
+            diagnostic=(
+                "Discord rejected the Message Content privileged intent; enable it in the "
+                "Developer Portal or disable academic free-text"
+            ),
+        )
     return HealthCheck(
         name="academic_discord_gateway",
         state=HealthState.HEALTHY if state == "running" else HealthState.ATTENTION,

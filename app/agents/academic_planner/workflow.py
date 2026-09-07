@@ -6,7 +6,7 @@ import json
 import re
 import uuid
 from collections.abc import Sequence
-from datetime import UTC, date, datetime
+from datetime import UTC, date, datetime, timedelta
 from typing import Any, Protocol, cast
 from zoneinfo import ZoneInfo
 
@@ -44,6 +44,10 @@ class AcademicPlannerStore(Protocol):
     def mark_checkin_applied(
         self, proposal_id: uuid.UUID, confirmation_event: str | None = None
     ) -> None: ...
+
+    def reject_checkin_proposal(
+        self, proposal_id: uuid.UUID, *, actor: str = "academic_planner"
+    ) -> tuple[str, CheckinProposal | None]: ...
 
 
 class NotionAcademicWriter(Protocol):
@@ -270,6 +274,12 @@ def _fallback_extract(reply: str) -> tuple[ProposedChange, ...]:
     return tuple(changes)
 
 
+def extract_checkin_changes(reply: str) -> tuple[ProposedChange, ...]:
+    """Extract only the local, conservative grammar used for private replies."""
+
+    return _fallback_extract(reply)
+
+
 async def create_checkin_proposal(
     *,
     store: AcademicPlannerStore,
@@ -277,6 +287,7 @@ async def create_checkin_proposal(
     plan_id: uuid.UUID | None = None,
     model: PlannerModelGateway | None = None,
     delivery: PlannerDelivery | None = None,
+    now: datetime | None = None,
 ) -> CheckinProposal:
     """Turn a reply into a proposal without performing any Notion write."""
 
@@ -286,12 +297,15 @@ async def create_checkin_proposal(
         tuple(await model.extract_checkin(reply)) if model is not None else _fallback_extract(reply)
     )
     proposal_id = uuid.uuid4()
-    confirmation = f"CONFIRM ACADEMIC {proposal_id}"
+    confirmation = f"confirm {proposal_id}"
+    current = now or datetime.now(UTC)
+    ttl_hours = int(getattr(store, "confirmation_ttl_hours", 24))
     proposal = CheckinProposal(
         proposal_id=proposal_id,
         confirmation_event=confirmation,
         changes=changes,
         source_plan_id=plan_id,
+        expires_at=current + timedelta(hours=ttl_hours),
         question=(
             "No confirmed changes were extracted; tell me what to update." if not changes else None
         ),
@@ -329,6 +343,9 @@ async def confirm_checkin_proposal(
 ) -> dict[str, object]:
     """Apply changes only when the confirmation event matches byte-for-byte."""
 
+    if confirmation_event != f"confirm {proposal_id}":
+        return {"status": "confirmation_required", "proposal_id": str(proposal_id)}
+
     status, proposal = store.prepare_checkin_application(proposal_id, confirmation_event)
     if status == "not_found" or proposal is None:
         return {"status": "not_found", "proposal_id": str(proposal_id)}
@@ -355,6 +372,33 @@ async def confirm_checkin_proposal(
         "proposal_id": str(proposal_id),
         "change_count": len(proposal.changes),
     }
+
+
+def reject_checkin_proposal(
+    *,
+    store: AcademicPlannerStore,
+    proposal_id: uuid.UUID,
+    rejection_event: str,
+) -> dict[str, object]:
+    """Terminally reject exactly one pending proposal without an external write."""
+
+    if rejection_event != f"reject {proposal_id}":
+        return {"status": "rejection_required", "proposal_id": str(proposal_id)}
+    status, proposal = store.reject_checkin_proposal(
+        proposal_id,
+        actor="discord_authorized_user",
+    )
+    if proposal is None:
+        status = "not_found"
+    elif status not in {"rejected", "already_rejected"}:
+        status = "rejection_required"
+    result: dict[str, object] = {
+        "status": status,
+        "proposal_id": str(proposal_id),
+    }
+    if proposal is not None:
+        result["change_count"] = len(proposal.changes)
+    return result
 
 
 async def run_academic_planner(run_id: str, idempotency_key: str) -> dict[str, object]:
@@ -506,6 +550,8 @@ __all__ = [
     "configure_academic_runtime",
     "confirm_checkin_proposal",
     "create_checkin_proposal",
+    "extract_checkin_changes",
+    "reject_checkin_proposal",
     "run_academic_planner",
     "run_end_of_day_checkin",
     "run_morning_plan",
