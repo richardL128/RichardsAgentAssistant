@@ -43,15 +43,13 @@ Use a separate local configuration entry for each connector. `.env.example` has 
 NOTION_TOKEN=
 NOTION_COURSES_DATABASE_ID=
 
-DISCORD_APPLICATION_ID=
-DISCORD_PUBLIC_KEY=
 DISCORD_BOT_TOKEN=
 DISCORD_ACADEMIC_AUTHORIZED_USER_IDS=[]
 DISCORD_ACADEMIC_GATEWAY_ENABLED=false
-DISCORD_PRIVATE_CHANNEL_ID=
+DISCORD_ACADEMIC_MESSAGE_CONTENT_ENABLED=false
+DISCORD_ACADEMIC_CHANNEL_ID=
 DISCORD_FINANCE_CHANNEL_ID=
 DISCORD_CODE_REVIEW_CHANNEL_ID=
-DISCORD_PLANNER_CHANNEL_ID=
 
 SEC_USER_AGENT=LifeAgent/0.1 contact@example.com
 EIA_API_KEY=
@@ -142,15 +140,15 @@ Create one Discord application with one bot user. The three agents share it, but
 
 Use the Discord **Gateway** for incoming private replies and the normal REST API for outbound messages. Gateway is a persistent connection from the local worker to Discord, so the Mac does not need to expose a public URL. This is preferable to an HTTP interaction endpoint for the first local deployment.
 
-The system needs inbound text only for the student's planner check-in/confirmation flow. Do not enable broad message collection. The gateway handler accepts messages only from `DISCORD_OWNER_USER_ID` in the configured private channel or direct-message context; it ignores everything else. Enable the Message Content intent only if this narrow reply flow requires it, and document that choice in the Discord Developer Portal.
+The system needs inbound text only for the student's planner check-in/confirmation flow. Do not enable broad message collection. The gateway handler accepts messages only from `DISCORD_ACADEMIC_AUTHORIZED_USER_IDS` in exactly `DISCORD_ACADEMIC_CHANNEL_ID`; direct messages and every other channel are ignored. Keep `DISCORD_ACADEMIC_MESSAGE_CONTENT_ENABLED=false` for button-only or outbound-only deployments. Enable both that flag and Discord's privileged Message Content intent only when this narrow free-text reply flow is required.
 
 ### User setup in Discord
 
 1. Create an application in the [Discord Developer Portal](https://discord.com/developers/applications), then add a Bot user.
-2. Copy the **Application ID**, **Public Key**, and bot token into the secret store. Rotate the token immediately if it is pasted into a terminal, chat, or repository by mistake.
-3. In the Bot settings, enable only required gateway intents. Initially that is no privileged intent for outbound-only testing; enable Message Content only when the planner's inbound free-text check-in is implemented.
+2. Copy the bot token into the secret store. The Application ID and Public Key are not runtime requirements for this Gateway-only flow; add them only if an HTTP interactions endpoint is implemented later. Rotate the token immediately if it is pasted into a terminal, chat, or repository by mistake.
+3. In the Bot settings, enable only required gateway intents. Leave every privileged intent disabled for outbound-only or button-only testing. To receive the planner's inbound free-text check-ins, enable **Message Content Intent** in the portal and set `DISCORD_ACADEMIC_MESSAGE_CONTENT_ENABLED=true`; the listener then requests only Guild Messages and Message Content. Never enable Presence Intent or Server Members Intent.
 4. Create a private server category or private channels for Finance, Code Review, and Planner. Restrict visibility to the owner and bot. A private channel is more reliable than bot DMs, which can be disabled by user/server privacy settings.
-5. Invite the bot with OAuth2 scopes `bot` and `applications.commands`. Grant only: View Channel, Send Messages, Embed Links, Read Message History, and Use Application Commands. Add Attach Files only if the plan intentionally sends files. Never grant Administrator, Manage Server, Manage Roles, or broad moderation permissions.
+5. Invite the bot with the OAuth2 scope `bot`. The `applications.commands` scope is optional and is needed only if slash commands are implemented later; it is a scope, not a bot permission. Grant only these bot permissions: View Channel, Send Messages, Embed Links, and Read Message History. Add Attach Files only if the plan intentionally sends files. Never grant Administrator, Manage Server, Manage Roles, or broad moderation permissions.
 6. Copy the owner user ID and channel IDs with Discord Developer Mode enabled. Put them in the secret/config store.
 7. Start in a test channel. Send a test message, capture its message ID/permalink, and verify no other channel is readable or writable by the bot.
 
@@ -173,7 +171,7 @@ For later buttons/modals/slash commands, Discord interactions may be received by
 
 - The bot can send one test message only to the configured test channel and stores a delivery receipt.
 - The gateway reconnects after a simulated network loss without duplicating an inbound event.
-- A message from any user other than `DISCORD_OWNER_USER_ID`, or from an unconfigured channel, is ignored and audited without storing its content.
+- A message from any user outside `DISCORD_ACADEMIC_AUTHORIZED_USER_IDS`, or from an unconfigured channel, is ignored before its content is inspected, audited, or stored.
 - A planner reply creates a proposal; only a matching owner confirmation applies it.
 - Rate-limit and permission failures become `attention`/`failed` diagnostics with no retry storm.
 

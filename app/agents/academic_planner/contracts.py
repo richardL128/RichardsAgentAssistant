@@ -178,7 +178,13 @@ class CheckinProposal(PlannerModel):
     confirmation_event: str = Field(min_length=1, max_length=255)
     changes: tuple[ProposedChange, ...] = Field(max_length=20)
     source_plan_id: UUID | None = None
+    expires_at: datetime | None = None
     question: str | None = Field(default=None, max_length=2_000)
+
+    @field_validator("expires_at")
+    @classmethod
+    def expires_at_aware(cls, value: datetime | None) -> datetime | None:
+        return _aware(value) if value is not None else None
 
 
 class CheckinExtraction(PlannerModel):

@@ -115,7 +115,7 @@ async def test_deliver_failure_alert_is_idempotent(engine: Engine) -> None:
     assert second.status == DeliveryStatus.SENT.value
     assert len(recorder.requests) == 1
     body = json.loads(recorder.requests[0].content)
-    assert body["nonce"] == str(first.id)
+    assert body["nonce"] == first.id.hex[:25]
     assert body["enforce_nonce"] is True
     assert "never-print-this-token" not in recorder.requests[0].content.decode()
 

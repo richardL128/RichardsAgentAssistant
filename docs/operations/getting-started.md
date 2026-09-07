@@ -246,7 +246,8 @@ schedule, or attempt a Notion write.
 ## 4. Configure Discord
 
 Discord is used for allowlisted outbound briefings and alerts, plus an optional
-outbound Gateway connection for academic clarification buttons.
+outbound Gateway connection for academic clarification buttons and private
+academic check-in replies.
 
 1. Create an application in the [Discord Developer Portal](https://discord.com/developers/applications).
 2. Add a Bot user and copy its token into `DISCORD_BOT_TOKEN`.
@@ -263,6 +264,7 @@ DISCORD_BOT_TOKEN=...
 DISCORD_ACADEMIC_CHANNEL_ID=...
 DISCORD_ACADEMIC_AUTHORIZED_USER_IDS=[123456789012345678]
 DISCORD_ACADEMIC_GATEWAY_ENABLED=true
+DISCORD_ACADEMIC_MESSAGE_CONTENT_ENABLED=false
 DISCORD_FINANCE_CHANNEL_ID=...
 DISCORD_CODE_REVIEW_CHANNEL_ID=...
 ```
@@ -271,6 +273,41 @@ Only the listed Discord users can authorize a clarification. The Gateway is an
 outbound WebSocket connection and does not expose a public port. Button
 interactions do not require broad message collection or the privileged Message
 Content intent.
+
+For button-only operation, leave
+`DISCORD_ACADEMIC_MESSAGE_CONTENT_ENABLED=false`; the bot identifies with
+Gateway intents `0`. To accept ordinary private planner replies, first open the
+application in the Discord Developer Portal, select **Bot**, enable only
+**Message Content Intent** under Privileged Gateway Intents, and then set:
+
+```dotenv
+DISCORD_ACADEMIC_GATEWAY_ENABLED=true
+DISCORD_ACADEMIC_MESSAGE_CONTENT_ENABLED=true
+```
+
+Free-text mode requests only Guild Messages and Message Content. Do not enable
+Presence Intent or Server Members Intent. Keep the academic channel private and
+grant the bot only View Channel, Send Messages, Embed Links, and Read Message
+History. Application ID and Public Key are not runtime requirements for this
+Gateway-only flow; configure them only if a separately deployed HTTP Discord
+interactions endpoint is added later.
+
+An authorized message in `DISCORD_ACADEMIC_CHANNEL_ID` may use these conservative
+forms:
+
+```text
+completed <assessment-id>
+logged <assessment-id> <minutes>
+actual <assessment-id> <minutes>
+confirm <canonical-proposal-uuid>
+reject <canonical-proposal-uuid>
+```
+
+Confirmation and rejection commands must match exactly, with no extra spaces or
+arguments. Unsupported prose receives a clarification response and cannot write
+to Notion. Proposal previews include the proposal ID, bounded typed changes,
+expiry, and both exact commands. Replies from other users/channels and bot-authored
+messages are ignored before their content is inspected or persisted.
 
 Planner check-ins can also be submitted to the LifeAgent API and produce a
 separate confirmation-gated proposal:
@@ -284,6 +321,12 @@ curl -H 'Content-Type: application/json' \
 Treat the returned proposal ID and confirmation event as sensitive workflow
 data. Do not enable broad message collection or grant unnecessary privileged
 intents.
+
+Confirmed Notion writes remain unavailable until a host integration supplies a
+reviewed `AcademicNotionWriter` containing the exact discovered page targets and
+allowlisted property IDs. Courses-only read synchronization does not invent
+write mappings. Proposal creation and rejection continue to work while that
+writer is unavailable; confirmation returns an actionable fail-closed response.
 
 For an ambiguous assessment label, LifeAgent first persists the request and
 then sends `Quiz`, `Assignment`, and `Ignore` buttons. Quiz or Assignment shows

@@ -35,6 +35,15 @@ class Store:
         self.applied = True
         self.applying = False
 
+    def reject_checkin_proposal(self, proposal_id, *, actor="academic_planner"):
+        proposal = self.get_checkin_proposal(proposal_id)
+        if proposal is None:
+            return "not_pending", None
+        if self.applied:
+            return "already_applied", proposal
+        self.proposal = proposal
+        return "rejected", proposal
+
 
 class Writer:
     def __init__(self) -> None:
@@ -78,6 +87,20 @@ def test_exact_confirmation_is_the_only_write_path() -> None:
     assert result.json()["status"] == "applied"
     assert writer.calls == 1
     assert store.applied
+
+
+def test_rejection_does_not_require_or_call_notion_writer() -> None:
+    store, writer = Store(), Writer()
+    with TestClient(_app(store, writer)) as client:
+        proposal = client.post("/academic/checkin", json={"reply": "completed essay"}).json()
+        result = client.post(
+            f"/academic/reject/{proposal['proposal_id']}",
+            json={"rejection_event": f"reject {proposal['proposal_id']}"},
+        )
+
+    assert result.status_code == 200
+    assert result.json()["status"] == "rejected"
+    assert writer.calls == 0
 
 
 def test_manual_sync_uses_the_production_sync_boundary() -> None:

@@ -59,6 +59,37 @@ def _course(engine) -> UUID:
         ).id
 
 
+def _checkin_proposal(
+    session: Session,
+    *,
+    event_id: str = "event-1",
+    idempotency_key: str = "proposal-1",
+    confirmation_event: str = "CONFIRM ACADEMIC exact-token",
+    expires_at: datetime | None = None,
+) -> AcademicProposedChange:
+    checkin = AcademicRepository.create_checkin(
+        session,
+        idempotency_key=f"discord:{event_id}",
+        external_event_id=event_id,
+        channel="discord",
+        received_at=datetime(2026, 9, 3, 21, tzinfo=UTC),
+        redacted_summary="One completion update proposed.",
+        status="proposal_pending",
+    )
+    return AcademicRepository.create_proposed_change(
+        session,
+        checkin_id=checkin.id,
+        idempotency_key=idempotency_key,
+        operation="notion_update",
+        target_type="assessment",
+        target_id="notion-assignment-1",
+        payload={"completed": True},
+        redacted_preview="Mark the assessment complete.",
+        confirmation_token=confirmation_event,
+        expires_at=expires_at,
+    )
+
+
 def test_delta_upserts_preserve_typed_citations_and_ambiguity(engine) -> None:
     course = _course(engine)
     due = datetime(2026, 10, 14, 15, tzinfo=UTC)
@@ -610,38 +641,19 @@ def test_plan_replay_and_incomplete_carry_forward_are_visible(engine) -> None:
 
 
 def test_checkin_proposal_requires_exact_confirmation_and_is_replay_safe(engine) -> None:
-    token = "CONFIRM ACADEMIC exact-token"
+    confirmation_event = "CONFIRM ACADEMIC exact-token"
     with Session(engine) as session, session.begin():
-        checkin = AcademicRepository.create_checkin(
-            session,
-            idempotency_key="discord:event-1",
-            external_event_id="event-1",
-            channel="discord",
-            received_at=datetime(2026, 9, 3, 21, tzinfo=UTC),
-            redacted_summary="One completion update proposed.",
-            status="proposal_pending",
-        )
-        proposal = AcademicRepository.create_proposed_change(
-            session,
-            checkin_id=checkin.id,
-            idempotency_key="proposal-1",
-            operation="notion_update",
-            target_type="assessment",
-            target_id="notion-assignment-1",
-            payload={"completed": True},
-            redacted_preview="Mark the assessment complete.",
-            confirmation_token=token,
-        )
+        proposal = _checkin_proposal(session, confirmation_event=confirmation_event)
         replay = AcademicRepository.create_proposed_change(
             session,
-            checkin_id=checkin.id,
+            checkin_id=proposal.checkin_id,
             idempotency_key="proposal-1",
             operation="notion_update",
             target_type="assessment",
             target_id="notion-assignment-1",
             payload={"completed": True},
             redacted_preview="Mark the assessment complete.",
-            confirmation_token=token,
+            confirmation_token=confirmation_event,
         )
         assert replay.id == proposal.id
         denied, _ = AcademicRepository.begin_confirmed_change(
@@ -651,29 +663,356 @@ def test_checkin_proposal_requires_exact_confirmation_and_is_replay_safe(engine)
         )
         assert denied == "confirmation_required"
         ready, claimed = AcademicRepository.begin_confirmed_change(
-            session, proposal_id=proposal.id, confirmation_event=token
+            session, proposal_id=proposal.id, confirmation_event=confirmation_event
         )
         assert ready == "ready"
         assert claimed.state == "applying"
         in_progress, _ = AcademicRepository.begin_confirmed_change(
-            session, proposal_id=proposal.id, confirmation_event=token
+            session, proposal_id=proposal.id, confirmation_event=confirmation_event
         )
         assert in_progress == "in_progress"
         applied = AcademicRepository.mark_proposed_change_applied(
-            session, proposal_id=proposal.id, confirmation_event=token
+            session, proposal_id=proposal.id, confirmation_event=confirmation_event
         )
         assert applied.state == "applied"
         assert (
             AcademicRepository.mark_proposed_change_applied(
-                session, proposal_id=proposal.id, confirmation_event=token
+                session, proposal_id=proposal.id, confirmation_event=confirmation_event
             ).id
             == proposal.id
         )
         already_applied, _ = AcademicRepository.begin_confirmed_change(
-            session, proposal_id=proposal.id, confirmation_event=token
+            session, proposal_id=proposal.id, confirmation_event=confirmation_event
         )
         assert already_applied == "already_applied"
 
     with Session(engine) as session:
         assert session.scalar(select(func.count()).select_from(AcademicCheckIn)) == 1
         assert session.scalar(select(func.count()).select_from(AcademicProposedChange)) == 1
+
+
+def test_checkin_proposal_rejection_is_atomic_audited_and_replay_safe(engine) -> None:
+    now = datetime(2026, 9, 3, 22, tzinfo=UTC)
+    with Session(engine) as session, session.begin():
+        proposal = _checkin_proposal(session, expires_at=now + timedelta(hours=2))
+        proposal_row_id = proposal.id
+        status, rejected = AcademicRepository.reject_proposed_change(
+            session,
+            proposal_id=proposal_row_id,
+            actor="discord:123456789",
+            now=now,
+        )
+        assert status == "rejected"
+        assert rejected.state == "rejected"
+        proposal_public_id = rejected.target_id
+        checkin = session.get(AcademicCheckIn, rejected.checkin_id)
+        assert checkin is not None
+        assert checkin.status == "completed"
+
+        replay_status, replay = AcademicRepository.reject_proposed_change(
+            session,
+            proposal_id=proposal_row_id,
+            actor="discord:123456789",
+            now=now + timedelta(minutes=1),
+        )
+        assert replay_status == "already_rejected"
+        assert replay.id == proposal_row_id
+
+        denied, _ = AcademicRepository.begin_confirmed_change(
+            session,
+            proposal_id=proposal_row_id,
+            confirmation_event="CONFIRM ACADEMIC exact-token",
+            now=now + timedelta(minutes=2),
+        )
+        assert denied == "confirmation_required"
+
+    with Session(engine) as session:
+        audit_events = list(session.scalars(select(AuditEvent)))
+        assert len(audit_events) == 1
+        assert audit_events[0].actor == "discord:123456789"
+        assert audit_events[0].action == "academic_proposal.rejected"
+        assert audit_events[0].target_id == proposal_public_id
+        assert audit_events[0].result == "rejected"
+        assert session.scalar(select(func.count()).select_from(Assessment)) == 0
+        assert session.scalar(select(func.count()).select_from(StudyBlock)) == 0
+
+
+def test_rejecting_expired_or_non_pending_proposal_never_audits(engine) -> None:
+    now = datetime(2026, 9, 3, 22, tzinfo=UTC)
+    with Session(engine) as session, session.begin():
+        expired = _checkin_proposal(
+            session,
+            event_id="event-expired-proposal",
+            idempotency_key="proposal-expired",
+            expires_at=now - timedelta(minutes=1),
+        )
+        expired_status, expired_row = AcademicRepository.reject_proposed_change(
+            session,
+            proposal_id=expired.id,
+            now=now,
+        )
+        assert expired_status == "expired"
+        assert expired_row.state == "expired"
+
+        applying = _checkin_proposal(
+            session,
+            event_id="event-applying-proposal",
+            idempotency_key="proposal-applying",
+            expires_at=now + timedelta(hours=1),
+        )
+        ready, applying_row = AcademicRepository.begin_confirmed_change(
+            session,
+            proposal_id=applying.id,
+            confirmation_event="CONFIRM ACADEMIC exact-token",
+            now=now,
+        )
+        assert ready == "ready"
+        assert applying_row.state == "applying"
+        reject_status, same_row = AcademicRepository.reject_proposed_change(
+            session,
+            proposal_id=applying.id,
+            now=now + timedelta(minutes=1),
+        )
+        assert reject_status == "in_progress"
+        assert same_row.state == "applying"
+
+    with Session(engine) as session:
+        assert session.scalar(select(func.count()).select_from(AuditEvent)) == 0
+
+
+def test_confirm_reject_race_resolves_to_one_terminal_winner(engine) -> None:
+    now = datetime(2026, 9, 3, 22, tzinfo=UTC)
+    with Session(engine) as session, session.begin():
+        reject_first = _checkin_proposal(
+            session,
+            event_id="event-reject-first",
+            idempotency_key="proposal-reject-first",
+            expires_at=now + timedelta(hours=1),
+        )
+        rejected, rejected_row = AcademicRepository.reject_proposed_change(
+            session,
+            proposal_id=reject_first.id,
+            now=now,
+        )
+        confirmed_after_reject, same_rejected_row = AcademicRepository.begin_confirmed_change(
+            session,
+            proposal_id=reject_first.id,
+            confirmation_event="CONFIRM ACADEMIC exact-token",
+            now=now + timedelta(seconds=1),
+        )
+        assert rejected == "rejected"
+        assert rejected_row.state == "rejected"
+        assert confirmed_after_reject == "confirmation_required"
+        assert same_rejected_row.state == "rejected"
+
+        confirm_first = _checkin_proposal(
+            session,
+            event_id="event-confirm-first",
+            idempotency_key="proposal-confirm-first",
+            expires_at=now + timedelta(hours=1),
+        )
+        confirmed, confirmed_row = AcademicRepository.begin_confirmed_change(
+            session,
+            proposal_id=confirm_first.id,
+            confirmation_event="CONFIRM ACADEMIC exact-token",
+            now=now,
+        )
+        rejected_after_confirm, same_confirmed_row = AcademicRepository.reject_proposed_change(
+            session,
+            proposal_id=confirm_first.id,
+            now=now + timedelta(seconds=1),
+        )
+        assert confirmed == "ready"
+        assert confirmed_row.state == "applying"
+        assert rejected_after_confirm == "in_progress"
+        assert same_confirmed_row.state == "applying"
+
+    with Session(engine) as session:
+        assert session.scalar(select(func.count()).select_from(AuditEvent)) == 1
+
+
+def test_store_rejects_checkin_proposal_by_public_id(engine) -> None:
+    from app.agents.academic_planner.contracts import CheckinProposal, ProposedChange
+
+    store = SQLAlchemyAcademicPlannerStore(engine)
+    proposal_id = uuid4()
+    store.save_checkin_proposal(
+        CheckinProposal(
+            proposal_id=proposal_id,
+            confirmation_event=f"confirm {proposal_id}",
+            changes=(
+                ProposedChange(
+                    field="completed",
+                    value="true",
+                    assessment_id="notion-assignment-1",
+                ),
+            ),
+        )
+    )
+
+    status, proposal = store.reject_checkin_proposal(proposal_id, actor="discord:123456789")
+    replay_status, replay = store.reject_checkin_proposal(proposal_id, actor="discord:123456789")
+
+    assert status == "rejected"
+    assert proposal is not None
+    assert proposal.proposal_id == proposal_id
+    assert replay_status == "already_rejected"
+    assert replay is not None
+    with Session(engine) as session:
+        row = session.scalar(
+            select(AcademicProposedChange).where(
+                AcademicProposedChange.idempotency_key == f"academic-proposal:{proposal_id}"
+            )
+        )
+        assert row is not None
+        assert row.state == "rejected"
+        assert session.scalar(select(func.count()).select_from(AuditEvent)) == 1
+
+
+def test_store_persists_discord_checkin_with_external_event_dedupe(engine) -> None:
+    from app.agents.academic_planner.contracts import CheckinProposal, ProposedChange
+
+    store = SQLAlchemyAcademicPlannerStore(engine)
+    proposal_id = uuid4()
+    received_at = datetime(2026, 9, 3, 22, tzinfo=UTC)
+    proposal = CheckinProposal(
+        proposal_id=proposal_id,
+        confirmation_event=f"confirm {proposal_id}",
+        changes=(
+            ProposedChange(
+                field="completed",
+                value="true",
+                assessment_id="notion-assignment-1",
+            ),
+        ),
+    )
+
+    created = store.save_discord_checkin(
+        proposal,
+        external_event_id="discord-message-1",
+        channel="discord",
+        received_at=received_at,
+    )
+    replayed = store.save_discord_checkin(
+        CheckinProposal(
+            proposal_id=uuid4(),
+            confirmation_event="confirm different-proposal",
+            changes=(
+                ProposedChange(
+                    field="completed",
+                    value="true",
+                    assessment_id="notion-assignment-2",
+                ),
+            ),
+        ),
+        external_event_id="discord-message-1",
+        channel="discord",
+        received_at=received_at + timedelta(minutes=1),
+    )
+
+    assert created.status == "created"
+    assert created.checkin_status == "proposal_pending"
+    assert created.proposal_row_id is not None
+    assert replayed.status == "replayed"
+    assert replayed.checkin_id == created.checkin_id
+    assert replayed.proposal_row_id == created.proposal_row_id
+    with Session(engine) as session:
+        assert session.scalar(select(func.count()).select_from(AcademicCheckIn)) == 1
+        assert session.scalar(select(func.count()).select_from(AcademicProposedChange)) == 1
+        checkin = session.get(AcademicCheckIn, created.checkin_id)
+        proposed = session.get(AcademicProposedChange, created.proposal_row_id)
+        assert checkin is not None
+        assert proposed is not None
+        assert checkin.external_event_id == "discord-message-1"
+        assert checkin.content_artifact_key is None
+        assert checkin.redacted_summary == "Academic check-in proposal pending confirmation."
+        assert proposed.payload == {
+            "changes": [
+                {
+                    "field": "completed",
+                    "value": "true",
+                    "assessment_id": "notion-assignment-1",
+                }
+            ]
+        }
+        assert "raw private text" not in str(checkin)
+        assert "raw private text" not in str(proposed.payload)
+
+
+def test_store_resolves_public_daily_plan_key_for_discord_checkin(engine) -> None:
+    from app.agents.academic_planner.contracts import CheckinProposal, ProposedChange
+
+    store = SQLAlchemyAcademicPlannerStore(engine)
+    public_plan_id = uuid4()
+    with Session(engine) as session, session.begin():
+        plan = AcademicRepository.upsert_study_plan(
+            session,
+            plan_key=str(public_plan_id),
+            starts_on=date(2026, 9, 3),
+            ends_on=date(2026, 9, 3),
+            timezone="America/Toronto",
+            status="published",
+        )
+        internal_plan_id = plan.id
+
+    result = store.save_discord_checkin(
+        CheckinProposal(
+            proposal_id=uuid4(),
+            confirmation_event="confirm 01234567-89ab-4def-8123-456789abcdef",
+            changes=(
+                ProposedChange(
+                    field="completed",
+                    value="true",
+                    assessment_id="notion-assignment-1",
+                ),
+            ),
+            source_plan_id=public_plan_id,
+        ),
+        external_event_id="discord-message-with-plan",
+        channel="discord",
+        received_at=datetime(2026, 9, 3, 22, tzinfo=UTC),
+    )
+
+    with Session(engine) as session:
+        checkin = session.get(AcademicCheckIn, result.checkin_id)
+        assert checkin is not None
+        assert checkin.plan_id == internal_plan_id
+
+
+def test_store_persists_zero_change_discord_checkin_as_questioned_only(engine) -> None:
+    from app.agents.academic_planner.contracts import CheckinProposal
+
+    store = SQLAlchemyAcademicPlannerStore(engine)
+    proposal_id = uuid4()
+    proposal = CheckinProposal(
+        proposal_id=proposal_id,
+        confirmation_event=f"confirm {proposal_id}",
+        changes=(),
+    )
+    received_at = datetime(2026, 9, 3, 22, tzinfo=UTC)
+
+    created = store.save_discord_checkin(
+        proposal,
+        external_event_id="discord-message-question",
+        channel="discord",
+        received_at=received_at,
+    )
+    replayed = store.save_discord_checkin(
+        proposal,
+        external_event_id="discord-message-question",
+        channel="discord",
+        received_at=received_at + timedelta(minutes=1),
+    )
+
+    assert created.status == "created"
+    assert created.checkin_status == "questioned"
+    assert created.proposal_row_id is None
+    assert replayed.status == "replayed"
+    assert replayed.checkin_id == created.checkin_id
+    assert replayed.proposal_row_id is None
+    with Session(engine) as session:
+        checkin = session.get(AcademicCheckIn, created.checkin_id)
+        assert checkin is not None
+        assert checkin.status == "questioned"
+        assert checkin.redacted_summary == "Academic check-in needs clarification."
+        assert session.scalar(select(func.count()).select_from(AcademicProposedChange)) == 0

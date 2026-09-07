@@ -39,6 +39,14 @@ from app.db.models import (
 from app.db.repositories import AuditRepository
 
 FactState = Literal["unconfirmed", "confirmed", "ambiguous", "rejected"]
+ProposalRejectionStatus = Literal[
+    "rejected",
+    "already_rejected",
+    "expired",
+    "already_applied",
+    "in_progress",
+    "not_pending",
+]
 CommitmentKind = Literal[
     "class",
     "test",
@@ -137,6 +145,16 @@ class ClarificationInput:
     assessment_id: uuid.UUID | None = None
     raw_label: str | None = None
     title_property_id: str | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class InboundCheckinPersistResult:
+    """Durable inbound Discord dedupe result without private message content."""
+
+    status: Literal["created", "replayed"]
+    checkin_id: uuid.UUID
+    checkin_status: str
+    proposal_row_id: uuid.UUID | None = None
 
 
 def _utc(value: datetime, field: str) -> datetime:
@@ -1125,6 +1143,85 @@ class AcademicRepository:
         session.flush()
         return proposal
 
+    @staticmethod
+    def reject_proposed_change(
+        session: Session,
+        *,
+        proposal_id: uuid.UUID,
+        actor: str = "academic_planner",
+        now: datetime | None = None,
+    ) -> tuple[ProposalRejectionStatus, AcademicProposedChange]:
+        """Atomically reject a pending proposal without any external write.
+
+        This uses the same row lock as confirmation claiming so a concurrent
+        confirm/reject pair can only produce one winning terminal path.
+        """
+
+        proposal = session.scalar(
+            select(AcademicProposedChange)
+            .where(AcademicProposedChange.id == proposal_id)
+            .with_for_update()
+        )
+        if proposal is None:
+            raise NoResultFound(f"academic proposal {proposal_id} was not found")
+        current = now or datetime.now(UTC)
+        if proposal.state == "rejected":
+            return "already_rejected", proposal
+        if proposal.state == "applied":
+            return "already_applied", proposal
+        if proposal.state == "applying":
+            return "in_progress", proposal
+        if proposal.expires_at is not None and _aware_db(proposal.expires_at) <= current:
+            proposal.state = "expired"
+            session.flush()
+            return "expired", proposal
+        if proposal.state != "pending":
+            return "not_pending", proposal
+        proposal.state = "rejected"
+        checkin = session.get(AcademicCheckIn, proposal.checkin_id)
+        if checkin is not None:
+            checkin.status = "completed"
+        AuditRepository.append(
+            session,
+            actor=_bounded(actor, 128),
+            action="academic_proposal.rejected",
+            target_type="academic_proposal",
+            target_id=proposal.target_id,
+            result="rejected",
+        )
+        session.flush()
+        return "rejected", proposal
+
+
+def _checkin_proposal_from_row(
+    proposal_type: Any,
+    proposal_id: uuid.UUID,
+    row: AcademicProposedChange,
+    changes: Sequence[Any],
+) -> Any:
+    values: dict[str, Any] = {
+        "proposal_id": proposal_id,
+        "confirmation_event": row.confirmation_token,
+        "changes": tuple(changes),
+    }
+    if "expires_at" in getattr(proposal_type, "model_fields", {}):
+        values["expires_at"] = _aware_db(row.expires_at) if row.expires_at is not None else None
+    return proposal_type(**values)
+
+
+def _resolve_study_plan_id(
+    session: Session,
+    source_plan_id: uuid.UUID | None,
+) -> uuid.UUID | None:
+    """Resolve a planner-facing plan key to the internal foreign-key ID."""
+
+    if source_plan_id is None:
+        return None
+    plan = session.get(StudyPlan, source_plan_id)
+    if plan is None:
+        plan = session.scalar(select(StudyPlan).where(StudyPlan.plan_key == str(source_plan_id)))
+    return plan.id if plan is not None else None
+
 
 class SQLAlchemyAcademicPlannerStore:
     """Adapter implementing the academic planner's persistence protocol.
@@ -1510,15 +1607,17 @@ class SQLAlchemyAcademicPlannerStore:
 
     def save_checkin_proposal(self, proposal: Any) -> None:
         with Session(self.engine) as session, session.begin():
+            now = datetime.now(UTC)
+            plan_id = _resolve_study_plan_id(session, proposal.source_plan_id)
             checkin = AcademicRepository.create_checkin(
                 session,
                 idempotency_key=f"academic-checkin:{proposal.proposal_id}",
                 external_event_id=f"proposal:{proposal.proposal_id}",
                 channel="discord",
-                received_at=datetime.now(UTC),
+                received_at=now,
                 redacted_summary="Academic check-in proposal pending confirmation.",
                 status="proposal_pending",
-                plan_id=proposal.source_plan_id,
+                plan_id=plan_id,
             )
             AcademicRepository.create_proposed_change(
                 session,
@@ -1532,7 +1631,97 @@ class SQLAlchemyAcademicPlannerStore:
                 },
                 redacted_preview="Academic planner proposed changes; confirmation required.",
                 confirmation_token=proposal.confirmation_event,
-                expires_at=datetime.now(UTC) + timedelta(hours=self.confirmation_ttl_hours),
+                expires_at=getattr(proposal, "expires_at", None)
+                or now + timedelta(hours=self.confirmation_ttl_hours),
+            )
+
+    def save_discord_checkin(
+        self,
+        proposal: Any,
+        *,
+        external_event_id: str,
+        channel: str,
+        received_at: datetime,
+    ) -> InboundCheckinPersistResult:
+        """Persist one authorized Discord message as a deduplicated check-in.
+
+        The raw Discord message body is deliberately not accepted. A message
+        with typed changes gets one pending proposal; a message with no typed
+        changes is recorded as questioned and cannot write to Notion.
+        """
+
+        event_id = _bounded(external_event_id)
+        event_key = f"discord-message:{event_id}"
+        with Session(self.engine) as session, session.begin():
+            changes = tuple(proposal.changes)
+            plan_id = _resolve_study_plan_id(session, proposal.source_plan_id)
+            checkin_status: Literal["questioned", "proposal_pending"] = (
+                "proposal_pending" if changes else "questioned"
+            )
+            checkin_values = {
+                "idempotency_key": event_key,
+                "external_event_id": event_id,
+                "channel": _bounded(channel, 64),
+                "received_at": _utc(received_at, "received_at"),
+                "content_artifact_key": None,
+                "redacted_summary": (
+                    "Academic check-in proposal pending confirmation."
+                    if changes
+                    else "Academic check-in needs clarification."
+                ),
+                "status": checkin_status,
+                "plan_id": plan_id,
+            }
+            try:
+                checkin = AcademicCheckIn(**checkin_values)
+                with session.begin_nested():
+                    session.add(checkin)
+                    session.flush()
+            except IntegrityError:
+                existing_checkin = session.scalar(
+                    select(AcademicCheckIn)
+                    .where(
+                        or_(
+                            AcademicCheckIn.idempotency_key == event_key,
+                            AcademicCheckIn.external_event_id == event_id,
+                        )
+                    )
+                    .with_for_update()
+                )
+                if existing_checkin is None:
+                    raise
+                existing_proposal = session.scalar(
+                    select(AcademicProposedChange).where(
+                        AcademicProposedChange.checkin_id == existing_checkin.id
+                    )
+                )
+                return InboundCheckinPersistResult(
+                    status="replayed",
+                    checkin_id=existing_checkin.id,
+                    checkin_status=existing_checkin.status,
+                    proposal_row_id=existing_proposal.id if existing_proposal is not None else None,
+                )
+            proposal_row: AcademicProposedChange | None = None
+            if changes:
+                now = datetime.now(UTC)
+                proposal_row = AcademicRepository.create_proposed_change(
+                    session,
+                    checkin_id=checkin.id,
+                    idempotency_key=f"academic-proposal:{proposal.proposal_id}",
+                    operation="notion_update",
+                    target_type="academic_checkin",
+                    target_id=str(proposal.proposal_id),
+                    payload={"changes": [change.model_dump(mode="json") for change in changes]},
+                    redacted_preview="Academic planner proposed changes; confirmation required.",
+                    confirmation_token=proposal.confirmation_event,
+                    expires_at=getattr(proposal, "expires_at", None)
+                    or now + timedelta(hours=self.confirmation_ttl_hours),
+                )
+            return InboundCheckinPersistResult(
+                status="created",
+                checkin_id=checkin.id,
+                checkin_status=checkin_status,
+                proposal_row_id=proposal_row.id if proposal_row is not None else None,
             )
 
     def get_checkin_proposal(self, proposal_id: uuid.UUID) -> Any | None:
@@ -1547,11 +1736,7 @@ class SQLAlchemyAcademicPlannerStore:
             if row is None:
                 return None
             changes = tuple(ProposedChange(**value) for value in row.payload.get("changes", []))
-            return CheckinProposal(
-                proposal_id=proposal_id,
-                confirmation_event=row.confirmation_token,
-                changes=changes,
-            )
+            return _checkin_proposal_from_row(CheckinProposal, proposal_id, row, changes)
 
     def prepare_checkin_application(
         self, proposal_id: uuid.UUID, confirmation_event: str
@@ -1574,11 +1759,7 @@ class SQLAlchemyAcademicPlannerStore:
                 confirmation_event=confirmation_event,
             )
             changes = tuple(ProposedChange(**value) for value in row.payload.get("changes", []))
-            proposal = CheckinProposal(
-                proposal_id=proposal_id,
-                confirmation_event=row.confirmation_token,
-                changes=changes,
-            )
+            proposal = _checkin_proposal_from_row(CheckinProposal, proposal_id, row, changes)
             return status, proposal
 
     def mark_checkin_applied(
@@ -1608,6 +1789,28 @@ class SQLAlchemyAcademicPlannerStore:
                 target_id=str(proposal_id),
                 result="applied",
             )
+
+    def reject_checkin_proposal(
+        self, proposal_id: uuid.UUID, *, actor: str = "academic_planner"
+    ) -> tuple[ProposalRejectionStatus, Any | None]:
+        from app.agents.academic_planner.contracts import CheckinProposal, ProposedChange
+
+        with Session(self.engine) as session, session.begin():
+            row = session.scalar(
+                select(AcademicProposedChange)
+                .where(AcademicProposedChange.idempotency_key == f"academic-proposal:{proposal_id}")
+                .with_for_update()
+            )
+            if row is None:
+                return "not_pending", None
+            status, row = AcademicRepository.reject_proposed_change(
+                session,
+                proposal_id=row.id,
+                actor=actor,
+            )
+            changes = tuple(ProposedChange(**value) for value in row.payload.get("changes", []))
+            proposal = _checkin_proposal_from_row(CheckinProposal, proposal_id, row, changes)
+            return status, proposal
 
     def upsert_course_calendar(
         self,

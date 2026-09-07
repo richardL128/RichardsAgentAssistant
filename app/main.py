@@ -16,15 +16,24 @@ from starlette.middleware.base import BaseHTTPMiddleware, RequestResponseEndpoin
 from starlette.responses import Response
 
 from app import __version__
+from app.agents.academic_planner.discord_checkin import AcademicDiscordCheckinHandler
 from app.agents.academic_planner.sync import AcademicClarificationService, AcademicNotionSync
+from app.agents.academic_planner.workflow import LLMPlannerModel
 from app.api.academic import router as academic_router
 from app.api.finance import router as finance_router
 from app.api.github import router as github_router
 from app.api.health import router as health_router
 from app.api.operations import router as operations_router
 from app.api.pages import router as pages_router
-from app.connectors.discord import DiscordAcademicPlannerAdapter
-from app.connectors.discord_gateway import DiscordGatewayListener
+from app.connectors.discord import (
+    DiscordAcademicPlannerAdapter,
+    DiscordAcademicResponseDelivery,
+)
+from app.connectors.discord_gateway import (
+    DiscordClarificationCallbackResult,
+    DiscordClarificationInteraction,
+    DiscordGatewayListener,
+)
 from app.connectors.notion import NotionConnector
 from app.core.config import Settings, get_settings
 from app.core.errors import LifeAgentError
@@ -94,12 +103,19 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     )
     academic_channel = app_settings.discord_academic_channel_id
     academic_discord = None
+    academic_delivery = None
     if app_settings.discord_bot_token is not None and academic_channel is not None:
         academic_discord = DiscordAcademicPlannerAdapter(
             token=app_settings.discord_bot_token,
             allowed_channel_ids={academic_channel},
             base_url=app_settings.discord_api_url,
         )
+        academic_delivery = DiscordAcademicResponseDelivery(
+            engine=database.engine,
+            channel_id=academic_channel,
+            adapter=academic_discord,
+        )
+    academic_model = LLMPlannerModel(gateway)
     notion_connector = None
     notion_setup_condition = "notion_configuration_missing"
     if (
@@ -136,20 +152,50 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     gateway_state = "disabled"
     if app_settings.discord_academic_gateway_enabled:
         gateway_state = "setup_required"
-        if (
+        discord_gateway_configured = (
             app_settings.discord_bot_token is not None
             and academic_channel is not None
             and app_settings.discord_academic_authorized_user_ids
-            and clarification_service is not None
-        ):
+        )
+        supports_configured_flow = (
+            clarification_service is not None
+            or app_settings.discord_academic_message_content_enabled
+        )
+        if discord_gateway_configured and supports_configured_flow:
+            configured_token = app_settings.discord_bot_token
+            configured_channel = academic_channel
+            assert configured_token is not None
+            assert configured_channel is not None
+            authorized_user_ids = {
+                str(item) for item in app_settings.discord_academic_authorized_user_ids
+            }
+
+            async def ignored_clarification(
+                interaction: DiscordClarificationInteraction,
+            ) -> DiscordClarificationCallbackResult:
+                del interaction
+                return DiscordClarificationCallbackResult(status="ignored")
+
+            message_handler = (
+                AcademicDiscordCheckinHandler(
+                    store=academic_store,
+                    delivery=academic_delivery,
+                    allowed_channel_ids={configured_channel},
+                    authorized_user_ids=authorized_user_ids,
+                    writer_provider=lambda: getattr(app.state, "notion_writer", None),
+                )
+                if app_settings.discord_academic_message_content_enabled
+                and academic_delivery is not None
+                else None
+            )
             gateway_listener = DiscordGatewayListener(
-                token=app_settings.discord_bot_token,
+                token=configured_token,
                 api_base_url=app_settings.discord_api_url,
-                allowed_channel_ids={academic_channel},
-                authorized_user_ids={
-                    str(item) for item in app_settings.discord_academic_authorized_user_ids
-                },
-                handler=clarification_service,
+                allowed_channel_ids={configured_channel},
+                authorized_user_ids=authorized_user_ids,
+                handler=clarification_service or ignored_clarification,
+                message_content_enabled=app_settings.discord_academic_message_content_enabled,
+                message_handler=message_handler,
             )
             gateway_state = "starting"
 
@@ -169,7 +215,12 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                 except asyncio.CancelledError:
                     raise
                 except Exception:
-                    application.state.discord_academic_gateway_state = "failed"
+                    application.state.discord_academic_gateway_state = (
+                        "message_content_intent_unavailable"
+                        if listener.last_diagnostic is not None
+                        and "Message Content" in listener.last_diagnostic
+                        else "failed"
+                    )
 
             gateway_task = asyncio.create_task(
                 run_gateway(),
@@ -186,6 +237,8 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                 gateway_task.cancel()
                 with suppress(asyncio.CancelledError):
                     await gateway_task
+                assert gateway_listener is not None
+                await gateway_listener.drain_message_tasks()
                 application.state.discord_academic_gateway_state = "stopped"
             database.dispose()
 
@@ -199,6 +252,8 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     app.state.enqueue_code_review = enqueue_code_review
     app.state.academic_store = academic_store
     app.state.academic_syncer = academic_syncer
+    app.state.academic_model = academic_model
+    app.state.academic_delivery = academic_delivery
     app.state.discord_academic_gateway_state = gateway_state
     app.state.finance_store = SQLAlchemyFinanceStore(
         database.engine,

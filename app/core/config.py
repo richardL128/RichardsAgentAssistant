@@ -101,6 +101,7 @@ class Settings(BaseSettings):
     discord_finance_channel_id: str | None = None
     discord_academic_authorized_user_ids: list[int] = Field(default_factory=lambda: list[int]())
     discord_academic_gateway_enabled: bool = False
+    discord_academic_message_content_enabled: bool = False
     github_webhook_max_body_bytes: Annotated[int, Field(gt=0, le=10_485_760)] = 1_048_576
     git_clone_timeout_seconds: Annotated[float, Field(gt=0, le=600)] = 60.0
     code_command_timeout_seconds: Annotated[float, Field(gt=0, le=1800)] = 120.0
@@ -327,6 +328,9 @@ class Settings(BaseSettings):
                 self.discord_academic_authorized_user_ids
             ),
             "discord_academic_gateway_enabled": self.discord_academic_gateway_enabled,
+            "discord_academic_message_content_enabled": (
+                self.discord_academic_message_content_enabled
+            ),
             "ops_console_auth_configured": (
                 self.ops_console_username is not None and self.ops_console_password is not None
             ),

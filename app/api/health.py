@@ -34,7 +34,9 @@ async def ready(request: Request) -> HealthResponse | Response:
             getattr(request.app.state, "discord_academic_gateway_state", None),
         )
     )
-    if result.status is HealthState.HEALTHY and any(
+    if any(check.state is HealthState.FAILED for check in result.checks):
+        result.status = HealthState.FAILED
+    elif result.status is HealthState.HEALTHY and any(
         check.state is HealthState.ATTENTION for check in result.checks
     ):
         result.status = HealthState.ATTENTION

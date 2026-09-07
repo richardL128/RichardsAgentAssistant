@@ -27,11 +27,18 @@ from app.core.errors import (
     transient_error,
 )
 from app.db.code_review import review_idempotency_key
-from app.db.models import Delivery, DeliveryStatus
-from app.db.repositories import DeliveryRepository, utc_now
+from app.db.models import Delivery, DeliveryStatus, RunStatus
+from app.db.repositories import DeliveryRepository, RunRepository, utc_now
 from app.health.checks import HealthState
 
 _DISCORD_CONTENT_LIMIT = 2_000
+_DISCORD_NONCE_LIMIT = 25
+
+
+def _discord_nonce(delivery_id: UUID) -> str:
+    """Encode a delivery UUID within Discord's 25-character nonce limit."""
+
+    return delivery_id.hex[:_DISCORD_NONCE_LIMIT]
 
 
 def _bounded_discord_content(content: str) -> str:
@@ -106,7 +113,7 @@ class DiscordFailureAlertAdapter:
                 headers={"Authorization": f"Bot {self._token.get_secret_value()}"},
                 json={
                     "content": content,
-                    "nonce": str(alert.delivery_id),
+                    "nonce": _discord_nonce(alert.delivery_id),
                     "enforce_nonce": True,
                     "allowed_mentions": {"parse": []},
                 },
@@ -235,7 +242,7 @@ class DiscordReviewSummaryAdapter:
                 headers={"Authorization": f"Bot {self._token.get_secret_value()}"},
                 json={
                     "content": summary.message_content(),
-                    "nonce": str(summary.delivery_id),
+                    "nonce": _discord_nonce(summary.delivery_id),
                     "enforce_nonce": True,
                     "allowed_mentions": {"parse": []},
                 },
@@ -335,7 +342,7 @@ class DiscordDailyReviewAdapter:
                 headers={"Authorization": f"Bot {self._token.get_secret_value()}"},
                 json={
                     "content": summary.message_content(),
-                    "nonce": str(summary.delivery_id),
+                    "nonce": _discord_nonce(summary.delivery_id),
                     "enforce_nonce": True,
                     "allowed_mentions": {"parse": []},
                 },
@@ -506,7 +513,7 @@ class DiscordAcademicPlannerAdapter:
                 headers={"Authorization": f"Bot {self._token.get_secret_value()}"},
                 json={
                     "content": message.content,
-                    "nonce": str(message.delivery_id),
+                    "nonce": _discord_nonce(message.delivery_id),
                     "enforce_nonce": True,
                     "allowed_mentions": {"parse": []},
                 },
@@ -570,7 +577,7 @@ class DiscordAcademicPlannerAdapter:
                 headers={"Authorization": f"Bot {self._token.get_secret_value()}"},
                 json={
                     "content": message.message_content(),
-                    "nonce": str(message.delivery_id),
+                    "nonce": _discord_nonce(message.delivery_id),
                     "enforce_nonce": True,
                     "allowed_mentions": {"parse": []},
                     "components": message.components(),
@@ -614,7 +621,7 @@ class DiscordAcademicPlannerAdapter:
                 headers={"Authorization": f"Bot {self._token.get_secret_value()}"},
                 json={
                     "content": message.message_content(),
-                    "nonce": str(message.delivery_id),
+                    "nonce": _discord_nonce(message.delivery_id),
                     "enforce_nonce": True,
                     "allowed_mentions": {"parse": []},
                     "components": [],
@@ -694,12 +701,90 @@ class DiscordAcademicPlannerDelivery:
         return await self._send(content, idempotency_key)
 
     async def send_confirmation(self, proposal: Any, *, idempotency_key: str) -> Delivery:
-        content = (
-            "Proposed academic updates:\n"
-            + "\n".join(f"- {change.field}: {change.value}" for change in proposal.changes)
-            + f"\nReply with the exact confirmation event: {proposal.confirmation_event}"
-        )
+        content = _academic_proposal_preview(proposal)
         return await self._send(content, idempotency_key)
+
+
+class DiscordAcademicResponseDelivery:
+    """Create one durable run and delivery intent per inbound academic response."""
+
+    def __init__(
+        self,
+        *,
+        engine: Engine,
+        channel_id: str,
+        adapter: DiscordAcademicPlannerAdapter,
+    ) -> None:
+        self._engine = engine
+        self._channel_id = channel_id
+        self._adapter = adapter
+
+    async def send_confirmation(self, proposal: Any, *, idempotency_key: str) -> Delivery:
+        return await self.send_response(
+            _academic_proposal_preview(proposal),
+            idempotency_key=idempotency_key,
+        )
+
+    async def send_response(self, content: str, *, idempotency_key: str) -> Delivery:
+        run_id = await asyncio.to_thread(
+            _academic_response_run_id,
+            self._engine,
+            idempotency_key,
+        )
+        try:
+            delivery = await deliver_academic_message(
+                engine=self._engine,
+                run_id=run_id,
+                channel_id=self._channel_id,
+                content=_bounded_discord_content(content),
+                idempotency_key=idempotency_key,
+                adapter=self._adapter,
+            )
+        except LifeAgentError as exc:
+            await asyncio.to_thread(
+                _finish_academic_response_run,
+                self._engine,
+                run_id,
+                RunStatus.ATTENTION
+                if exc.record.category is ErrorCategory.TRANSIENT
+                else RunStatus.FAILED,
+                exc.record.code.value,
+            )
+            raise
+        await asyncio.to_thread(
+            _finish_academic_response_run,
+            self._engine,
+            run_id,
+            RunStatus.SUCCEEDED,
+            None,
+        )
+        return delivery
+
+
+def _academic_proposal_preview(proposal: Any) -> str:
+    proposal_id = str(proposal.proposal_id)
+    changes = tuple(proposal.changes)[:20]
+    if not changes:
+        question = str(proposal.question or "Please use a supported check-in format.")[:500]
+        return _bounded_discord_content(
+            f"Academic check-in needs clarification (proposal {proposal_id}).\n{question}\n"
+            "Supported forms: completed <assessment-id> or "
+            "logged <assessment-id> <minutes>. No Notion change is ready to confirm."
+        )
+    lines = [f"Proposed academic updates (proposal {proposal_id}):"]
+    for change in changes:
+        target = f" for {change.assessment_id}" if change.assessment_id is not None else ""
+        lines.append(f"- {change.field}{target}: {change.value}")
+    expiry = getattr(proposal, "expires_at", None)
+    if expiry is not None:
+        lines.append(f"Expires: {expiry.isoformat()}")
+    lines.extend(
+        (
+            f"Confirm exactly: confirm {proposal_id}",
+            f"Reject exactly: reject {proposal_id}",
+        )
+    )
+    return _bounded_discord_content("\n".join(lines))
 
 
 class FinanceDiscordBriefingMessage(BaseModel):
@@ -743,7 +828,7 @@ class DiscordFinanceBriefingAdapter:
                 headers={"Authorization": f"Bot {self._token.get_secret_value()}"},
                 json={
                     "content": message.content,
-                    "nonce": str(message.delivery_id),
+                    "nonce": _discord_nonce(message.delivery_id),
                     "enforce_nonce": True,
                     "allowed_mentions": {"parse": []},
                 },
@@ -957,6 +1042,34 @@ async def deliver_finance_briefing(
 class _ReviewIntent:
     delivery: Delivery
     already_delivered: bool
+
+
+def _academic_response_run_id(engine: Engine, idempotency_key: str) -> UUID:
+    with Session(engine) as session, session.begin():
+        run = RunRepository.create_or_get(
+            session,
+            idempotency_key=f"{idempotency_key}:run",
+            agent_name="academic_planner",
+            trigger="discord_message",
+            input_version="discord-academic-message-v1",
+        )
+        return run.id
+
+
+def _finish_academic_response_run(
+    engine: Engine,
+    run_id: UUID,
+    status: RunStatus,
+    error_code: str | None,
+) -> None:
+    with Session(engine) as session, session.begin():
+        RunRepository.set_status(
+            session,
+            run_id,
+            status,
+            summary="Academic Discord response delivery completed.",
+            error_code=error_code,
+        )
 
 
 def _open_review_intent(engine: Engine, *, run_id: UUID, target: str, key: str) -> _ReviewIntent:
@@ -1352,6 +1465,7 @@ __all__ = [
     "DailyReviewSummary",
     "DiscordAcademicPlannerAdapter",
     "DiscordAcademicPlannerDelivery",
+    "DiscordAcademicResponseDelivery",
     "DiscordDailyReviewAdapter",
     "DiscordDeliveryReceipt",
     "DiscordFailureAlertAdapter",

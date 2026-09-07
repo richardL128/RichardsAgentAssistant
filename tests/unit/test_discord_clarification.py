@@ -62,7 +62,7 @@ async def test_clarification_message_has_three_opaque_buttons_and_previews() -> 
     assert receipt.external_id == "123456789012345678"
     assert len(requests) == 1
     body = json.loads(requests[0].content)
-    assert body["nonce"] == str(delivery_id)
+    assert body["nonce"] == delivery_id.hex[:25]
     assert body["enforce_nonce"] is True
     assert body["allowed_mentions"] == {"parse": []}
     assert body["content"] == (
