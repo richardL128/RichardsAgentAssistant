@@ -289,7 +289,8 @@ class LLMGateway:
         encoded_schema = json.dumps(schema, sort_keys=True, separators=(",", ":"))
         return (
             "Return only one valid JSON object matching the supplied JSON schema. "
-            "Do not include markdown, commentary, tool calls, or fields absent from the schema.\n"
+            "Do not use model-native tool execution or include markdown, commentary, or fields "
+            "absent from the schema.\n"
             f"JSON schema:\n{encoded_schema}\nRequest:\n{original_prompt}"
         )
 
@@ -322,7 +323,8 @@ class LLMGateway:
         encoded_schema = json.dumps(schema, sort_keys=True, separators=(",", ":"))
         return (
             "Repair the previous response. Return only one valid JSON object "
-            "matching this JSON schema; do not include markdown, commentary, or tool calls.\n"
+            "matching this JSON schema; do not use model-native tool execution or include "
+            "markdown, commentary, or fields absent from the schema.\n"
             f"Original request:\n{original_prompt}\nPrevious response:\n{invalid_output}\n"
             f"{encoded_schema}"
         )

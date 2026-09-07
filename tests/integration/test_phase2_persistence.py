@@ -17,7 +17,7 @@ from sqlalchemy.orm import Session
 from testcontainers.community.postgres import PostgresContainer
 
 from app.core.errors import ErrorCode, LifeAgentError, authorization_error, transient_error
-from app.db.finance import FinanceApprovedSource, FinanceRepository
+from app.db.finance import FinanceApprovedSource, FinanceRepository, FinanceSourceEndpoint
 from app.db.models import (
     AgentRun,
     ApprovalState,
@@ -70,7 +70,10 @@ def postgres_engine() -> Generator[Engine, None, None]:
     container: PostgresContainer | None = None
     database_url = DATABASE_URL
     if database_url is None:
-        container = PostgresContainer("postgres:16.4-bookworm", driver="psycopg")
+        container = PostgresContainer(
+            "pgvector/pgvector:0.8.6-pg16-bookworm",
+            driver="psycopg",
+        )
         container.start()
         database_url = container.get_connection_url()
     if not database_url.startswith(("postgresql://", "postgresql+psycopg://")):
@@ -218,6 +221,60 @@ def test_phase6_finance_allowlist_is_seeded_disabled_and_audited(
         )
         is False
     )
+    audit_id = uuid.uuid5(uuid.NAMESPACE_URL, f"lifeagent:{allowlist_version}:recorded")
+    audit = db_session.get(AuditEvent, audit_id)
+    assert audit is not None
+    assert audit.actor == "richard"
+    assert audit.action == "record_finance_source_allowlist"
+    assert audit.target_id == allowlist_version
+
+
+def test_public_finance_v2_coexists_disabled_with_reviewed_endpoints(
+    db_session: Session,
+) -> None:
+    allowlist_version = "finance-sources-2026.09-v2"
+    rows = tuple(
+        db_session.scalars(
+            select(FinanceApprovedSource)
+            .where(FinanceApprovedSource.allowlist_version == allowlist_version)
+            .order_by(FinanceApprovedSource.source_id)
+        )
+    )
+    endpoints = tuple(
+        db_session.scalars(
+            select(FinanceSourceEndpoint).where(
+                FinanceSourceEndpoint.allowlist_version == allowlist_version
+            )
+        )
+    )
+
+    assert {row.source_id for row in rows} == {
+        "defense_gov_rss",
+        "breaking_defense_public",
+        "eia_public_data",
+        "federal_register_energy",
+        "sec_edgar",
+        "company_ir_registry",
+        "issuer_etf_holdings",
+        "technology_official_feeds",
+    }
+    assert all(not row.enabled for row in rows)
+    assert all(row.approved_at is None and row.approval_audit_id is None for row in rows)
+    assert len(endpoints) == 9
+    assert len({(row.source_id, row.endpoint_id) for row in endpoints}) == 9
+    assert db_session.scalar(
+        select(func.count())
+        .select_from(AuditEvent)
+        .where(
+            AuditEvent.target_type == "finance_source_allowlist",
+            AuditEvent.target_id == allowlist_version,
+            AuditEvent.action == "record_finance_source_allowlist",
+        )
+    ) == 1
+    assert FinanceRepository.source_approval_gate(
+        db_session,
+        allowlist_version=allowlist_version,
+    ) is False
 
     audit_id = uuid.uuid5(uuid.NAMESPACE_URL, f"lifeagent:{allowlist_version}:recorded")
     audit = db_session.get(AuditEvent, audit_id)

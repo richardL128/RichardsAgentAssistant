@@ -20,7 +20,10 @@ def test_paused_approval_survives_checkpointer_restart() -> None:
     approval_request_id = uuid4()
     artifact_key = "b" * 64
 
-    with PostgresContainer("postgres:16.4-bookworm", driver="psycopg") as postgres:
+    with PostgresContainer(
+        "pgvector/pgvector:0.8.6-pg16-bookworm",
+        driver="psycopg",
+    ) as postgres:
         database_url = postgres.get_connection_url()
 
         with postgres_checkpointer(database_url, setup=True) as first_process:

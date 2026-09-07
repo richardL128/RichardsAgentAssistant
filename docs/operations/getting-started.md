@@ -283,17 +283,18 @@ application in the Discord Developer Portal, select **Bot**, enable only
 ```dotenv
 DISCORD_ACADEMIC_GATEWAY_ENABLED=true
 DISCORD_ACADEMIC_MESSAGE_CONTENT_ENABLED=true
+DISCORD_APPLICATION_ID=<the application's numeric Application ID>
 ```
 
 Free-text mode requests only Guild Messages and Message Content. Do not enable
 Presence Intent or Server Members Intent. Keep the academic channel private and
 grant the bot only View Channel, Send Messages, Embed Links, and Read Message
-History. Application ID and Public Key are not runtime requirements for this
-Gateway-only flow; configure them only if a separately deployed HTTP Discord
-interactions endpoint is added later.
+History. The Application ID lets LifeAgent normalize bot mentions; the Public
+Key remains unnecessary unless a separately deployed HTTP Discord interactions
+endpoint is added later.
 
-An authorized message in `DISCORD_ACADEMIC_CHANNEL_ID` may use these conservative
-forms:
+An authorized message in `DISCORD_ACADEMIC_CHANNEL_ID` may use an exact legacy
+form or mention the bot with a natural-language batch request:
 
 ```text
 completed <assessment-id>
@@ -301,7 +302,17 @@ logged <assessment-id> <minutes>
 actual <assessment-id> <minutes>
 confirm <canonical-proposal-uuid>
 reject <canonical-proposal-uuid>
+<@bot> create an assignment in ECE 202 due Friday, and delete the old lab in ECE 250
 ```
+
+Natural-language requests run through the local Qwen agent loop. The loop can
+search only the synchronized course and assessment catalog. Create, update, and
+delete/archive operations are returned as one proposal; none is written to
+Notion until the exact `confirm <canonical-proposal-uuid>` response is received.
+LifeAgent implements delete as Notion archive and refuses stale or ambiguous
+targets. With `DISCORD_APPLICATION_ID` configured, the bot ignores unmentioned
+natural-language messages; exact confirmation and rejection replies remain
+available without repeating the mention.
 
 Confirmation and rejection commands must match exactly, with no extra spaces or
 arguments. Unsupported prose receives a clarification response and cannot write
@@ -335,38 +346,66 @@ LifeAgent rechecks the stored title and edited timestamp, then changes only the
 discovered title property. A concurrent Notion edit cancels the write. Ignore
 records the decision and performs no write; repeated interactions are harmless.
 
-## 5. Configure finance APIs
+## 5. Configure finance sources
 
 Finance runs are read-only and are gated by the exact allowlist version in
-`FINANCE_SOURCE_ALLOWLIST_VERSION`. The current eight source IDs are:
+`FINANCE_SOURCE_ALLOWLIST_VERSION`. The configured default is the public-first
+`finance-sources-2026.09-v2` architecture. Its source records are seeded
+disabled, so a newly migrated deployment remains fail-closed until every source
+has a separate audited approval.
 
-| Source | Credential | Where to obtain it |
+The public-first v2 allowlist is `finance-sources-2026.09-v2` and contains these
+eight logical source IDs:
+
+| Source ID | Coverage | Credential |
 | --- | --- | --- |
-| DVIDS | `DVIDS_API_KEY` | DVIDS/API account, if required by the selected endpoint |
-| Breaking Defense | none | Public endpoint; no key in this repository |
-| EIA Open Data | `EIA_API_KEY` | [EIA Open Data registration](https://www.eia.gov/opendata/register.php) |
-| Federal Register Energy | none | Public Federal Register API |
-| Alpha Vantage News and ETF | `ALPHA_VANTAGE_API_KEY` | [Alpha Vantage](https://www.alphavantage.co/support/#api-key) |
-| Benzinga News | `BENZINGA_API_TOKEN` | Benzinga developer/account portal |
-| Financial Modeling Prep ETF | `FMP_API_KEY` | [FMP developer portal](https://site.financialmodelingprep.com/developer/docs) |
+| `defense_gov_rss` | Official Defense RSS at its current `war.gov` canonical host | none |
+| `breaking_defense_public` | Fast reported defense discovery from the public WordPress endpoint | none |
+| `eia_public_data` | Official EIA public data, bulk by default | none in `bulk`; optional `EIA_API_KEY` in `api` |
+| `federal_register_energy` | Official Federal Register energy/regulatory documents | none |
+| `sec_edgar` | Public SEC submissions and filing metadata | descriptive `SEC_USER_AGENT` only |
+| `company_ir_registry` | Reviewed official issuer IR feeds | none |
+| `issuer_etf_holdings` | Reviewed direct issuer ETF holdings files | none |
+| `technology_official_feeds` | CISA KEV and reviewed official vendor security feeds | none |
 
-The Alpha Vantage credential is used by two allowlisted source adapters, so it
-is listed twice conceptually but configured once. Put keys in `.env`:
+Use these local defaults for the v2 public baseline:
 
 ```dotenv
-FINANCE_SOURCE_ALLOWLIST_VERSION=finance-sources-2026.09
-DVIDS_API_KEY=...
-EIA_API_KEY=...
-ALPHA_VANTAGE_API_KEY=...
-BENZINGA_API_TOKEN=...
-FMP_API_KEY=...
+FINANCE_SOURCE_ALLOWLIST_VERSION=finance-sources-2026.09-v2
+SEC_USER_AGENT=LifeAgent/0.1 contact@example.com
+FINANCE_EIA_MODE=bulk
+EIA_API_KEY=
+FINANCE_FEED_POLL_MINUTES=10
+FINANCE_FEDERAL_REGISTER_POLL_MINUTES=60
+FINANCE_EIA_BULK_POLL_MINUTES=720
+FINANCE_EIA_API_POLL_MINUTES=60
+FINANCE_ETF_POLL_MINUTES=1440
+FINANCE_COLD_START_BACKFILL_HOURS=24
+FINANCE_REGISTRY_MAX_FANOUT=20
+FINANCE_BULK_MAX_PAYLOAD_BYTES=67108864
 ```
 
-A key is necessary but not sufficient: the database must also contain one
-approved record for each of the eight source IDs, with the matching allowlist
-version. The finance gate intentionally stays disabled if an approval record,
-credential, parser, or source contract is missing. Never substitute open web
-search or a different source. Check the gate at:
+`FINANCE_EIA_MODE=api` is selected only at startup and requires `EIA_API_KEY`.
+If API mode is selected without a key, startup fails closed. Bulk mode must work
+with `EIA_API_KEY` empty.
+
+These legacy v1 credentials are not part of normal setup. They remain listed
+only because this rollout explicitly requires v1 rollback compatibility; keep
+them empty unless that exceptional rollback is deliberately invoked after a
+provider-terms review:
+
+```dotenv
+DVIDS_API_KEY=
+ALPHA_VANTAGE_API_KEY=
+BENZINGA_API_TOKEN=
+FMP_API_KEY=
+```
+
+Approval remains separate from configuration: the database must contain exactly
+eight records for the active allowlist version, and each source must be enabled
+with `approved_at` and `approval_audit_id`. The v2 seed intentionally creates
+disabled records with no individual approvals. Never substitute open web search
+or a different source. Check the gate at:
 
 ```bash
 curl http://127.0.0.1:8000/finance/sources | jq .
@@ -375,6 +414,23 @@ curl http://127.0.0.1:8000/finance/sources | jq .
 Do not add paid news credentials unless the provider has granted programmatic
 access and permitted the intended retention and local-LLM use. A normal
 website subscription is not an API license.
+
+The initial v2 registries are deliberately small: SEC and company IR cover LMT
+only, ETF holdings cover IVV only, and technology feeds begin with CISA KEV
+only. Missing mappings should appear as attention diagnostics instead of causing
+generic crawling or arbitrary URL fetches.
+
+Roll out v2 in this order: deploy the code and migration with scheduled finance
+delivery disabled, confirm all eight v2 records are present and disabled,
+validate fixtures and permitted public smoke tests, record the endpoint/licence
+review, approve sources individually through the audited procedure, run one
+delivery-disabled dry briefing, and enable scheduled delivery only after
+explicit approval.
+
+The explicitly requested legacy rollback does not downgrade or delete v2 audit
+records. Switch
+`FINANCE_SOURCE_ALLOWLIST_VERSION` back to `finance-sources-2026.09` and keep
+the v1 credential settings available for that path.
 
 ## 6. Verify and operate
 
@@ -408,5 +464,6 @@ For queue, source, Notion, or delivery failures, use the runbooks in
 - Ollama is reachable only from the local machine/Docker network.
 - Notion pages and Discord channels are shared only with the intended account.
 - Discord has no Administrator permission.
-- Finance source approvals match `finance-sources-2026.09`.
+- Finance source approvals match the configured allowlist version; v2 remains
+  disabled until all eight records are individually approved.
 - No API key, token, or private URL appears in a commit or log.

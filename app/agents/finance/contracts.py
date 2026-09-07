@@ -110,6 +110,8 @@ class SourceQuery(FinanceModel):
     window_start: datetime
     window_end: datetime
     tickers: tuple[str, ...] = Field(max_length=100)
+    issuer_tickers: tuple[str, ...] = Field(default=(), max_length=100)
+    etf_tickers: tuple[str, ...] = Field(default=(), max_length=100)
     themes: tuple[str, ...] = Field(max_length=50)
 
     @field_validator("window_start", "window_end")
@@ -145,6 +147,8 @@ class SourceDocument(FinanceModel):
     external_id: str = Field(min_length=1, max_length=255)
     title: str = Field(min_length=1, max_length=500)
     url: HttpUrl
+    issuer: str | None = Field(default=None, max_length=200)
+    feed_endpoint: HttpUrl | None = None
     published_at: datetime | None = None
     retrieved_at: datetime
     language: str = Field(default="en", min_length=2, max_length=16)
@@ -180,10 +184,51 @@ class SourceFailure(FinanceModel):
     diagnostic: str = Field(min_length=1, max_length=1_000)
 
 
+class SourceEndpointFailure(FinanceModel):
+    endpoint_id: str = Field(min_length=1, max_length=128)
+    error_code: str = Field(min_length=1, max_length=128)
+    diagnostic: str = Field(min_length=1, max_length=1_000)
+
+
+class SourceFetchMetadata(FinanceModel):
+    transport: str = Field(min_length=1, max_length=64)
+    request_count: int = Field(default=0, ge=0, le=100)
+    endpoint_count: int = Field(default=1, ge=1, le=100)
+    not_modified_count: int = Field(default=0, ge=0, le=100)
+    ingestion_latency_seconds: float | None = Field(default=None, ge=0)
+    stale: bool = False
+    endpoint_failures: tuple[SourceEndpointFailure, ...] = Field(default=(), max_length=100)
+
+    @model_validator(mode="after")
+    def request_counts_are_bounded(self) -> SourceFetchMetadata:
+        if self.request_count > self.endpoint_count:
+            raise ValueError("finance source request count exceeds the endpoint envelope")
+        if self.not_modified_count > self.request_count:
+            raise ValueError("not-modified count exceeds finance source request count")
+        return self
+
+
+class ETFExposure(FinanceModel):
+    etf_symbol: str = Field(min_length=1, max_length=32)
+    underlying_symbol: str = Field(min_length=1, max_length=32)
+    weight_percent: float = Field(ge=0, le=100)
+    source_id: str = Field(min_length=1, max_length=64)
+    as_of: date
+    source_url: HttpUrl | None = None
+    retrieved_at: datetime | None = None
+
+    @field_validator("retrieved_at")
+    @classmethod
+    def retrieved_at_aware(cls, value: datetime | None) -> datetime | None:
+        return _aware(value) if value is not None else None
+
+
 class SourceFetchResult(FinanceModel):
     source_id: str
     documents: tuple[SourceDocument, ...] = Field(default=(), max_length=200)
+    etf_exposures: tuple[ETFExposure, ...] = Field(default=(), max_length=5_000)
     failure: SourceFailure | None = None
+    metadata: SourceFetchMetadata | None = None
 
 
 class NormalizedEvent(FinanceModel):
@@ -232,14 +277,6 @@ class WatchlistItem(FinanceModel):
     name: str = Field(min_length=1, max_length=200)
     thesis_id: UUID | None = None
     themes: tuple[str, ...] = Field(default=(), max_length=50)
-
-
-class ETFExposure(FinanceModel):
-    etf_symbol: str = Field(min_length=1, max_length=32)
-    underlying_symbol: str = Field(min_length=1, max_length=32)
-    weight_percent: float = Field(ge=0, le=100)
-    source_id: str = Field(min_length=1, max_length=64)
-    as_of: date
 
 
 class PortfolioSnapshot(FinanceModel):
@@ -341,7 +378,9 @@ __all__ = [
     "SourceApproval",
     "SourceClassification",
     "SourceDocument",
+    "SourceEndpointFailure",
     "SourceFailure",
+    "SourceFetchMetadata",
     "SourceFetchResult",
     "SourceHealth",
     "SourceQuery",

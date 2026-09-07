@@ -84,15 +84,33 @@ individually enabled with an approval timestamp and approval audit event.
   `finance_source_allowlist_version = "finance-sources-2026.09"`, source API
   credentials for the ratified set, `discord_finance_channel_id`, safe
   diagnostics, and redaction.
+- Added public-first v2 finance source support under
+  `finance-sources-2026.09-v2`: explicit endpoint definitions, RSS/Atom and
+  bulk-file transports, conditional cache/watermark state, provider registries,
+  delivery-independent polling policy, optional EIA API mode, and SEC
+  descriptive User-Agent validation. The configured allowlist default is the
+  public-first v2 architecture; disabled source approvals keep rollout
+  fail-closed.
+- Added `finance_source_endpoints`, `finance_source_cache_state`, and
+  `finance_source_request_audits` persistence
+  in migration `0010_public_finance_sources.py`, plus ETF source/as-of
+  metadata for `finance_etf_exposures`. The v2 source records are seeded
+  disabled with no individual approvals and have a deterministic allowlist audit
+  event.
+- Extended the operations source page to show approval state, transport/parser
+  kind, endpoint freshness, request ceilings, scope, cache health, and endpoint
+  diagnostics without rendering full endpoint URLs, secrets, cookies, or raw
+  source content.
 
 ## Approved source allowlist
 
-The active allowlist version is `finance-sources-2026.09`. Richard originally
+The configured allowlist default is `finance-sources-2026.09-v2`. Its records
+remain disabled until they are reviewed and individually approved. Richard originally
 approved a set containing Janes, S&P Global Commodity Insights, and ETF.com /
-VettaFi. That paid-source set was explicitly superseded for this phase by the
-ratified public-detail set below, because these sources expose enough public API
-detail to implement and test the disabled gate without inventing private
-contract endpoints.
+VettaFi. That paid-source set was explicitly superseded for the initial v1
+implementation by the ratified public-detail set below, because these sources
+expose enough public API detail to implement and test the disabled gate without
+inventing private contract endpoints.
 
 All eight records are seeded with `enabled=false`, `approved_at=NULL`, and
 `approval_audit_id=NULL`. The allowlist itself is recorded by the deterministic
@@ -110,12 +128,46 @@ not live-approved by this seed.
 | `fmp_etf` | secondary | `fmp-api-v3` | FMP paid plan (Starter+ for ETF endpoints); commercial licence, internal use | Excerpts not allowed; numeric holdings data may be cited as a derived-number source only. |
 | `alpha_vantage_etf` | secondary | `etf-profile-v1` | Alpha Vantage premium API plan; private individual use | Excerpts not allowed; numeric ETF profile and holdings data may be used only for Richard's private individual investment analysis and monitoring. |
 
-The exact seeded licence notes and entitlement strings live in
-`app/db/migrations/versions/0008_phase6_finance_allowlist.py`; this section
-summarizes the operational boundary rather than replacing the migration as the
-audited source of truth.
+The exact seeded licence notes and entitlement strings live in migrations
+`0008_phase6_finance_allowlist.py` (v1) and
+`0010_public_finance_sources.py` (v2); this section summarizes the
+operational boundary rather than replacing those migrations as the audited
+source of truth.
+
+The v2 allowlist version is `finance-sources-2026.09-v2`. It preserves the
+eight-envelope workflow while replacing credential-heavy aggregators with
+primary/public sources and one fast reported discovery source:
+
+| Source | Classification | Transport | Credential | Current reviewed scope |
+| --- | --- | --- | --- | --- |
+| `defense_gov_rss` | primary | RSS/Atom | none | official Defense feed at its current `war.gov` canonical host |
+| `breaking_defense_public` | reported | JSON HTTP | none | public WordPress posts endpoint |
+| `eia_public_data` | primary | reviewed `PET.zip` bulk file by default, optional targeted JSON API | `EIA_API_KEY` only when `FINANCE_EIA_MODE=api` | four audited petroleum price/inventory series |
+| `federal_register_energy` | primary | JSON HTTP | none | Federal Register documents API |
+| `sec_edgar` | primary | JSON HTTP | descriptive `SEC_USER_AGENT` | LMT / CIK `0000936468` |
+| `company_ir_registry` | primary | RSS/Atom or documented JSON registry | none | Lockheed Martin official IR RSS |
+| `issuer_etf_holdings` | primary | bulk file | none | IVV iShares holdings CSV |
+| `technology_official_feeds` | primary | JSON HTTP | none | CISA KEV JSON |
+
+Every v2 source is seeded with `enabled=false`, `approved_at=NULL`, and
+`approval_audit_id=NULL`. Endpoint child records are versioned, allowlisted, and
+bounded by request ceilings. A registry failure is reported in source health and
+does not trigger substitute providers or generic search.
 
 ## Acceptance evidence
+
+- `tests/unit/test_finance_public_registry.py` covers the keyless exact-eight v2
+  registry, SEC User-Agent, raw-request counts/audits, missing-mapping
+  diagnostics, and no substitute request.
+- `tests/unit/test_finance_transport_primitives.py` covers conditional 304s,
+  hostname enforcement, payload ceilings, HTTP failure handling, RSS/Atom,
+  persisted watermark recovery, and bulk artifact references.
+- `tests/unit/test_finance_public_providers.py` covers the reviewed provider
+  registries, EIA ZIP/audited-series parsing, SEC CIK/form filtering, company IR,
+  IVV holdings/as-of freshness, and CISA KEV normalization.
+- `tests/unit/test_finance_public_sources_migration.py` covers v1/v2 coexistence,
+  eight disabled v2 rows, nine endpoint rows, deterministic audit identity, and
+  history-preserving rollback.
 
 - `tests/unit/test_finance_sources.py` covers the hard source gate, exact-eight
   query construction, incomplete registry rejection, and no-fallback behavior
@@ -139,6 +191,12 @@ audited source of truth.
 - `tests/integration/test_phase2_persistence.py` includes the migration check
   proving the `finance-sources-2026.09` allowlist is seeded disabled and audited
   with the recorded allowlist event.
+- `tests/unit/test_finance_public_config.py`, `tests/unit/test_finance_polling.py`,
+  `tests/unit/test_finance_public_providers.py`,
+  `tests/unit/test_finance_transport_primitives.py`, and the updated repository
+  tests cover the v2 public baseline, bulk/API EIA mode selection, descriptive
+  SEC User-Agent, endpoint allowlisting, polling cadence, public provider
+  parsing, conditional cache behavior, and v1/v2 coexistence.
 
 There is not yet a standalone `tests/acceptance/test_phase6_finance.py` file in
 the current tree. The Phase 6 acceptance contract is covered by the focused unit
@@ -147,12 +205,25 @@ the clearest future consolidation point.
 
 ## Deferred external verification
 
-- Live source fetches require credentials and individual approval records for
+- Live v1 source fetches require credentials and individual approval records for
   `dvids`, `eia_open_data`, `alpha_vantage_news`, `benzinga_news`, `fmp_etf`,
   and `alpha_vantage_etf`; `breaking_defense` and `federal_register_energy`
   need no API key but still remain disabled until Richard flips their approval
   flags. The Phase 6 gate intentionally stays closed until all eight records are
   enabled and audited.
+- Live v2 bulk-mode fetches require no paid vendor keys. `EIA_API_KEY` is
+  optional and used only when `FINANCE_EIA_MODE=api`; API mode without the key
+  fails closed at configuration time. `DVIDS_API_KEY`, `ALPHA_VANTAGE_API_KEY`,
+  `BENZINGA_API_TOKEN`, and `FMP_API_KEY` remain exceptional legacy-v1 options
+  only because this rollout explicitly requires v1 rollback compatibility; they
+  are not part of the default architecture.
+- V2 coverage is intentionally bounded at launch: SEC and company IR cover LMT
+  only, ETF holdings cover IVV only, and technology coverage begins with CISA KEV
+  only. Additional issuers, CIKs, ETFs, vendor advisory feeds, or reported feeds
+  require a reviewed registry/version update.
+- Feed-like v2 sources target p95 ingestion within 15 minutes while workers and
+  providers are healthy. EIA bulk and ETF holdings are judged against
+  source-specific update schedules instead of the feed latency target.
 - Live Discord delivery requires `discord_bot_token` and
   `discord_finance_channel_id`. Automated tests use mocked transports and
   durable delivery records.

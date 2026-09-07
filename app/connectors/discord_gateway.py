@@ -31,8 +31,9 @@ _CUSTOM_ID_PATTERN = re.compile(
     r"[0-9a-fA-F]{4}-[0-9a-fA-F]{12}):"
     r"(?P<action>quiz|assignment|ignore)$"
 )
+_DISCORD_ID_PATTERN = re.compile(r"^[0-9]{5,24}$")
 _DISCORD_MESSAGE_COMPONENT_TYPE = 3
-_DISCORD_INTERACTION_CALLBACK_DEFERRED_UPDATE = 6
+_DISCORD_INTERACTION_CALLBACK_CHANNEL_MESSAGE = 4
 _DISCORD_INTENT_GUILD_MESSAGES = 1 << 9
 _DISCORD_INTENT_MESSAGE_CONTENT = 1 << 15
 _DISCORD_MESSAGE_CONTENT_INTENTS = _DISCORD_INTENT_GUILD_MESSAGES | _DISCORD_INTENT_MESSAGE_CONTENT
@@ -70,6 +71,7 @@ class DiscordAcademicMessageCreate(BaseModel):
     author_id: str = Field(pattern=r"^[0-9]{5,24}$")
     timestamp: datetime
     content: SecretStr = Field(repr=False)
+    mentioned_user_ids: tuple[str, ...] = Field(default=(), max_length=20)
 
     @field_validator("timestamp")
     @classmethod
@@ -118,6 +120,13 @@ class DiscordGatewayHttpClient(Protocol):
     ) -> httpx.Response: ...
 
     async def post(
+        self,
+        url: str,
+        *,
+        json: Mapping[str, object] | None = None,
+    ) -> httpx.Response: ...
+
+    async def patch(
         self,
         url: str,
         *,
@@ -274,11 +283,24 @@ class DiscordGatewayListener:
         if data is None or _int_value(data.get("type")) != _DISCORD_MESSAGE_COMPONENT_TYPE:
             return "ignored"
 
+        parsed_custom_id = parse_clarification_custom_id(_custom_id(data) or "")
+        if parsed_custom_id is None:
+            return "ignored"
+        _, action = parsed_custom_id
         interaction_id = _str_value(data.get("id"))
         token = _str_value(data.get("token"))
-        if interaction_id is None or token is None:
+        application_id = _str_value(data.get("application_id"))
+        if (
+            interaction_id is None
+            or _DISCORD_ID_PATTERN.fullmatch(interaction_id) is None
+            or token is None
+            or not token
+            or application_id is None
+            or _DISCORD_ID_PATTERN.fullmatch(application_id) is None
+        ):
             return "invalid"
-        await self._acknowledge_interaction(interaction_id, token)
+        if interaction_id in self._seen_interactions:
+            return "duplicate"
 
         parsed = normalize_clarification_interaction(
             data,
@@ -286,14 +308,38 @@ class DiscordGatewayListener:
             authorized_user_ids=self._authorized_user_ids,
         )
         if parsed is None:
-            return _rejection_status(data, self._allowed_channel_ids, self._authorized_user_ids)
-        if parsed.interaction_id in self._seen_interactions:
-            return "duplicate"
-        self._remember_interaction(parsed.interaction_id)
+            status = _rejection_status(
+                data,
+                self._allowed_channel_ids,
+                self._authorized_user_ids,
+            )
+            await self._acknowledge_interaction(
+                interaction_id,
+                token,
+                content=_interaction_confirmation_content(action, status, initial=True),
+            )
+            self._remember_interaction(interaction_id)
+            return status
+
+        await self._acknowledge_interaction(
+            interaction_id,
+            token,
+            content=_interaction_confirmation_content(action, "handled", initial=True),
+        )
         try:
             result = await self._handler(parsed)
         except Exception:
+            result = DiscordClarificationCallbackResult(status="failed")
+        try:
+            await self._complete_interaction(
+                application_id,
+                token,
+                content=_interaction_confirmation_content(action, result.status),
+            )
+        except httpx.HTTPError:
+            self._remember_interaction(parsed.interaction_id)
             return "failed"
+        self._remember_interaction(parsed.interaction_id)
         return result.status
 
     async def _handle_message_create(
@@ -385,7 +431,13 @@ class DiscordGatewayListener:
     async def _send_heartbeat(self, websocket: DiscordGatewayWebSocket) -> None:
         await websocket.send(json.dumps({"op": 1, "d": self._sequence}))
 
-    async def _acknowledge_interaction(self, interaction_id: str, token: str) -> None:
+    async def _acknowledge_interaction(
+        self,
+        interaction_id: str,
+        token: str,
+        *,
+        content: str,
+    ) -> None:
         owns_client = self._http_client is None
         client = self._http_client or httpx.AsyncClient(
             base_url=self._api_base_url,
@@ -394,7 +446,38 @@ class DiscordGatewayListener:
         try:
             response = await client.post(
                 f"/interactions/{interaction_id}/{token}/callback",
-                json={"type": _DISCORD_INTERACTION_CALLBACK_DEFERRED_UPDATE},
+                json={
+                    "type": _DISCORD_INTERACTION_CALLBACK_CHANNEL_MESSAGE,
+                    "data": {
+                        "content": content,
+                        "allowed_mentions": {"parse": []},
+                    },
+                },
+            )
+            response.raise_for_status()
+        finally:
+            if owns_client:
+                await cast(httpx.AsyncClient, client).aclose()
+
+    async def _complete_interaction(
+        self,
+        application_id: str,
+        token: str,
+        *,
+        content: str,
+    ) -> None:
+        owns_client = self._http_client is None
+        client = self._http_client or httpx.AsyncClient(
+            base_url=self._api_base_url,
+            timeout=httpx.Timeout(10.0),
+        )
+        try:
+            response = await client.patch(
+                f"/webhooks/{application_id}/{token}/messages/@original",
+                json={
+                    "content": content,
+                    "allowed_mentions": {"parse": []},
+                },
             )
             response.raise_for_status()
         finally:
@@ -473,6 +556,39 @@ class DiscordGatewayListener:
             return DiscordMessageCallbackResult(status="failed")
 
 
+def _interaction_confirmation_content(
+    action: DiscordClarificationAction,
+    status: DiscordInteractionStatus,
+    *,
+    initial: bool = False,
+) -> str:
+    label = action.capitalize()
+    if initial:
+        if status == "unauthorized":
+            return f"Choice not accepted: {label}. This Discord user is not authorized."
+        return f"Choice received: {label}. Processing this decision now."
+    if status == "handled":
+        return f"Confirmed choice: {label}. The Notion assessment was updated once."
+    if status == "ignored":
+        return "Confirmed choice: Ignore. No Notion change was made."
+    if status == "duplicate":
+        return (
+            f"Choice received: {label}. This clarification was already resolved; "
+            "no duplicate Notion change was made."
+        )
+    if status == "unauthorized":
+        return f"Choice not accepted: {label}. This Discord user is not authorized."
+    if status == "invalid":
+        return (
+            f"Choice not accepted: {label}. The clarification is invalid or expired; "
+            "no Notion change was made."
+        )
+    return (
+        f"Choice received: {label}, but LifeAgent could not apply it. "
+        "No duplicate Notion change was made."
+    )
+
+
 def parse_clarification_custom_id(
     custom_id: str,
 ) -> tuple[UUID, DiscordClarificationAction] | None:
@@ -540,12 +656,21 @@ def normalize_academic_message(
         return None
     if not content or len(content) > _DISCORD_MESSAGE_CONTENT_LIMIT:
         return None
+    raw_mentions = data.get("mentions")
+    mentioned_user_ids: list[str] = []
+    if isinstance(raw_mentions, list):
+        for item in cast(list[Any], raw_mentions)[:20]:
+            mention = _mapping_value(item)
+            mention_id = _str_value(mention.get("id")) if mention is not None else None
+            if mention_id is not None and _DISCORD_ID_PATTERN.fullmatch(mention_id) is not None:
+                mentioned_user_ids.append(mention_id)
     return DiscordAcademicMessageCreate(
         message_id=message_id,
         channel_id=channel_id,
         author_id=author_id,
         timestamp=timestamp,
         content=SecretStr(content),
+        mentioned_user_ids=tuple(mentioned_user_ids),
     )
 
 

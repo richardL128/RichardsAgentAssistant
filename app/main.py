@@ -17,6 +17,8 @@ from starlette.responses import Response
 
 from app import __version__
 from app.agents.academic_planner.discord_checkin import AcademicDiscordCheckinHandler
+from app.agents.academic_planner.memory_workflow import AcademicMemoryService
+from app.agents.academic_planner.notion_mutations import DiscoveredAcademicNotionWriter
 from app.agents.academic_planner.sync import AcademicClarificationService, AcademicNotionSync
 from app.agents.academic_planner.workflow import LLMPlannerModel
 from app.api.academic import router as academic_router
@@ -40,6 +42,7 @@ from app.core.errors import LifeAgentError
 from app.db.academic import SQLAlchemyAcademicPlannerStore
 from app.db.finance import SQLAlchemyFinanceStore
 from app.db.session import Database
+from app.llm.embeddings import AcademicEmbeddingGateway
 from app.llm.gateway import LLMGateway
 from app.queue.app import procrastinate_app
 from app.queue.tasks import code_review_task, defer_idempotent_async
@@ -97,9 +100,25 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     app_settings = settings or get_settings()
     database = Database(app_settings)
     gateway = LLMGateway(app_settings)
+    embedding_gateway = AcademicEmbeddingGateway(app_settings)
     academic_store = SQLAlchemyAcademicPlannerStore(
         database.engine,
         confirmation_ttl_hours=app_settings.academic_confirmation_ttl_hours,
+        embedding_gateway=embedding_gateway,
+        default_practice_minutes=app_settings.academic_memory_default_practice_minutes,
+    )
+    academic_memory_service = (
+        AcademicMemoryService(
+            store=academic_store,
+            model_gateway=gateway,
+            embedding_gateway=embedding_gateway,
+            timezone=app_settings.app_timezone,
+            default_practice_minutes=(app_settings.academic_memory_default_practice_minutes),
+            end_of_day_time=app_settings.academic_end_of_day_schedule,
+            session_ttl_hours=app_settings.academic_confirmation_ttl_hours,
+        )
+        if app_settings.academic_memory_enabled
+        else None
     )
     academic_channel = app_settings.discord_academic_channel_id
     academic_discord = None
@@ -183,6 +202,11 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                     allowed_channel_ids={configured_channel},
                     authorized_user_ids=authorized_user_ids,
                     writer_provider=lambda: getattr(app.state, "notion_writer", None),
+                    agent_gateway=gateway,
+                    agent_catalog=academic_store,
+                    assistant_user_id=app_settings.discord_application_id,
+                    timezone=app_settings.app_timezone,
+                    memory_service=academic_memory_service,
                 )
                 if app_settings.discord_academic_message_content_enabled
                 and academic_delivery is not None
@@ -253,17 +277,23 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     app.state.academic_store = academic_store
     app.state.academic_syncer = academic_syncer
     app.state.academic_model = academic_model
+    app.state.academic_memory_service = academic_memory_service
     app.state.academic_delivery = academic_delivery
     app.state.discord_academic_gateway_state = gateway_state
     app.state.finance_store = SQLAlchemyFinanceStore(
         database.engine,
         allowlist_version=app_settings.finance_source_allowlist_version,
     )
-    # The concrete Notion writer is injected only after scoped database,
-    # property, and page-target mappings have been supplied.  Keeping it
-    # absent makes confirmation fail closed while proposal capture remains
-    # available in a local deployment.
-    app.state.notion_writer = None
+    # Writes resolve only synchronized, valid per-course calendar mappings and
+    # still require the proposal's exact confirmation event.
+    app.state.notion_writer = (
+        DiscoveredAcademicNotionWriter(
+            connector=notion_connector,
+            target_store=academic_store,
+        )
+        if notion_connector is not None
+        else None
+    )
     app.mount("/static", StaticFiles(directory=str(_APP_ROOT / "static")), name="static")
     app.include_router(health_router)
     app.include_router(github_router)

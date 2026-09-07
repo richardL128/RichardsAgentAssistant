@@ -7,6 +7,7 @@ accepted by these repository APIs.
 
 from __future__ import annotations
 
+import math
 import re
 import uuid
 from collections.abc import Iterable, Mapping, Sequence
@@ -15,7 +16,7 @@ from datetime import UTC, date, datetime, timedelta
 from typing import Any, Literal, cast
 from zoneinfo import ZoneInfo
 
-from sqlalchemy import and_, delete, func, or_, select
+from sqlalchemy import and_, delete, func, or_, select, update
 from sqlalchemy.exc import IntegrityError, NoResultFound
 from sqlalchemy.orm import Session
 
@@ -23,9 +24,14 @@ from app.db.models import (
     AcademicCheckIn,
     AcademicClarification,
     AcademicCourseCalendar,
+    AcademicDiscourseSession,
+    AcademicDiscourseTurn,
     AcademicDocument,
     AcademicDocumentChunk,
+    AcademicLearningFocus,
+    AcademicLearningFocusEvent,
     AcademicProposedChange,
+    AcademicReflectionMemory,
     AcademicSetupReminder,
     AcademicSyncCursor,
     Assessment,
@@ -47,6 +53,7 @@ ProposalRejectionStatus = Literal[
     "in_progress",
     "not_pending",
 ]
+LearningFocusReminderStatus = Literal["remind", "snoozed_and_remind", "delete"]
 CommitmentKind = Literal[
     "class",
     "test",
@@ -131,6 +138,30 @@ class AssessmentSourceTrace:
 
 
 @dataclass(frozen=True, slots=True)
+class AcademicCourseMutationTarget:
+    """A discovered, writable per-course Assessments data source."""
+
+    course_id: str
+    course_code: str
+    data_source_id: str
+    title_property_id: str
+    date_property_id: str
+
+
+@dataclass(frozen=True, slots=True)
+class AcademicAssessmentMutationTarget:
+    """A synchronized assessment target with optimistic-write preconditions."""
+
+    assessment_id: str
+    course_id: str
+    page_id: str
+    title: str
+    last_edited_at: datetime
+    title_property_id: str
+    date_property_id: str
+
+
+@dataclass(frozen=True, slots=True)
 class ClarificationInput:
     """Bounded durable Discord clarification request."""
 
@@ -155,6 +186,17 @@ class InboundCheckinPersistResult:
     checkin_id: uuid.UUID
     checkin_status: str
     proposal_row_id: uuid.UUID | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class LearningFocusMemoryInput:
+    """Raw reflection text plus optional embedding payload for one focus turn."""
+
+    raw_text: str
+    embedding: Sequence[float] | None = None
+    embedding_model: str | None = None
+    embedding_metadata: Mapping[str, Any] | None = None
+    redacted_summary: str | None = None
 
 
 def _utc(value: datetime, field: str) -> datetime:
@@ -920,6 +962,8 @@ class AcademicRepository:
             "planned", "in_progress", "completed", "incomplete", "carried_forward"
         ] = "planned",
         assessment_id: uuid.UUID | None = None,
+        learning_focus_id: uuid.UUID | None = None,
+        block_kind: Literal["assessment", "practice"] = "assessment",
         carry_forward_from_id: uuid.UUID | None = None,
         notes: str | None = None,
     ) -> StudyBlock:
@@ -936,6 +980,8 @@ class AcademicRepository:
             "allocated_minutes": allocated_minutes,
             "status": status,
             "assessment_id": assessment_id,
+            "learning_focus_id": learning_focus_id,
+            "block_kind": block_kind,
             "carry_forward_from_id": carry_forward_from_id,
             "notes": notes,
         }
@@ -977,6 +1023,7 @@ class AcademicRepository:
                 plan_id=target_plan_id,
                 block_key=key[:255],
                 assessment_id=source.assessment_id,
+                learning_focus_id=source.learning_focus_id,
                 title=source.title,
                 starts_at=cursor,
                 ends_at=cursor + duration,
@@ -988,6 +1035,541 @@ class AcademicRepository:
             result.append(carried)
             cursor = carried.ends_at + timedelta(minutes=gap_minutes)
         return result
+
+    @staticmethod
+    def create_discourse_session(
+        session: Session,
+        *,
+        external_event_id: str,
+        started_at: datetime,
+        channel: str = "discord",
+        discord_channel_id: str | None = None,
+        discord_user_id: str | None = None,
+        session_kind: str = "learning_focus",
+        partial_state: Mapping[str, Any] | None = None,
+        expires_at: datetime | None = None,
+    ) -> AcademicDiscourseSession:
+        if channel != "discord":
+            raise ValueError("academic discourse sessions are Discord-only in this phase")
+        event_id = _bounded(external_event_id)
+        existing = session.scalar(
+            select(AcademicDiscourseSession).where(
+                AcademicDiscourseSession.external_event_id == event_id
+            )
+        )
+        if existing is not None:
+            return existing
+        started = _utc(started_at, "started_at")
+        return _upsert(
+            session,
+            AcademicDiscourseSession,
+            [AcademicDiscourseSession.external_event_id == event_id],
+            {
+                "external_event_id": event_id,
+                "channel": channel,
+                "discord_channel_id": _bounded_optional(discord_channel_id, 24),
+                "discord_user_id": _bounded_optional(discord_user_id, 24),
+                "session_kind": _bounded(session_kind, 64),
+                "state": "open",
+                "partial_state": dict(partial_state or {}),
+                "missed_review_count": 0,
+                "reminder_count": 0,
+                "started_at": started,
+                "last_turn_at": started,
+                "expires_at": _utc(expires_at, "expires_at") if expires_at else None,
+            },
+        )
+
+    @staticmethod
+    def resume_discourse_session(
+        session: Session,
+        *,
+        session_id: uuid.UUID | None = None,
+        external_event_id: str | None = None,
+        now: datetime,
+        partial_state: Mapping[str, Any] | None = None,
+    ) -> AcademicDiscourseSession:
+        if (session_id is None) == (external_event_id is None):
+            raise ValueError("resume requires exactly one session identifier")
+        statement = select(AcademicDiscourseSession).with_for_update()
+        if session_id is not None:
+            statement = statement.where(AcademicDiscourseSession.id == session_id)
+        else:
+            statement = statement.where(
+                AcademicDiscourseSession.external_event_id == _bounded(cast(str, external_event_id))
+            )
+        row = session.scalar(statement)
+        if row is None:
+            raise NoResultFound("academic discourse session was not found")
+        current = _utc(now, "now")
+        if row.expires_at is not None and _aware_db(row.expires_at) <= current:
+            row.state = "expired"
+            row.partial_state = {}
+            session.flush()
+            return row
+        if row.state == "open":
+            row.last_turn_at = current
+            if partial_state is not None:
+                row.partial_state = {**row.partial_state, **dict(partial_state)}
+        session.flush()
+        return row
+
+    @staticmethod
+    def find_open_discourse_session(
+        session: Session,
+        *,
+        discord_channel_id: str,
+        discord_user_id: str,
+        now: datetime,
+    ) -> AcademicDiscourseSession | None:
+        """Return the owner's latest unexpired clarification session."""
+
+        current = _utc(now, "now")
+        return session.scalar(
+            select(AcademicDiscourseSession)
+            .where(
+                AcademicDiscourseSession.state == "open",
+                AcademicDiscourseSession.discord_channel_id == _bounded(discord_channel_id, 24),
+                AcademicDiscourseSession.discord_user_id == _bounded(discord_user_id, 24),
+                or_(
+                    AcademicDiscourseSession.expires_at.is_(None),
+                    AcademicDiscourseSession.expires_at > current,
+                ),
+            )
+            .order_by(AcademicDiscourseSession.last_turn_at.desc())
+            .limit(1)
+        )
+
+    @staticmethod
+    def complete_discourse_session(
+        session: Session,
+        *,
+        session_id: uuid.UUID,
+        completed_at: datetime,
+        final_state: Mapping[str, Any] | None = None,
+    ) -> AcademicDiscourseSession:
+        row = session.get(AcademicDiscourseSession, session_id)
+        if row is None:
+            raise NoResultFound(f"academic discourse session {session_id} was not found")
+        current = _utc(completed_at, "completed_at")
+        if row.state == "open":
+            row.state = "completed"
+            row.completed_at = current
+            row.last_turn_at = current
+            if final_state is not None:
+                row.partial_state = {**row.partial_state, **dict(final_state)}
+        session.flush()
+        return row
+
+    @staticmethod
+    def record_discourse_turn(
+        session: Session,
+        *,
+        session_id: uuid.UUID,
+        external_event_id: str,
+        received_at: datetime,
+    ) -> tuple[AcademicDiscourseTurn, bool]:
+        """Record one inbound Discord event and report whether it was new."""
+
+        event_id = _bounded(external_event_id)
+        existing = session.scalar(
+            select(AcademicDiscourseTurn).where(AcademicDiscourseTurn.external_event_id == event_id)
+        )
+        if existing is not None:
+            return existing, False
+        row = AcademicDiscourseTurn(
+            session_id=session_id,
+            external_event_id=event_id,
+            received_at=_utc(received_at, "received_at"),
+        )
+        session.add(row)
+        session.flush()
+        return row, True
+
+    @staticmethod
+    def expire_discourse_sessions(session: Session, *, now: datetime) -> int:
+        current = _utc(now, "now")
+        rows = list(
+            session.scalars(
+                select(AcademicDiscourseSession)
+                .where(
+                    AcademicDiscourseSession.state == "open",
+                    AcademicDiscourseSession.expires_at.is_not(None),
+                    AcademicDiscourseSession.expires_at <= current,
+                )
+                .with_for_update()
+            )
+        )
+        for row in rows:
+            row.state = "expired"
+            row.partial_state = {}
+        session.flush()
+        return len(rows)
+
+    @staticmethod
+    def create_learning_focus(
+        session: Session,
+        *,
+        topic: str,
+        now: datetime,
+        course_id: uuid.UUID | None = None,
+        assessment_id: uuid.UUID | None = None,
+        course_code: str | None = None,
+        source_session_id: uuid.UUID | None = None,
+        source_external_event_id: str | None = None,
+        next_review_at: datetime | None = None,
+        practice_due_on: date | None = None,
+        practice_minutes: int | None = None,
+        memory: LearningFocusMemoryInput | None = None,
+        actor: str = "academic_planner",
+    ) -> AcademicLearningFocus:
+        current = _utc(now, "now")
+        event_id = _bounded_optional(source_external_event_id)
+        if event_id is not None:
+            existing = session.scalar(
+                select(AcademicLearningFocus).where(
+                    AcademicLearningFocus.source_external_event_id == event_id
+                )
+            )
+            if existing is not None:
+                return existing
+            event = session.scalar(
+                select(AcademicLearningFocusEvent).where(
+                    AcademicLearningFocusEvent.external_event_id == event_id
+                )
+            )
+            if event is not None:
+                replayed = session.get(AcademicLearningFocus, event.focus_id)
+                if replayed is not None:
+                    return replayed
+        if practice_minutes is not None and practice_minutes <= 0:
+            raise ValueError("practice_minutes must be positive")
+        focus = AcademicLearningFocus(
+            course_id=course_id,
+            assessment_id=assessment_id,
+            course_code=_bounded_optional(course_code, 64),
+            topic=_bounded(topic),
+            status="active",
+            source_session_id=source_session_id,
+            source_external_event_id=event_id,
+            reinforcement_count=1,
+            next_review_at=_utc(next_review_at, "next_review_at") if next_review_at else None,
+            practice_due_on=practice_due_on,
+            practice_minutes=practice_minutes,
+            last_reinforced_at=current,
+        )
+        session.add(focus)
+        session.flush()
+        _append_learning_focus_event(
+            session,
+            focus_id=focus.id,
+            session_id=source_session_id,
+            external_event_id=event_id,
+            event_type="created",
+            actor=actor,
+            occurred_at=current,
+            payload={
+                "topic": focus.topic,
+                "course_code": focus.course_code,
+                "practice_due_on": practice_due_on.isoformat() if practice_due_on else None,
+                "practice_minutes": practice_minutes,
+            },
+        )
+        if memory is not None:
+            _persist_reflection_memory(
+                session,
+                focus_id=focus.id,
+                session_id=source_session_id,
+                external_event_id=event_id,
+                memory=memory,
+                recorded_at=current,
+            )
+        return focus
+
+    @staticmethod
+    def reinforce_learning_focus(
+        session: Session,
+        *,
+        focus_id: uuid.UUID,
+        now: datetime,
+        source_session_id: uuid.UUID | None = None,
+        external_event_id: str | None = None,
+        next_review_at: datetime | None = None,
+        practice_due_on: date | None = None,
+        practice_minutes: int | None = None,
+        memory: LearningFocusMemoryInput | None = None,
+        actor: str = "academic_planner",
+    ) -> AcademicLearningFocus:
+        event_id = _bounded_optional(external_event_id)
+        if event_id is not None:
+            existing_event = session.scalar(
+                select(AcademicLearningFocusEvent).where(
+                    AcademicLearningFocusEvent.external_event_id == event_id
+                )
+            )
+            if existing_event is not None:
+                if existing_event.focus_id != focus_id:
+                    raise ValueError("external event is associated with another learning focus")
+                existing_focus = session.get(AcademicLearningFocus, focus_id)
+                if existing_focus is None:
+                    raise NoResultFound(f"academic learning focus {focus_id} was not found")
+                return existing_focus
+        focus = session.scalar(
+            select(AcademicLearningFocus)
+            .where(AcademicLearningFocus.id == focus_id)
+            .with_for_update()
+        )
+        if focus is None:
+            raise NoResultFound(f"academic learning focus {focus_id} was not found")
+        if practice_minutes is not None and practice_minutes <= 0:
+            raise ValueError("practice_minutes must be positive")
+        current = _utc(now, "now")
+        focus.status = "active"
+        focus.snoozed_at = None
+        focus.reinforcement_count += 1
+        focus.last_reinforced_at = current
+        focus.last_reviewed_at = current
+        focus.last_review_prompted_at = None
+        focus.missed_review_count = 0
+        focus.reminder_count = 0
+        focus.last_reminded_at = None
+        if source_session_id is not None:
+            focus.source_session_id = source_session_id
+        if next_review_at is not None:
+            focus.next_review_at = _utc(next_review_at, "next_review_at")
+        if practice_due_on is not None:
+            focus.practice_due_on = practice_due_on
+        if practice_minutes is not None:
+            focus.practice_minutes = practice_minutes
+        _append_learning_focus_event(
+            session,
+            focus_id=focus.id,
+            session_id=source_session_id,
+            external_event_id=event_id,
+            event_type="reinforced",
+            actor=actor,
+            occurred_at=current,
+            payload={
+                "next_review_at": focus.next_review_at.isoformat()
+                if focus.next_review_at is not None
+                else None,
+                "practice_due_on": focus.practice_due_on.isoformat()
+                if focus.practice_due_on is not None
+                else None,
+                "practice_minutes": focus.practice_minutes,
+            },
+        )
+        if memory is not None:
+            _persist_reflection_memory(
+                session,
+                focus_id=focus.id,
+                session_id=source_session_id,
+                external_event_id=event_id,
+                memory=memory,
+                recorded_at=current,
+            )
+        session.flush()
+        return focus
+
+    @staticmethod
+    def list_active_learning_focuses(
+        session: Session,
+        *,
+        course_id: uuid.UUID | None = None,
+        include_snoozed: bool = False,
+        limit: int = 50,
+    ) -> list[AcademicLearningFocus]:
+        if limit < 1:
+            return []
+        statuses = ["active", "snoozed"] if include_snoozed else ["active"]
+        statement = (
+            select(AcademicLearningFocus)
+            .where(AcademicLearningFocus.status.in_(statuses))
+            .order_by(AcademicLearningFocus.next_review_at, AcademicLearningFocus.topic)
+            .limit(limit)
+        )
+        if course_id is not None:
+            statement = statement.where(AcademicLearningFocus.course_id == course_id)
+        return list(session.scalars(statement))
+
+    @staticmethod
+    def list_due_learning_focus_reviews(
+        session: Session,
+        *,
+        now: datetime,
+        limit: int = 50,
+    ) -> list[AcademicLearningFocus]:
+        if limit < 1:
+            return []
+        current = _utc(now, "now")
+        return list(
+            session.scalars(
+                select(AcademicLearningFocus)
+                .where(
+                    AcademicLearningFocus.status.in_(["active", "snoozed"]),
+                    AcademicLearningFocus.next_review_at.is_not(None),
+                    AcademicLearningFocus.next_review_at <= current,
+                )
+                .order_by(AcademicLearningFocus.next_review_at, AcademicLearningFocus.topic)
+                .limit(limit)
+            )
+        )
+
+    @staticmethod
+    def snooze_learning_focus(
+        session: Session,
+        *,
+        focus_id: uuid.UUID,
+        now: datetime,
+        actor: str = "academic_planner",
+        reason: str | None = None,
+    ) -> AcademicLearningFocus:
+        focus = session.get(AcademicLearningFocus, focus_id)
+        if focus is None:
+            raise NoResultFound(f"academic learning focus {focus_id} was not found")
+        current = _utc(now, "now")
+        focus.status = "snoozed"
+        focus.snoozed_at = current
+        focus.practice_due_on = None
+        focus.practice_minutes = None
+        _append_learning_focus_event(
+            session,
+            focus_id=focus.id,
+            session_id=focus.source_session_id,
+            external_event_id=None,
+            event_type="snoozed",
+            actor=actor,
+            occurred_at=current,
+            payload={"reason": reason},
+        )
+        session.flush()
+        return focus
+
+    @staticmethod
+    def mark_learning_focus_review_prompted(
+        session: Session,
+        *,
+        focus_id: uuid.UUID,
+        now: datetime,
+        next_review_at: datetime,
+        external_event_id: str | None = None,
+    ) -> AcademicLearningFocus:
+        focus = session.get(AcademicLearningFocus, focus_id)
+        if focus is None:
+            raise NoResultFound(f"academic learning focus {focus_id} was not found")
+        current = _utc(now, "now")
+        focus.last_review_prompted_at = current
+        focus.next_review_at = _utc(next_review_at, "next_review_at")
+        _append_learning_focus_event(
+            session,
+            focus_id=focus.id,
+            session_id=focus.source_session_id,
+            external_event_id=_bounded_optional(external_event_id),
+            event_type="review_requested",
+            actor="academic_planner",
+            occurred_at=current,
+        )
+        session.flush()
+        return focus
+
+    @staticmethod
+    def hard_delete_learning_focus(session: Session, *, focus_id: uuid.UUID) -> bool:
+        focus = session.get(AcademicLearningFocus, focus_id)
+        if focus is None:
+            return False
+        session.execute(
+            delete(AcademicReflectionMemory).where(AcademicReflectionMemory.focus_id == focus_id)
+        )
+        session.execute(
+            delete(AcademicLearningFocusEvent).where(
+                AcademicLearningFocusEvent.focus_id == focus_id
+            )
+        )
+        session.execute(
+            update(StudyBlock)
+            .where(StudyBlock.learning_focus_id == focus_id)
+            .values(learning_focus_id=None)
+        )
+        session.delete(focus)
+        session.flush()
+        return True
+
+    @staticmethod
+    def advance_learning_focus_reminder(
+        session: Session,
+        *,
+        focus_id: uuid.UUID,
+        now: datetime,
+        next_reminder_at: datetime | None = None,
+        external_event_id: str | None = None,
+        actor: str = "academic_planner",
+        snooze_after_missed: int = 2,
+        delete_after_reminders: int = 5,
+    ) -> tuple[LearningFocusReminderStatus, AcademicLearningFocus | None]:
+        if snooze_after_missed < 1 or delete_after_reminders < snooze_after_missed:
+            raise ValueError("invalid missed-review lifecycle thresholds")
+        event_id = _bounded_optional(external_event_id)
+        if event_id is not None:
+            existing_event = session.scalar(
+                select(AcademicLearningFocusEvent).where(
+                    AcademicLearningFocusEvent.external_event_id == event_id
+                )
+            )
+            if existing_event is not None:
+                focus = session.get(AcademicLearningFocus, existing_event.focus_id)
+                if focus is None:
+                    return "delete", None
+                status: LearningFocusReminderStatus = (
+                    "snoozed_and_remind" if focus.status == "snoozed" else "remind"
+                )
+                return status, focus
+        focus = session.scalar(
+            select(AcademicLearningFocus)
+            .where(AcademicLearningFocus.id == focus_id)
+            .with_for_update()
+        )
+        if focus is None:
+            raise NoResultFound(f"academic learning focus {focus_id} was not found")
+        if focus.reminder_count >= delete_after_reminders:
+            AcademicRepository.hard_delete_learning_focus(session, focus_id=focus_id)
+            return "delete", None
+        current = _utc(now, "now")
+        focus.missed_review_count += 1
+        focus.reminder_count += 1
+        focus.last_reminded_at = current
+        if focus.source_session_id is not None:
+            discourse_session = session.get(AcademicDiscourseSession, focus.source_session_id)
+            if discourse_session is not None:
+                discourse_session.missed_review_count += 1
+                discourse_session.reminder_count += 1
+                discourse_session.last_turn_at = current
+        if next_reminder_at is not None:
+            focus.next_review_at = _utc(next_reminder_at, "next_reminder_at")
+        event_type = "reminder_sent"
+        status = "remind"
+        if focus.missed_review_count >= snooze_after_missed:
+            focus.status = "snoozed"
+            focus.snoozed_at = focus.snoozed_at or current
+            focus.practice_due_on = None
+            focus.practice_minutes = None
+            event_type = "snoozed"
+            status = "snoozed_and_remind"
+        _append_learning_focus_event(
+            session,
+            focus_id=focus.id,
+            session_id=focus.source_session_id,
+            external_event_id=event_id,
+            event_type=event_type,
+            actor=actor,
+            occurred_at=current,
+            payload={
+                "missed_review_count": focus.missed_review_count,
+                "reminder_count": focus.reminder_count,
+                "delete_after_reminders": delete_after_reminders,
+            },
+        )
+        session.flush()
+        return cast(LearningFocusReminderStatus, status), focus
 
     @staticmethod
     def create_checkin(
@@ -1193,6 +1775,91 @@ class AcademicRepository:
         return "rejected", proposal
 
 
+def _append_learning_focus_event(
+    session: Session,
+    *,
+    focus_id: uuid.UUID,
+    session_id: uuid.UUID | None,
+    external_event_id: str | None,
+    event_type: str,
+    actor: str,
+    occurred_at: datetime,
+    payload: Mapping[str, Any] | None = None,
+) -> AcademicLearningFocusEvent:
+    values = {
+        "focus_id": focus_id,
+        "session_id": session_id,
+        "external_event_id": _bounded_optional(external_event_id),
+        "event_type": _bounded(event_type, 64),
+        "actor": _bounded_optional(actor),
+        "occurred_at": _utc(occurred_at, "occurred_at"),
+        "payload": dict(payload or {}),
+    }
+    row = AcademicLearningFocusEvent(**values)
+    session.add(row)
+    session.flush()
+    return row
+
+
+def _persist_reflection_memory(
+    session: Session,
+    *,
+    focus_id: uuid.UUID,
+    session_id: uuid.UUID | None,
+    external_event_id: str | None,
+    memory: LearningFocusMemoryInput,
+    recorded_at: datetime,
+) -> AcademicReflectionMemory:
+    raw_text = memory.raw_text
+    if not raw_text.strip() or len(raw_text) > CHUNK_MAX_CHARS:
+        raise ValueError("reflection text must be non-empty and bounded")
+    embedding = _embedding_vector(memory.embedding)
+    model = _bounded_optional(memory.embedding_model)
+    if embedding is not None and model is None:
+        raise ValueError("embedding_model is required when an embedding is stored")
+    existing = None
+    event_id = _bounded_optional(external_event_id)
+    if event_id is not None:
+        existing = session.scalar(
+            select(AcademicReflectionMemory).where(
+                AcademicReflectionMemory.external_event_id == event_id
+            )
+        )
+    if existing is not None:
+        return existing
+    row = AcademicReflectionMemory(
+        focus_id=focus_id,
+        session_id=session_id,
+        external_event_id=event_id,
+        raw_text=raw_text,
+        redacted_summary=_bounded_optional(memory.redacted_summary, 2_000),
+        embedding=embedding,
+        embedding_model=model,
+        embedding_dimensions=len(embedding) if embedding is not None else None,
+        embedding_metadata=dict(memory.embedding_metadata or {}),
+        recorded_at=_utc(recorded_at, "recorded_at"),
+    )
+    session.add(row)
+    session.flush()
+    return row
+
+
+def _embedding_vector(value: Sequence[float] | None) -> list[float] | None:
+    if value is None:
+        return None
+    result: list[float] = []
+    for item in value:
+        if isinstance(item, bool):
+            raise ValueError("embedding values must be numeric")
+        numeric = float(item)
+        if not math.isfinite(numeric):
+            raise ValueError("embedding values must be finite")
+        result.append(numeric)
+    if not result:
+        raise ValueError("embedding must not be empty")
+    return result
+
+
 def _checkin_proposal_from_row(
     proposal_type: Any,
     proposal_id: uuid.UUID,
@@ -1223,6 +1890,43 @@ def _resolve_study_plan_id(
     return plan.id if plan is not None else None
 
 
+def _learning_focus_option(session: Session, focus: AcademicLearningFocus) -> Any:
+    from app.agents.academic_planner.contracts import (
+        AcademicLearningFocusOption,
+        LearningFocusStatus,
+    )
+
+    assessment = (
+        session.get(Assessment, focus.assessment_id) if focus.assessment_id is not None else None
+    )
+    return AcademicLearningFocusOption(
+        focus_id=str(focus.id),
+        status=LearningFocusStatus(focus.status),
+        topic=focus.topic,
+        course_id=str(focus.course_id) if focus.course_id is not None else None,
+        course_code=focus.course_code,
+        assessment_id=str(focus.assessment_id) if focus.assessment_id is not None else None,
+        assessment_title=assessment.title if assessment is not None else None,
+        target_minutes=focus.practice_minutes or 30,
+        next_review_at=(
+            _aware_db(focus.next_review_at) if focus.next_review_at is not None else None
+        ),
+        missed_checkin_count=focus.missed_review_count,
+        snoozed_until=None,
+    )
+
+
+def _cosine_similarity(left: Sequence[float], right: Sequence[float]) -> float:
+    if len(left) != len(right) or not left:
+        return 0.0
+    dot = sum(a * b for a, b in zip(left, right, strict=True))
+    left_norm = math.sqrt(sum(value * value for value in left))
+    right_norm = math.sqrt(sum(value * value for value in right))
+    if left_norm == 0 or right_norm == 0:
+        return 0.0
+    return dot / (left_norm * right_norm)
+
+
 class SQLAlchemyAcademicPlannerStore:
     """Adapter implementing the academic planner's persistence protocol.
 
@@ -1231,11 +1935,385 @@ class SQLAlchemyAcademicPlannerStore:
     choose its own worker-thread boundary around database calls.
     """
 
-    def __init__(self, engine: Any, *, confirmation_ttl_hours: int = 24) -> None:
+    def __init__(
+        self,
+        engine: Any,
+        *,
+        confirmation_ttl_hours: int = 24,
+        embedding_gateway: Any | None = None,
+        default_practice_minutes: int = 30,
+    ) -> None:
         if confirmation_ttl_hours < 1 or confirmation_ttl_hours > 168:
             raise ValueError("confirmation_ttl_hours must be between 1 and 168")
         self.engine = engine
         self.confirmation_ttl_hours = confirmation_ttl_hours
+        self.embedding_gateway = embedding_gateway
+        self.default_practice_minutes = default_practice_minutes
+
+    def search_courses(self, query: str) -> Sequence[Any]:
+        """Return bounded writable course options for the model's read-only tool."""
+
+        from app.agents.academic_planner.contracts import AcademicCourseOption
+
+        needle = _academic_search_text(query)
+        with Session(self.engine) as session:
+            rows = session.execute(
+                select(Course, AcademicCourseCalendar)
+                .join(AcademicCourseCalendar, AcademicCourseCalendar.course_id == Course.id)
+                .where(
+                    Course.active.is_(True),
+                    AcademicCourseCalendar.discovery_status == "valid",
+                    AcademicCourseCalendar.child_data_source_id.is_not(None),
+                    AcademicCourseCalendar.title_property_id.is_not(None),
+                    AcademicCourseCalendar.date_property_id.is_not(None),
+                )
+                .order_by(Course.course_code, Course.term, Course.id)
+                .limit(200)
+            )
+            options = [
+                AcademicCourseOption(
+                    course_id=str(course.id),
+                    course_code=course.course_code,
+                    title=course.title,
+                )
+                for course, _calendar in rows
+                if _academic_option_matches(
+                    needle,
+                    str(course.id),
+                    course.course_code,
+                    course.title,
+                    course.term,
+                )
+            ]
+        return tuple(options[:20])
+
+    def search_assessments(
+        self,
+        query: str,
+        course_id: str | None = None,
+    ) -> Sequence[Any]:
+        """Return bounded active assessment options for the model's read-only tool."""
+
+        from app.agents.academic_planner.contracts import (
+            AcademicAssessmentOption,
+            AssessmentType,
+        )
+
+        needle = _academic_search_text(query)
+        selected_course_id = _parse_uuid(course_id) if course_id is not None else None
+        if course_id is not None and selected_course_id is None:
+            return ()
+        with Session(self.engine) as session:
+            statement = (
+                select(Assessment, Course)
+                .join(Course, Course.id == Assessment.course_id)
+                .join(AcademicCourseCalendar, AcademicCourseCalendar.course_id == Course.id)
+                .where(
+                    Course.active.is_(True),
+                    Assessment.active.is_(True),
+                    Assessment.archived.is_(False),
+                    Assessment.notion_last_edited_at.is_not(None),
+                    Assessment.title_property_id.is_not(None),
+                    AcademicCourseCalendar.discovery_status == "valid",
+                    AcademicCourseCalendar.date_property_id.is_not(None),
+                )
+                .order_by(Assessment.due_at, Assessment.title, Assessment.id)
+                .limit(500)
+            )
+            if selected_course_id is not None:
+                statement = statement.where(Course.id == selected_course_id)
+            rows = session.execute(statement)
+            options = [
+                AcademicAssessmentOption(
+                    assessment_id=str(assessment.id),
+                    course_id=str(course.id),
+                    course_code=course.course_code,
+                    title=assessment.title,
+                    due_at=(
+                        _aware_db(assessment.due_at) if assessment.due_at is not None else None
+                    ),
+                    assessment_type=_planner_assessment_type(
+                        AssessmentType,
+                        assessment.assessment_type,
+                    ),
+                    expected_last_edited_at=_aware_db(assessment.notion_last_edited_at),
+                )
+                for assessment, course in rows
+                if _academic_option_matches(
+                    needle,
+                    str(assessment.id),
+                    assessment.notion_id,
+                    assessment.title,
+                    course.course_code,
+                )
+            ]
+        return tuple(options[:20])
+
+    def search_learning_focuses(
+        self,
+        query: str | None,
+        statuses: Sequence[Any],
+    ) -> Sequence[Any]:
+        """Return bounded active/snoozed focus options for model-selected reads."""
+
+        from app.agents.academic_planner.contracts import LearningFocusStatus
+
+        allowed = {
+            item.value if isinstance(item, LearningFocusStatus) else str(item) for item in statuses
+        }
+        allowed &= {"active", "snoozed"}
+        if not allowed:
+            return ()
+        needle = _academic_search_text(query or "")
+        with Session(self.engine) as session:
+            rows = list(
+                session.scalars(
+                    select(AcademicLearningFocus)
+                    .where(AcademicLearningFocus.status.in_(sorted(allowed)))
+                    .order_by(
+                        AcademicLearningFocus.next_review_at,
+                        AcademicLearningFocus.topic,
+                    )
+                    .limit(100)
+                )
+            )
+            return tuple(
+                _learning_focus_option(session, row)
+                for row in rows
+                if _academic_option_matches(
+                    needle,
+                    str(row.id),
+                    row.topic,
+                    row.course_code or "",
+                )
+            )[:20]
+
+    async def search_semantic_focuses(self, query: str, *, limit: int) -> Sequence[Any]:
+        """Embed a query and run owner-local exact cosine search in pgvector."""
+
+        from app.agents.academic_planner.contracts import AcademicSemanticCandidate
+        from app.llm.embeddings import EmbeddingStatus
+
+        if self.embedding_gateway is None or limit < 1:
+            return ()
+        result = await self.embedding_gateway.embed_reflection_text(query)
+        if result.status is not EmbeddingStatus.VALID or result.embedding is None:
+            return ()
+        vector = result.embedding.vector
+        with Session(self.engine) as session:
+            if session.get_bind().dialect.name == "postgresql":
+                distance = AcademicReflectionMemory.embedding.cosine_distance(vector).label(
+                    "distance"
+                )
+                rows = session.execute(
+                    select(AcademicReflectionMemory, AcademicLearningFocus, distance)
+                    .join(
+                        AcademicLearningFocus,
+                        AcademicLearningFocus.id == AcademicReflectionMemory.focus_id,
+                    )
+                    .where(
+                        AcademicReflectionMemory.embedding.is_not(None),
+                        AcademicReflectionMemory.embedding_dimensions == len(vector),
+                        AcademicLearningFocus.status.in_(["active", "snoozed"]),
+                    )
+                    .order_by(distance)
+                    .limit(limit)
+                )
+                candidates = [
+                    AcademicSemanticCandidate(
+                        candidate_id=str(memory.id),
+                        source_kind="reflection",
+                        source_id=str(memory.id),
+                        text=memory.raw_text[:1_000],
+                        score=max(0.0, min(1.0, 1.0 - float(distance_value))),
+                        focus=_learning_focus_option(session, focus),
+                    )
+                    for memory, focus, distance_value in rows
+                ]
+                return tuple(candidates)
+
+            rows = session.execute(
+                select(AcademicReflectionMemory, AcademicLearningFocus)
+                .join(
+                    AcademicLearningFocus,
+                    AcademicLearningFocus.id == AcademicReflectionMemory.focus_id,
+                )
+                .where(
+                    AcademicReflectionMemory.embedding.is_not(None),
+                    AcademicReflectionMemory.embedding_dimensions == len(vector),
+                    AcademicLearningFocus.status.in_(["active", "snoozed"]),
+                )
+            )
+            ranked = sorted(
+                (
+                    (
+                        _cosine_similarity(vector, cast(Sequence[float], memory.embedding)),
+                        memory,
+                        focus,
+                    )
+                    for memory, focus in rows
+                ),
+                key=lambda item: item[0],
+                reverse=True,
+            )[:limit]
+            return tuple(
+                AcademicSemanticCandidate(
+                    candidate_id=str(memory.id),
+                    source_kind="reflection",
+                    source_id=str(memory.id),
+                    text=memory.raw_text[:1_000],
+                    score=max(0.0, min(1.0, score)),
+                    focus=_learning_focus_option(session, focus),
+                )
+                for score, memory, focus in ranked
+            )
+
+    def prepare_learning_focus_checkin(
+        self,
+        *,
+        now: datetime,
+        next_review_at: datetime,
+        idempotency_key: str,
+        snooze_after_missed: int,
+        delete_after_reminders: int,
+    ) -> tuple[dict[str, Any], ...]:
+        """Advance due focus reviews and return bounded Discord prompt facts."""
+
+        results: list[dict[str, Any]] = []
+        with Session(self.engine) as session, session.begin():
+            due = AcademicRepository.list_due_learning_focus_reviews(session, now=now)
+            for focus in due:
+                event_key = f"{idempotency_key}:focus:{focus.id}"
+                if focus.last_review_prompted_at is None:
+                    AcademicRepository.mark_learning_focus_review_prompted(
+                        session,
+                        focus_id=focus.id,
+                        now=now,
+                        next_review_at=next_review_at,
+                        external_event_id=f"{event_key}:initial",
+                    )
+                    results.append(
+                        {
+                            "focus_id": str(focus.id),
+                            "course_code": focus.course_code,
+                            "topic": focus.topic,
+                            "kind": "review",
+                            "reminder_count": 0,
+                            "delete_after_reminders": delete_after_reminders,
+                        }
+                    )
+                    continue
+                status, updated = AcademicRepository.advance_learning_focus_reminder(
+                    session,
+                    focus_id=focus.id,
+                    now=now,
+                    next_reminder_at=next_review_at,
+                    external_event_id=f"{event_key}:reminder",
+                    snooze_after_missed=snooze_after_missed,
+                    delete_after_reminders=delete_after_reminders,
+                )
+                if status == "delete" or updated is None:
+                    results.append(
+                        {
+                            "focus_id": str(focus.id),
+                            "course_code": focus.course_code,
+                            "topic": focus.topic,
+                            "kind": "deleted",
+                            "reminder_count": delete_after_reminders,
+                            "delete_after_reminders": delete_after_reminders,
+                        }
+                    )
+                    continue
+                results.append(
+                    {
+                        "focus_id": str(updated.id),
+                        "course_code": updated.course_code,
+                        "topic": updated.topic,
+                        "kind": status,
+                        "reminder_count": updated.reminder_count,
+                        "delete_after_reminders": delete_after_reminders,
+                    }
+                )
+        return tuple(results)
+
+    def resolve_course_mutation_target(self, course_id: str) -> AcademicCourseMutationTarget | None:
+        """Resolve only a valid discovered course calendar to a write target."""
+
+        parsed = _parse_uuid(course_id)
+        if parsed is None:
+            return None
+        with Session(self.engine) as session:
+            row = session.execute(
+                select(Course, AcademicCourseCalendar)
+                .join(AcademicCourseCalendar, AcademicCourseCalendar.course_id == Course.id)
+                .where(
+                    Course.id == parsed,
+                    Course.active.is_(True),
+                    AcademicCourseCalendar.discovery_status == "valid",
+                )
+            ).one_or_none()
+            if row is None:
+                return None
+            course, calendar = row
+            if not all(
+                (
+                    calendar.child_data_source_id,
+                    calendar.title_property_id,
+                    calendar.date_property_id,
+                )
+            ):
+                return None
+            return AcademicCourseMutationTarget(
+                course_id=str(course.id),
+                course_code=course.course_code,
+                data_source_id=cast(str, calendar.child_data_source_id),
+                title_property_id=cast(str, calendar.title_property_id),
+                date_property_id=cast(str, calendar.date_property_id),
+            )
+
+    def resolve_assessment_mutation_target(
+        self, assessment_id: str
+    ) -> AcademicAssessmentMutationTarget | None:
+        """Resolve an active synchronized assessment with guarded-write metadata."""
+
+        parsed = _parse_uuid(assessment_id)
+        if parsed is None:
+            return None
+        with Session(self.engine) as session:
+            row = session.execute(
+                select(Assessment, AcademicCourseCalendar)
+                .join(
+                    AcademicCourseCalendar,
+                    AcademicCourseCalendar.course_id == Assessment.course_id,
+                )
+                .where(
+                    Assessment.id == parsed,
+                    Assessment.active.is_(True),
+                    Assessment.archived.is_(False),
+                    AcademicCourseCalendar.discovery_status == "valid",
+                )
+            ).one_or_none()
+            if row is None:
+                return None
+            assessment, calendar = row
+            if not all(
+                (
+                    assessment.notion_id,
+                    assessment.notion_last_edited_at,
+                    assessment.title_property_id,
+                    calendar.date_property_id,
+                )
+            ):
+                return None
+            return AcademicAssessmentMutationTarget(
+                assessment_id=str(assessment.id),
+                course_id=str(assessment.course_id),
+                page_id=assessment.notion_id,
+                title=assessment.title,
+                last_edited_at=_aware_db(cast(datetime, assessment.notion_last_edited_at)),
+                title_property_id=cast(str, assessment.title_property_id),
+                date_property_id=cast(str, calendar.date_property_id),
+            )
 
     def get_sync_cursor(self, database: str) -> str | None:
         scope = f"notion:{database}"
@@ -1393,6 +2471,7 @@ class SQLAlchemyAcademicPlannerStore:
             AssessmentType,
             IncompleteBlock,
             PlannerFacts,
+            PracticeNeed,
         )
         from app.agents.academic_planner.contracts import (
             Assessment as PlannerAssessment,
@@ -1509,6 +2588,49 @@ class SQLAlchemyAcademicPlannerStore:
                 for row in incomplete_rows
                 if row.assessment_id is not None
             ]
+            local_day = current.astimezone(_TORONTO).date()
+            practice_needs: list[Any] = []
+            focus_rows = session.scalars(
+                select(AcademicLearningFocus)
+                .where(
+                    AcademicLearningFocus.status == "active",
+                    AcademicLearningFocus.practice_due_on.is_not(None),
+                    AcademicLearningFocus.practice_due_on <= local_day,
+                )
+                .order_by(
+                    AcademicLearningFocus.next_review_at,
+                    AcademicLearningFocus.topic,
+                )
+            )
+            for row in focus_rows:
+                linked_assessment = (
+                    session.get(Assessment, row.assessment_id)
+                    if row.assessment_id is not None
+                    else None
+                )
+                practice_needs.append(
+                    PracticeNeed(
+                        focus_id=str(row.id),
+                        course_id=str(row.course_id) if row.course_id is not None else None,
+                        course_code=row.course_code,
+                        assessment_id=(
+                            str(row.assessment_id) if row.assessment_id is not None else None
+                        ),
+                        assessment_title=(linked_assessment.title if linked_assessment else None),
+                        topic=row.topic,
+                        target_minutes=row.practice_minutes or self.default_practice_minutes,
+                        next_review_at=(
+                            _aware_db(row.next_review_at)
+                            if row.next_review_at is not None
+                            else current + timedelta(days=1)
+                        ),
+                        source_action="reinforce_focus",
+                        rationale=(
+                            "Scheduled as a separate practice block because this academic topic "
+                            "is an active learning focus from the latest reflection."
+                        ),
+                    )
+                )
             preference = session.scalar(
                 select(PlanningPreference).order_by(PlanningPreference.updated_at.desc())
             )
@@ -1519,6 +2641,7 @@ class SQLAlchemyAcademicPlannerStore:
             commitments=tuple(commitments),
             availability=tuple(availability),
             incomplete_blocks=tuple(incomplete),
+            practice_needs=tuple(practice_needs),
             ambiguous_facts=tuple(ambiguous),
             buffer_minutes=buffer_minutes,
             horizon_days=horizon_days,
@@ -1544,6 +2667,8 @@ class SQLAlchemyAcademicPlannerStore:
                     plan_id=stored.id,
                     block_key=str(block.id),
                     assessment_id=assessment.id if assessment else None,
+                    learning_focus_id=_parse_uuid(_field(block, "learning_focus_id")),
+                    block_kind=_field(block, "block_kind") or "assessment",
                     title=block.title,
                     starts_at=block.start_at,
                     ends_at=block.end_at,
@@ -1591,6 +2716,15 @@ class SQLAlchemyAcademicPlannerStore:
                     PlannerBlock(
                         id=row.block_key,
                         assessment_id=assessment_id,
+                        learning_focus_id=(
+                            str(row.learning_focus_id)
+                            if row.learning_focus_id is not None
+                            else None
+                        ),
+                        block_kind=cast(
+                            Literal["assessment", "practice"],
+                            row.block_kind,
+                        ),
                         title=row.title,
                         start_at=_aware_db(row.starts_at),
                         end_at=_aware_db(row.ends_at),
@@ -1627,7 +2761,10 @@ class SQLAlchemyAcademicPlannerStore:
                 target_type="academic_checkin",
                 target_id=str(proposal.proposal_id),
                 payload={
-                    "changes": [change.model_dump(mode="json") for change in proposal.changes]
+                    "changes": [
+                        change.model_dump(mode="json", exclude_none=True)
+                        for change in proposal.changes
+                    ]
                 },
                 redacted_preview="Academic planner proposed changes; confirmation required.",
                 confirmation_token=proposal.confirmation_event,
@@ -1711,7 +2848,11 @@ class SQLAlchemyAcademicPlannerStore:
                     operation="notion_update",
                     target_type="academic_checkin",
                     target_id=str(proposal.proposal_id),
-                    payload={"changes": [change.model_dump(mode="json") for change in changes]},
+                    payload={
+                        "changes": [
+                            change.model_dump(mode="json", exclude_none=True) for change in changes
+                        ]
+                    },
                     redacted_preview="Academic planner proposed changes; confirmation required.",
                     confirmation_token=proposal.confirmation_event,
                     expires_at=getattr(proposal, "expires_at", None)
@@ -2273,6 +3414,19 @@ def _fact_state(value: Any, *, due_at: datetime | None) -> FactState:
     if candidate not in {"unconfirmed", "confirmed", "ambiguous", "rejected"}:
         return "ambiguous"
     return cast(FactState, candidate)
+
+
+def _academic_search_text(value: str) -> str:
+    bounded = value.strip()[:300].casefold()
+    if bounded in {"*", "all", "any", "everything"}:
+        return ""
+    return re.sub(r"[^a-z0-9]+", "", bounded)
+
+
+def _academic_option_matches(needle: str, *values: str) -> bool:
+    if not needle:
+        return True
+    return any(needle in re.sub(r"[^a-z0-9]+", "", value.casefold()) for value in values)
 
 
 def _resolve_course(session: Session, value: Any) -> Course:

@@ -5,11 +5,23 @@ from pathlib import Path
 from uuid import uuid4
 
 import pytest
-from sqlalchemy import create_engine
+from sqlalchemy import create_engine, select
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
-from app.agents.finance.contracts import BriefingPayload, EventCard, ExposureMapping, ImpactLabel
-from app.db.finance import FinanceRepository, SQLAlchemyFinanceStore
+from app.agents.finance.contracts import (
+    BriefingPayload,
+    ETFExposure,
+    EventCard,
+    ExposureMapping,
+    ImpactLabel,
+)
+from app.db.finance import (
+    FinanceRepository,
+    FinanceSourceEndpoint,
+    FinanceSourceRequestAudit,
+    SQLAlchemyFinanceStore,
+)
 from app.db.models import AuditEvent, Base
 
 ALLOWLIST = "finance-sources-v1"
@@ -142,6 +154,8 @@ def test_portfolio_snapshot_briefing_payload_and_run_filter_metadata(engine) -> 
             weight_percent=4.5,
             source_id="source1",
             as_of=date(2026, 9, 4),
+            source_url="https://issuer.example/holdings.csv",
+            retrieved_at=NOW,
         )
         payload = BriefingPayload(
             run_id=run_id,
@@ -170,7 +184,160 @@ def test_portfolio_snapshot_briefing_payload_and_run_filter_metadata(engine) -> 
     assert snapshot.holdings[0].symbol == "ACME"
     assert snapshot.watchlist[0].thesis_id == thesis_id
     assert snapshot.etf_exposures[0].weight_percent == 4.5
+    assert str(snapshot.etf_exposures[0].source_url) == "https://issuer.example/holdings.csv"
+    assert snapshot.etf_exposures[0].retrieved_at == NOW
     filters = store.list_run_filter_metadata()
     assert filters[0].run_id == run_id
     assert filters[0].tickers == ("ACME",)
     assert filters[0].themes == ("earnings",)
+
+
+def test_bulk_etf_exposure_upsert_preserves_source_metadata(engine) -> None:
+    store = SQLAlchemyFinanceStore(engine, allowlist_version=ALLOWLIST)
+    store.upsert_etf_exposures(
+        (
+            ETFExposure(
+                etf_symbol="IVV",
+                underlying_symbol="LMT",
+                weight_percent=1.25,
+                source_id="issuer_etf_holdings",
+                as_of=date(2026, 9, 7),
+                source_url="https://www.ishares.com/holdings.csv",
+                retrieved_at=NOW,
+            ),
+        )
+    )
+
+    snapshot = store.load_portfolio_snapshot()
+    assert len(snapshot.etf_exposures) == 1
+    exposure = snapshot.etf_exposures[0]
+    assert exposure.etf_symbol == "IVV"
+    assert exposure.underlying_symbol == "LMT"
+    assert str(exposure.source_url) == "https://www.ishares.com/holdings.csv"
+    assert exposure.retrieved_at == NOW
+
+
+def test_source_endpoints_and_cache_state_round_trip(engine) -> None:
+    with Session(engine) as session, session.begin():
+        FinanceRepository.upsert_approved_source(
+            session,
+            source_id="sec_edgar",
+            name="SEC EDGAR",
+            base_url="https://data.sec.gov/submissions/",
+            source_version="sec-edgar-public-v1",
+            allowlist_version=ALLOWLIST,
+            license_note="Public SEC filing metadata.",
+            entitlement="Public SEC access with descriptive user agent.",
+            classification="primary",
+        )
+        FinanceRepository.upsert_source_endpoint(
+            session,
+            allowlist_version=ALLOWLIST,
+            source_id="sec_edgar",
+            endpoint_id="sec_submissions",
+            base_url="https://data.sec.gov/submissions/",
+            host="data.sec.gov",
+            transport_kind="json_http",
+            parser_kind="json",
+            registry_version="sec-edgar-public-v1",
+            expected_freshness_seconds=600,
+            request_ceiling=10,
+            license_note="Public SEC submissions endpoint.",
+            retention_note="Retain normalized filing metadata and cache validators.",
+            cik_scope=("0000936468",),
+            ticker_scope=("LMT",),
+        )
+        FinanceRepository.save_source_cache_state(
+            session,
+            allowlist_version=ALLOWLIST,
+            source_id="sec_edgar",
+            endpoint_id="sec_submissions",
+            etag='"abc"',
+            last_modified="Mon, 07 Sep 2026 12:00:00 GMT",
+            watermark_external_id="0000936468-26-000001",
+            watermark_published_at=NOW,
+            cached_artifact_key="finance/sec/submissions.json",
+            payload_sha256="a" * 64,
+            last_retrieved_at=NOW,
+        )
+
+    store = SQLAlchemyFinanceStore(engine, allowlist_version=ALLOWLIST)
+    endpoints = store.list_source_endpoints(source_id="sec_edgar")
+    assert len(endpoints) == 1
+    assert endpoints[0].host == "data.sec.gov"
+    assert endpoints[0].request_ceiling == 10
+    assert endpoints[0].cik_scope == ("0000936468",)
+    assert endpoints[0].ticker_scope == ("LMT",)
+
+    state = store.load_source_cache_state(source_id="sec_edgar", endpoint_id="sec_submissions")
+    assert state is not None
+    assert state.etag == '"abc"'
+    assert state.watermark_external_id == "0000936468-26-000001"
+    assert state.watermark_published_at == NOW
+    assert state.last_retrieved_at == NOW
+
+    store.save_source_cache_state(
+        source_id="sec_edgar",
+        endpoint_id="sec_submissions",
+        etag='"def"',
+        last_not_modified_at=NOW,
+    )
+    updated = store.load_source_cache_state(
+        source_id="sec_edgar", endpoint_id="sec_submissions"
+    )
+    assert updated is not None
+    assert updated.etag == '"def"'
+    assert updated.last_not_modified_at == NOW
+
+    store.record_source_request_audit(
+        source_id="sec_edgar",
+        endpoint_id="sec_submissions",
+        requested_at=NOW,
+        status_code=304,
+        error_code=None,
+        not_modified=True,
+    )
+    with Session(engine) as session:
+        audit = session.scalar(select(FinanceSourceRequestAudit))
+        assert audit is not None
+        assert audit.outcome == "not_modified"
+        assert audit.status_code == 304
+
+
+def test_source_endpoint_uniqueness(engine) -> None:
+    values = {
+        "allowlist_version": ALLOWLIST,
+        "source_id": "defense_gov_rss",
+        "endpoint_id": "defense_feed",
+        "base_url": "https://www.defense.gov/feed",
+        "host": "www.defense.gov",
+        "transport_kind": "rss_atom",
+        "parser_kind": "rss",
+        "registry_version": "defense-gov-rss-v1",
+        "expected_freshness_seconds": 600,
+        "request_ceiling": 1,
+        "license_note": "Official feed.",
+        "retention_note": "Metadata and short excerpts only.",
+    }
+    with Session(engine) as session, session.begin():
+        FinanceRepository.upsert_approved_source(
+            session,
+            source_id="defense_gov_rss",
+            name="Defense.gov RSS",
+            base_url="https://www.defense.gov/feed",
+            source_version="defense-gov-rss-v1",
+            allowlist_version=ALLOWLIST,
+            license_note="Official feed.",
+            entitlement="Public.",
+            classification="primary",
+        )
+        FinanceRepository.upsert_source_endpoint(session, **values)
+
+    duplicate = dict(values, id=uuid4())
+    with pytest.raises(IntegrityError):
+        _insert_source_endpoint_duplicate(engine, duplicate)
+
+
+def _insert_source_endpoint_duplicate(engine, values: dict[str, object]) -> None:
+    with Session(engine) as session, session.begin():
+        session.execute(FinanceSourceEndpoint.__table__.insert().values(**values))

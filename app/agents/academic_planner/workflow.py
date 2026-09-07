@@ -6,11 +6,11 @@ import json
 import re
 import uuid
 from collections.abc import Sequence
-from datetime import UTC, date, datetime, timedelta
+from datetime import UTC, date, datetime, time, timedelta
 from typing import Any, Protocol, cast
 from zoneinfo import ZoneInfo
 
-from app.agents.academic_planner.allocator import allocate_plan
+from app.agents.academic_planner.allocator import allocate_plan_with_deferred
 from app.agents.academic_planner.contracts import (
     AmbiguousFact,
     CheckinProposal,
@@ -166,7 +166,7 @@ def build_daily_plan(
 ) -> DailyPlan:
     """Build a deterministic plan; ambiguous facts become questions only."""
 
-    blocks = allocate_plan(facts, now=now)
+    blocks, deferred_practice = allocate_plan_with_deferred(facts, now=now)
     deferred = tuple(
         assessment.id
         for assessment in facts.assessments
@@ -180,6 +180,7 @@ def build_daily_plan(
         created_at=current,
         blocks=blocks,
         deferred_assessment_ids=deferred,
+        deferred_practice_focus_ids=deferred_practice,
         ambiguous_questions=facts.ambiguous_facts,
         critique=critique,
     )
@@ -214,6 +215,7 @@ async def run_morning_plan(
             "sync": summary,
             "block_count": 0,
             "deferred_count": 0,
+            "deferred_practice_count": 0,
             "ambiguous_count": 0,
             "delivery_count": 0,
         }
@@ -245,6 +247,7 @@ async def run_morning_plan(
         "plan_id": str(plan.plan_id),
         "block_count": len(plan.blocks),
         "deferred_count": len(plan.deferred_assessment_ids),
+        "deferred_practice_count": len(plan.deferred_practice_focus_ids),
         "ambiguous_count": len(plan.ambiguous_questions),
         "delivery_count": delivery_count,
     }
@@ -324,13 +327,47 @@ async def run_end_of_day_checkin(
     plan: DailyPlan | None,
     delivery: PlannerDelivery,
     idempotency_key: str,
+    store: AcademicPlannerStore | None = None,
+    now: datetime | None = None,
+    end_of_day_time: time = time(21, 0),
+    timezone: str = "America/Toronto",
+    snooze_after_missed: int = 2,
+    delete_after_reminders: int = 5,
 ) -> dict[str, object]:
-    """Send the explicit end-of-day questions without mutating planner state."""
+    """Send the daily reflection and advance due learning-focus reminders."""
 
     await delivery.send_checkin(plan=plan, idempotency_key=idempotency_key)
+    focus_updates: tuple[dict[str, Any], ...] = ()
+    prepare = getattr(store, "prepare_learning_focus_checkin", None)
+    send_focus_reviews = getattr(delivery, "send_focus_reviews", None)
+    if callable(prepare):
+        current = now or datetime.now(UTC)
+        zone = ZoneInfo(timezone)
+        local = current.astimezone(zone)
+        next_local = datetime.combine(
+            local.date() + timedelta(days=1),
+            end_of_day_time,
+            tzinfo=zone,
+        )
+        focus_updates = tuple(
+            cast(Any, prepare)(
+                now=current,
+                next_review_at=next_local.astimezone(UTC),
+                idempotency_key=idempotency_key,
+                snooze_after_missed=snooze_after_missed,
+                delete_after_reminders=delete_after_reminders,
+            )
+        )
+        if focus_updates and callable(send_focus_reviews):
+            await cast(Any, send_focus_reviews)(
+                focus_updates,
+                idempotency_key=f"{idempotency_key}:learning-focus",
+            )
     return {
         "status": "sent",
         "plan_id": str(plan.plan_id) if plan is not None else None,
+        "focus_review_count": sum(item.get("kind") != "deleted" for item in focus_updates),
+        "focus_deleted_count": sum(item.get("kind") == "deleted" for item in focus_updates),
     }
 
 
@@ -413,6 +450,11 @@ async def run_academic_planner(run_id: str, idempotency_key: str) -> dict[str, o
             plan=plan,
             delivery=runtime.delivery,
             idempotency_key=idempotency_key,
+            store=runtime.store,
+            end_of_day_time=runtime.end_of_day_time,
+            timezone=runtime.timezone,
+            snooze_after_missed=runtime.snooze_after_missed,
+            delete_after_reminders=runtime.delete_after_reminders,
         )
     else:
         result = await run_morning_plan(
@@ -434,12 +476,20 @@ class _Runtime:
         model: PlannerModelGateway | None,
         syncer: AcademicSynchronizer | None,
         horizon_days: int,
+        end_of_day_time: time = time(21, 0),
+        timezone: str = "America/Toronto",
+        snooze_after_missed: int = 2,
+        delete_after_reminders: int = 5,
     ) -> None:
         self.store = store
         self.delivery = delivery
         self.model = model
         self.syncer = syncer
         self.horizon_days = horizon_days
+        self.end_of_day_time = end_of_day_time
+        self.timezone = timezone
+        self.snooze_after_missed = snooze_after_missed
+        self.delete_after_reminders = delete_after_reminders
 
 
 _runtime: _Runtime | None = None
@@ -489,6 +539,7 @@ def _load_default_runtime(run_id: uuid.UUID) -> _Runtime:
     store = cast(Any, store_factory)(
         engine,
         confirmation_ttl_hours=settings.academic_confirmation_ttl_hours,
+        default_practice_minutes=settings.academic_memory_default_practice_minutes,
     )
     from app.agents.academic_planner.sync import AcademicNotionSync
     from app.connectors.notion import NotionConnector
@@ -520,6 +571,10 @@ def _load_default_runtime(run_id: uuid.UUID) -> _Runtime:
         model,
         syncer,
         settings.academic_plan_horizon_days,
+        settings.academic_end_of_day_schedule,
+        settings.app_timezone,
+        settings.academic_memory_snooze_after_missed_checkins,
+        settings.academic_memory_delete_after_missed_checkins,
     )
 
 
@@ -530,13 +585,27 @@ def configure_academic_runtime(
     model: PlannerModelGateway | None = None,
     syncer: AcademicSynchronizer | None = None,
     horizon_days: int = 7,
+    end_of_day_time: time = time(21, 0),
+    timezone: str = "America/Toronto",
+    snooze_after_missed: int = 2,
+    delete_after_reminders: int = 5,
 ) -> None:
     """Inject host integrations for the worker process."""
 
     if not 7 <= horizon_days <= 14:
         raise ValueError("horizon_days must be between 7 and 14")
     global _runtime
-    _runtime = _Runtime(store, delivery, model, syncer, horizon_days)
+    _runtime = _Runtime(
+        store,
+        delivery,
+        model,
+        syncer,
+        horizon_days,
+        end_of_day_time,
+        timezone,
+        snooze_after_missed,
+        delete_after_reminders,
+    )
 
 
 __all__ = [

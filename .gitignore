@@ -35,3 +35,10 @@ htmlcov/
 /prompts/
 
 /presentations/LifeAgent-Intern-Architecture.pptx
+
+# Local learning notes. These explain the project for the current developer
+# but are intentionally not part of the tracked product documentation.
+/learning-architecture/
+
+# Local operational checklists and rollout notes.
+/to-do/

@@ -8,6 +8,11 @@ from collections.abc import Callable
 from datetime import timedelta
 from typing import Any, Literal, Protocol, cast
 
+from app.agents.academic_planner.agent_loop import (
+    AcademicAgentCatalog,
+    AcademicAgentGateway,
+    run_academic_agent_loop,
+)
 from app.agents.academic_planner.contracts import CheckinProposal
 from app.agents.academic_planner.workflow import (
     NotionAcademicWriter,
@@ -56,6 +61,18 @@ class DiscordCheckinDelivery(Protocol):
 WriterProvider = Callable[[], NotionAcademicWriter | None]
 
 
+class AcademicMemoryHandler(Protocol):
+    async def handle_reflection(
+        self,
+        *,
+        external_event_id: str,
+        channel_id: str,
+        user_id: str,
+        raw_text: str,
+        received_at: Any,
+    ) -> Any: ...
+
+
 def parse_academic_command(content: str) -> tuple[AcademicCommandAction, uuid.UUID] | None:
     """Parse only a lowercase command with one canonical UUID and no extras."""
 
@@ -79,12 +96,24 @@ class AcademicDiscordCheckinHandler:
         allowed_channel_ids: set[str],
         authorized_user_ids: set[str],
         writer_provider: WriterProvider,
+        agent_gateway: AcademicAgentGateway | None = None,
+        agent_catalog: AcademicAgentCatalog | None = None,
+        assistant_user_id: str | None = None,
+        timezone: str = "America/Toronto",
+        memory_service: AcademicMemoryHandler | None = None,
     ) -> None:
         self._store = store
         self._delivery = delivery
         self._allowed_channel_ids = frozenset(allowed_channel_ids)
         self._authorized_user_ids = frozenset(authorized_user_ids)
         self._writer_provider = writer_provider
+        self._agent_gateway = agent_gateway
+        self._agent_catalog = agent_catalog
+        self._assistant_user_id = assistant_user_id
+        self._timezone = timezone
+        self._memory_service = memory_service
+        if (agent_gateway is None) != (agent_catalog is None):
+            raise ValueError("academic agent gateway and catalog must be configured together")
 
     async def __call__(self, message: DiscordAcademicMessageCreate) -> DiscordMessageCallbackResult:
         if (
@@ -92,17 +121,40 @@ class AcademicDiscordCheckinHandler:
             or message.author_id not in self._authorized_user_ids
         ):
             return DiscordMessageCallbackResult(status="unauthorized")
-        content = message.content.get_secret_value()
+        raw_content = message.content.get_secret_value()
+        assistant_was_mentioned = self._assistant_was_mentioned(message, raw_content)
+        content = self._without_assistant_mention(raw_content)
         command = parse_academic_command(content)
         if command is not None:
             return await self._handle_command(message, *command)
-        if content.startswith(("confirm", "reject")):
+        if content.casefold().startswith(("confirm", "reject")):
             await self._delivery.send_response(
                 "Command not accepted. Use exactly `confirm <proposal-uuid>` or "
                 "`reject <proposal-uuid>` from the authorized private channel.",
                 idempotency_key=f"academic-command-invalid:{message.message_id}:v1",
             )
             return DiscordMessageCallbackResult(status="invalid")
+        if self._memory_service is not None and content:
+            memory_result = await self._memory_service.handle_reflection(
+                external_event_id=message.message_id,
+                channel_id=message.channel_id,
+                user_id=message.author_id,
+                raw_text=content,
+                received_at=message.timestamp,
+            )
+            if memory_result.status == "duplicate":
+                return DiscordMessageCallbackResult(status="duplicate")
+            if memory_result.status in {"clarification", "applied"}:
+                if memory_result.response:
+                    await self._delivery.send_response(
+                        memory_result.response,
+                        idempotency_key=(
+                            f"academic-discord-message:{message.message_id}:memory:v1"
+                        ),
+                    )
+                return DiscordMessageCallbackResult(status="handled")
+        if self._assistant_user_id is not None and not assistant_was_mentioned:
+            return DiscordMessageCallbackResult(status="ignored")
         return await self._handle_checkin(message, content)
 
     async def _handle_checkin(
@@ -111,18 +163,34 @@ class AcademicDiscordCheckinHandler:
         proposal_id = uuid.uuid5(_PROPOSAL_NAMESPACE, message.message_id)
         latest_plan = self._store.get_latest_daily_plan()
         plan_id = getattr(latest_plan, "plan_id", None)
-        changes = extract_checkin_changes(content)
+        question: str | None = None
+        if self._agent_gateway is not None and self._agent_catalog is not None:
+            await self._delivery.send_response(
+                "I received that request and Qwen is checking the course and assessment targets.",
+                idempotency_key=f"academic-discord-message:{message.message_id}:received:v1",
+            )
+            if not content:
+                changes = ()
+                question = "What academic change would you like me to prepare?"
+            else:
+                planned = await run_academic_agent_loop(
+                    gateway=self._agent_gateway,
+                    catalog=self._agent_catalog,
+                    message=content,
+                    now=message.timestamp,
+                    timezone=self._timezone,
+                )
+                changes = planned.changes
+                question = planned.question
+        else:
+            changes = extract_checkin_changes(content)
         proposal = CheckinProposal(
             proposal_id=proposal_id,
             confirmation_event=f"confirm {proposal_id}",
             changes=changes,
             source_plan_id=plan_id,
             expires_at=message.timestamp + timedelta(hours=self._store.confirmation_ttl_hours),
-            question=(
-                None
-                if changes
-                else "No supported change was extracted. Reply with an explicit supported form."
-            ),
+            question=(None if changes else question or "No supported change was safely extracted."),
         )
         persisted = self._store.save_discord_checkin(
             proposal,
@@ -136,6 +204,27 @@ class AcademicDiscordCheckinHandler:
         )
         return DiscordMessageCallbackResult(
             status=("duplicate" if getattr(persisted, "status", None) == "replayed" else "handled")
+        )
+
+    def _without_assistant_mention(self, content: str) -> str:
+        if self._assistant_user_id is None:
+            return content.strip()
+        return re.sub(
+            rf"<@!?{re.escape(self._assistant_user_id)}>",
+            " ",
+            content,
+        ).strip()
+
+    def _assistant_was_mentioned(
+        self,
+        message: DiscordAcademicMessageCreate,
+        content: str,
+    ) -> bool:
+        if self._assistant_user_id is None:
+            return True
+        return (
+            self._assistant_user_id in message.mentioned_user_ids
+            or re.search(rf"<@!?{re.escape(self._assistant_user_id)}>", content) is not None
         )
 
     async def _handle_command(
@@ -192,6 +281,7 @@ class AcademicDiscordCheckinHandler:
 __all__ = [
     "AcademicCommandAction",
     "AcademicDiscordCheckinHandler",
+    "AcademicMemoryHandler",
     "DiscordCheckinDelivery",
     "DiscordCheckinStore",
     "WriterProvider",

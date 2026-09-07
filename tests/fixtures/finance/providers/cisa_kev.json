@@ -1,0 +1,17 @@
+{
+  "title": "CISA Known Exploited Vulnerabilities Catalog",
+  "dateReleased": "2026-09-04T10:00:00Z",
+  "vulnerabilities": [
+    {
+      "cveID": "CVE-2026-12345",
+      "vendorProject": "ExampleVendor",
+      "product": "ExampleProduct",
+      "vulnerabilityName": "ExampleProduct Improper Access Control Vulnerability",
+      "dateAdded": "2026-09-04",
+      "shortDescription": "ExampleProduct contains an improper access control vulnerability.",
+      "requiredAction": "Apply mitigations per vendor instructions.",
+      "dueDate": "2026-09-25",
+      "knownRansomwareCampaignUse": "Unknown"
+    }
+  ]
+}

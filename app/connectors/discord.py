@@ -676,14 +676,23 @@ class DiscordAcademicPlannerDelivery:
         )
 
     async def send_morning_plan(self, plan: Any, *, idempotency_key: str) -> Delivery:
-        blocks = list(getattr(plan, "blocks", ()))[:3]
-        lines = ["Today's three highest-value study blocks:"]
-        lines.extend(
-            f"- {block.title} ({block.start_at.isoformat()}-{block.end_at.isoformat()}): "
-            f"{block.rationale}"
-            for block in blocks
-        )
-        if not blocks:
+        blocks = list(getattr(plan, "blocks", ()))
+        practice = [block for block in blocks if getattr(block, "block_kind", None) == "practice"]
+        assessments = [block for block in blocks if block not in practice][:3]
+        lines = ["Today's academic plan:"]
+        if practice:
+            lines.append("Separate practice blocks:")
+            lines.extend(_academic_block_line(block) for block in practice)
+        if assessments:
+            lines.append("Highest-value assessment blocks:")
+            lines.extend(_academic_block_line(block) for block in assessments)
+        deferred_practice = tuple(getattr(plan, "deferred_practice_focus_ids", ()))
+        if deferred_practice:
+            lines.append(
+                f"Could not fit {len(deferred_practice)} required practice block(s) before "
+                "their review time; add availability so they can be scheduled."
+            )
+        if not practice and not assessments:
             lines.append("- No schedulable blocks were found.")
         return await self._send("\n".join(lines), idempotency_key)
 
@@ -696,6 +705,44 @@ class DiscordAcademicPlannerDelivery:
         )
         return await self._send(content, idempotency_key)
 
+    async def send_focus_reviews(
+        self,
+        reviews: tuple[dict[str, Any], ...],
+        *,
+        idempotency_key: str,
+    ) -> Delivery:
+        lines = ["Learning-focus follow-up:"]
+        for review in reviews:
+            label = " ".join(
+                part for part in (review.get("course_code"), review.get("topic")) if part
+            )
+            focus_id = review.get("focus_id")
+            kind = review.get("kind")
+            count = int(review.get("reminder_count", 0))
+            delete_after = int(review.get("delete_after_reminders", 5))
+            if kind == "review":
+                lines.append(
+                    f"- Do you still need practice on {label}? Reply yes to keep it active "
+                    f"or no to delete it. (focus {focus_id})"
+                )
+            elif kind == "remind":
+                lines.append(
+                    f"- Reminder {count}/{delete_after}: do you still need practice on {label}? "
+                    f"(focus {focus_id})"
+                )
+            elif kind == "snoozed_and_remind":
+                lines.append(
+                    f"- Reminder {count}/{delete_after}: {label} is snoozed, so no new "
+                    "practice block "
+                    f"will be scheduled until you reply. (focus {focus_id})"
+                )
+            elif kind == "deleted":
+                lines.append(
+                    f"- Deleted {label} and its reflection memory after {delete_after} "
+                    "unanswered daily reminders."
+                )
+        return await self._send(_bounded_discord_content("\n".join(lines)), idempotency_key)
+
     async def send_ambiguity_question(self, fact: Any, *, idempotency_key: str) -> Delivery:
         content = f"Please confirm this academic fact before scheduling: {fact.question}"
         return await self._send(content, idempotency_key)
@@ -703,6 +750,13 @@ class DiscordAcademicPlannerDelivery:
     async def send_confirmation(self, proposal: Any, *, idempotency_key: str) -> Delivery:
         content = _academic_proposal_preview(proposal)
         return await self._send(content, idempotency_key)
+
+
+def _academic_block_line(block: Any) -> str:
+    return (
+        f"- {block.title} ({block.start_at.isoformat()}-{block.end_at.isoformat()}): "
+        f"{block.rationale}"
+    )
 
 
 class DiscordAcademicResponseDelivery:
@@ -773,6 +827,29 @@ def _academic_proposal_preview(proposal: Any) -> str:
         )
     lines = [f"Proposed academic updates (proposal {proposal_id}):"]
     for change in changes:
+        if change.field == "create_assessment":
+            kind = getattr(change.assessment_type, "value", change.assessment_type) or "event"
+            course = change.course_code or change.course_id or "the selected course"
+            due = change.due_at.isoformat() if change.due_at is not None else "an unset date"
+            lines.append(f"- Create {kind} `{change.title}` in {course}, due {due}.")
+            continue
+        if change.field == "update_assessment":
+            updates: list[str] = []
+            if change.title is not None:
+                updates.append(f"title to `{change.title}`")
+            if change.due_at is not None:
+                updates.append(f"due date to {change.due_at.isoformat()}")
+            lines.append(
+                f"- Update `{change.expected_title or change.assessment_id}`: "
+                + ", ".join(updates)
+                + "."
+            )
+            continue
+        if change.field == "archive_assessment":
+            lines.append(
+                f"- Archive `{change.expected_title or change.assessment_id}` (Notion delete)."
+            )
+            continue
         target = f" for {change.assessment_id}" if change.assessment_id is not None else ""
         lines.append(f"- {change.field}{target}: {change.value}")
     expiry = getattr(proposal, "expires_at", None)

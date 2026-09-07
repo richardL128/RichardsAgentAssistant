@@ -82,7 +82,10 @@ def _upgrade(database_url: str) -> None:
 
 @pytest.fixture(scope="module")
 def postgres_engine() -> Generator[Engine, None, None]:
-    with PostgresContainer("postgres:16.4-bookworm", driver="psycopg") as postgres:
+    with PostgresContainer(
+        "pgvector/pgvector:0.8.6-pg16-bookworm",
+        driver="psycopg",
+    ) as postgres:
         database_url = postgres.get_connection_url()
         _upgrade(database_url)
         engine = create_engine(database_url, pool_pre_ping=True)
@@ -247,7 +250,10 @@ def test_backup_restore_round_trip_preserves_durable_records(tmp_path: Path) -> 
     _require_docker_acceptance()
     _require_commands(("age", "age-keygen", "pg_dump", "pg_restore"))
 
-    with PostgresContainer("postgres:16.4-bookworm", driver="psycopg") as postgres:
+    with PostgresContainer(
+        "pgvector/pgvector:0.8.6-pg16-bookworm",
+        driver="psycopg",
+    ) as postgres:
         source_url = postgres.get_connection_url()
         _upgrade(source_url)
         source_engine = create_engine(source_url, pool_pre_ping=True)

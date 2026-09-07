@@ -9,9 +9,10 @@ indicates an incomplete allowlist. Finance runs must never fall back to open web
 search; they stop and report the specific source that failed, with a diagnostic
 explaining why.
 
-Finance source failures may include: a configured source API endpoint returning
-an error, missing or expired authentication credentials, a source record being
-disabled in the allowlist, or the source data being stale or malformed.
+Finance source failures may include: a reviewed public endpoint returning an
+error, `FINANCE_EIA_MODE=api` without `EIA_API_KEY`, a source record being
+disabled in the allowlist, endpoint fan-out or hostname validation rejecting a
+request, or source data being stale or malformed.
 
 ## Diagnosis
 
@@ -26,13 +27,69 @@ SELECT
   approved_at,
   entitlement
 FROM finance_approved_sources
-WHERE allowlist_version = '\''finance-sources-2026.09'\''
+WHERE allowlist_version = '\''finance-sources-2026.09-v2'\''
 ORDER BY source_id;"'
 ```
 
-Look at the `enabled` column: all sources should be `true` for production use. If
-any are `false`, that source is disabled and will cause finance runs to fail
-with a gate-violation error.
+Use the configured `FINANCE_SOURCE_ALLOWLIST_VERSION` in the query. The default
+is `finance-sources-2026.09-v2`. Look at the `enabled` column: all sources should
+be `true` for production use. If any are `false`, that source is disabled and
+will cause finance runs to fail with a gate-violation error.
+
+Check the reviewed endpoint registry. The page at `/settings/sources` shows the
+same endpoint hosts, transport/parser kinds, freshness windows, request ceilings,
+scope, and state without rendering credential-bearing URLs:
+
+```bash
+docker compose exec -T postgres sh -lc 'psql -U "$POSTGRES_USER" -d "$POSTGRES_DB" -c "
+SELECT
+  source_id,
+  endpoint_id,
+  host,
+  transport_kind,
+  parser_kind,
+  registry_version,
+  enabled,
+  expected_freshness_seconds,
+  request_ceiling,
+  ticker_scope,
+  cik_scope
+FROM finance_source_endpoints
+WHERE allowlist_version = '\''finance-sources-2026.09-v2'\''
+ORDER BY source_id, endpoint_id;"'
+```
+
+Check cache and watermark state when a source looks stale:
+
+```bash
+docker compose exec -T postgres sh -lc 'psql -U "$POSTGRES_USER" -d "$POSTGRES_DB" -c "
+SELECT
+  source_id,
+  endpoint_id,
+  watermark_external_id,
+  watermark_published_at,
+  cached_artifact_key,
+  last_retrieved_at,
+  last_not_modified_at
+FROM finance_source_cache_state
+WHERE allowlist_version = '\''finance-sources-2026.09-v2'\''
+ORDER BY updated_at DESC
+LIMIT 20;"'
+```
+
+Confirm that every attempted child request has a metadata-only audit row:
+
+```bash
+docker compose exec -T postgres sh -lc 'psql -U "$POSTGRES_USER" -d "$POSTGRES_DB" -c "
+SELECT source_id, endpoint_id, requested_at, status_code, outcome, error_code
+FROM finance_source_request_audits
+WHERE allowlist_version = '\''finance-sources-2026.09-v2'\''
+ORDER BY requested_at DESC
+LIMIT 50;"'
+```
+
+This audit table intentionally excludes request URLs, headers, credentials, and
+response bodies.
 
 Check the source health history. Each source gets a health check that records
 its last successful fetch and any error diagnostics:
@@ -50,8 +107,9 @@ ORDER BY checked_at DESC
 LIMIT 20;"'
 ```
 
-If any source has status `failed`, its diagnostic explains why (e.g., `HTTP 401
-Unauthorized`, `timeout`, `malformed JSON`). Note the `source_id` and diagnostic.
+If any source has status `failed`, its diagnostic explains why (for example,
+`timeout`, `malformed JSON`, `malformed XML`, `HTTP 429`, or hostname not
+allowlisted). Note the `source_id` and diagnostic.
 
 Check the latest finance runs to see which ones failed and why:
 
@@ -97,12 +155,20 @@ responses:
 docker compose logs --tail=500 worker-finance 2>&1 | grep -i "error\|failed\|exception"
 ```
 
-Look for lines mentioning specific sources by name or error classes like
-`CONNECTOR_TRANSIENT` or `CONNECTOR_UNAUTHORIZED`.
+Look for lines mentioning specific sources or endpoint IDs and error classes
+like `CONNECTOR_TRANSIENT`, `CONNECTOR_UNAUTHORIZED`, `payload_oversized`, or
+`not_modified`. Do not paste full payloads, source text, API keys, or private
+URLs into tickets or chat.
 
 ## Fix
 
-**If credentials are missing or expired:**
+**If EIA API mode is selected without a key:**
+
+Either set `FINANCE_EIA_MODE=bulk` for the public baseline or configure
+`EIA_API_KEY` after confirming the EIA API mode is intended. The system selects
+bulk or API mode at startup and does not switch modes after a source failure.
+
+**If legacy v1 credentials are missing or expired:**
 
 Update the credential in the host environment or the secrets source used by
 Docker Compose. Do not commit credentials to the repository. Then restart the
@@ -123,18 +189,27 @@ Use the reviewed application approval workflow or a deliberate database migratio
 so the audit trail remains intact. This keeps a record of who approved the source
 and when.
 
-**If a vendor API is temporarily unavailable:**
+**If a reviewed endpoint is temporarily unavailable:**
 
 Leave the failed source health row visible and allow the scheduled finance run
-to retry automatically. The finance system does not substitute another source or
-fallback to web search. The run will fail until the vendor recovers.
+to retry automatically. The finance system does not substitute another endpoint
+or fallback to web search. Partial registry failures remain visible in source
+health and do not create a ninth logical source call.
 
 **If the source data is stale or malformed:**
 
-Check the vendor's API documentation to understand what changed. If the vendor
-deprecated an endpoint or changed the response format, the source adapter in
-`app/connectors/finance_sources/` may need an update. After fixing the adapter,
+Check the reviewed source documentation or endpoint/licence review notes. If an
+official endpoint changed format, the adapter in `app/connectors/finance_sources/`
+may need an update. Do not add arbitrary replacement URLs; a substitute endpoint
+requires a new reviewed registry/version or migration. After fixing the adapter,
 restart the worker and re-queue the finance run.
+
+**If a mapping is missing:**
+
+For the initial v2 registry, SEC and company IR mappings cover LMT only, ETF
+holdings cover IVV only, and technology feeds begin with CISA KEV only. Missing
+ticker, CIK, issuer, or ETF mappings should stay visible as attention
+diagnostics until a reviewed registry update adds the mapping.
 
 ## Expected health and Discord behavior
 
@@ -147,9 +222,11 @@ the failing source. The alert does not include the source data, API errors,
 credentials, or article excerpts; it provides only the source ID and failure
 classification.
 
-The operations console's `/settings/sources` page shows the finance source gate
-state. If any source is disabled or unapproved, the gate is incomplete and the
-page displays an `Attention` or `Failed` state.
+The operations console's `/settings/sources` page shows the finance source gate,
+per-source health, reviewed endpoint hosts, transport/parser kinds, expected
+freshness, request ceilings, scopes, and endpoint cache/health state. It must
+not display API keys, cookies, full source URLs, raw article bodies, or licensed
+full text.
 
 ## Verify
 
@@ -159,7 +236,7 @@ Check the allowlist again to confirm all sources are enabled:
 docker compose exec -T postgres sh -lc 'psql -U "$POSTGRES_USER" -d "$POSTGRES_DB" -c "
 SELECT source_id, enabled, approved_at
 FROM finance_approved_sources
-WHERE allowlist_version = '\''finance-sources-2026.09'\''
+WHERE allowlist_version = '\''finance-sources-2026.09-v2'\''
 AND enabled = false;"'
 ```
 
@@ -181,3 +258,9 @@ curl http://127.0.0.1:8000/health/ready | jq '.checks[] | select(.name == "finan
 
 The finance check should have state `healthy`. Open the operations console at
 `/settings/sources` and confirm all eight sources show green/healthy status.
+
+The exceptional v1 rollback explicitly required for this rollout is a
+configuration change, not a destructive migration: set
+`FINANCE_SOURCE_ALLOWLIST_VERSION=finance-sources-2026.09`, leave v2 audit and
+endpoint records in place, restore any required legacy v1 credentials, and
+restart `api` plus `worker-finance`. V1 is not the configured default.
