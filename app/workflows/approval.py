@@ -12,7 +12,7 @@ from langgraph.types import Command, interrupt
 from pydantic import BaseModel, ConfigDict
 
 from app.workflows.checkpoint import thread_config
-
+ 
 
 class ApprovalState(TypedDict):
     run_id: str
