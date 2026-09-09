@@ -27,6 +27,7 @@ NOTION_API_VERSION: Final[str] = "2025-09-03"
 DatabaseName = Literal["courses", "assessments", "study_blocks"]
 NotionSourceType = Literal["database", "data_source"]
 DiagnosticSeverity = Literal["info", "warning", "error"]
+NotionMaterialSourceKind = Literal["notion_page_body", "notion_property_file", "notion_block_file"]
 _DATABASES: Final[frozenset[str]] = frozenset({"courses", "assessments", "study_blocks"})
 _REQUIRED_PROPERTIES: Final[dict[str, frozenset[str]]] = {
     "courses": frozenset({"course", "term", "priority", "outline", "policy"}),
@@ -60,6 +61,34 @@ MAX_NOTION_RESPONSE_BYTES = 5 * 1024 * 1024
 MAX_ATTACHMENT_BYTES = 25 * 1024 * 1024
 MAX_DISCOVERY_CURSOR_PAGES = 100
 MAX_DISCOVERY_RESULTS = 500
+MAX_ASSESSMENT_MATERIAL_BLOCKS = 500
+MAX_ASSESSMENT_MATERIAL_REQUESTS = 100
+MAX_ASSESSMENT_MATERIAL_DEPTH = 4
+MAX_ASSESSMENT_MATERIAL_TEXT_CHARS = 50_000
+MAX_ASSESSMENT_MATERIAL_FILES = 100
+_TEXT_BLOCK_TYPES: Final[frozenset[str]] = frozenset(
+    {
+        "paragraph",
+        "heading_1",
+        "heading_2",
+        "heading_3",
+        "bulleted_list_item",
+        "numbered_list_item",
+        "to_do",
+        "toggle",
+        "quote",
+        "callout",
+        "code",
+        "equation",
+        "breadcrumb",
+        "table_of_contents",
+        "template",
+        "link_to_page",
+        "synced_block",
+        "table_row",
+    }
+)
+_FILE_BLOCK_TYPES: Final[frozenset[str]] = frozenset({"file", "pdf"})
 
 
 class NotionAttachment(BaseModel):
@@ -223,6 +252,68 @@ class NotionBlockBatch(BaseModel):
     has_more: bool
 
 
+class NotionMaterialDiagnostic(BaseModel):
+    """A safe diagnostic for one material source on an assessment page."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    code: str = Field(min_length=1, max_length=80)
+    severity: DiagnosticSeverity = "warning"
+    message: str = Field(min_length=1, max_length=300)
+    source_page_id: str = Field(pattern=_ID_PATTERN.pattern)
+    source_block_id: str | None = Field(default=None, max_length=128)
+    source_property_id: str | None = Field(default=None, max_length=128)
+    source_key: str | None = Field(default=None, max_length=512)
+
+
+class NotionMaterialTextBlock(BaseModel):
+    """One text-bearing Notion body block preserved as assessment material."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    source_kind: Literal["notion_page_body"] = "notion_page_body"
+    source_page_id: str = Field(pattern=_ID_PATTERN.pattern)
+    source_block_id: str = Field(pattern=_ID_PATTERN.pattern)
+    source_key: str = Field(min_length=1, max_length=512)
+    order: int = Field(ge=0)
+    block_type: str = Field(min_length=1, max_length=80)
+    text: str = Field(min_length=1, max_length=MAX_ASSESSMENT_MATERIAL_TEXT_CHARS)
+
+
+class NotionMaterialFile(BaseModel):
+    """A property or body file reference with stable identity and refreshed URL."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    source_kind: Literal["notion_property_file", "notion_block_file"]
+    source_page_id: str = Field(pattern=_ID_PATTERN.pattern)
+    source_block_id: str | None = Field(default=None, max_length=128)
+    source_property_id: str | None = Field(default=None, max_length=128)
+    source_key: str = Field(min_length=1, max_length=512)
+    order: int = Field(ge=0)
+    name: str = Field(default="attachment", min_length=1, max_length=255)
+    url: str = Field(min_length=1, max_length=4_096)
+    mime_type: str | None = Field(default=None, max_length=128)
+
+    def as_attachment(self) -> NotionAttachment:
+        """Return the legacy download shape after host validation."""
+
+        return NotionAttachment(name=self.name, url=self.url, mime_type=self.mime_type)
+
+
+class NotionAssessmentMaterials(BaseModel):
+    """All bounded body text and file material currently visible on one assessment page."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    assessment_page_id: str = Field(pattern=_ID_PATTERN.pattern)
+    last_edited_at: datetime
+    source_url: str | None = Field(default=None, max_length=4_096)
+    text_blocks: tuple[NotionMaterialTextBlock, ...] = Field(default=(), max_length=500)
+    files: tuple[NotionMaterialFile, ...] = Field(default=(), max_length=100)
+    diagnostics: tuple[NotionMaterialDiagnostic, ...] = Field(default=(), max_length=1_000)
+
+
 class ConfirmedPropertyChange(BaseModel):
     """One user-confirmed, allowlisted Notion property update."""
 
@@ -360,6 +451,217 @@ def _plain_text(value: Any) -> str:
     return "".join(parts).strip()
 
 
+def _source_key(*parts: str | int | None) -> str:
+    return ":".join(str(part) for part in parts if part is not None)[:512]
+
+
+def _file_media_type(name: str, explicit: Any = None) -> str | None:
+    if isinstance(explicit, str) and explicit.strip():
+        return explicit[:128]
+    lowered = name.casefold()
+    if lowered.endswith(".pdf"):
+        return "application/pdf"
+    if lowered.endswith(".txt"):
+        return "text/plain"
+    if lowered.endswith((".md", ".markdown")):
+        return "text/plain"
+    return None
+
+
+def _file_reference_payload(value: Mapping[str, Any]) -> tuple[str, str, str | None] | None:
+    kind = value.get("type")
+    source = value.get("file") if kind == "file" else value.get("external")
+    if not isinstance(source, Mapping):
+        return None
+    url_value = cast(Mapping[str, Any], source).get("url")
+    if not isinstance(url_value, str):
+        return None
+    name = value.get("name")
+    normalized_name = str(name).strip()[:255] if isinstance(name, str) and name.strip() else "file"
+    return url_value, normalized_name, _file_media_type(normalized_name, value.get("mime_type"))
+
+
+def _property_file_items(
+    *,
+    source_page_id: str,
+    properties: Mapping[str, Any],
+    diagnostics: list[NotionMaterialDiagnostic],
+    order_start: int,
+) -> tuple[list[NotionMaterialFile], int]:
+    files: list[NotionMaterialFile] = []
+    order = order_start
+    for property_name, property_value in properties.items():
+        if not isinstance(property_value, Mapping):
+            continue
+        property_map = cast(Mapping[str, Any], property_value)
+        if property_map.get("type") != "files":
+            continue
+        property_id = _property_id(property_name, property_map)
+        raw_files = property_map.get("files")
+        if not isinstance(raw_files, list):
+            diagnostics.append(
+                NotionMaterialDiagnostic(
+                    code="notion_property_files_malformed",
+                    message="Notion returned malformed files property material",
+                    source_page_id=source_page_id,
+                    source_property_id=property_id,
+                )
+            )
+            continue
+        for index, item in enumerate(cast(list[Any], raw_files)):
+            key = _source_key(source_page_id, "property", property_id, "file", index)
+            if len(files) >= MAX_ASSESSMENT_MATERIAL_FILES:
+                diagnostics.append(
+                    NotionMaterialDiagnostic(
+                        code="notion_material_file_limit_reached",
+                        message="Assessment material file limit was reached",
+                        source_page_id=source_page_id,
+                        source_property_id=property_id,
+                    )
+                )
+                return files, order
+            if not isinstance(item, Mapping):
+                diagnostics.append(
+                    NotionMaterialDiagnostic(
+                        code="notion_file_reference_malformed",
+                        message="Notion returned malformed file material",
+                        source_page_id=source_page_id,
+                        source_property_id=property_id,
+                        source_key=key,
+                    )
+                )
+                continue
+            payload = _file_reference_payload(cast(Mapping[str, Any], item))
+            if payload is None:
+                diagnostics.append(
+                    NotionMaterialDiagnostic(
+                        code="notion_file_reference_malformed",
+                        message="Notion file material did not include a usable URL",
+                        source_page_id=source_page_id,
+                        source_property_id=property_id,
+                        source_key=key,
+                    )
+                )
+                continue
+            url, name, mime_type = payload
+            try:
+                _validate_attachment_url(url)
+                files.append(
+                    NotionMaterialFile(
+                        source_kind="notion_property_file",
+                        source_page_id=source_page_id,
+                        source_property_id=property_id,
+                        source_key=key,
+                        order=order,
+                        name=name,
+                        url=url,
+                        mime_type=mime_type,
+                    )
+                )
+                order += 1
+            except (ValidationError, LifeAgentError):
+                diagnostics.append(
+                    NotionMaterialDiagnostic(
+                        code="notion_file_url_rejected",
+                        message="Notion file material URL was not allowlisted",
+                        source_page_id=source_page_id,
+                        source_property_id=property_id,
+                        source_key=key,
+                    )
+                )
+    return files, order
+
+
+def _block_text(block: Mapping[str, Any]) -> str:
+    block_type = block.get("type")
+    if not isinstance(block_type, str) or block_type not in _TEXT_BLOCK_TYPES:
+        return ""
+    value = block.get(block_type)
+    if not isinstance(value, Mapping):
+        return ""
+    value_map = cast(Mapping[str, Any], value)
+    if block_type == "table_row":
+        cells = value_map.get("cells")
+        if not isinstance(cells, list):
+            return ""
+        rendered = [_plain_text(cell) for cell in cast(list[Any], cells) if isinstance(cell, list)]
+        return " | ".join(part for part in rendered if part).strip()
+    if block_type == "equation":
+        expression = value_map.get("expression")
+        return (
+            expression.strip()[:MAX_ASSESSMENT_MATERIAL_TEXT_CHARS]
+            if isinstance(expression, str)
+            else ""
+        )
+    return _plain_text(value_map.get("rich_text"))[:MAX_ASSESSMENT_MATERIAL_TEXT_CHARS]
+
+
+def _block_file(
+    *,
+    source_page_id: str,
+    block: Mapping[str, Any],
+    order: int,
+    diagnostics: list[NotionMaterialDiagnostic],
+) -> NotionMaterialFile | None:
+    block_type = block.get("type")
+    block_id = block.get("id")
+    if (
+        not isinstance(block_type, str)
+        or block_type not in _FILE_BLOCK_TYPES
+        or not isinstance(block_id, str)
+    ):
+        return None
+    key = _source_key(source_page_id, "block", block_id, "file")
+    value = block.get(block_type)
+    if not isinstance(value, Mapping):
+        diagnostics.append(
+            NotionMaterialDiagnostic(
+                code="notion_block_file_malformed",
+                message="Notion returned malformed body file material",
+                source_page_id=source_page_id,
+                source_block_id=block_id,
+                source_key=key,
+            )
+        )
+        return None
+    payload = _file_reference_payload(cast(Mapping[str, Any], value))
+    if payload is None:
+        diagnostics.append(
+            NotionMaterialDiagnostic(
+                code="notion_block_file_malformed",
+                message="Notion body file material did not include a usable URL",
+                source_page_id=source_page_id,
+                source_block_id=block_id,
+                source_key=key,
+            )
+        )
+        return None
+    url, name, mime_type = payload
+    try:
+        _validate_attachment_url(url)
+        return NotionMaterialFile(
+            source_kind="notion_block_file",
+            source_page_id=source_page_id,
+            source_block_id=block_id,
+            source_key=key,
+            order=order,
+            name=name,
+            url=url,
+            mime_type=mime_type,
+        )
+    except (ValidationError, LifeAgentError):
+        diagnostics.append(
+            NotionMaterialDiagnostic(
+                code="notion_file_url_rejected",
+                message="Notion body file material URL was not allowlisted",
+                source_page_id=source_page_id,
+                source_block_id=block_id,
+                source_key=key,
+            )
+        )
+        return None
+
+
 def _date_value(value: Any) -> NotionDateValue | None:
     if not isinstance(value, Mapping):
         return None
@@ -412,8 +714,47 @@ def _notion_date_start(value: datetime | str) -> str:
         raise permanent_error(ErrorCode.INPUT_INVALID, "Notion due date is invalid") from None
 
 
-def _date_property_value(value: datetime | str) -> dict[str, Any]:
-    return {"date": {"start": _notion_date_start(value)}}
+def _notion_datetime_for_range(value: datetime | str, field_name: str) -> datetime:
+    if isinstance(value, datetime):
+        if value.tzinfo is None or value.utcoffset() is None:
+            raise permanent_error(
+                ErrorCode.INPUT_INVALID, f"Notion {field_name} must be timezone-aware"
+            )
+        return value.astimezone(UTC)
+    raw = value.strip()
+    if "T" not in raw:
+        raise permanent_error(ErrorCode.INPUT_INVALID, f"Notion {field_name} must include a time")
+    try:
+        parsed = datetime.fromisoformat(raw.replace("Z", "+00:00"))
+    except ValueError:
+        raise permanent_error(ErrorCode.INPUT_INVALID, f"Notion {field_name} is invalid") from None
+    if parsed.tzinfo is None or parsed.utcoffset() is None:
+        raise permanent_error(
+            ErrorCode.INPUT_INVALID, f"Notion {field_name} must be timezone-aware"
+        )
+    return parsed.astimezone(UTC)
+
+
+def _date_property_value(
+    value: datetime | str,
+    *,
+    ends_at: datetime | str | None = None,
+) -> dict[str, Any]:
+    start = _notion_date_start(value)
+    date_value = {"start": start}
+    if ends_at is not None:
+        start_at = _notion_datetime_for_range(value, "start date")
+        end_at = _notion_datetime_for_range(ends_at, "end date")
+        duration = end_at - start_at
+        if duration.total_seconds() <= 0:
+            raise permanent_error(ErrorCode.INPUT_INVALID, "Notion end date must be after start")
+        if duration.total_seconds() < 5 * 60 or duration.total_seconds() > 240 * 60:
+            raise permanent_error(
+                ErrorCode.INPUT_INVALID,
+                "Studying Block duration must be between 5 and 240 minutes",
+            )
+        date_value["end"] = end_at.isoformat().replace("+00:00", "Z")
+    return {"date": date_value}
 
 
 def _property_id(name: str, value: Mapping[str, Any]) -> str:
@@ -852,6 +1193,13 @@ class NotionConnector:
                 ErrorCode.INPUT_INVALID, "Notion edited timestamp must be timezone-aware"
             )
         current = await self.retrieve_title_precondition(page_id, title_property_id)
+        if current.current_title == new_title:
+            return NotionWriteReceipt(
+                proposal_id="title-rename",
+                page_id=current.page_id,
+                url=current.source_url,
+                property_id=title_property_id,
+            )
         if (
             current.current_title != expected_title
             or current.last_edited_at != expected_edited.astimezone(UTC)
@@ -890,6 +1238,7 @@ class NotionConnector:
         date_property_id: str,
         title: str,
         due: datetime | str,
+        ends_at: datetime | str | None = None,
     ) -> NotionWriteReceipt:
         """Create one assessment page under a discovered Notion data source."""
 
@@ -904,7 +1253,7 @@ class NotionConnector:
                 "parent": {"type": "data_source_id", "data_source_id": source_id},
                 "properties": {
                     title_id: {"title": _title_segments(_validate_title_text(title))},
-                    date_id: _date_property_value(due),
+                    date_id: _date_property_value(due, ends_at=ends_at),
                 },
             },
         )
@@ -1089,6 +1438,219 @@ class NotionConnector:
                 ErrorCode.CONNECTOR_TRANSIENT, "Notion returned invalid page"
             ) from None
 
+    async def retrieve_assessment_materials(
+        self,
+        page_id: str,
+        *,
+        page_size: int = 100,
+        max_depth: int = MAX_ASSESSMENT_MATERIAL_DEPTH,
+        max_blocks: int = MAX_ASSESSMENT_MATERIAL_BLOCKS,
+        max_requests: int = MAX_ASSESSMENT_MATERIAL_REQUESTS,
+    ) -> NotionAssessmentMaterials:
+        """Retrieve lossless, bounded material refs from an assessment page body."""
+
+        source_page_id = _validate_page_id(page_id)
+        if page_size < 1 or page_size > 100:
+            raise permanent_error(ErrorCode.INPUT_INVALID, "Notion block page size is invalid")
+        if max_depth < 0 or max_depth > MAX_ASSESSMENT_MATERIAL_DEPTH:
+            raise permanent_error(ErrorCode.INPUT_INVALID, "Notion material depth is invalid")
+        if max_blocks < 1 or max_blocks > MAX_ASSESSMENT_MATERIAL_BLOCKS:
+            raise permanent_error(ErrorCode.INPUT_INVALID, "Notion material block limit is invalid")
+        if max_requests < 1 or max_requests > MAX_ASSESSMENT_MATERIAL_REQUESTS:
+            raise permanent_error(
+                ErrorCode.INPUT_INVALID, "Notion material request limit is invalid"
+            )
+
+        response = await self._request(
+            "GET", f"/pages/{quote(source_page_id, safe='')}", json_body=None
+        )
+        data = self._json_object(response, "Notion page")
+        raw_page_id = data.get("id")
+        properties = data.get("properties")
+        if not isinstance(raw_page_id, str) or not isinstance(properties, Mapping):
+            raise transient_error(ErrorCode.CONNECTOR_TRANSIENT, "Notion returned invalid page")
+        try:
+            source_page_id = _validate_page_id(raw_page_id)
+            last_edited_at = _parse_edited(data.get("last_edited_time"))
+        except (ValueError, LifeAgentError):
+            raise transient_error(
+                ErrorCode.CONNECTOR_TRANSIENT, "Notion returned invalid page"
+            ) from None
+
+        diagnostics: list[NotionMaterialDiagnostic] = []
+        files, order = _property_file_items(
+            source_page_id=source_page_id,
+            properties=cast(Mapping[str, Any], properties),
+            diagnostics=diagnostics,
+            order_start=0,
+        )
+        text_blocks: list[NotionMaterialTextBlock] = []
+        request_count = 0
+        block_count = 0
+        stopped = False
+
+        async def walk(parent_id: str, depth: int) -> None:
+            nonlocal block_count, order, request_count, stopped
+            if stopped:
+                return
+            if depth > max_depth:
+                diagnostics.append(
+                    NotionMaterialDiagnostic(
+                        code="notion_material_depth_limit_reached",
+                        message="Assessment body material exceeded the traversal depth limit",
+                        source_page_id=source_page_id,
+                        source_block_id=parent_id,
+                    )
+                )
+                return
+            cursor: str | None = None
+            seen_cursors: set[str] = set()
+            while True:
+                if request_count >= max_requests:
+                    diagnostics.append(
+                        NotionMaterialDiagnostic(
+                            code="notion_material_request_limit_reached",
+                            message="Assessment body material exceeded the request limit",
+                            source_page_id=source_page_id,
+                            source_block_id=parent_id,
+                        )
+                    )
+                    stopped = True
+                    return
+                batch = await self.retrieve_block_children(
+                    parent_id, start_cursor=cursor, page_size=page_size
+                )
+                request_count += 1
+                for block in batch.blocks:
+                    if block_count >= max_blocks:
+                        diagnostics.append(
+                            NotionMaterialDiagnostic(
+                                code="notion_material_block_limit_reached",
+                                message="Assessment body material exceeded the block limit",
+                                source_page_id=source_page_id,
+                                source_block_id=parent_id,
+                            )
+                        )
+                        stopped = True
+                        return
+                    block_id = block.get("id")
+                    block_type = block.get("type")
+                    if not isinstance(block_id, str) or not isinstance(block_type, str):
+                        diagnostics.append(
+                            NotionMaterialDiagnostic(
+                                code="notion_material_block_malformed",
+                                message="Notion returned malformed assessment body material",
+                                source_page_id=source_page_id,
+                            )
+                        )
+                        continue
+                    block_count += 1
+                    text = _block_text(block)
+                    if text:
+                        try:
+                            text_blocks.append(
+                                NotionMaterialTextBlock(
+                                    source_page_id=source_page_id,
+                                    source_block_id=_validate_page_id(block_id),
+                                    source_key=_source_key(source_page_id, "body", block_id),
+                                    order=order,
+                                    block_type=block_type,
+                                    text=text,
+                                )
+                            )
+                            order += 1
+                        except (ValidationError, LifeAgentError):
+                            diagnostics.append(
+                                NotionMaterialDiagnostic(
+                                    code="notion_material_text_rejected",
+                                    message="Notion body text material was invalid or too large",
+                                    source_page_id=source_page_id,
+                                    source_block_id=block_id,
+                                )
+                            )
+                    if len(files) < MAX_ASSESSMENT_MATERIAL_FILES:
+                        file_material = _block_file(
+                            source_page_id=source_page_id,
+                            block=block,
+                            order=order,
+                            diagnostics=diagnostics,
+                        )
+                        if file_material is not None:
+                            files.append(file_material)
+                            order += 1
+                    elif block_type in _FILE_BLOCK_TYPES:
+                        diagnostics.append(
+                            NotionMaterialDiagnostic(
+                                code="notion_material_file_limit_reached",
+                                message="Assessment material file limit was reached",
+                                source_page_id=source_page_id,
+                                source_block_id=block_id,
+                            )
+                        )
+                    if block.get("has_children") is True:
+                        if depth >= max_depth:
+                            diagnostics.append(
+                                NotionMaterialDiagnostic(
+                                    code="notion_material_depth_limit_reached",
+                                    message=(
+                                        "Assessment body material exceeded the traversal depth "
+                                        "limit"
+                                    ),
+                                    source_page_id=source_page_id,
+                                    source_block_id=block_id,
+                                )
+                            )
+                        else:
+                            await walk(_validate_page_id(block_id), depth + 1)
+                            if stopped:
+                                return
+                if not batch.has_more:
+                    return
+                if batch.next_cursor is None or batch.next_cursor in seen_cursors:
+                    raise transient_error(
+                        ErrorCode.CONNECTOR_TRANSIENT,
+                        "Notion body material returned invalid pagination",
+                    )
+                cursor = batch.next_cursor
+                seen_cursors.add(cursor)
+
+        await walk(source_page_id, 0)
+        try:
+            return NotionAssessmentMaterials(
+                assessment_page_id=source_page_id,
+                last_edited_at=last_edited_at,
+                source_url=data.get("url") if isinstance(data.get("url"), str) else None,
+                text_blocks=tuple(text_blocks),
+                files=tuple(files),
+                diagnostics=tuple(diagnostics),
+            )
+        except ValidationError:
+            raise transient_error(
+                ErrorCode.CONNECTOR_TRANSIENT, "Notion returned too much assessment material"
+            ) from None
+
+    async def refresh_assessment_material_file(
+        self,
+        *,
+        assessment_page_id: str,
+        source_key: str,
+        page_size: int = 100,
+    ) -> NotionMaterialFile:
+        """Re-fetch an assessment page/body and return the current URL for a source key."""
+
+        if not source_key.strip() or len(source_key) > 512:
+            raise permanent_error(ErrorCode.INPUT_INVALID, "Notion material source key is invalid")
+        materials = await self.retrieve_assessment_materials(
+            assessment_page_id,
+            page_size=page_size,
+        )
+        for file_material in materials.files:
+            if file_material.source_key == source_key:
+                return file_material
+        raise permanent_error(
+            ErrorCode.INPUT_INVALID, "Notion material file is no longer available"
+        )
+
     async def retrieve_block_children(
         self, page_id: str, *, start_cursor: str | None = None, page_size: int = 100
     ) -> NotionBlockBatch:
@@ -1183,8 +1745,16 @@ class NotionConnector:
         client = self._client or httpx.AsyncClient(timeout=httpx.Timeout(self._timeout_seconds))
         try:
             async with client.stream(
-                "GET", attachment.url, timeout=self._timeout_seconds
+                "GET",
+                attachment.url,
+                timeout=self._timeout_seconds,
+                follow_redirects=False,
             ) as response:
+                _validate_attachment_url(str(response.url))
+                if 300 <= response.status_code < 400:
+                    raise permanent_error(
+                        ErrorCode.INPUT_INVALID, "Notion attachment redirects are not allowed"
+                    )
                 if response.status_code in {401, 403}:
                     raise authorization_error("Notion attachment authorization is invalid")
                 if response.status_code == 429 or response.status_code >= 500:
@@ -1957,6 +2527,7 @@ __all__ = [
     "DatabaseName",
     "NotionAppConnector",
     "NotionAssessment",
+    "NotionAssessmentMaterials",
     "NotionAttachment",
     "NotionBlockBatch",
     "NotionConnector",
@@ -1964,6 +2535,10 @@ __all__ = [
     "NotionDateValue",
     "NotionDiscoveryDiagnostic",
     "NotionDiscoveryResult",
+    "NotionMaterialDiagnostic",
+    "NotionMaterialFile",
+    "NotionMaterialSourceKind",
+    "NotionMaterialTextBlock",
     "NotionPage",
     "NotionPageBatch",
     "NotionPageTarget",

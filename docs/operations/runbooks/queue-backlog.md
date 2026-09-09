@@ -7,34 +7,33 @@ with a diagnostic message mentioning `queue`. Recent activity entries show runs
 in `Queued` or `Running` state that are not progressing. The queue health check
 diagnostic reports high depth (`queue depth N`) or terminal failures (`terminal
 failures M`). A stalled worker appears as a `procrastinate_job` with status
-`doing` whose corresponding worker's `last_heartbeat` timestamp is older than
-the `QUEUE_STALLED_AFTER_SECONDS` threshold (default: 120 seconds).
+`doing` whose corresponding Procrastinate heartbeat timestamp is older than the
+`QUEUE_STALLED_AFTER_SECONDS` threshold (default: 120 seconds).
 
-When the queue is backlogged, finance briefings, code reviews, and academic
-plans wait in the queue without being processed.
+When the queue is backlogged, current Discord-triggered API work can stop
+progressing. Scheduled finance, code-review, and academic paths are not
+executable in the current architecture.
 
 ## Diagnosis
 
-Check the status of all worker containers first:
+Check the status of the current runtime containers first:
 
 ```bash
-docker compose ps worker-code-review worker-academic-planner worker-finance
+docker compose ps api postgres
 ```
 
-Look for container state: if you see `Exit` or `Exited`, the worker crashed. If
-you see `Up`, the container is running. If you see `Paused`, it is stopped by
-the Compose orchestrator.
+Look for container state: if the API shows `Exit` or `Exited`, the runtime
+crashed. If it shows `Up`, the API is running. If it shows `Paused`, it is
+stopped by the Compose orchestrator.
 
-Check recent worker logs for crash messages or errors:
+Check recent API logs for queue crash messages or errors:
 
 ```bash
-docker compose logs --tail=100 worker-code-review
-docker compose logs --tail=100 worker-academic-planner
-docker compose logs --tail=100 worker-finance
+docker compose logs --tail=200 api
 ```
 
 Look for `ERROR`, `Exception`, or `Traceback` messages that indicate why the
-worker stopped.
+queue processor stopped.
 
 Inspect the queue depth and identify stalled workers. The query shows all active
 and stuck jobs with their worker heartbeat timestamps:
@@ -90,20 +89,22 @@ GROUP BY status;"'
 
 ## Fix
 
-Restart one or all workers depending on the failure mode. If a specific worker
-container has crashed, restart it:
+Restart the API if the embedded queue processor has stopped or the API
+container crashed:
 
 ```bash
-docker compose restart worker-code-review
-docker compose restart worker-academic-planner
-docker compose restart worker-finance
+docker compose restart api worker-academic-planner
 ```
 
-If the API is healthy but no workers are running, bring them all up:
+If the API was down, bring up the current runtime services:
 
 ```bash
-docker compose up -d worker-code-review worker-academic-planner worker-finance
+docker compose up -d postgres api worker-academic-planner
 ```
+
+Do not start legacy code-review or finance model workers; the academic worker
+runs only durable Discord academic jobs and model-free/ingestion work. There is
+no configured scheduled model worker.
 
 Do not manually delete `procrastinate_jobs` rows to clear a queue backlog.
 Deleting rows erases the job definition and retry history without creating an
@@ -112,12 +113,21 @@ guarantees. If a job is permanently invalid after you have inspected the
 corresponding run and determined no recovery is possible, create a deliberate
 remediation record through application code or a reviewed database migration.
 
+For `lifeagent.academic_material_ingestion`, job arguments must contain only
+`assessment_page_id` and `source_fingerprint`. A 403 is normally an expired
+Notion URL and is recovered by the job's fresh page read. Repeated OCR failures
+require `tesseract --version` inside the academic worker; repeated embedding
+failures require the configured local embedding model to appear in Ollama's
+`/api/tags`. Last-good active chunks remain available while a newer version is
+pending or failed.
+
 ## Expected health and Discord behavior
 
-Once workers restart and begin processing jobs, the queue depth should decrease
+Once the API runtime resumes queue processing, the queue depth should decrease
 over time. The queue health check evaluates every five minutes and reports the
 count of active jobs and terminal failures. A backlog of `todo` jobs with no
-worker assigned is normal; jobs become `doing` as workers pick them up.
+Procrastinate worker assigned is normal; jobs become `doing` as processing
+claims them.
 
 If terminal failures are present, the queue health state becomes `attention`
 until those jobs are resolved. The health check records:
@@ -136,10 +146,10 @@ provides only the queue depth and failure count.
 ## Verify
 
 ```bash
-docker compose ps worker-code-review worker-academic-planner worker-finance
+docker compose ps api postgres worker-academic-planner
 ```
 
-Confirm all workers show `Up` status. Then check queue depth:
+Confirm both services show `Up` status. Then check queue depth:
 
 ```bash
 docker compose exec -T postgres sh -lc 'psql -U "$POSTGRES_USER" -d "$POSTGRES_DB" -c "

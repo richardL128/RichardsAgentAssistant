@@ -17,6 +17,7 @@ from sqlalchemy.orm import Session
 from testcontainers.community.postgres import PostgresContainer
 
 from app.core.errors import ErrorCode, LifeAgentError, authorization_error, transient_error
+from app.db.academic import AcademicRepository, DocumentChunkInput, SourceCitation
 from app.db.finance import FinanceApprovedSource, FinanceRepository, FinanceSourceEndpoint
 from app.db.models import (
     AgentRun,
@@ -156,6 +157,126 @@ def test_duplicate_delivery_intent_is_suppressed(db_session: Session) -> None:
     )
 
 
+def test_assessment_material_vectors_are_active_versioned_and_scope_isolated(
+    db_session: Session,
+) -> None:
+    suffix = uuid.uuid4().hex
+    first_course = AcademicRepository.upsert_course(
+        db_session,
+        notion_id=f"course-material-a-{suffix}",
+        course_code=f"ECE-{suffix[:6]}",
+        title="Circuits",
+        term="2026F",
+    )
+    second_course = AcademicRepository.upsert_course(
+        db_session,
+        notion_id=f"course-material-b-{suffix}",
+        course_code=f"HIST-{suffix[:6]}",
+        title="History",
+        term="2026F",
+    )
+    first_assessment = AcademicRepository.upsert_assessment(
+        db_session,
+        notion_id=f"assessment-material-a-{suffix}",
+        course_id=first_course.id,
+        title="Circuit assignment",
+        assessment_type="assignment",
+        due_at=datetime.now(UTC) + timedelta(days=1),
+        grade_weight_percent=40,
+        estimated_minutes=60,
+        confidence=1.0,
+        fact_state="confirmed",
+        citation=SourceCitation(block="assessment-a"),
+    )
+    second_assessment = AcademicRepository.upsert_assessment(
+        db_session,
+        notion_id=f"assessment-material-b-{suffix}",
+        course_id=second_course.id,
+        title="History essay",
+        assessment_type="essay",
+        due_at=datetime.now(UTC) + timedelta(days=2),
+        grade_weight_percent=30,
+        estimated_minutes=90,
+        confidence=1.0,
+        fact_state="confirmed",
+        citation=SourceCitation(block="assessment-b"),
+    )
+    first_document = AcademicRepository.upsert_document(
+        db_session,
+        notion_id=first_assessment.notion_id,
+        document_version=f"v1-{suffix}",
+        title="Circuit requirements",
+        document_type="assessment_material",
+        retrieved_at=datetime.now(UTC),
+        artifact_key="a" * 64,
+        content_hash="b" * 64,
+        assessment_id=first_assessment.id,
+        source_kind="notion_page_body",
+        source_page_id=first_assessment.notion_id,
+        source_key=f"{first_assessment.notion_id}:body",
+        media_type="text/plain",
+        extraction_status="extracted",
+        active=False,
+    )
+    second_document = AcademicRepository.upsert_document(
+        db_session,
+        notion_id=second_assessment.notion_id,
+        document_version=f"v1-{suffix}",
+        title="Essay requirements",
+        document_type="assessment_material",
+        retrieved_at=datetime.now(UTC),
+        artifact_key="c" * 64,
+        content_hash="d" * 64,
+        assessment_id=second_assessment.id,
+        source_kind="notion_page_body",
+        source_page_id=second_assessment.notion_id,
+        source_key=f"{second_assessment.notion_id}:body",
+        media_type="text/plain",
+        extraction_status="extracted",
+        active=False,
+    )
+    first_chunks = AcademicRepository.replace_document_chunks(
+        db_session,
+        document_id=first_document.id,
+        chunks=(
+            DocumentChunkInput(
+                ordinal=0,
+                heading="Requirements",
+                content="Review linear circuits and compare AC with DC behavior.",
+                citation=SourceCitation(block="circuit-requirements"),
+                embedding=(1.0, 0.0, 0.0),
+                embedding_model="integration-embedding:v1",
+            ),
+        ),
+    )
+    AcademicRepository.replace_document_chunks(
+        db_session,
+        document_id=second_document.id,
+        chunks=(
+            DocumentChunkInput(
+                ordinal=0,
+                heading="Requirements",
+                content="Compare two primary historical sources.",
+                citation=SourceCitation(block="essay-requirements"),
+                embedding=(0.0, 1.0, 0.0),
+                embedding_model="integration-embedding:v1",
+            ),
+        ),
+    )
+    AcademicRepository.activate_document_version(db_session, document_id=first_document.id)
+    AcademicRepository.activate_document_version(db_session, document_id=second_document.id)
+
+    matches = AcademicRepository.search_semantic_document_chunks(
+        db_session,
+        assessment_id=first_assessment.id,
+        query_embedding=(1.0, 0.0, 0.0),
+        embedding_model="integration-embedding:v1",
+        limit=8,
+    )
+
+    assert [(row.id, score) for row, score in matches] == [(first_chunks[0].id, 1.0)]
+
+
 def test_audit_events_are_append_only(db_session: Session) -> None:
     event = AuditRepository.append(
         db_session,
@@ -262,19 +383,25 @@ def test_public_finance_v2_coexists_disabled_with_reviewed_endpoints(
     assert all(row.approved_at is None and row.approval_audit_id is None for row in rows)
     assert len(endpoints) == 9
     assert len({(row.source_id, row.endpoint_id) for row in endpoints}) == 9
-    assert db_session.scalar(
-        select(func.count())
-        .select_from(AuditEvent)
-        .where(
-            AuditEvent.target_type == "finance_source_allowlist",
-            AuditEvent.target_id == allowlist_version,
-            AuditEvent.action == "record_finance_source_allowlist",
+    assert (
+        db_session.scalar(
+            select(func.count())
+            .select_from(AuditEvent)
+            .where(
+                AuditEvent.target_type == "finance_source_allowlist",
+                AuditEvent.target_id == allowlist_version,
+                AuditEvent.action == "record_finance_source_allowlist",
+            )
         )
-    ) == 1
-    assert FinanceRepository.source_approval_gate(
-        db_session,
-        allowlist_version=allowlist_version,
-    ) is False
+        == 1
+    )
+    assert (
+        FinanceRepository.source_approval_gate(
+            db_session,
+            allowlist_version=allowlist_version,
+        )
+        is False
+    )
 
     audit_id = uuid.uuid5(uuid.NAMESPACE_URL, f"lifeagent:{allowlist_version}:recorded")
     audit = db_session.get(AuditEvent, audit_id)

@@ -1,11 +1,17 @@
 # Phase 8 - Reliability, backup, and operating runbooks
 
+Historical phase note: this closeout describes the Phase 8 implementation at
+the time it shipped. The current configured runtime uses only `postgres` and
+`api`; Qwen is triggered solely by an authorized Discord mention, and the
+legacy standalone scheduled execution described here is not current executable
+Compose services.
+
 ## Contract and acceptance criteria
 
 Phase 8 completes the local operating layer for LifeAgent. The deployment must
-survive ordinary host restarts, worker termination, connector failures, and
-database recovery drills without losing run history, audit history, artifact
-references, or delivery idempotency guarantees.
+survive ordinary host restarts, legacy queue-worker termination, connector
+failures, and database recovery drills without losing run history, audit
+history, artifact references, or delivery idempotency guarantees.
 
 The plan's acceptance tests require that:
 
@@ -92,8 +98,8 @@ The plan's acceptance tests require that:
 - Added seven scenario-specific runbooks under `docs/operations/runbooks/`:
   - `model-unavailable-slow.md`: diagnose and recover from Ollama unavailability,
     missing models, digest mismatches, or performance degradation.
-  - `queue-backlog.md`: resolve worker crashes, queue depth buildup, and stalled
-    jobs by inspecting heartbeats and restarting workers.
+  - `queue-backlog.md`: resolve queue depth buildup and stalled jobs by
+    inspecting heartbeats and restarting the current API runtime.
   - `duplicate-delivery.md`: reconcile idempotent delivery intent and prevent
     duplicate Discord messages. GitHub inline comments remain out of scope for
     this implementation.
@@ -139,12 +145,13 @@ The plan's acceptance tests require that:
     and 10-second start period. `depends_on` API with `condition:
     service_healthy` ensures the API waits for PostgreSQL before starting.
     Uses `restart: unless-stopped`.
-  - Worker services (`worker-code-review`, `worker-academic-planner`,
-    `worker-finance`) depend on a healthy API. Use `restart: unless-stopped`.
-  - Worker entrypoints call `/usr/local/bin/lifeagent-idle-worker` which
-    `exec`s into the Procrastinate queue worker. This allows `SIGTERM` signals
-    from Docker `stop` to reach the queue worker directly, enabling graceful
-    shutdown and job resumption on restart.
+  - Historical Phase 8 standalone queue-worker services depended on a healthy
+    API and used `restart: unless-stopped`. These services are not present in
+    the current Compose runtime.
+  - The historical worker entrypoints called
+    `/usr/local/bin/lifeagent-idle-worker`, which `exec`ed into the
+    Procrastinate queue worker. The current Compose stack does not provide those
+    entrypoints as launchable services.
 - Artifact and PostgreSQL data are persisted in named volumes.
 
 ### Documentation and configuration
@@ -168,10 +175,11 @@ Phase 8 closeout produced the following evidence:
    not run here. Unit coverage verifies script arguments and restore safety
    checks; the real round trip remains deferred below.
 
-2. **Worker resilience:** The isolated Docker Compose acceptance test passed.
+2. **Historical worker resilience:** The isolated Docker Compose acceptance test passed.
    It verifies that the worker entrypoint `exec`s into Procrastinate, kills the
    worker during a non-side-effecting shared-services task, restarts it, and
-   observes the expected recovered health result.
+   observes the expected recovered health result. This is retained as Phase 8
+   evidence, not as current launch guidance.
 
 3. **Delivery idempotency:** The isolated Docker Compose SIGKILL acceptance
    test passed. It kills the worker after the durable intent and stub Discord
@@ -182,7 +190,7 @@ Phase 8 closeout produced the following evidence:
    unimplemented/read-only by design.
 
 4. **Health state transitions:** Simulated failures (Ollama unavailable,
-   PostgreSQL down, stalled workers, Discord/GitHub/Notion API errors) causes
+   PostgreSQL down, historical stalled workers, Discord/GitHub/Notion API errors) causes
    the appropriate health checks to transition to `attention` or `failed`.
    Discord alerting sends an idempotent durable alert when policy requires it,
    using the component name, state, error code, retry count, and run id. When
@@ -222,9 +230,10 @@ and volumes.
   Compose runs.
 - A live recovery drill on Richard's running system remains required after the
   launchd and credential setup: create an encrypted backup, restore it into a
-  disposable database, and perform worker termination/restart under realistic
-  load to validate the documented recovery objectives. The passing automated
-  Compose tests used isolated projects and volumes, never the live dev stack.
+  disposable database, and perform current API restart and queue recovery under
+  realistic load to validate the documented recovery objectives. The passing
+  automated Compose tests used isolated projects and volumes, never the live dev
+  stack.
 
 ## Final phase status
 

@@ -54,12 +54,10 @@ ORDER BY created_at DESC
 LIMIT 30;"'
 ```
 
-For each uncertain or failed delivery, reconcile with the provider. For Discord,
-manually check the target channel to see if a message exists at the
-`external_url` ID. For finance and academic deliveries, verify the idempotency
-key matches the deterministic format (`finance:<date>:market-open:v1` or
-`academic-ambiguity:<fact-id>:v1`). GitHub inline comments are not implemented;
-the GitHub connector remains read-only.
+For each uncertain or failed delivery, reconcile with the provider. For current
+Discord deliveries, manually check the target channel to see if a message exists
+at the `external_url` ID. Historical finance or academic delivery keys may still
+appear in persisted data, but they are not current executable worker paths.
 
 Check the health row tied to delivery failures:
 
@@ -87,10 +85,10 @@ in the channel, the delivery succeeded and should be marked `sent`. Do not send
 again. Update the delivery status only through a reviewed application endpoint
 or migration, recording the provider's confirmation.
 
-**For finance and academic deliveries:** Verify the idempotency key matches the
-deterministic format for the event date or ID. If an identical idempotency key
-exists with status `sent`, the delivery completed and retrying will create a
-duplicate.
+**For historical finance or academic deliveries:** Treat the rows as historical
+audit data unless a future architecture explicitly re-enables those workflows.
+If an identical idempotency key exists with status `sent`, the delivery
+completed and retrying would create a duplicate.
 
 If the provider did not receive the message:
 - Do not manually delete the delivery row.
@@ -99,12 +97,11 @@ If the provider did not receive the message:
 - The delivery system checks the idempotency key before creating a new message,
   preventing duplicates on retry.
 
-Only restart a worker after reconciliation:
+Only restart the API after reconciliation, and only if queue processing is
+stalled:
 
 ```bash
-docker compose restart worker-code-review
-docker compose restart worker-academic-planner
-docker compose restart worker-finance
+docker compose restart api
 ```
 
 ## Expected health and Discord behavior

@@ -308,12 +308,13 @@ async def test_clone_failure_yields_failed_with_checkout_diagnostic_and_no_deliv
         assert run.status == RunStatus.FAILED
 
 
-def test_importing_worker_registers_a_code_review_handler() -> None:
+def test_importing_worker_does_not_register_a_code_review_model_handler() -> None:
     import app.queue.worker  # noqa: F401
     from app.agents.code_review.workflow import run_code_review as workflow_handler
     from app.queue import tasks
 
-    assert tasks._handlers.get("code_review") is workflow_handler
+    assert tasks._handlers.get("code_review") is not workflow_handler
+    assert "code_review" not in tasks._handlers
 
 
 @pytest.mark.parametrize(

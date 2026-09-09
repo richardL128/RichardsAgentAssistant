@@ -355,9 +355,7 @@ def _build_public_adapter_registry(
             request_parameters=_public_request_parameters(settings, source_id, mode),
             request_headers=_public_request_headers(settings, source_id),
             request_audit_sink=(
-                _source_audit_sink(request_audit, source_id)
-                if request_audit is not None
-                else None
+                _source_audit_sink(request_audit, source_id) if request_audit is not None else None
             ),
         )
     return adapters
@@ -431,9 +429,8 @@ def _federal_register_definition() -> SourceDefinition:
 
 def _public_selector(source_id: str) -> EndpointSelector:
     if source_id not in {"sec_edgar", "company_ir_registry", "issuer_etf_holdings"}:
-        def select_all(
-            _query: SourceQuery, definition: SourceDefinition
-        ) -> EndpointSelection:
+
+        def select_all(_query: SourceQuery, definition: SourceDefinition) -> EndpointSelection:
             return EndpointSelection(definition.endpoints)
 
         return select_all
@@ -478,17 +475,15 @@ def _public_parsers(
     parsers: dict[str, PayloadParser] = {}
     for endpoint in definition.endpoints:
         if source_id == "defense_gov_rss":
-            def parse_defense(
-                payload: RawSourcePayload, query: SourceQuery
-            ) -> ParsedSourcePayload:
+
+            def parse_defense(payload: RawSourcePayload, query: SourceQuery) -> ParsedSourcePayload:
                 return ParsedSourcePayload(
-                    documents=parse_defense_gov_rss(
-                        payload.body, query, payload.retrieved_at
-                    )
+                    documents=parse_defense_gov_rss(payload.body, query, payload.retrieved_at)
                 )
 
             parsers[endpoint.endpoint_id] = parse_defense
         elif source_id == "breaking_defense_public":
+
             def parse_breaking(
                 payload: RawSourcePayload, query: SourceQuery
             ) -> ParsedSourcePayload:
@@ -504,6 +499,7 @@ def _public_parsers(
             parsers[endpoint.endpoint_id] = parse_breaking
         elif source_id == "eia_public_data":
             if mode is EiaMode.API:
+
                 def parse_eia_api(
                     payload: RawSourcePayload, query: SourceQuery
                 ) -> ParsedSourcePayload:
@@ -518,6 +514,7 @@ def _public_parsers(
 
                 parsers[endpoint.endpoint_id] = parse_eia_api
             else:
+
                 def parse_eia_bulk(
                     payload: RawSourcePayload, query: SourceQuery
                 ) -> ParsedSourcePayload:
@@ -532,9 +529,8 @@ def _public_parsers(
 
                 parsers[endpoint.endpoint_id] = parse_eia_bulk
         elif source_id == "federal_register_energy":
-            def parse_federal(
-                payload: RawSourcePayload, query: SourceQuery
-            ) -> ParsedSourcePayload:
+
+            def parse_federal(payload: RawSourcePayload, query: SourceQuery) -> ParsedSourcePayload:
                 return ParsedSourcePayload(
                     documents=_require_document_hosts(
                         federal_register_energy_parser(
@@ -604,13 +600,12 @@ def _public_parsers(
 
             parsers[endpoint.endpoint_id] = parse_etf
         elif source_id == "technology_official_feeds":
+
             def parse_technology(
                 payload: RawSourcePayload, query: SourceQuery
             ) -> ParsedSourcePayload:
                 return ParsedSourcePayload(
-                    documents=parse_cisa_kev(
-                        payload.body, query, payload.retrieved_at
-                    )
+                    documents=parse_cisa_kev(payload.body, query, payload.retrieved_at)
                 )
 
             parsers[endpoint.endpoint_id] = parse_technology

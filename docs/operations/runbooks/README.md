@@ -2,20 +2,26 @@
 
 These runbooks cover the Phase 8 operating scenarios for the local
 single-Mac Compose deployment. They assume commands are run from the repository
-root and that the stack uses the service names in `compose.yaml`:
-`postgres`, `api`, `worker-code-review`, `worker-academic-planner`, and
-`worker-finance`.
+root and that the current stack uses the service names in `compose.yaml`:
+`postgres`, `api`, and `worker-academic-planner`.
+
+The current configured runtime includes two native macOS LaunchAgents plus the
+Compose API, PostgreSQL, and academic worker. Qwen-powered work is triggered
+only by an authorized Discord mention; scheduled code review, academic
+planning, and finance workflows are not executable runtime paths.
 
 For first-time setup, see [Getting started](../getting-started.md).
 
 For a quick console check, open `http://127.0.0.1:8000/` after the API is
 healthy. The shared-services card is backed by the persisted
-`health_checks.check_name = 'shared_services'` row. Agent cards are backed by
-`finance`, `code_review`, and `academic_planner` health rows.
+`health_checks.check_name = 'shared_services'` row. Historical component rows
+such as `finance`, `code_review`, and `academic_planner` may still appear in the
+database, but they do not imply standalone services can be started.
 
 ## Scenario Index
 
 - [Model unavailable or slow](model-unavailable-slow.md)
+- [Discord cold wake](discord-cold-wake.md)
 - [Queue backlog](queue-backlog.md)
 - [Duplicate delivery](duplicate-delivery.md)
 - [Failed database migration](failed-database-migration.md)
@@ -31,9 +37,6 @@ Check the stack:
 docker compose ps
 curl --fail http://127.0.0.1:8000/health/ready
 docker compose logs --tail=200 api
-docker compose logs --tail=200 worker-code-review
-docker compose logs --tail=200 worker-academic-planner
-docker compose logs --tail=200 worker-finance
 ```
 
 Inspect the latest persisted health rows:

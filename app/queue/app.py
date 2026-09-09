@@ -23,7 +23,10 @@ JOB_KINDS: dict[str, str] = {
     "code_review": "code_review",
     "code_review_daily": "code_review",
     "code_review_ingest": "code_review",
-    "academic_planner": "academic_planner",
+    "discord_academic": "academic_planner",
+    "academic_clarification": "academic_planner",
+    "academic_clarification_status": "academic_planner",
+    "academic_material_ingestion": "academic_planner",
     "finance": "finance",
 }
 

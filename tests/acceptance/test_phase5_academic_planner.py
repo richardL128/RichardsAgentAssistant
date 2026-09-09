@@ -1,31 +1,70 @@
 from __future__ import annotations
 
+import asyncio
+import json
+import re
 from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
+from types import SimpleNamespace
+from typing import Any
 from zoneinfo import ZoneInfo
 
 import fitz
 import httpx
 import pytest
+from pydantic import SecretStr
 from sqlalchemy import create_engine, select
 from sqlalchemy.orm import Session
 
+from app.agents.academic_planner.agent_clarification import AcademicAgentClarificationService
 from app.agents.academic_planner.allocator import allocate_plan
 from app.agents.academic_planner.contracts import (
+    AcademicAgentDecision,
+    AcademicAgentWireDecision,
+    AcademicRequestRouteDecision,
     Assessment,
     AssessmentType,
     AvailabilityWindow,
+    CreateStudySessionCall,
     FixedCommitment,
+    MorningBriefing,
+    PlanCritique,
     PlannerFacts,
+    SearchCoursesCall,
+    WorkBreakdown,
 )
+from app.agents.academic_planner.discord_checkin import AcademicDiscordCheckinHandler
 from app.agents.academic_planner.documents import detect_ambiguous_deadlines, extract_document
+from app.agents.academic_planner.material_ingestion import AssessmentMaterialIngestionService
+from app.agents.academic_planner.material_reasoning import (
+    AssessmentMaterialDecision,
+    AssessmentMaterialInsightCritique,
+    AssessmentMaterialMorningValidator,
+    AssessmentMaterialReasonerService,
+    AssessmentMaterialToolCall,
+    MorningMaterialGroundingCritique,
+)
+from app.agents.academic_planner.notion_mutations import DiscoveredAcademicNotionWriter
 from app.agents.academic_planner.retrieval import retrieve_with_academic_repository
 from app.agents.academic_planner.workflow import (
     confirm_checkin_proposal,
     create_checkin_proposal,
     run_morning_plan,
 )
-from app.connectors.notion import AcademicNotionWriter, NotionConnector, NotionPageTarget
+from app.artifacts.store import ArtifactStore
+from app.connectors.discord import (
+    DiscordAcademicPlannerAdapter,
+    DiscordAcademicPlannerDelivery,
+    DiscordAcademicResponseDelivery,
+)
+from app.connectors.discord_gateway import DiscordAcademicMessageCreate
+from app.connectors.notion import (
+    AcademicNotionWriter,
+    NotionAssessmentMaterials,
+    NotionConnector,
+    NotionMaterialFile,
+    NotionPageTarget,
+)
 from app.db.academic import (
     AcademicRepository,
     DocumentChunkInput,
@@ -33,6 +72,8 @@ from app.db.academic import (
     SQLAlchemyAcademicPlannerStore,
 )
 from app.db.models import (
+    AcademicDocumentChunk,
+    AcademicProposalOperationJournal,
     AcademicProposedChange,
     Base,
     StudyBlock,
@@ -43,8 +84,13 @@ from app.db.models import (
 from app.db.models import (
     FixedCommitment as StoredCommitment,
 )
+from app.db.repositories import RunRepository
+from app.llm.embeddings import EmbeddingStatus
 
 TORONTO = ZoneInfo("America/Toronto")
+ACCEPTANCE_CHANNEL_ID = "987654321012345678"
+ACCEPTANCE_OWNER_ID = "123456789012345678"
+ACCEPTANCE_ASSISTANT_ID = "777777777777777777"
 
 
 @pytest.fixture
@@ -60,9 +106,11 @@ def engine(tmp_path: Path):
 class DeliveryRecorder:
     def __init__(self) -> None:
         self.calls: list[tuple[str, str, str | None]] = []
+        self.morning_briefing: MorningBriefing | None = None
 
-    async def send_morning_plan(self, plan, *, idempotency_key: str) -> object:
-        self.calls.append(("morning", idempotency_key, str(plan.plan_id)))
+    async def send_morning_plan(self, briefing, *, idempotency_key: str) -> object:
+        self.morning_briefing = briefing
+        self.calls.append(("morning", idempotency_key, briefing.message_text))
         return object()
 
     async def send_checkin(self, *, plan, idempotency_key: str) -> object:
@@ -76,6 +124,712 @@ class DeliveryRecorder:
     async def send_confirmation(self, proposal, *, idempotency_key: str) -> object:
         self.calls.append(("confirmation", idempotency_key, str(proposal.proposal_id)))
         return object()
+
+
+class BriefingModel:
+    def __init__(self) -> None:
+        self.morning_contexts = []
+
+    async def breakdown(self, assessment) -> WorkBreakdown:
+        return WorkBreakdown(
+            assessment_id=assessment.id,
+            steps=(f"Review {assessment.title}",),
+            estimated_minutes=assessment.estimated_minutes,
+            rationale="Use the scheduled deterministic block.",
+        )
+
+    async def critique(self, plan) -> PlanCritique:
+        return PlanCritique(acceptable=True, concerns=())
+
+    async def morning_briefing(self, context) -> MorningBriefing:
+        self.morning_contexts.append(context)
+        assessments = " ".join(
+            (
+                f"{item.title} for {item.course_code} is due "
+                f"{item.exact_date_label} ({item.relative_date_label})."
+            )
+            for item in context.assessments
+        )
+        blocks = " ".join(
+            f"Study {item.duration_minutes} minutes for {item.title}."
+            for item in context.scheduled_blocks
+        )
+        return MorningBriefing(
+            message_text=(
+                "Good morning, Richard. "
+                + " ".join(part for part in (assessments, blocks) if part)
+                + " Have a good day!"
+            ),
+            referenced_assessment_ids=tuple(item.assessment_id for item in context.assessments),
+            referenced_block_ids=tuple(item.block_id for item in context.scheduled_blocks),
+        )
+
+    async def extract_checkin(self, reply):
+        return ()
+
+
+class ReadyRuntime:
+    async def ensure_ready(self) -> object:
+        return object()
+
+
+class QueuedAcademicGateway:
+    def __init__(self, *decisions: AcademicAgentDecision) -> None:
+        self._decisions = list(decisions)
+        self.prompts: list[str] = []
+
+    async def invoke_structured(self, *, prompt: str, response_model):
+        assert response_model is AcademicAgentWireDecision
+        self.prompts.append(prompt)
+        if not self._decisions:
+            raise AssertionError("unexpected academic agent turn")
+        return SimpleNamespace(output=self._decisions.pop(0))
+
+
+class CalendarSemanticRouter:
+    async def invoke_structured(self, *, prompt: str, response_model):
+        assert response_model is AcademicRequestRouteDecision
+        payload = json.loads(prompt.partition("\n")[2])
+        return SimpleNamespace(
+            output=AcademicRequestRouteDecision(
+                calendar_request=payload["message_untrusted"],
+            )
+        )
+
+
+def _discord_message(
+    message_id: str,
+    content: str,
+    *,
+    timestamp: datetime,
+) -> DiscordAcademicMessageCreate:
+    mentions = (
+        (ACCEPTANCE_ASSISTANT_ID,)
+        if re.search(rf"<@!?{ACCEPTANCE_ASSISTANT_ID}>", content) is not None
+        else ()
+    )
+    return DiscordAcademicMessageCreate(
+        message_id=message_id,
+        channel_id=ACCEPTANCE_CHANNEL_ID,
+        author_id=ACCEPTANCE_OWNER_ID,
+        timestamp=timestamp,
+        content=SecretStr(content),
+        mentioned_user_ids=mentions,
+    )
+
+
+def _sent_discord_contents(requests: list[httpx.Request]) -> list[str]:
+    contents: list[str] = []
+    for request in requests:
+        if request.method != "POST" or not request.url.path.endswith("/messages"):
+            continue
+        body = json.loads(request.content)
+        content = body.get("content")
+        if isinstance(content, str):
+            contents.append(content)
+    return contents
+
+
+@pytest.mark.asyncio
+async def test_conversation_triggered_study_session_flow_reaches_notion_once(
+    engine, tmp_path: Path
+) -> None:
+    class MemoryNotApplicable:
+        async def handle_memory_review(self, **_kwargs: Any) -> object:
+            return SimpleNamespace(status="not_applicable", response=None)
+
+        async def handle_reflection(self, **_kwargs: Any) -> object:
+            return SimpleNamespace(status="not_applicable", response=None)
+
+    store = SQLAlchemyAcademicPlannerStore(engine)
+    store.upsert_course_calendar(
+        {
+            "notion_id": "course-ece250-page",
+            "course_code": "ECE 250",
+            "course_title": "Data Structures and Algorithms",
+            "term": "2026F",
+            "child_database_id": "ece250-assessments-db",
+            "child_data_source_id": "ece250-assessments-source",
+            "title_property_id": "title-prop",
+            "date_property_id": "date-prop",
+        },
+        status="valid",
+        schema_fingerprint="ece250-schema",
+    )
+    course = store.search_courses("ECE 250")[0]
+    start = datetime(2026, 9, 10, 19, 0, tzinfo=TORONTO)
+    gateway = QueuedAcademicGateway(
+        AcademicAgentDecision(
+            question=(
+                "When should I schedule the ECE 250 race conditions and insertion sort "
+                "study blocks, and how long should each be?"
+            )
+        ),
+        AcademicAgentDecision(
+            tool_calls=(SearchCoursesCall(tool="search_courses", query="ECE 250"),)
+        ),
+        AcademicAgentDecision(
+            tool_calls=(
+                CreateStudySessionCall(
+                    tool="create_study_session",
+                    course_id=course.course_id,
+                    topic="Race conditions",
+                    starts_at=start,
+                    duration_minutes=45,
+                ),
+                CreateStudySessionCall(
+                    tool="create_study_session",
+                    course_id=course.course_id,
+                    topic="Insertion sort",
+                    starts_at=start + timedelta(minutes=45),
+                    duration_minutes=45,
+                ),
+            )
+        ),
+        AcademicAgentDecision(
+            tool_calls=(SearchCoursesCall(tool="search_courses", query="ECE 250"),)
+        ),
+        AcademicAgentDecision(
+            tool_calls=(
+                CreateStudySessionCall(
+                    tool="create_study_session",
+                    course_id=course.course_id,
+                    topic="Graph traversals",
+                    starts_at=datetime(2026, 9, 10, 21, 0, tzinfo=TORONTO),
+                    duration_minutes=30,
+                ),
+            )
+        ),
+    )
+
+    discord_requests: list[httpx.Request] = []
+    notion_requests: list[httpx.Request] = []
+
+    def discord_respond(request: httpx.Request) -> httpx.Response:
+        discord_requests.append(request)
+        external_id = str(200000000000000000 + len(discord_requests))
+        return httpx.Response(
+            200,
+            json={"id": external_id, "guild_id": "42"},
+            request=request,
+        )
+
+    def notion_respond(request: httpx.Request) -> httpx.Response:
+        notion_requests.append(request)
+        page_number = len(notion_requests)
+        return httpx.Response(
+            200,
+            json={
+                "id": f"notion-study-page-{page_number}",
+                "url": f"https://notion.test/{page_number}",
+            },
+            request=request,
+        )
+
+    async with (
+        httpx.AsyncClient(
+            base_url="https://discord.com/api/v10",
+            transport=httpx.MockTransport(discord_respond),
+        ) as discord_client,
+        httpx.AsyncClient(transport=httpx.MockTransport(notion_respond)) as notion_client,
+    ):
+        writer = DiscoveredAcademicNotionWriter(
+            connector=NotionConnector(
+                token=SecretStr("notion-token"),
+                courses_database_id="courses-db",
+                client=notion_client,
+            ),
+            target_store=store,
+        )
+        handler = AcademicDiscordCheckinHandler(
+            store=store,
+            delivery=DiscordAcademicResponseDelivery(
+                engine=engine,
+                channel_id=ACCEPTANCE_CHANNEL_ID,
+                adapter=DiscordAcademicPlannerAdapter(
+                    token=SecretStr("discord-token"),
+                    allowed_channel_ids={ACCEPTANCE_CHANNEL_ID},
+                    client=discord_client,
+                ),
+            ),
+            allowed_channel_ids={ACCEPTANCE_CHANNEL_ID},
+            authorized_user_ids={ACCEPTANCE_OWNER_ID},
+            writer_provider=lambda: writer,
+            ollama_runtime=ReadyRuntime(),
+            agent_gateway=gateway,
+            semantic_router_gateway=CalendarSemanticRouter(),
+            agent_catalog=store,
+            assistant_user_id=ACCEPTANCE_ASSISTANT_ID,
+            memory_service=MemoryNotApplicable(),
+            agent_clarification_service=AcademicAgentClarificationService(
+                engine=engine,
+                artifact_store=ArtifactStore(tmp_path / "agent-clarifications"),
+            ),
+        )
+
+        now = datetime(2026, 9, 9, 18, 0, tzinfo=TORONTO)
+        initial = _discord_message(
+            "100000000000000001",
+            (
+                f"<@{ACCEPTANCE_ASSISTANT_ID}> I need to study for ECE 250, specifically "
+                "race conditions and insertion sort."
+            ),
+            timestamp=now,
+        )
+        assert (await handler(initial)).status == "handled"
+        assert notion_requests == []
+        clarification = next(
+            content
+            for content in _sent_discord_contents(discord_requests)
+            if "Reply with the requested details, or say cancel" in content
+        )
+        assert clarification.startswith(
+            "When should I schedule the ECE 250 race conditions and insertion sort "
+            "study blocks, and how long should each be?"
+        )
+        assert "No Notion change is ready to confirm" not in clarification
+        assert f"<@{ACCEPTANCE_ASSISTANT_ID}>" not in clarification
+
+        continuation = _discord_message(
+            "100000000000000002",
+            "Tomorrow at 7 PM, 45 minutes each.",
+            timestamp=now + timedelta(minutes=1),
+        )
+        assert (await handler(continuation)).status == "handled"
+        assert notion_requests == []
+        preview = next(
+            content
+            for content in reversed(_sent_discord_contents(discord_requests))
+            if content.startswith("Proposed academic updates")
+        )
+        assert (
+            "- Create `Studying Block — Race conditions` in ECE 250, "
+            "September 10, 2026, 7:00\N{EN DASH}7:45 PM America/Toronto (45 minutes)."
+        ) in preview
+        assert (
+            "- Create `Studying Block — Insertion sort` in ECE 250, "
+            "September 10, 2026, 7:45\N{EN DASH}8:30 PM America/Toronto (45 minutes)."
+        ) in preview
+        match = re.search(r"Confirm exactly: confirm ([0-9a-f-]{36})", preview)
+        assert match is not None
+        proposal_id = match.group(1)
+
+        confirmation = _discord_message(
+            "100000000000000003",
+            f"confirm {proposal_id}",
+            timestamp=now + timedelta(minutes=2),
+        )
+        assert (await handler(confirmation)).status == "handled"
+        notion_page_requests = [
+            request
+            for request in notion_requests
+            if request.method == "POST" and request.url.path.endswith("/pages")
+        ]
+        assert len(notion_page_requests) == 2
+        notion_bodies = [json.loads(request.content) for request in notion_page_requests]
+        assert [
+            body["properties"]["title-prop"]["title"][0]["text"]["content"]
+            for body in notion_bodies
+        ] == [
+            "Studying Block — Race conditions",
+            "Studying Block — Insertion sort",
+        ]
+        assert [body["properties"]["date-prop"]["date"] for body in notion_bodies] == [
+            {"start": "2026-09-10T23:00:00Z", "end": "2026-09-10T23:45:00Z"},
+            {"start": "2026-09-10T23:45:00Z", "end": "2026-09-11T00:30:00Z"},
+        ]
+
+        with Session(engine) as session:
+            journal_rows = session.scalars(
+                select(AcademicProposalOperationJournal).order_by(
+                    AcademicProposalOperationJournal.ordinal
+                )
+            ).all()
+        assert [row.state for row in journal_rows] == ["applied", "applied"]
+
+        discord_post_count = len(_sent_discord_contents(discord_requests))
+        assert (await handler(initial)).status == "duplicate"
+        assert (await handler(continuation)).status == "ignored"
+        assert (await handler(confirmation)).status == "handled"
+        assert (
+            len(
+                [
+                    request
+                    for request in notion_requests
+                    if request.method == "POST" and request.url.path.endswith("/pages")
+                ]
+            )
+            == 2
+        )
+        assert len(_sent_discord_contents(discord_requests)) == discord_post_count
+
+        second_initial = _discord_message(
+            "100000000000000004",
+            (
+                f"<@{ACCEPTANCE_ASSISTANT_ID}> Please schedule study time for ECE 250 "
+                "graph traversals tomorrow at 9 PM for 30 minutes."
+            ),
+            timestamp=now + timedelta(minutes=3),
+        )
+        assert (await handler(second_initial)).status == "handled"
+        second_preview = next(
+            content
+            for content in reversed(_sent_discord_contents(discord_requests))
+            if content.startswith("Proposed academic updates") and "Graph traversals" in content
+        )
+        reject_match = re.search(r"Reject exactly: reject ([0-9a-f-]{36})", second_preview)
+        assert reject_match is not None
+        rejection = _discord_message(
+            "100000000000000005",
+            f"reject {reject_match.group(1)}",
+            timestamp=now + timedelta(minutes=4),
+        )
+        assert (await handler(rejection)).status == "handled"
+        assert (
+            len(
+                [
+                    request
+                    for request in notion_requests
+                    if request.method == "POST" and request.url.path.endswith("/pages")
+                ]
+            )
+            == 2
+        )
+        assert any(
+            "is rejected. No Notion change was made." in content
+            for content in _sent_discord_contents(discord_requests)
+        )
+
+
+@pytest.mark.asyncio
+async def test_morning_briefing_reaches_discord_user_boundary_within_timeout(engine) -> None:
+    now = datetime(2026, 9, 9, 8, 0, tzinfo=TORONTO)
+    facts = PlannerFacts(
+        assessments=(
+            Assessment(
+                id="quiz-circuits",
+                course="ECE 222",
+                title="Linear Circuits quiz",
+                assessment_type=AssessmentType.QUIZ,
+                due_at=datetime(2026, 9, 10, 10, 0, tzinfo=TORONTO),
+                estimated_minutes=60,
+                weight_percent=10,
+            ),
+        ),
+        availability=(
+            AvailabilityWindow(
+                start_at=now,
+                end_at=now + timedelta(hours=2),
+            ),
+        ),
+    )
+
+    class FactStore:
+        def __init__(self) -> None:
+            self.plan = None
+
+        def load_planner_facts(self, *, now, horizon_days):
+            return facts
+
+        def save_daily_plan(self, plan) -> None:
+            self.plan = plan
+
+    with Session(engine) as session, session.begin():
+        run = RunRepository.create_or_get(
+            session,
+            idempotency_key="academic-user-boundary:2026-09-09",
+            agent_name="academic_planner",
+            trigger="schedule",
+        )
+        run_id = run.id
+
+    requests: list[httpx.Request] = []
+
+    def respond(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        return httpx.Response(
+            200,
+            json={"id": "123456789012345678", "guild_id": "42"},
+            request=request,
+        )
+
+    channel_id = "987654321012345678"
+    async with httpx.AsyncClient(
+        base_url="https://discord.com/api/v10",
+        transport=httpx.MockTransport(respond),
+    ) as client:
+        delivery = DiscordAcademicPlannerDelivery(
+            engine=engine,
+            run_id=run_id,
+            channel_id=channel_id,
+            adapter=DiscordAcademicPlannerAdapter(
+                token=SecretStr("test-token"),
+                allowed_channel_ids={channel_id},
+                client=client,
+            ),
+        )
+        result = await asyncio.wait_for(
+            run_morning_plan(
+                store=FactStore(),
+                delivery=delivery,
+                model=BriefingModel(),
+                now=now,
+            ),
+            timeout=1,
+        )
+
+    assert result["status"] == "succeeded"
+    assert len(requests) == 1
+    body = json.loads(requests[0].content)
+    assert body["content"].startswith("Good morning, Richard.")
+    assert "September 10, 2026 (tomorrow)" in body["content"]
+    assert "60 minutes" in body["content"]
+    assert body["allowed_mentions"] == {"parse": []}
+    assert body["enforce_nonce"] is True
+
+
+@pytest.mark.asyncio
+async def test_assessment_material_reaches_grounded_discord_morning_guidance(
+    engine, tmp_path: Path
+) -> None:
+    """Exercise acquisition through private storage, retrieval, validation, and delivery."""
+
+    now = datetime(2026, 9, 9, 8, 0, tzinfo=TORONTO)
+    assessment_page_id = "assessment-material-page"
+    with Session(engine) as session, session.begin():
+        course = AcademicRepository.upsert_course(
+            session,
+            notion_id="course-material-page",
+            course_code="ECE 222",
+            title="Linear Circuits",
+            term="2026F",
+        )
+        AcademicRepository.upsert_assessment(
+            session,
+            notion_id=assessment_page_id,
+            course_id=course.id,
+            title="Assignment 1",
+            assessment_type="assignment",
+            due_at=datetime(2026, 9, 10, 20, 0, tzinfo=TORONTO),
+            grade_weight_percent=40,
+            estimated_minutes=60,
+            confidence=1.0,
+            fact_state="confirmed",
+            citation=SourceCitation(block="assessment-row"),
+        )
+        AcademicRepository.upsert_preferences(
+            session,
+            scope="default",
+            timezone="America/Toronto",
+            availability={
+                "windows": [
+                    {
+                        "start_at": now.isoformat(),
+                        "end_at": (now + timedelta(hours=2)).isoformat(),
+                    }
+                ]
+            },
+            daily_capacity_minutes=120,
+            buffer_minutes=0,
+        )
+
+    snapshot = NotionAssessmentMaterials(
+        assessment_page_id=assessment_page_id,
+        last_edited_at=now.astimezone(UTC),
+        files=(
+            NotionMaterialFile(
+                source_kind="notion_property_file",
+                source_page_id=assessment_page_id,
+                source_property_id="materials-property",
+                source_key=f"{assessment_page_id}:property:materials-property:file:0",
+                order=0,
+                name="assignment-one.pdf",
+                url=("https://prod-files-secure.s3.us-west-2.amazonaws.com/assignment-one.pdf"),
+                mime_type="application/pdf",
+            ),
+        ),
+    )
+
+    class Connector:
+        async def retrieve_assessment_materials(self, page_id: str, **kwargs):
+            assert page_id == assessment_page_id
+            assert kwargs == {"max_depth": 8, "max_blocks": 1000, "max_requests": 20}
+            return snapshot
+
+        async def refresh_assessment_material_file(
+            self, *, assessment_page_id: str, source_key: str
+        ):
+            assert assessment_page_id == snapshot.assessment_page_id
+            assert source_key == snapshot.files[0].source_key
+            return snapshot.files[0]
+
+        async def download_attachment(self, attachment, *, max_bytes: int) -> bytes:
+            assert attachment.name == "assignment-one.pdf"
+            assert max_bytes == 1024 * 1024
+            return _pdf(
+                "Assignment 1 is worth 40%. Begin with linear circuits, then compare AC and DC "
+                "behavior."
+            )
+
+    class Embeddings:
+        model_identity = "acceptance-embedding:v1"
+
+        async def embed_academic_text(self, text: str):
+            vector = [1.0, float(len(text) % 7 + 1)]
+            return SimpleNamespace(
+                status=EmbeddingStatus.VALID,
+                model_identity=self.model_identity,
+                embedding=SimpleNamespace(vector=vector),
+            )
+
+    embeddings = Embeddings()
+    artifacts = ArtifactStore(tmp_path / "material-artifacts")
+    ingestion = AssessmentMaterialIngestionService(
+        engine=engine,
+        connector=Connector(),  # type: ignore[arg-type]
+        artifact_store=artifacts,
+        embedding_gateway=embeddings,
+        max_bytes=1024 * 1024,
+    )
+    ingestion_result = await ingestion.ingest_assessment(assessment_page_id)
+    assert ingestion_result.status == "succeeded"
+
+    with Session(engine) as session:
+        chunk = session.scalar(select(AcademicDocumentChunk))
+        assert chunk is not None
+        chunk_id = str(chunk.id)
+
+    class GroundedModel:
+        def __init__(self) -> None:
+            self.decision_count = 0
+
+        async def breakdown(self, assessment) -> WorkBreakdown:
+            return WorkBreakdown(
+                assessment_id=assessment.id,
+                steps=("Review linear circuits", "Compare AC and DC behavior"),
+                estimated_minutes=60,
+                rationale="Follow the verified assignment requirements.",
+            )
+
+        async def critique(self, plan) -> PlanCritique:
+            return PlanCritique(acceptable=True, concerns=())
+
+        async def morning_briefing(self, context) -> MorningBriefing:
+            assessment = context.assessments[0]
+            block = context.scheduled_blocks[0]
+            insight = context.material_insights[0]
+            return MorningBriefing(
+                message_text=(
+                    f"Good morning, Richard. {assessment.title} for {assessment.course_code} "
+                    f"is due {assessment.exact_date_label} ({assessment.relative_date_label}). "
+                    f"Study {block.duration_minutes} minutes; it is worth 40%, so begin with "
+                    "linear circuits and then compare AC and DC behavior. Have a good day!"
+                ),
+                referenced_assessment_ids=(assessment.assessment_id,),
+                referenced_block_ids=(block.block_id,),
+                referenced_insight_ids=(insight.insight_id,),
+            )
+
+        async def extract_checkin(self, reply):
+            return ()
+
+        async def invoke_structured(self, *, prompt: str, response_model: type[Any]) -> object:
+            if response_model is AssessmentMaterialDecision:
+                self.decision_count += 1
+                if self.decision_count == 1:
+                    output = AssessmentMaterialDecision(
+                        tool_calls=(
+                            AssessmentMaterialToolCall(
+                                tool="semantic_search_assessment_materials",
+                                assessment_id=assessment_page_id,
+                                query="What should today's Assignment 1 block focus on?",
+                                limit=4,
+                            ),
+                        )
+                    )
+                else:
+                    from app.agents.academic_planner.contracts import GroundedAssessmentInsight
+
+                    output = AssessmentMaterialDecision(
+                        insights=(
+                            GroundedAssessmentInsight(
+                                insight_id="insight-assignment-material",
+                                assessment_id=assessment_page_id,
+                                text=(
+                                    "Assignment 1 is worth 40%; begin with linear circuits, "
+                                    "then compare AC and DC behavior."
+                                ),
+                                evidence_chunk_ids=(chunk_id,),
+                            ),
+                        )
+                    )
+            elif response_model is AssessmentMaterialInsightCritique:
+                output = AssessmentMaterialInsightCritique(
+                    insight_id="insight-assignment-material",
+                    accepted=True,
+                    entailed=True,
+                    relevant_to_today=True,
+                    safe=True,
+                )
+            elif response_model is MorningMaterialGroundingCritique:
+                output = MorningMaterialGroundingCritique(
+                    accepted=True,
+                    no_new_material_claims=True,
+                    no_cross_assessment_leakage=True,
+                    recommendations_match_scheduled_blocks=True,
+                )
+            else:  # pragma: no cover - guards future protocol expansion
+                raise AssertionError(response_model)
+            return SimpleNamespace(output=output)
+
+    model = GroundedModel()
+    store = SQLAlchemyAcademicPlannerStore(engine, embedding_gateway=embeddings)
+    with Session(engine) as session, session.begin():
+        run = RunRepository.create_or_get(
+            session,
+            idempotency_key="material-guidance:2026-09-09",
+            agent_name="academic_planner",
+            trigger="schedule",
+        )
+        run_id = run.id
+
+    requests: list[httpx.Request] = []
+
+    def respond(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        return httpx.Response(200, json={"id": "123456789012345679"}, request=request)
+
+    channel_id = "987654321012345678"
+    async with httpx.AsyncClient(
+        base_url="https://discord.com/api/v10",
+        transport=httpx.MockTransport(respond),
+    ) as client:
+        delivery = DiscordAcademicPlannerDelivery(
+            engine=engine,
+            run_id=run_id,
+            channel_id=channel_id,
+            adapter=DiscordAcademicPlannerAdapter(
+                token=SecretStr("test-token"),
+                allowed_channel_ids={channel_id},
+                client=client,
+            ),
+        )
+        result = await run_morning_plan(
+            store=store,
+            delivery=delivery,
+            model=model,
+            material_reasoner=AssessmentMaterialReasonerService(model=model, store=store),
+            semantic_validator=AssessmentMaterialMorningValidator(model),
+            now=now,
+        )
+
+    assert result["material_insight_count"] == 1
+    assert result["delivery_count"] == 1
+    assert len(requests) == 1
+    delivered = json.loads(requests[0].content)["content"]
+    assert "worth 40%" in delivered
+    assert "linear circuits" in delivered
+    assert "AC and DC" in delivered
 
 
 def _pdf(text: str) -> bytes:
@@ -333,14 +1087,26 @@ async def test_phase5_academic_planner_acceptance_contract(engine) -> None:
 
     store = SQLAlchemyAcademicPlannerStore(engine)
     delivery = DeliveryRecorder()
+    model = BriefingModel()
     result = await run_morning_plan(
         store=store,
         delivery=delivery,
+        model=model,
         now=now,
         horizon_days=7,
     )
     assert result["status"] == "succeeded"
     assert result["ambiguous_count"] == 1
+    assert model.morning_contexts
+    assert delivery.morning_briefing is not None
+    assert any(
+        call[0] == "morning"
+        and call[1].endswith(":v2")
+        and call[2] is not None
+        and call[2].startswith("Good morning, Richard.")
+        and "Today's academic plan:" not in call[2]
+        for call in delivery.calls
+    )
     assert ("question", "academic-ambiguity:notion-ambiguous-pdf:v1", "notion-ambiguous-pdf") in (
         delivery.calls
     )

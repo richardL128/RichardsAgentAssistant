@@ -153,12 +153,61 @@ def test_unschedulable_practice_focus_is_reported_as_deferred() -> None:
                 rationale="The user explicitly reported difficulty with recursion.",
             ),
         ),
-        availability=(
-            AvailabilityWindow(start_at=now, end_at=now + timedelta(minutes=30)),
-        ),
+        availability=(AvailabilityWindow(start_at=now, end_at=now + timedelta(minutes=30)),),
     )
 
     blocks, deferred = allocate_plan_with_deferred(facts, now=now)
 
     assert blocks == ()
     assert deferred == ("focus-recursion",)
+
+
+def test_expanded_todo_types_schedule_as_generic_assessment_blocks() -> None:
+    now = datetime(2025, 3, 9, 14, tzinfo=UTC)
+    facts = PlannerFacts(
+        assessments=(
+            _assessment("tutorial").model_copy(
+                update={
+                    "title": "Tutorial problems",
+                    "assessment_type": AssessmentType.TUTORIAL,
+                    "due_at": now + timedelta(days=1),
+                    "estimated_minutes": 30,
+                }
+            ),
+            _assessment("lab").model_copy(
+                update={
+                    "title": "Lab writeup",
+                    "assessment_type": AssessmentType.LAB,
+                    "due_at": now + timedelta(days=2),
+                    "estimated_minutes": 30,
+                }
+            ),
+            _assessment("study-session").model_copy(
+                update={
+                    "title": "Review chapter 4",
+                    "assessment_type": AssessmentType.STUDYING_BLOCK,
+                    "due_at": now + timedelta(days=3),
+                    "estimated_minutes": 30,
+                }
+            ),
+        ),
+        availability=(
+            AvailabilityWindow(
+                start_at=now,
+                end_at=now + timedelta(hours=3),
+            ),
+        ),
+        buffer_minutes=0,
+    )
+
+    blocks = allocate_plan(facts, now=now)
+
+    studying_todo = next(
+        assessment for assessment in facts.assessments if assessment.id == "study-session"
+    )
+    assert {block.assessment_id for block in blocks} == {"tutorial", "lab", "study-session"}
+    assert studying_todo.assessment_type == AssessmentType.STUDYING_BLOCK
+    assert all(block.block_kind == "assessment" for block in blocks)
+    studying_todo_block = next(block for block in blocks if block.assessment_id == "study-session")
+    assert studying_todo_block.block_kind == "assessment"
+    assert studying_todo_block.title == "Review chapter 4"

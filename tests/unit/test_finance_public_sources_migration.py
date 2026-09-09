@@ -19,9 +19,7 @@ from app.db.finance import FinanceRepository
 def test_0010_migration_seeds_disabled_v2_allowlist_and_endpoint_registry(
     tmp_path: Path,
 ) -> None:
-    migration = importlib.import_module(
-        "app.db.migrations.versions.0010_public_finance_sources"
-    )
+    migration = importlib.import_module("app.db.migrations.versions.0010_public_finance_sources")
     engine = create_engine(f"sqlite+pysqlite:///{tmp_path / 'finance-migration.db'}")
     try:
         with engine.begin() as connection:
@@ -81,9 +79,7 @@ def test_0010_migration_seeds_disabled_v2_allowlist_and_endpoint_registry(
             ).one()
             columns = {
                 row[1]
-                for row in connection.exec_driver_sql(
-                    "PRAGMA table_info(finance_etf_exposures)"
-                )
+                for row in connection.exec_driver_sql("PRAGMA table_info(finance_etf_exposures)")
             }
             table_names = set(sa.inspect(connection).get_table_names())
 

@@ -82,11 +82,13 @@ class ArtifactStore:
         retention_days_by_class: Mapping[str, int | None] | None = None,
         default_retention_days: int = _DEFAULT_RETENTION_DAYS,
         clock: Callable[[], datetime] | None = None,
+        create_root: bool = True,
     ) -> None:
         if default_retention_days < 1:
             raise ValueError("default_retention_days must be positive")
         self.root = root.expanduser().resolve()
-        self.root.mkdir(parents=True, exist_ok=True)
+        if create_root:
+            self.root.mkdir(parents=True, exist_ok=True)
         self._retention_days = dict(retention_days_by_class or {})
         for data_class, days in self._retention_days.items():
             _validate_data_class(data_class)

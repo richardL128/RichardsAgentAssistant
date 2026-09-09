@@ -128,10 +128,7 @@ async def run_finance_briefing(
         etf_tickers=etf_tickers,
     )
     approval_by_id = {approval.source_id: approval for approval in approvals}
-    logical_failures = {
-        result.source_id: _result_failure(result)
-        for result in results
-    }
+    logical_failures = {result.source_id: _result_failure(result) for result in results}
     for result in results:
         approval = approval_by_id[result.source_id]
         logical_failure = logical_failures[result.source_id]
@@ -274,6 +271,7 @@ async def _load_default_runtime(run_id: uuid.UUID) -> _Runtime:
     )
     client = httpx.AsyncClient()
     try:
+
         def record_request(source_id: str, audit: EndpointRequestAudit) -> None:
             store.record_source_request_audit(
                 source_id=source_id,
@@ -310,9 +308,7 @@ async def _load_default_runtime(run_id: uuid.UUID) -> _Runtime:
 
             def save(watermark: EndpointWatermark) -> None:
                 last_external_id = (
-                    sorted(watermark.seen_external_ids)[-1]
-                    if watermark.seen_external_ids
-                    else None
+                    sorted(watermark.seen_external_ids)[-1] if watermark.seen_external_ids else None
                 )
                 store.save_source_cache_state(
                     source_id=source_id,
@@ -334,9 +330,7 @@ async def _load_default_runtime(run_id: uuid.UUID) -> _Runtime:
             default_retention_days=settings.artifact_retention_days,
         )
 
-        def persist_bulk_artifact(
-            _source_id: str, payload: RawSourcePayload
-        ) -> str:
+        def persist_bulk_artifact(_source_id: str, payload: RawSourcePayload) -> str:
             metadata = artifact_store.put(
                 payload.body,
                 media_type=payload.content_type or "application/octet-stream",

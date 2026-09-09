@@ -33,8 +33,7 @@ def etf_missing_mapping_diagnostics(tickers: tuple[str, ...]) -> tuple[ProviderD
         ProviderDiagnostic(
             code="etf_holdings_mapping_missing",
             diagnostic=(
-                "No reviewed issuer holdings endpoint is configured "
-                f"for ETF {ticker.upper()}"
+                f"No reviewed issuer holdings endpoint is configured for ETF {ticker.upper()}"
             ),
             ticker=ticker.upper(),
         )
@@ -116,9 +115,7 @@ def _header_index(rows: tuple[list[str], ...]) -> int:
 
 def _row_mapping(header: list[str], row: list[str]) -> Mapping[str, str]:
     return {
-        name.strip(): row[index].strip()
-        for index, name in enumerate(header)
-        if index < len(row)
+        name.strip(): row[index].strip() for index, name in enumerate(header) if index < len(row)
     }
 
 

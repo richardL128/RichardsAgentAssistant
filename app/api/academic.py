@@ -72,6 +72,7 @@ class AcademicSyncResponse(BaseModel):
     assessment_count: int
     archived_count: int
     clarification_count: int
+    material_job_count: int = 0
     invalid_calendar_count: int
     diagnostic_codes: list[str]
 

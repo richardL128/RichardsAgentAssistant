@@ -133,4 +133,6 @@ def _string_column(root: JsonObject, key: str) -> tuple[str, ...]:
 def _filing_url(cik: str, accession: str, primary_document: str) -> str:
     numeric_cik = str(int(cik))
     accession_path = accession.replace("-", "")
-    return f"https://www.sec.gov/Archives/edgar/data/{numeric_cik}/{accession_path}/{primary_document}"
+    return (
+        f"https://www.sec.gov/Archives/edgar/data/{numeric_cik}/{accession_path}/{primary_document}"
+    )

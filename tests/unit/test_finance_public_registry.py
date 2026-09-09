@@ -171,9 +171,7 @@ async def test_v2_registry_fetches_exactly_eight_keyless_public_envelopes() -> N
         if host == "data.sec.gov":
             assert "LifeAgent/0.1" in request.headers["user-agent"]
             assert "@" in request.headers["user-agent"]
-            return httpx.Response(
-                200, content=(FIXTURES / "sec_submissions_lmt.json").read_bytes()
-            )
+            return httpx.Response(200, content=(FIXTURES / "sec_submissions_lmt.json").read_bytes())
         if host == "news.lockheedmartin.com":
             return httpx.Response(200, content=(FIXTURES / "company_ir_lmt.xml").read_bytes())
         if host == "www.ishares.com":
@@ -215,11 +213,9 @@ async def test_v2_registry_fetches_exactly_eight_keyless_public_envelopes() -> N
     assert len(requests) == 8
     assert len(audits) == 8
     assert all(result.metadata is not None for result in results)
-    assert sum(
-        result.metadata.request_count
-        for result in results
-        if result.metadata is not None
-    ) == 8
+    assert (
+        sum(result.metadata.request_count for result in results if result.metadata is not None) == 8
+    )
     assert all(result.failure is None for result in results)
     assert all("api_key" not in request.url.params for request in requests)
     etf_result = next(result for result in results if result.source_id == "issuer_etf_holdings")
@@ -244,26 +240,24 @@ async def test_registry_missing_mapping_is_visible_without_substitute_request() 
 
     def handler(request: httpx.Request) -> httpx.Response:
         requests.append(request)
-        return httpx.Response(
-            200, content=(FIXTURES / "company_ir_lmt.xml").read_bytes()
-        )
+        return httpx.Response(200, content=(FIXTURES / "company_ir_lmt.xml").read_bytes())
 
     async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
-        adapter = build_finance_adapter_registry(
-            settings, approvals, client=client
-        )["company_ir_registry"]
+        adapter = build_finance_adapter_registry(settings, approvals, client=client)[
+            "company_ir_registry"
+        ]
         result = await adapter.fetch(
             next(
                 query
                 for query in build_source_queries(
-                        approvals,
-                        allowlist_version=FINANCE_SOURCE_ALLOWLIST_VERSION_V2,
-                        window_start=NOW - timedelta(days=1),
-                        window_end=NOW,
-                        tickers=("LMT", "MSFT"),
-                        issuer_tickers=("LMT", "MSFT"),
-                        themes=("defense",),
-                    )
+                    approvals,
+                    allowlist_version=FINANCE_SOURCE_ALLOWLIST_VERSION_V2,
+                    window_start=NOW - timedelta(days=1),
+                    window_end=NOW,
+                    tickers=("LMT", "MSFT"),
+                    issuer_tickers=("LMT", "MSFT"),
+                    themes=("defense",),
+                )
                 if query.source_id == "company_ir_registry"
             )
         )

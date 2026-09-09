@@ -64,9 +64,7 @@ class ConditionalHttpTransport:
     max_payload_bytes: int = 2_000_000
     timeout_seconds: float = 10.0
     clock: Callable[[], datetime] = field(default=_now, repr=False)
-    bulk_artifact_sink: Callable[[RawSourcePayload], str] | None = field(
-        default=None, repr=False
-    )
+    bulk_artifact_sink: Callable[[RawSourcePayload], str] | None = field(default=None, repr=False)
 
     async def fetch_endpoint(
         self,

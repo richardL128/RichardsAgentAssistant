@@ -312,12 +312,13 @@ async def test_partial_registry_failure_stays_one_logical_call_and_marks_attenti
     assert "reviewed finance endpoints failed" in health["source8"]["diagnostic"]
 
 
-def test_importing_worker_registers_finance_handler() -> None:
+def test_importing_worker_does_not_register_finance_model_handler() -> None:
     import app.queue.worker  # noqa: F401
     from app.agents.finance.workflow import run_finance
     from app.queue import tasks
 
-    assert tasks._handlers.get("finance") is run_finance
+    assert tasks._handlers.get("finance") is not run_finance
+    assert "finance" not in tasks._handlers
 
 
 @pytest.mark.asyncio

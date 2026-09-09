@@ -63,9 +63,7 @@ def build_v2_polling_plan(settings: Settings) -> tuple[SourcePollPolicy, ...]:
             source_id=source_id,
             interval=intervals[source_id],
             lookback=bounded_backfill,
-            feed_latency_target=(
-                timedelta(minutes=15) if source_id in feed_sources else None
-            ),
+            feed_latency_target=(timedelta(minutes=15) if source_id in feed_sources else None),
         )
         for source_id in V2_SOURCE_IDS
     )

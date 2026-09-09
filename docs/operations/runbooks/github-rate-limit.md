@@ -5,8 +5,12 @@
 Code review discovery slows down, skips repositories, or fails with rate-limit
 errors. Code review runs show status `Attention` or retry repeatedly. The
 operations console's code review card shows `run_overdue` or `waiting_for_retry`
-state. Worker logs mention `rate_limit` or `CONNECTOR_TRANSIENT` errors with
+state. API logs may mention `rate_limit` or `CONNECTOR_TRANSIENT` errors with
 HTTP 429 status.
+
+This runbook is for historical code-review data and future troubleshooting if a
+reviewed architecture re-enables GitHub discovery. The current configured
+runtime does not launch a separate GitHub discovery service.
 
 GitHub's API enforces rate limits based on the authenticated app or token.
 Discovery against a large organization can exceed the rate limit if the polling
@@ -74,17 +78,17 @@ ORDER BY status;"'
 If many jobs have status `failed` or high attempt counts, rate limiting is
 preventing retries from succeeding.
 
-Inspect worker logs for rate-limit diagnostics:
+Inspect API logs for rate-limit diagnostics:
 
 ```bash
-docker compose logs --tail=500 worker-code-review 2>&1 | grep -i "rate\|429\|transient"
+docker compose logs --tail=500 api 2>&1 | grep -i "rate\|429\|transient"
 ```
 
 Check the GitHub App configuration to confirm credentials are valid. If
 authorization fails, the diagnostics will show `CONNECTOR_UNAUTHORIZED`:
 
 ```bash
-docker compose logs --tail=300 worker-code-review 2>&1 | grep -i "unauthorized\|forbidden"
+docker compose logs --tail=300 api 2>&1 | grep -i "unauthorized\|forbidden"
 ```
 
 Check the code-review health check:
@@ -115,7 +119,7 @@ If rate limiting is persistent, reduce the discovery call rate by increasing the
 minimum interval between API calls or reducing the page size:
 
 ```bash
-GITHUB_MIN_CALL_INTERVAL_SECONDS=5 GITHUB_DISCOVERY_PAGE_SIZE=25 docker compose up -d api worker-code-review
+GITHUB_MIN_CALL_INTERVAL_SECONDS=5 GITHUB_DISCOVERY_PAGE_SIZE=25 docker compose up -d api
 ```
 
 This increases the minimum interval from the default 2 seconds to 5 seconds and
@@ -126,10 +130,10 @@ discovery but respect rate limits better.
 
 The GitHub App credential has likely expired or been revoked. Update the GitHub
 App private key and installation ID outside the repository (they should never be
-stored in the repo). Then restart the API and worker to load the new credentials:
+stored in the repo). Then restart the API to load the new credentials:
 
 ```bash
-docker compose up -d api worker-code-review
+docker compose up -d api
 ```
 
 Do not replace the GitHub App with a personal access token. The permission
@@ -150,7 +154,9 @@ SET page = 1, last_full_name = NULL, discovery_complete = false
 WHERE scope = '\''github-installation'\'';"'
 ```
 
-After resetting, the next scheduled discovery run will restart from page 1.
+After resetting, discovery will restart from page 1 only if a future reviewed
+runtime path re-enables it. Do not start a separate GitHub discovery service;
+it is not part of the current Compose stack.
 
 ## Expected health and Discord behavior
 

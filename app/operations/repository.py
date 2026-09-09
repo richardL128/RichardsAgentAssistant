@@ -147,9 +147,7 @@ def _source_endpoint(
     source_health: str | None,
     now: datetime,
 ) -> SourceEndpoint:
-    last_retrieved_at = _aware(
-        cache_state.last_retrieved_at if cache_state is not None else None
-    )
+    last_retrieved_at = _aware(cache_state.last_retrieved_at if cache_state is not None else None)
     last_not_modified_at = _aware(
         cache_state.last_not_modified_at if cache_state is not None else None
     )

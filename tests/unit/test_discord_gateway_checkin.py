@@ -4,12 +4,16 @@ import asyncio
 import json
 from collections.abc import Mapping
 from datetime import UTC, datetime
+from types import SimpleNamespace
 from typing import Any
 
 import httpx
 import pytest
 from pydantic import SecretStr
 
+from app.agents.academic_planner import discord_checkin
+from app.agents.academic_planner.contracts import AcademicRequestRouteDecision
+from app.agents.academic_planner.discord_checkin import AcademicDiscordCheckinHandler
 from app.connectors.discord_gateway import (
     DiscordAcademicMessageCreate,
     DiscordClarificationCallbackResult,
@@ -20,12 +24,14 @@ from app.connectors.discord_gateway import (
     DiscordMessageCallbackResult,
     normalize_academic_message,
 )
+from app.llm.ollama_runtime import OllamaRuntimeReady
 
 CHANNEL = "987654321012345678"
 OTHER_CHANNEL = "111112222233333"
 USER = "222223333344444"
 OTHER_USER = "555556666677777"
 MESSAGE = "333334444455555"
+ASSISTANT = "444445555566666"
 TOKEN = "never-print-this-discord-token"
 PRIVATE_CONTENT = "completed assessment-secret"
 MESSAGE_CONTENT_INTENTS = 33_280
@@ -138,14 +144,14 @@ class _ContentGuard(dict[str, object]):
 def _listener(
     *,
     message_content_enabled: bool = True,
-    message_handler: _MessageHandler | None = None,
+    message_handler: Any | None = None,
 ) -> DiscordGatewayListener:
     return DiscordGatewayListener(
         token=SecretStr(TOKEN),
         api_base_url="https://discord.com/api/v10",
         allowed_channel_ids={CHANNEL},
         authorized_user_ids={USER},
-        handler=_ClarificationHandler(),
+        clarification_enqueuer=_ClarificationHandler(),
         message_content_enabled=message_content_enabled,
         message_handler=message_handler,
         http_client=_GatewayHttp(),
@@ -160,6 +166,7 @@ def _message_payload(
     author_id: str = USER,
     content: str = PRIVATE_CONTENT,
     bot: bool = False,
+    mentioned_user_ids: tuple[str, ...] = (),
 ) -> dict[str, object]:
     return {
         "op": 0,
@@ -171,8 +178,45 @@ def _message_payload(
             "author": {"id": author_id, "bot": bot},
             "timestamp": "2026-09-03T21:00:00.000000+00:00",
             "content": content,
+            "mentions": [{"id": item} for item in mentioned_user_ids],
         },
     }
+
+
+class _AcademicStore:
+    confirmation_ttl_hours = 24
+
+    def __init__(self, events: list[str]) -> None:
+        self.events = events
+
+    def get_latest_daily_plan(self) -> None:
+        return None
+
+    def save_discord_checkin(self, *args: object, **kwargs: object) -> object:
+        self.events.append("persist")
+        return SimpleNamespace(status="created")
+
+
+class _AcademicDelivery:
+    def __init__(self, events: list[str]) -> None:
+        self.events = events
+
+    async def send_response(self, content: str, *, idempotency_key: str) -> object:
+        self.events.append("ack")
+        return object()
+
+    async def send_confirmation(self, proposal: object, *, idempotency_key: str) -> object:
+        self.events.append("confirm")
+        return object()
+
+
+class _AcademicRuntime:
+    def __init__(self, events: list[str]) -> None:
+        self.events = events
+
+    async def ensure_ready(self) -> OllamaRuntimeReady:
+        self.events.append("ready")
+        return OllamaRuntimeReady(model="qwen-test:latest", digest="digest")
 
 
 @pytest.mark.asyncio
@@ -193,7 +237,7 @@ async def test_message_content_flag_controls_gateway_intents() -> None:
         api_base_url="https://discord.com/api/v10",
         allowed_channel_ids={CHANNEL},
         authorized_user_ids={USER},
-        handler=_ClarificationHandler(),
+        clarification_enqueuer=_ClarificationHandler(),
         http_client=_GatewayHttp(),
         websocket_connect=connect_disabled,
     )
@@ -216,7 +260,7 @@ async def test_message_content_flag_controls_gateway_intents() -> None:
         api_base_url="https://discord.com/api/v10",
         allowed_channel_ids={CHANNEL},
         authorized_user_ids={USER},
-        handler=_ClarificationHandler(),
+        clarification_enqueuer=_ClarificationHandler(),
         message_content_enabled=True,
         http_client=_GatewayHttp(),
         websocket_connect=connect_enabled,
@@ -252,6 +296,52 @@ async def test_authorized_message_create_is_scheduled_once_and_redacted() -> Non
 
     handler.release.set()
     await listener.drain_message_tasks()
+
+
+@pytest.mark.asyncio
+async def test_duplicate_mentioned_event_runs_readiness_and_qwen_once(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    events: list[str] = []
+
+    async def run_loop(**kwargs: object) -> object:
+        events.append("qwen")
+        return SimpleNamespace(changes=(), question="Which academic target should I change?")
+
+    monkeypatch.setattr(discord_checkin, "run_academic_agent_loop", run_loop)
+
+    class SemanticRouter:
+        async def invoke_structured(self, **_kwargs: object) -> object:
+            return SimpleNamespace(
+                output=AcademicRequestRouteDecision(
+                    calendar_request="help plan my quiz",
+                )
+            )
+
+    handler = AcademicDiscordCheckinHandler(
+        store=_AcademicStore(events),
+        delivery=_AcademicDelivery(events),
+        allowed_channel_ids={CHANNEL},
+        authorized_user_ids={USER},
+        writer_provider=lambda: None,
+        ollama_runtime=_AcademicRuntime(events),
+        agent_gateway=object(),
+        semantic_router_gateway=SemanticRouter(),
+        agent_catalog=object(),
+        assistant_user_id=ASSISTANT,
+    )
+    listener = _listener(message_handler=handler)
+    payload = _message_payload(
+        content=f"<@{ASSISTANT}> help plan my quiz",
+        mentioned_user_ids=(ASSISTANT,),
+    )
+
+    assert await listener.handle_gateway_payload(payload) == "handled"
+    assert await listener.handle_gateway_payload(payload) == "duplicate"
+    await listener.drain_message_tasks()
+    assert await listener.handle_gateway_payload(payload) == "duplicate"
+
+    assert events == ["ready", "qwen", "persist", "ack"]
 
 
 @pytest.mark.asyncio
@@ -373,7 +463,7 @@ async def test_privileged_intent_close_sets_safe_actionable_diagnostic() -> None
         api_base_url="https://discord.com/api/v10",
         allowed_channel_ids={CHANNEL},
         authorized_user_ids={USER},
-        handler=_ClarificationHandler(),
+        clarification_enqueuer=_ClarificationHandler(),
         message_content_enabled=True,
         http_client=_GatewayHttp(),
         websocket_connect=connect,

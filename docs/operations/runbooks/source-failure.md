@@ -9,6 +9,10 @@ indicates an incomplete allowlist. Finance runs must never fall back to open web
 search; they stop and report the specific source that failed, with a diagnostic
 explaining why.
 
+This runbook is for historical finance data and future troubleshooting if a
+reviewed architecture re-enables the finance workflow. The current configured
+runtime does not run scheduled finance execution.
+
 Finance source failures may include: a reviewed public endpoint returning an
 error, `FINANCE_EIA_MODE=api` without `EIA_API_KEY`, a source record being
 disabled in the allowlist, endpoint fan-out or hostname validation rejecting a
@@ -148,11 +152,11 @@ ORDER BY checked_at DESC
 LIMIT 1;"'
 ```
 
-Inspect worker logs for connector errors without exposing credentials or API
+Inspect API logs for connector errors without exposing credentials or API
 responses:
 
 ```bash
-docker compose logs --tail=500 worker-finance 2>&1 | grep -i "error\|failed\|exception"
+docker compose logs --tail=500 api 2>&1 | grep -i "error\|failed\|exception"
 ```
 
 Look for lines mentioning specific sources or endpoint IDs and error classes
@@ -172,10 +176,10 @@ bulk or API mode at startup and does not switch modes after a source failure.
 
 Update the credential in the host environment or the secrets source used by
 Docker Compose. Do not commit credentials to the repository. Then restart the
-API and finance worker so they load the new credential:
+API so it loads the new credential:
 
 ```bash
-docker compose up -d api worker-finance
+docker compose up -d api
 ```
 
 **If a source is disabled in the allowlist:**
@@ -191,10 +195,11 @@ and when.
 
 **If a reviewed endpoint is temporarily unavailable:**
 
-Leave the failed source health row visible and allow the scheduled finance run
-to retry automatically. The finance system does not substitute another endpoint
-or fallback to web search. Partial registry failures remain visible in source
-health and do not create a ninth logical source call.
+Leave the failed source health row visible. The finance system does not
+substitute another endpoint or fallback to web search. Partial registry failures
+remain visible in source health and do not create a ninth logical source call.
+In the current runtime, there is no scheduled finance retry; any future retry
+path requires an explicit architecture change.
 
 **If the source data is stale or malformed:**
 
@@ -202,7 +207,7 @@ Check the reviewed source documentation or endpoint/licence review notes. If an
 official endpoint changed format, the adapter in `app/connectors/finance_sources/`
 may need an update. Do not add arbitrary replacement URLs; a substitute endpoint
 requires a new reviewed registry/version or migration. After fixing the adapter,
-restart the worker and re-queue the finance run.
+restart the API. Re-queuing finance work is not a current runtime operation.
 
 **If a mapping is missing:**
 
@@ -259,8 +264,8 @@ curl http://127.0.0.1:8000/health/ready | jq '.checks[] | select(.name == "finan
 The finance check should have state `healthy`. Open the operations console at
 `/settings/sources` and confirm all eight sources show green/healthy status.
 
-The exceptional v1 rollback explicitly required for this rollout is a
+The exceptional v1 rollback documented for the original rollout was a historical
 configuration change, not a destructive migration: set
 `FINANCE_SOURCE_ALLOWLIST_VERSION=finance-sources-2026.09`, leave v2 audit and
-endpoint records in place, restore any required legacy v1 credentials, and
-restart `api` plus `worker-finance`. V1 is not the configured default.
+endpoint records in place, and restore any required legacy v1 credentials. V1 is
+not the configured default and is not a current executable runtime path.

@@ -17,7 +17,7 @@ Start every connector in **read-only / dry-run** mode. A connector may write onl
 Each provider has one typed Python adapter under `app/connectors/`. An adapter is the only code allowed to know the provider's base URL, credentials, and request format.
 
 ```text
-scheduled or inbound event
+authorized inbound event
   -> connector adapter (allowlisted operation only)
   -> Pydantic-normalized record + source metadata
   -> validation/redaction/deduplication
@@ -45,11 +45,13 @@ NOTION_COURSES_DATABASE_ID=
 
 DISCORD_BOT_TOKEN=
 DISCORD_ACADEMIC_AUTHORIZED_USER_IDS=[]
-DISCORD_ACADEMIC_GATEWAY_ENABLED=false
 DISCORD_ACADEMIC_MESSAGE_CONTENT_ENABLED=false
 DISCORD_ACADEMIC_CHANNEL_ID=
 DISCORD_FINANCE_CHANNEL_ID=
 DISCORD_CODE_REVIEW_CHANNEL_ID=
+DISCORD_APPLICATION_ID=
+DISCORD_HOST_HANDOFF_SECRET=
+MODEL_TRIGGER_MODE=discord_mentions_only
 
 SEC_USER_AGENT=LifeAgent/0.1 contact@example.com
 EIA_API_KEY=
@@ -59,6 +61,10 @@ FT_API_KEY=
 WSJ_OR_DOW_JONES_CREDENTIALS=
 BLOOMBERG_CREDENTIALS=
 ```
+
+`MODEL_TRIGGER_MODE` is closed to `discord_mentions_only`. The authorized
+Discord mention path is the only executable Qwen trigger; scheduled academic,
+code-review, and finance model paths require a future architecture change.
 
 The finance credential names are intentionally placeholders. They become real only after the exact source contract and approved API method are known.
 
@@ -138,9 +144,31 @@ Official reference: [Notion authorization](https://developers.notion.com/guides/
 
 Create one Discord application with one bot user. The three agents share it, but each uses a configured private channel/thread and clear message prefix. This avoids three tokens, three duplicate permission models, and confusing ownership.
 
-Use the Discord **Gateway** for incoming private replies and the normal REST API for outbound messages. Gateway is a persistent connection from the local worker to Discord, so the Mac does not need to expose a public URL. This is preferable to an HTTP interaction endpoint for the first local deployment.
+Use the Discord **Gateway** for incoming private replies and the normal REST API
+for outbound messages. The sole Gateway connection runs in the lightweight
+native macOS `com.lifeagent.discord-wake` LaunchAgent, so it remains connected
+when Docker is stopped and can acknowledge a valid mention before waking the
+Compose stack. The host sends an HMAC-authenticated reference to a loopback-only
+backend endpoint; it never stores message content or interaction tokens in its
+outbox.
 
-The system needs inbound text only for the student's planner check-in/confirmation flow. Do not enable broad message collection. The gateway handler accepts messages only from `DISCORD_ACADEMIC_AUTHORIZED_USER_IDS` in exactly `DISCORD_ACADEMIC_CHANNEL_ID`; direct messages and every other channel are ignored. When `DISCORD_APPLICATION_ID` is configured, natural-language requests must mention the bot; exact `confirm` and `reject` replies do not need another mention. Keep `DISCORD_ACADEMIC_MESSAGE_CONTENT_ENABLED=false` for button-only or outbound-only deployments. Enable both that flag and Discord's privileged Message Content intent only when this narrow free-text reply flow is required.
+The system needs inbound text only for the student's planner check-in,
+confirmation, and study-session clarification flow. Do not enable broad message
+collection. The gateway handler accepts messages only from
+`DISCORD_ACADEMIC_AUTHORIZED_USER_IDS` in exactly
+`DISCORD_ACADEMIC_CHANNEL_ID`; direct messages and every other channel are
+ignored. With `MODEL_TRIGGER_MODE=discord_mentions_only`, natural-language
+requests must mention the configured `DISCORD_APPLICATION_ID` before
+any persistence, memory handling, readiness check, Discord response, or model
+call. One narrow exception permits the same authorized user/channel to answer
+one open, unexpired academic-agent clarification without another mention. The
+host checks owner-scoped session state by identifiers before accepting or
+persisting that bounded continuation; other unmentioned prose is ignored.
+Exact `confirm` and `reject` replies and component interactions do not need a
+mention and remain model-free. Keep
+`DISCORD_ACADEMIC_MESSAGE_CONTENT_ENABLED=false` for button-only or
+outbound-only deployments. Enable both that flag and Discord's privileged
+Message Content intent only when this narrow free-text reply flow is required.
 
 ### User setup in Discord
 
@@ -158,7 +186,7 @@ Keep the public command surface small:
 
 | Input | Purpose | Allowed action |
 | --- | --- | --- |
-| Planner end-of-day reply in private channel | Report progress/new work | Creates a **proposed** planner/Notion change only. |
+| `<@bot> planner reply ...` in private channel | Report progress/new work | Checks host Ollama readiness, runs bounded Qwen planning, and creates a **proposed** planner/Notion change only. |
 | `<@bot> create ...; update ...; delete ...` | Ask Qwen to resolve one or more course-calendar operations | Runs bounded read-only course/assessment lookups and creates one ordered **proposal**. `delete` is shown and applied as Notion archive. |
 | `confirm <proposal-id>` | Confirm a displayed proposed change | Allows exactly that queued Notion patch. |
 | `reject <proposal-id>` | Decline a proposed change | Marks the proposal rejected; makes no external write. |
@@ -166,15 +194,41 @@ Keep the public command surface small:
 
 Do not add commands to trade, publish GitHub comments, modify finance sources, run arbitrary jobs, or expose raw source material. Agent-sent messages must include the run/proposal ID and a concise source/deep link. Persist a delivery intent before the REST call, then persist the message ID and permalink receipt on success.
 
+Qwen-powered academic replies are mention-triggered and host-grounded. After an
+authorized mention, the native daemon immediately sends exactly one wake
+acknowledgement, starts Docker Desktop, the fixed no-build Compose services, and
+the supervised Ollama API as needed, then submits a signed reference. The
+backend refetches and validates the Discord message and adopts the host message
+as its durable progress message. The first real structured request—not a probe
+or warm-up—lazily loads Qwen. The model receives only bounded
+normalized planner facts and the verified mention-stripped message; raw Notion
+envelopes, source document text, private unrelated Discord message bodies,
+embeddings, and unrelated memory must not cross the model boundary.
+
+Scheduled academic, code-review, and finance Qwen paths are non-executable in
+the current runtime. Restoring one requires a future architecture change; none
+is an exception to the inbound mention trigger.
+
 The Qwen loop may call only the two read tools `search_courses` and `search_assessments` while resolving names. Its create, update, and archive calls are stored as one proposal and cannot reach Notion until the authorized user sends the exact `confirm <proposal-id>` shown by the bot. Course data-source IDs and assessment page IDs must come from the synchronized catalog; unknown or ambiguous names produce a question instead of a write.
 
-For later buttons/modals/slash commands, Discord interactions may be received by Gateway **or** HTTP webhook, but not both for the same application interaction flow. If an HTTP interaction endpoint is added later, it must be publicly reachable, verify Discord signatures, respond to the initial request quickly, and enqueue long work; it must not run model inference inline.
+Assessment-classification buttons are received through the native Gateway.
+After authorization, the host first spools only the interaction ID,
+clarification UUID, allowlisted action, channel/user IDs, and state. It then
+acknowledges the component within Discord's deadline and hands the reference to
+the backend after Docker is ready. The ephemeral interaction token is never
+persisted or sent in the handoff. The academic worker performs the existing
+guarded clarification job; Notion work and synchronization never run inline in
+the Gateway receive loop.
+
+If an HTTP interaction endpoint is added later, Discord interactions may be received by Gateway **or** HTTP webhook, but not both for the same application interaction flow. The endpoint must be publicly reachable, verify Discord signatures, acknowledge within Discord's deadline, and use the same durable queue architecture.
 
 ### Discord connection tests
 
 - The bot can send one test message only to the configured test channel and stores a delivery receipt.
 - The gateway reconnects after a simulated network loss without duplicating an inbound event.
 - A message from any user outside `DISCORD_ACADEMIC_AUTHORIZED_USER_IDS`, or from an unconfigured channel, is ignored before its content is inspected, audited, or stored.
+- Two classification choices received while Notion work is slow are both acknowledged promptly and produce no duplicate Notion write.
+- A terminal Notion success, conflict, or failure updates the original clarification message and removes its buttons; Discord edit retries are independent of Notion retries.
 - A planner reply creates a proposal; only a matching owner confirmation applies it.
 - Rate-limit and permission failures become `attention`/`failed` diagnostics with no retry storm.
 
@@ -313,7 +367,7 @@ The finance agent validates that exactly eight envelopes have the active allowli
 3. For each licensed connector, add the provider-supplied sandbox/test credential or a contract-approved production smoke test. Do not test by scraping a website.
 4. Simulate timeout, 429, invalid credential, empty result, and malformed payload for every source. A failed source must be visible in the health record and must not trigger a substitute source.
 5. Run one complete dry-run briefing and assert there are exactly eight source envelopes, no trade directive, source citations on every factual claim, and no disallowed full-text content in the database/Discord payload.
-6. The user approves `finance-allowlist-v1`—including licences, retention, and local-LLM-use notes—before the market-open schedule is enabled.
+6. The user approves `finance-allowlist-v1`—including licences, retention, and local-LLM-use notes—before any finance briefing design work. A market-open Qwen schedule is non-executable in the current runtime and would require a future architecture change.
 
 ## First setup order
 
@@ -322,4 +376,4 @@ The finance agent validates that exactly eight envelopes have the active allowli
 3. Add the confirmed planner reply/confirmation flow, then enable the minimal inbound Discord permission/intent required.
 4. Configure SEC, company-IR registry, EIA, and SAM.gov in dry-run mode.
 5. Obtain explicit API/licence approval for Reuters, FT, WSJ/Dow Jones, and Bloomberg. Leave each disabled if approval is absent.
-6. Approve the final eight-source `finance-allowlist-v1`, test an eight-call dry run, and only then enable the scheduled finance briefing.
+6. Approve the final eight-source `finance-allowlist-v1` and test an eight-call dry run. Scheduled finance briefing remains non-executable in the current Discord-mentions-only runtime and cannot be turned on by an operator flag.

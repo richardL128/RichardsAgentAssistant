@@ -1,5 +1,10 @@
 # Phase 6 — Finance briefing
 
+Historical phase note: this closeout describes the original Phase 6 finance
+implementation. In the current configured runtime, only `postgres` and `api` are
+Compose services; Qwen is triggered solely by an authorized Discord mention, and
+scheduled finance execution is not a current runtime path.
+
 ## Contract and acceptance criteria
 
 Phase 6 adds the gated finance briefing workflow: a versioned eight-source
@@ -72,10 +77,10 @@ individually enabled with an approval timestamp and approval audit event.
 - Added `app/api/finance.py`: read-only finance source and run-filter metadata
   endpoints. `app/main.py` mounts the finance router and initializes
   `app.state.finance_store`.
-- Wired the finance worker path through `app/queue/worker.py`, the finance
-  schedule through `app/queue/tasks.py`, and the `worker-finance` Compose service.
-  While the source approval gate is closed, the periodic path is expected to
-  return `approval_required` or no-op rather than calling vendors.
+- At original Phase 6 closeout, the finance path was wired through the queue
+  worker and a standalone Compose service. That service is removed from the
+  current runtime; scheduled finance execution is non-executable unless a future
+  architecture explicitly reintroduces and validates it.
 - Added Discord finance delivery in `app/connectors/discord.py`: rendered
   single-message delivery to an allowlisted finance channel with a deterministic
   idempotency key of `finance:<date>:market-open:v1` and durable delivery-intent
@@ -221,15 +226,16 @@ the clearest future consolidation point.
   only, ETF holdings cover IVV only, and technology coverage begins with CISA KEV
   only. Additional issuers, CIKs, ETFs, vendor advisory feeds, or reported feeds
   require a reviewed registry/version update.
-- Feed-like v2 sources target p95 ingestion within 15 minutes while workers and
-  providers are healthy. EIA bulk and ETF holdings are judged against
-  source-specific update schedules instead of the feed latency target.
+- Feed-like v2 sources targeted p95 ingestion within 15 minutes while the
+  historical queue processors and providers were healthy. EIA bulk and ETF holdings are
+  judged against source-specific update schedules instead of the feed latency
+  target.
 - Live Discord delivery requires `discord_bot_token` and
   `discord_finance_channel_id`. Automated tests use mocked transports and
   durable delivery records.
-- Live finance schedules must remain no-op/approval-required until the complete
-  allowlist gate is satisfied. The code is present, but the seed migration does
-  not enable production vendor access.
+- Live finance schedules are non-executable in the current runtime. The seed
+  migration does not enable production vendor access, and reintroducing
+  scheduled finance execution requires a future architecture change.
 - LLM event-card enrichment through `FinanceModelGateway.event_cards` is
   deferred. The shipped path uses deterministic cards and keeps the finance
   contracts' trade-directive validators authoritative.

@@ -34,10 +34,13 @@ services:
       ARTIFACT_RETENTION_DAYS: ${ARTIFACT_RETENTION_DAYS:-30}
       OLLAMA_BASE_URL: ${OLLAMA_BASE_URL:-http://host.docker.internal:11434}
       OLLAMA_MODEL: ${OLLAMA_MODEL:-qwen3-32gb:latest}
+      MODEL_TRIGGER_MODE: ${MODEL_TRIGGER_MODE:-discord_mentions_only}
       OLLAMA_MAX_CONCURRENCY: ${OLLAMA_MAX_CONCURRENCY:-1}
       OLLAMA_NUM_CTX: ${OLLAMA_NUM_CTX:-2048}
       OLLAMA_NUM_BATCH: ${OLLAMA_NUM_BATCH:-32}
       OLLAMA_TIMEOUT_SECONDS: ${OLLAMA_TIMEOUT_SECONDS:-300}
+      OLLAMA_MODEL_KEEP_ALIVE_SECONDS: ${OLLAMA_MODEL_KEEP_ALIVE_SECONDS:-300}
+      OLLAMA_STARTUP_TIMEOUT_SECONDS: ${OLLAMA_STARTUP_TIMEOUT_SECONDS:-30}
       OLLAMA_MAX_INPUT_TOKENS: ${OLLAMA_MAX_INPUT_TOKENS:-6000}
       OLLAMA_MAX_OUTPUT_TOKENS: ${OLLAMA_MAX_OUTPUT_TOKENS:-384}
       OLLAMA_REPAIR_ATTEMPTS: ${OLLAMA_REPAIR_ATTEMPTS:-1}
@@ -77,6 +80,15 @@ services:
       ACADEMIC_PLAN_HORIZON_DAYS: ${ACADEMIC_PLAN_HORIZON_DAYS:-14}
       ACADEMIC_BUFFER_RATIO: ${ACADEMIC_BUFFER_RATIO:-0.15}
       ACADEMIC_DEFAULT_BLOCK_MINUTES: ${ACADEMIC_DEFAULT_BLOCK_MINUTES:-60}
+      NOTION_MATERIAL_MAX_BLOCK_DEPTH: ${NOTION_MATERIAL_MAX_BLOCK_DEPTH:-8}
+      NOTION_MATERIAL_MAX_BLOCKS: ${NOTION_MATERIAL_MAX_BLOCKS:-1000}
+      NOTION_MATERIAL_MAX_CURSOR_PAGES: ${NOTION_MATERIAL_MAX_CURSOR_PAGES:-20}
+      ACADEMIC_MATERIAL_PDF_MAX_PAGES: ${ACADEMIC_MATERIAL_PDF_MAX_PAGES:-15}
+      ACADEMIC_MATERIAL_OCR_TIMEOUT_SECONDS: ${ACADEMIC_MATERIAL_OCR_TIMEOUT_SECONDS:-30}
+      ACADEMIC_MATERIAL_OCR_MIN_PAGE_CHARS: ${ACADEMIC_MATERIAL_OCR_MIN_PAGE_CHARS:-24}
+      ACADEMIC_MATERIAL_RETRIEVAL_LIMIT: ${ACADEMIC_MATERIAL_RETRIEVAL_LIMIT:-8}
+      ACADEMIC_MATERIAL_AGENT_MAX_TURNS: ${ACADEMIC_MATERIAL_AGENT_MAX_TURNS:-4}
+      ACADEMIC_MATERIAL_PROMPT_MAX_CHARS: ${ACADEMIC_MATERIAL_PROMPT_MAX_CHARS:-16000}
       ACADEMIC_MEMORY_ENABLED: ${ACADEMIC_MEMORY_ENABLED:-true}
       ACADEMIC_MEMORY_DEFAULT_PRACTICE_MINUTES: ${ACADEMIC_MEMORY_DEFAULT_PRACTICE_MINUTES:-30}
       ACADEMIC_MEMORY_SNOOZE_AFTER_MISSED_CHECKINS: ${ACADEMIC_MEMORY_SNOOZE_AFTER_MISSED_CHECKINS:-2}
@@ -109,10 +121,14 @@ services:
       GITHUB_PRIVATE_KEY: ${GITHUB_PRIVATE_KEY:-}
       GITHUB_WEBHOOK_SECRET: ${GITHUB_WEBHOOK_SECRET:-}
       DISCORD_BOT_TOKEN: ${DISCORD_BOT_TOKEN:-}
+      DISCORD_HOST_HANDOFF_SECRET: ${DISCORD_HOST_HANDOFF_SECRET:-}
+      DISCORD_HANDOFF_MAX_BODY_BYTES: ${DISCORD_HANDOFF_MAX_BODY_BYTES:-4096}
+      DISCORD_HANDOFF_MAX_CLOCK_SKEW_SECONDS: ${DISCORD_HANDOFF_MAX_CLOCK_SKEW_SECONDS:-60}
+      DISCORD_HANDOFF_REQUEST_TIMEOUT_SECONDS: ${DISCORD_HANDOFF_REQUEST_TIMEOUT_SECONDS:-10}
+      DISCORD_HANDOFF_RETRY_ATTEMPTS: ${DISCORD_HANDOFF_RETRY_ATTEMPTS:-3}
       DISCORD_APPLICATION_ID: ${DISCORD_APPLICATION_ID:-}
       DISCORD_ACADEMIC_CHANNEL_ID: ${DISCORD_ACADEMIC_CHANNEL_ID:-}
       DISCORD_ACADEMIC_AUTHORIZED_USER_IDS: ${DISCORD_ACADEMIC_AUTHORIZED_USER_IDS:-[]}
-      DISCORD_ACADEMIC_GATEWAY_ENABLED: ${DISCORD_ACADEMIC_GATEWAY_ENABLED:-false}
       DISCORD_ACADEMIC_MESSAGE_CONTENT_ENABLED: ${DISCORD_ACADEMIC_MESSAGE_CONTENT_ENABLED:-false}
       DISCORD_FINANCE_CHANNEL_ID: ${DISCORD_FINANCE_CHANNEL_ID:-}
       NOTION_TOKEN: ${NOTION_TOKEN:-}
@@ -143,27 +159,8 @@ services:
       start_period: 10s
     restart: unless-stopped
 
-  worker-code-review:
-    image: lifeagent-app:local
-    build:
-      context: .
-      dockerfile: infra/Dockerfile
-    command: ["/usr/local/bin/lifeagent-idle-worker", "code_review"]
-    environment: *app-environment
-    volumes:
-      - artifacts:/var/lib/lifeagent/artifacts
-    extra_hosts:
-      - host.docker.internal:host-gateway
-    depends_on:
-      api:
-        condition: service_healthy
-    restart: unless-stopped
-
   worker-academic-planner:
     image: lifeagent-app:local
-    build:
-      context: .
-      dockerfile: infra/Dockerfile
     command: ["/usr/local/bin/lifeagent-idle-worker", "academic_planner"]
     environment: *app-environment
     volumes:
@@ -171,23 +168,7 @@ services:
     extra_hosts:
       - host.docker.internal:host-gateway
     depends_on:
-      api:
-        condition: service_healthy
-    restart: unless-stopped
-
-  worker-finance:
-    image: lifeagent-app:local
-    build:
-      context: .
-      dockerfile: infra/Dockerfile
-    command: ["/usr/local/bin/lifeagent-idle-worker", "finance"]
-    environment: *app-environment
-    volumes:
-      - artifacts:/var/lib/lifeagent/artifacts
-    extra_hosts:
-      - host.docker.internal:host-gateway
-    depends_on:
-      api:
+      postgres:
         condition: service_healthy
     restart: unless-stopped
 

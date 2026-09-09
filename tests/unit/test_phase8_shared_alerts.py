@@ -126,7 +126,11 @@ async def test_shared_services_alert_hook_skips_healthy_state(engine: Engine) ->
 
     result = await tasks._maybe_send_shared_services_alert(
         database=SimpleNamespace(engine=engine),
-        settings=Settings(discord_bot_token="discord-secret", discord_target_channels=[CHANNEL_ID]),
+        settings=Settings(
+            _env_file=None,
+            discord_bot_token="discord-secret",
+            discord_target_channels=[CHANNEL_ID],
+        ),
         health=_healthy_health(),
         checks=(),
         alert_sender=fail_if_called,
@@ -155,7 +159,11 @@ async def test_shared_services_alert_hook_uses_injected_sender(engine: Engine) -
 
     result = await tasks._maybe_send_shared_services_alert(
         database=SimpleNamespace(engine=engine),
-        settings=Settings(discord_bot_token="discord-secret", discord_target_channels=[CHANNEL_ID]),
+        settings=Settings(
+            _env_file=None,
+            discord_bot_token="discord-secret",
+            discord_target_channels=[CHANNEL_ID],
+        ),
         health=_failed_health(),
         checks=(
             HealthCheck(

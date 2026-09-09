@@ -426,7 +426,7 @@ async def test_sigterm_contract_and_delivery_intent_retry_are_idempotent(
             )
         assert len(recorder.requests) == 1
         body = json.loads(recorder.requests[0].content)
-        assert body["nonce"] == str(delivery.id)
+        assert body["nonce"] == delivery.id.hex[:25]
         assert body["enforce_nonce"] is True
         return {"status": "succeeded", "delivered": True, "delivery_count": 1}
 
@@ -492,7 +492,7 @@ async def _run_shared_health(
     engine = create_engine(f"sqlite+pysqlite:///{tmp_path / uuid.uuid4().hex}.db")
     HealthCheck.__table__.create(engine)
     monkeypatch.setattr(tasks, "_database", SimpleNamespace(engine=engine))
-    monkeypatch.setattr(tasks, "_settings", Settings())
+    monkeypatch.setattr(tasks, "_settings", Settings(_env_file=None))
     monkeypatch.setattr(tasks, "check_database", lambda _database: database_checks)
     monkeypatch.setattr(
         tasks,
@@ -687,7 +687,7 @@ async def test_discord_failure_alert_policy_allows_only_non_healthy_states() -> 
     assert receipt.external_id == "123456789012345678"
     assert len(recorder.requests) == 1
     body = json.loads(recorder.requests[0].content)
-    assert body["nonce"] == str(alert.delivery_id)
+    assert body["nonce"] == alert.delivery_id.hex[:25]
     assert body["enforce_nonce"] is True
     assert body["allowed_mentions"] == {"parse": []}
     assert "never-print-this-token" not in recorder.requests[0].content.decode()

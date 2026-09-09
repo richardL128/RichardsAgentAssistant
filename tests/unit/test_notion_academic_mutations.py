@@ -85,6 +85,79 @@ async def test_create_assessment_page_posts_data_source_parent_with_title_and_da
 
 
 @pytest.mark.asyncio
+async def test_create_assessment_page_posts_optional_date_end_for_study_range() -> None:
+    requests: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        return httpx.Response(200, json=_receipt())
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+        connector = NotionConnector(token="secret", courses_database_id="courses-db", client=client)
+        await connector.create_assessment_page(
+            proposal_id="proposal-1",
+            data_source_id="assessments-source-1",
+            title_property_id="title-prop",
+            date_property_id="date-prop",
+            title="Studying Block - Race conditions",
+            due=datetime(2026, 9, 10, 23, 0, tzinfo=UTC),
+            ends_at=datetime(2026, 9, 10, 23, 45, tzinfo=UTC),
+        )
+
+    assert json.loads(requests[0].content)["properties"]["date-prop"] == {
+        "date": {
+            "start": "2026-09-10T23:00:00Z",
+            "end": "2026-09-10T23:45:00Z",
+        }
+    }
+
+
+@pytest.mark.parametrize(
+    ("due", "ends_at"),
+    [
+        (
+            datetime(2026, 9, 10, 23, 0, tzinfo=UTC),
+            datetime(2026, 9, 10, 23, 0, tzinfo=UTC),
+        ),
+        (
+            datetime(2026, 9, 10, 23, 0, tzinfo=UTC),
+            datetime(2026, 9, 10, 23, 4, tzinfo=UTC),
+        ),
+        (
+            datetime(2026, 9, 10, 23, 0, tzinfo=UTC),
+            datetime(2026, 9, 11, 3, 1, tzinfo=UTC),
+        ),
+        ("2026-09-10", "2026-09-11"),
+    ],
+)
+@pytest.mark.asyncio
+async def test_create_assessment_page_rejects_invalid_date_ranges_without_request(
+    due: datetime | str,
+    ends_at: datetime | str,
+) -> None:
+    requests: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        return httpx.Response(200, json=_receipt())
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+        connector = NotionConnector(token="secret", courses_database_id="courses-db", client=client)
+        with pytest.raises(LifeAgentError):
+            await connector.create_assessment_page(
+                proposal_id="proposal-1",
+                data_source_id="assessments-source-1",
+                title_property_id="title-prop",
+                date_property_id="date-prop",
+                title="Studying Block - Race conditions",
+                due=due,
+                ends_at=ends_at,
+            )
+
+    assert requests == []
+
+
+@pytest.mark.asyncio
 async def test_guarded_update_patches_title_date_only_after_precondition() -> None:
     requests: list[httpx.Request] = []
 

@@ -146,9 +146,7 @@ def _document(
                 "title": clean_text(title)[:500],
                 "url": url,
                 "issuer": options.issuer,
-                "feed_endpoint": (
-                    options.endpoint_url if options.issuer is not None else None
-                ),
+                "feed_endpoint": (options.endpoint_url if options.issuer is not None else None),
                 "published_at": published_at,
                 "retrieved_at": retrieved_at,
                 "classification": options.classification,

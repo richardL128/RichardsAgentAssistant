@@ -1,5 +1,9 @@
 # Phase 0 — repository and local platform
 
+> Historical implementation record. The current replacement architecture runs
+> only `postgres` and `api`; the named model workers recorded below are no
+> longer configured or executable runtime services.
+
 ## Contract
 
 Phase 0 establishes the shared Python 3.12 platform only: reproducible `uv`

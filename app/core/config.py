@@ -48,10 +48,13 @@ class Settings(BaseSettings):
 
     ollama_base_url: AnyHttpUrl = AnyHttpUrl("http://host.docker.internal:11434")
     ollama_model: str = "qwen3-32gb:latest"
+    model_trigger_mode: Literal["discord_mentions_only"] = "discord_mentions_only"
     ollama_max_concurrency: Annotated[int, Field(gt=0, le=128)] = 1
     ollama_num_ctx: Annotated[int, Field(gt=0)] = 2048
     ollama_num_batch: Annotated[int, Field(ge=32, le=512)] = 32
     ollama_timeout_seconds: Annotated[float, Field(gt=0, le=1800)] = 300.0
+    ollama_model_keep_alive_seconds: Annotated[int, Field(gt=0, le=3600)] = 300
+    ollama_startup_timeout_seconds: Annotated[float, Field(gt=0, le=300)] = 30.0
     ollama_max_input_tokens: Annotated[int, Field(gt=0)] = 6000
     ollama_max_output_tokens: Annotated[int, Field(gt=0)] = 384
     ollama_repair_attempts: Annotated[int, Field(ge=0, le=1)] = 1
@@ -73,6 +76,7 @@ class Settings(BaseSettings):
     github_webhook_secret: SecretValue = None
     discord_bot_token: SecretValue = None
     discord_webhook_secret: SecretValue = None
+    discord_host_handoff_secret: SecretValue = None
     notion_token: SecretValue = None
     ops_console_username: SecretValue = None
     ops_console_password: SecretValue = None
@@ -105,8 +109,11 @@ class Settings(BaseSettings):
     discord_finance_channel_id: str | None = None
     discord_application_id: str | None = None
     discord_academic_authorized_user_ids: list[int] = Field(default_factory=lambda: list[int]())
-    discord_academic_gateway_enabled: bool = False
     discord_academic_message_content_enabled: bool = False
+    discord_handoff_max_body_bytes: Annotated[int, Field(gt=0, le=65_536)] = 4_096
+    discord_handoff_max_clock_skew_seconds: Annotated[int, Field(gt=0, le=300)] = 60
+    discord_handoff_request_timeout_seconds: Annotated[float, Field(gt=0, le=30)] = 10.0
+    discord_handoff_retry_attempts: Annotated[int, Field(gt=0, le=5)] = 3
     github_webhook_max_body_bytes: Annotated[int, Field(gt=0, le=10_485_760)] = 1_048_576
     git_clone_timeout_seconds: Annotated[float, Field(gt=0, le=600)] = 60.0
     code_command_timeout_seconds: Annotated[float, Field(gt=0, le=1800)] = 120.0
@@ -123,6 +130,15 @@ class Settings(BaseSettings):
     github_discovery_page_size: Annotated[int, Field(gt=0, le=100)] = 50
     github_min_call_interval_seconds: Annotated[float, Field(ge=0, le=60)] = 2.0
     notion_attachment_max_bytes: Annotated[int, Field(gt=0, le=104_857_600)] = 25_165_824
+    notion_material_max_block_depth: Annotated[int, Field(gt=0, le=16)] = 8
+    notion_material_max_blocks: Annotated[int, Field(gt=0, le=5_000)] = 1_000
+    notion_material_max_cursor_pages: Annotated[int, Field(gt=0, le=100)] = 20
+    academic_material_pdf_max_pages: Annotated[int, Field(gt=0, le=15)] = 15
+    academic_material_ocr_timeout_seconds: Annotated[float, Field(gt=0, le=120)] = 30.0
+    academic_material_ocr_min_page_chars: Annotated[int, Field(ge=0, le=1_000)] = 24
+    academic_material_retrieval_limit: Annotated[int, Field(gt=0, le=8)] = 8
+    academic_material_agent_max_turns: Annotated[int, Field(gt=0, le=4)] = 4
+    academic_material_prompt_max_chars: Annotated[int, Field(ge=1_000, le=16_000)] = 16_000
     academic_plan_horizon_days: Annotated[int, Field(ge=7, le=14)] = 14
     academic_buffer_ratio: Annotated[float, Field(ge=0.05, le=0.5)] = 0.15
     academic_default_block_minutes: Annotated[int, Field(ge=15, le=240)] = 60
@@ -149,6 +165,7 @@ class Settings(BaseSettings):
         "github_webhook_secret",
         "discord_bot_token",
         "discord_webhook_secret",
+        "discord_host_handoff_secret",
         "notion_token",
         "ops_console_username",
         "ops_console_password",
@@ -328,11 +345,14 @@ class Settings(BaseSettings):
             "artifact_root": str(self.artifact_root),
             "ollama_base_url": self._safe_url(str(self.ollama_base_url)),
             "ollama_model": self.ollama_model,
+            "model_trigger_mode": self.model_trigger_mode,
             "ollama_max_concurrency": self.ollama_max_concurrency,
             "ollama_num_ctx": self.ollama_num_ctx,
             "ollama_num_batch": self.ollama_num_batch,
             "ollama_max_input_tokens": self.ollama_max_input_tokens,
             "ollama_max_output_tokens": self.ollama_max_output_tokens,
+            "ollama_model_keep_alive_seconds": self.ollama_model_keep_alive_seconds,
+            "ollama_startup_timeout_seconds": self.ollama_startup_timeout_seconds,
             "ollama_repair_attempts": self.ollama_repair_attempts,
             "ollama_seed": self.ollama_seed,
             "ollama_reasoning": self.ollama_reasoning,
@@ -364,10 +384,16 @@ class Settings(BaseSettings):
             "discord_academic_authorized_user_count": len(
                 self.discord_academic_authorized_user_ids
             ),
-            "discord_academic_gateway_enabled": self.discord_academic_gateway_enabled,
             "discord_academic_message_content_enabled": (
                 self.discord_academic_message_content_enabled
             ),
+            "discord_host_handoff_configured": self.discord_host_handoff_secret is not None,
+            "discord_handoff_max_body_bytes": self.discord_handoff_max_body_bytes,
+            "discord_handoff_max_clock_skew_seconds": (self.discord_handoff_max_clock_skew_seconds),
+            "discord_handoff_request_timeout_seconds": (
+                self.discord_handoff_request_timeout_seconds
+            ),
+            "discord_handoff_retry_attempts": self.discord_handoff_retry_attempts,
             "ops_console_auth_configured": (
                 self.ops_console_username is not None and self.ops_console_password is not None
             ),
@@ -432,6 +458,15 @@ class Settings(BaseSettings):
             "github_discovery_page_size": self.github_discovery_page_size,
             "github_min_call_interval_seconds": self.github_min_call_interval_seconds,
             "notion_attachment_max_bytes": self.notion_attachment_max_bytes,
+            "notion_material_max_block_depth": self.notion_material_max_block_depth,
+            "notion_material_max_blocks": self.notion_material_max_blocks,
+            "notion_material_max_cursor_pages": self.notion_material_max_cursor_pages,
+            "academic_material_pdf_max_pages": self.academic_material_pdf_max_pages,
+            "academic_material_ocr_timeout_seconds": (self.academic_material_ocr_timeout_seconds),
+            "academic_material_ocr_min_page_chars": (self.academic_material_ocr_min_page_chars),
+            "academic_material_retrieval_limit": self.academic_material_retrieval_limit,
+            "academic_material_agent_max_turns": self.academic_material_agent_max_turns,
+            "academic_material_prompt_max_chars": self.academic_material_prompt_max_chars,
             "academic_plan_horizon_days": self.academic_plan_horizon_days,
             "academic_buffer_ratio": self.academic_buffer_ratio,
             "academic_default_block_minutes": self.academic_default_block_minutes,
