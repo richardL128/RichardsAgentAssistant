@@ -21,8 +21,13 @@ _JSON_EMPTY = sa.text("'{}'")
 
 
 def upgrade() -> None:
-    if op.get_bind().dialect.name == "postgresql":
-        op.execute("CREATE EXTENSION IF NOT EXISTS vector")
+    bind = op.get_bind()
+    if bind.dialect.name == "postgresql":
+        vector_installed = bind.execute(
+            sa.text("SELECT 1 FROM pg_extension WHERE extname = 'vector'")
+        ).scalar_one_or_none()
+        if vector_installed is None:
+            op.execute("CREATE EXTENSION vector")
     op.create_table(
         "academic_discourse_sessions",
         sa.Column("id", _UUID, primary_key=True),
@@ -120,7 +125,9 @@ def upgrade() -> None:
         sa.CheckConstraint("reinforcement_count >= 1", name="reinforcement_count_positive"),
         sa.CheckConstraint("missed_review_count >= 0", name="missed_review_count_nonnegative"),
         sa.CheckConstraint("reminder_count >= 0", name="reminder_count_nonnegative"),
-        sa.CheckConstraint("practice_minutes IS NULL OR practice_minutes > 0", name="practice_minutes_positive"),
+        sa.CheckConstraint(
+            "practice_minutes IS NULL OR practice_minutes > 0", name="practice_minutes_positive"
+        ),
         sa.UniqueConstraint("source_external_event_id", name="uq_academic_focus_source_event"),
     )
     op.create_index(

@@ -4,11 +4,12 @@ from __future__ import annotations
 
 import asyncio
 import re
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
-from datetime import date
-from typing import Any, Literal, cast
+from datetime import UTC, date, datetime
+from typing import TYPE_CHECKING, Any, Literal, cast
 from uuid import UUID
+from zoneinfo import ZoneInfo
 
 import httpx
 from pydantic import BaseModel, ConfigDict, Field, SecretStr, field_validator
@@ -31,8 +32,42 @@ from app.db.models import Delivery, DeliveryStatus, RunStatus
 from app.db.repositories import DeliveryRepository, RunRepository, utc_now
 from app.health.checks import HealthState
 
+if TYPE_CHECKING:
+    from app.agents.academic_planner.contracts import MorningBriefing
+
 _DISCORD_CONTENT_LIMIT = 2_000
 _DISCORD_NONCE_LIMIT = 25
+_DISCORD_ID_PATTERN = re.compile(r"^[0-9]{5,24}$")
+_ACADEMIC_TIMEZONE_NAME = "America/Toronto"
+_ACADEMIC_TIMEZONE = ZoneInfo(_ACADEMIC_TIMEZONE_NAME)
+
+DiscordAcademicProgressPhase = Literal[
+    "runtime_waking",
+    "model_turn",
+    "course_lookup",
+    "assessment_lookup",
+    "proposal_validation",
+    "proposal_ready",
+    "completed",
+    "clarification_needed",
+    "failed",
+]
+_TERMINAL_PROGRESS_PHASES = frozenset(
+    {"proposal_ready", "completed", "clarification_needed", "failed"}
+)
+_ACADEMIC_PROGRESS_PHASES = frozenset(
+    {
+        "runtime_waking",
+        "model_turn",
+        "course_lookup",
+        "assessment_lookup",
+        "proposal_validation",
+        "proposal_ready",
+        "completed",
+        "clarification_needed",
+        "failed",
+    }
+)
 
 
 def _discord_nonce(delivery_id: UUID) -> str:
@@ -75,6 +110,77 @@ class DiscordDeliveryReceipt(BaseModel):
 
     external_id: str
     permalink: str
+
+
+class DiscordFetchedAuthor(BaseModel):
+    """Bounded Discord author identity returned by a message refetch."""
+
+    model_config = ConfigDict(extra="ignore", frozen=True)
+
+    id: str = Field(pattern=r"^[0-9]{5,24}$")
+    bot: bool = False
+
+
+class DiscordFetchedMessage(BaseModel):
+    """Private refetched message; content stays secret in representations."""
+
+    model_config = ConfigDict(extra="ignore", frozen=True)
+
+    id: str = Field(pattern=r"^[0-9]{5,24}$")
+    channel_id: str = Field(pattern=r"^[0-9]{5,24}$")
+    author: DiscordFetchedAuthor
+    timestamp: datetime
+    content: SecretStr = Field(repr=False)
+    mentions: tuple[DiscordFetchedAuthor, ...] = Field(default=(), max_length=20)
+
+    @field_validator("timestamp")
+    @classmethod
+    def timestamp_is_aware(cls, value: datetime) -> datetime:
+        if value.tzinfo is None or value.utcoffset() is None:
+            raise ValueError("Discord message timestamp must be timezone-aware")
+        return value.astimezone(UTC)
+
+    @field_validator("content")
+    @classmethod
+    def content_is_bounded(cls, value: SecretStr) -> SecretStr:
+        if not value.get_secret_value() or len(value.get_secret_value()) > _DISCORD_CONTENT_LIMIT:
+            raise ValueError("Discord message content must be present and bounded")
+        return value
+
+
+class DiscordAcademicProgressEvent(BaseModel):
+    """Allowlisted progress metadata rendered without private request details."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    phase: DiscordAcademicProgressPhase
+    attempt_number: int = Field(default=1, ge=1, le=3)
+    attempt_limit: int = Field(default=3, ge=1, le=3)
+    model_turn_number: int | None = Field(default=None, ge=1, le=10)
+    model_turn_limit: int | None = Field(default=None, ge=1, le=10)
+    lookup_kind: Literal["course", "assessment"] | None = None
+    result_count: int | None = Field(default=None, ge=0, le=20)
+    terminal: bool = False
+
+    def model_post_init(self, __context: object) -> None:
+        if self.attempt_number > self.attempt_limit:
+            raise ValueError("attempt_number must not exceed attempt_limit")
+        if (
+            self.model_turn_number is not None
+            and self.model_turn_limit is not None
+            and self.model_turn_number > self.model_turn_limit
+        ):
+            raise ValueError("model_turn_number must not exceed model_turn_limit")
+
+
+class DiscordAcademicProgressHandle(BaseModel):
+    """Validated identity for the single editable Discord progress message."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True, arbitrary_types_allowed=True)
+
+    delivery: Delivery
+    channel_id: str = Field(pattern=r"^[0-9]{5,24}$")
+    message_id: str = Field(pattern=r"^[0-9]{5,24}$")
 
 
 class DiscordFailureAlertAdapter:
@@ -413,17 +519,30 @@ class AcademicClarificationMessage(BaseModel):
     current_title: str = Field(min_length=1, max_length=500)
     quiz_title_preview: str = Field(min_length=1, max_length=500)
     assignment_title_preview: str = Field(min_length=1, max_length=500)
+    tutorial_title_preview: str = Field(min_length=1, max_length=500)
+    lab_title_preview: str = Field(min_length=1, max_length=500)
+    studying_block_title_preview: str = Field(min_length=1, max_length=500)
 
     def message_content(self) -> str:
-        content = (
-            "Please classify this Notion assessment before any title change.\n"
-            f"Current title: {self.current_title}\n"
-            f"Quiz preview: {self.quiz_title_preview}\n"
-            f"Assignment preview: {self.assignment_title_preview}"
-        )
-        return _bounded_discord_content(content)
+        lines = [
+            "Please classify this Notion assessment before any title change.",
+            f"Current title: {self.current_title}",
+            f"Quiz preview: {self.quiz_title_preview}",
+            f"Assignment preview: {self.assignment_title_preview}",
+            f"Tutorial preview: {self.tutorial_title_preview}",
+            f"Lab preview: {self.lab_title_preview}",
+            f"Studying Block preview: {self.studying_block_title_preview}",
+        ]
+        return _bounded_discord_content("\n".join(lines))
 
     def components(self) -> list[dict[str, object]]:
+        primary_buttons = [
+            ("Quiz", "quiz"),
+            ("Assignment", "assignment"),
+            ("Tutorial", "tutorial"),
+            ("Lab", "lab"),
+            ("Studying Block", "studying_block"),
+        ]
         return [
             {
                 "type": 1,
@@ -431,15 +550,15 @@ class AcademicClarificationMessage(BaseModel):
                     {
                         "type": 2,
                         "style": 1,
-                        "label": "Quiz",
-                        "custom_id": f"academic_clarify:{self.clarification_id}:quiz",
-                    },
-                    {
-                        "type": 2,
-                        "style": 1,
-                        "label": "Assignment",
-                        "custom_id": f"academic_clarify:{self.clarification_id}:assignment",
-                    },
+                        "label": label,
+                        "custom_id": f"academic_clarify:{self.clarification_id}:{action}",
+                    }
+                    for label, action in primary_buttons
+                ],
+            },
+            {
+                "type": 1,
+                "components": [
                     {
                         "type": 2,
                         "style": 2,
@@ -447,7 +566,7 @@ class AcademicClarificationMessage(BaseModel):
                         "custom_id": f"academic_clarify:{self.clarification_id}:ignore",
                     },
                 ],
-            }
+            },
         ]
 
 
@@ -498,6 +617,77 @@ class DiscordAcademicPlannerAdapter:
         self._allowed_channel_ids = frozenset(allowed_channel_ids)
         self._base_url = base_url.rstrip("/")
         self._client = client
+
+    async def fetch_message(
+        self,
+        *,
+        channel_id: str,
+        message_id: str,
+    ) -> DiscordFetchedMessage:
+        """Refetch one referenced message through the configured bot credential."""
+
+        if channel_id not in self._allowed_channel_ids:
+            raise ValueError("Discord academic fetch target is not allowlisted")
+        if _DISCORD_ID_PATTERN.fullmatch(message_id) is None:
+            raise ValueError("Discord academic fetch message id is invalid")
+        owns_client = self._client is None
+        client = self._client or httpx.AsyncClient(
+            base_url=self._base_url,
+            timeout=httpx.Timeout(10.0),
+        )
+        try:
+            response = await client.get(
+                f"/channels/{channel_id}/messages/{message_id}",
+                headers={"Authorization": f"Bot {self._token.get_secret_value()}"},
+            )
+            try:
+                response.raise_for_status()
+            except httpx.HTTPStatusError as exc:
+                if exc.response.status_code in {401, 403}:
+                    raise authorization_error(
+                        "Discord academic message fetch authorization is invalid"
+                    ) from None
+                if exc.response.status_code == 429 or exc.response.status_code >= 500:
+                    raise transient_error(
+                        ErrorCode.CONNECTOR_TRANSIENT,
+                        "Discord academic message fetch is temporarily unavailable",
+                    ) from None
+                raise permanent_error(
+                    ErrorCode.INPUT_INVALID,
+                    "Discord academic message reference is unavailable",
+                ) from None
+            return DiscordFetchedMessage.model_validate(response.json())
+        except httpx.TransportError:
+            raise transient_error(
+                ErrorCode.CONNECTOR_TRANSIENT,
+                "Discord academic message fetch transport is unavailable",
+            ) from None
+        except (TypeError, ValueError):
+            raise permanent_error(
+                ErrorCode.INPUT_INVALID,
+                "Discord academic message reference is invalid",
+            ) from None
+        finally:
+            if owns_client:
+                await client.aclose()
+
+    async def validate_wake_acknowledgement(
+        self,
+        *,
+        channel_id: str,
+        message_id: str,
+        bot_user_id: str,
+    ) -> DiscordFetchedMessage:
+        """Verify that an adoptable acknowledgement belongs to this bot/channel."""
+
+        message = await self.fetch_message(channel_id=channel_id, message_id=message_id)
+        if (
+            message.channel_id != channel_id
+            or message.author.id != bot_user_id
+            or not message.author.bot
+        ):
+            raise ValueError("Discord wake acknowledgement identity is invalid")
+        return message
 
     async def send(self, message: AcademicDiscordMessage) -> DiscordDeliveryReceipt:
         if message.channel_id not in self._allowed_channel_ids:
@@ -604,6 +794,108 @@ class DiscordAcademicPlannerAdapter:
             if owns_client:
                 await client.aclose()
 
+    async def edit_clarification(
+        self,
+        *,
+        channel_id: str,
+        message_id: str,
+        content: str,
+    ) -> DiscordDeliveryReceipt:
+        if channel_id not in self._allowed_channel_ids:
+            raise ValueError("Discord academic clarification target is not allowlisted")
+        if not message_id.isdigit() or not 5 <= len(message_id) <= 24:
+            raise ValueError("Discord academic clarification message id is invalid")
+        if not content:
+            raise ValueError("Discord academic clarification content is required")
+        owns_client = self._client is None
+        client = self._client or httpx.AsyncClient(
+            base_url=self._base_url,
+            timeout=httpx.Timeout(10.0),
+        )
+        try:
+            response = await client.patch(
+                f"/channels/{channel_id}/messages/{message_id}",
+                headers={"Authorization": f"Bot {self._token.get_secret_value()}"},
+                json={
+                    "content": _bounded_discord_content(content),
+                    "allowed_mentions": {"parse": []},
+                    "components": [],
+                },
+            )
+            return _academic_receipt_from_response(
+                response,
+                channel_id=channel_id,
+                authorization_message=(
+                    "Discord academic clarification edit authorization is invalid"
+                ),
+                transient_message=(
+                    "Discord academic clarification edit endpoint is temporarily unavailable"
+                ),
+                rejected_message="Discord rejected the academic clarification edit request",
+                invalid_receipt_message=(
+                    "Discord returned an invalid academic clarification edit receipt"
+                ),
+            )
+        except httpx.TransportError:
+            raise transient_error(
+                ErrorCode.CONNECTOR_TRANSIENT,
+                "Discord academic clarification edit transport is unavailable",
+            ) from None
+        finally:
+            if owns_client:
+                await client.aclose()
+
+    async def edit_academic_message(
+        self,
+        *,
+        channel_id: str,
+        message_id: str,
+        content: str,
+    ) -> DiscordDeliveryReceipt:
+        """Safely edit one non-interactive academic Discord message."""
+
+        if channel_id not in self._allowed_channel_ids:
+            raise ValueError("Discord academic message edit target is not allowlisted")
+        if _DISCORD_ID_PATTERN.fullmatch(message_id) is None:
+            raise ValueError("Discord academic message edit message id is invalid")
+        if not content:
+            raise ValueError("Discord academic message edit content is required")
+        owns_client = self._client is None
+        client = self._client or httpx.AsyncClient(
+            base_url=self._base_url,
+            timeout=httpx.Timeout(10.0),
+        )
+        try:
+            response = await client.patch(
+                f"/channels/{channel_id}/messages/{message_id}",
+                headers={"Authorization": f"Bot {self._token.get_secret_value()}"},
+                json={
+                    "content": _bounded_discord_content(content),
+                    "allowed_mentions": {"parse": []},
+                    "components": [],
+                },
+            )
+            return _academic_receipt_from_response(
+                response,
+                channel_id=channel_id,
+                authorization_message="Discord academic message edit authorization is invalid",
+                transient_message=(
+                    "Discord academic message edit endpoint is temporarily unavailable"
+                ),
+                rejected_message="Discord rejected the academic message edit request",
+                invalid_receipt_message=(
+                    "Discord returned an invalid academic message edit receipt"
+                ),
+            )
+        except httpx.TransportError:
+            raise transient_error(
+                ErrorCode.CONNECTOR_TRANSIENT,
+                "Discord academic message edit transport is unavailable",
+            ) from None
+        finally:
+            if owns_client:
+                await client.aclose()
+
     async def send_setup_reminder(
         self,
         message: AcademicSetupReminderMessage,
@@ -675,26 +967,15 @@ class DiscordAcademicPlannerDelivery:
             adapter=self._adapter,
         )
 
-    async def send_morning_plan(self, plan: Any, *, idempotency_key: str) -> Delivery:
-        blocks = list(getattr(plan, "blocks", ()))
-        practice = [block for block in blocks if getattr(block, "block_kind", None) == "practice"]
-        assessments = [block for block in blocks if block not in practice][:3]
-        lines = ["Today's academic plan:"]
-        if practice:
-            lines.append("Separate practice blocks:")
-            lines.extend(_academic_block_line(block) for block in practice)
-        if assessments:
-            lines.append("Highest-value assessment blocks:")
-            lines.extend(_academic_block_line(block) for block in assessments)
-        deferred_practice = tuple(getattr(plan, "deferred_practice_focus_ids", ()))
-        if deferred_practice:
-            lines.append(
-                f"Could not fit {len(deferred_practice)} required practice block(s) before "
-                "their review time; add availability so they can be scheduled."
-            )
-        if not practice and not assessments:
-            lines.append("- No schedulable blocks were found.")
-        return await self._send("\n".join(lines), idempotency_key)
+    async def send_morning_plan(
+        self,
+        briefing: MorningBriefing,
+        *,
+        idempotency_key: str,
+    ) -> Delivery:
+        """Deliver only the validated model-written morning briefing text."""
+
+        return await self._send(_bounded_discord_content(briefing.message_text), idempotency_key)
 
     async def send_checkin(self, *, plan: Any | None, idempotency_key: str) -> Delivery:
         content = (
@@ -752,13 +1033,6 @@ class DiscordAcademicPlannerDelivery:
         return await self._send(content, idempotency_key)
 
 
-def _academic_block_line(block: Any) -> str:
-    return (
-        f"- {block.title} ({block.start_at.isoformat()}-{block.end_at.isoformat()}): "
-        f"{block.rationale}"
-    )
-
-
 class DiscordAcademicResponseDelivery:
     """Create one durable run and delivery intent per inbound academic response."""
 
@@ -772,6 +1046,170 @@ class DiscordAcademicResponseDelivery:
         self._engine = engine
         self._channel_id = channel_id
         self._adapter = adapter
+
+    def create_progress_reporter(
+        self,
+        *,
+        root_event_id: str,
+        existing_message_id: str | None = None,
+        attempt_number: int = 1,
+        attempt_limit: int = 3,
+        edit_every_n_updates: int = 1,
+    ) -> DiscordAcademicProgressReporter:
+        return DiscordAcademicProgressReporter(
+            delivery=self,
+            root_event_id=root_event_id,
+            existing_message_id=existing_message_id,
+            attempt_number=attempt_number,
+            attempt_limit=attempt_limit,
+            edit_every_n_updates=edit_every_n_updates,
+        )
+
+    async def adopt_progress(
+        self,
+        *,
+        root_event_id: str,
+        message_id: str,
+    ) -> DiscordAcademicProgressHandle:
+        """Persist and adopt a host-created, already-validated wake message."""
+
+        if _DISCORD_ID_PATTERN.fullmatch(root_event_id) is None:
+            raise ValueError("Discord academic progress root event id is invalid")
+        if _DISCORD_ID_PATTERN.fullmatch(message_id) is None:
+            raise ValueError("Discord academic progress message id is invalid")
+        idempotency_key = f"academic-discord-message:{root_event_id}:progress:v1"
+        run_id = await asyncio.to_thread(
+            _academic_response_run_id,
+            self._engine,
+            idempotency_key,
+        )
+        intent = await asyncio.to_thread(
+            _open_review_intent,
+            self._engine,
+            run_id=run_id,
+            target=self._channel_id,
+            key=idempotency_key,
+        )
+        if intent.already_delivered:
+            persisted_message_id = _message_id_from_delivery(intent.delivery)
+            if persisted_message_id != message_id:
+                raise ValueError("Discord academic progress adoption receipt does not match")
+            return DiscordAcademicProgressHandle(
+                delivery=intent.delivery,
+                channel_id=self._channel_id,
+                message_id=message_id,
+            )
+        delivery = await asyncio.to_thread(
+            _record_review_attempt,
+            self._engine,
+            delivery_id=intent.delivery.id,
+            status=DeliveryStatus.SENT,
+            external_url=(f"https://discord.com/channels/@me/{self._channel_id}/{message_id}"),
+            error_code=None,
+        )
+        await asyncio.to_thread(
+            _finish_academic_response_run,
+            self._engine,
+            run_id,
+            RunStatus.SUCCEEDED,
+            None,
+        )
+        return DiscordAcademicProgressHandle(
+            delivery=delivery,
+            channel_id=self._channel_id,
+            message_id=message_id,
+        )
+
+    async def start_progress(
+        self,
+        *,
+        root_event_id: str,
+        content: str,
+    ) -> DiscordAcademicProgressHandle:
+        if _DISCORD_ID_PATTERN.fullmatch(root_event_id) is None:
+            raise ValueError("Discord academic progress root event id is invalid")
+        idempotency_key = f"academic-discord-message:{root_event_id}:progress:v1"
+        run_id = await asyncio.to_thread(
+            _academic_response_run_id,
+            self._engine,
+            idempotency_key,
+        )
+        intent = await asyncio.to_thread(
+            _open_review_intent,
+            self._engine,
+            run_id=run_id,
+            target=self._channel_id,
+            key=idempotency_key,
+        )
+        if intent.already_delivered:
+            message_id = _message_id_from_delivery(intent.delivery)
+            if message_id is None:
+                raise ValueError("Discord academic progress receipt is missing a message id")
+            return DiscordAcademicProgressHandle(
+                delivery=intent.delivery,
+                channel_id=self._channel_id,
+                message_id=message_id,
+            )
+        message = AcademicDiscordMessage(
+            delivery_id=intent.delivery.id,
+            channel_id=self._channel_id,
+            content=_bounded_discord_content(content),
+        )
+        try:
+            receipt = await self._adapter.send(message)
+        except LifeAgentError as exc:
+            await asyncio.to_thread(
+                _record_review_attempt,
+                self._engine,
+                delivery_id=intent.delivery.id,
+                status=DeliveryStatus.UNCERTAIN
+                if exc.record.category is ErrorCategory.TRANSIENT
+                else DeliveryStatus.FAILED,
+                external_url=None,
+                error_code=exc.record.code.value,
+            )
+            await asyncio.to_thread(
+                _finish_academic_response_run,
+                self._engine,
+                run_id,
+                RunStatus.ATTENTION
+                if exc.record.category is ErrorCategory.TRANSIENT
+                else RunStatus.FAILED,
+                exc.record.code.value,
+            )
+            raise
+        delivery = await asyncio.to_thread(
+            _record_review_attempt,
+            self._engine,
+            delivery_id=intent.delivery.id,
+            status=DeliveryStatus.SENT,
+            external_url=receipt.permalink,
+            error_code=None,
+        )
+        await asyncio.to_thread(
+            _finish_academic_response_run,
+            self._engine,
+            run_id,
+            RunStatus.SUCCEEDED,
+            None,
+        )
+        return DiscordAcademicProgressHandle(
+            delivery=delivery,
+            channel_id=self._channel_id,
+            message_id=receipt.external_id,
+        )
+
+    async def edit_progress(
+        self,
+        handle: DiscordAcademicProgressHandle,
+        *,
+        content: str,
+    ) -> DiscordDeliveryReceipt:
+        return await self._adapter.edit_academic_message(
+            channel_id=handle.channel_id,
+            message_id=handle.message_id,
+            content=content,
+        )
 
     async def send_confirmation(self, proposal: Any, *, idempotency_key: str) -> Delivery:
         return await self.send_response(
@@ -815,6 +1253,326 @@ class DiscordAcademicResponseDelivery:
         return delivery
 
 
+class DiscordAcademicProgressReporter:
+    """Best-effort semantic progress stream for one academic Discord message."""
+
+    def __init__(
+        self,
+        *,
+        delivery: DiscordAcademicResponseDelivery,
+        root_event_id: str,
+        existing_message_id: str | None = None,
+        attempt_number: int = 1,
+        attempt_limit: int = 3,
+        edit_every_n_updates: int = 1,
+    ) -> None:
+        if edit_every_n_updates < 1:
+            raise ValueError("edit_every_n_updates must be positive")
+        self._delivery = delivery
+        self._root_event_id = root_event_id
+        self._existing_message_id = existing_message_id
+        self._attempt_number = attempt_number
+        self._attempt_limit = attempt_limit
+        self._edit_every_n_updates = edit_every_n_updates
+        self._lock = asyncio.Lock()
+        self._handle: DiscordAcademicProgressHandle | None = None
+        self._stages: list[str] = []
+        self._last_stage_key: tuple[object, ...] | None = None
+        self._pending_updates = 0
+        self._disabled = False
+
+    @property
+    def handle(self) -> DiscordAcademicProgressHandle | None:
+        return self._handle
+
+    async def start(
+        self,
+        event: DiscordAcademicProgressEvent | Mapping[str, object] | object | None = None,
+    ) -> DiscordAcademicProgressHandle | None:
+        async with self._lock:
+            return await self._start_locked(event)
+
+    async def update(
+        self,
+        event: DiscordAcademicProgressEvent | Mapping[str, object] | object,
+    ) -> None:
+        async with self._lock:
+            if self._disabled:
+                return
+            progress_event = _coerce_progress_event(
+                event,
+                attempt_number=self._attempt_number,
+                attempt_limit=self._attempt_limit,
+            )
+            stage = _progress_stage_text(progress_event)
+            stage_key = _progress_stage_key(progress_event)
+            if stage_key == self._last_stage_key:
+                return
+            if self._handle is None:
+                await self._start_locked(progress_event)
+                return
+            self._append_stage(stage, stage_key)
+            self._pending_updates += 1
+            if (
+                progress_event.terminal
+                or progress_event.phase in _TERMINAL_PROGRESS_PHASES
+                or self._pending_updates >= self._edit_every_n_updates
+            ):
+                await self._flush_locked()
+
+    async def finish_proposal_ready(self) -> None:
+        await self.update(
+            DiscordAcademicProgressEvent(
+                phase="proposal_ready",
+                attempt_number=self._attempt_number,
+                attempt_limit=self._attempt_limit,
+                terminal=True,
+            )
+        )
+
+    async def finish_completed(self) -> None:
+        await self.update(
+            DiscordAcademicProgressEvent(
+                phase="completed",
+                attempt_number=self._attempt_number,
+                attempt_limit=self._attempt_limit,
+                terminal=True,
+            )
+        )
+
+    async def finish_waiting_for_clarification(self) -> None:
+        await self.update(
+            DiscordAcademicProgressEvent(
+                phase="clarification_needed",
+                attempt_number=self._attempt_number,
+                attempt_limit=self._attempt_limit,
+                terminal=True,
+            )
+        )
+
+    async def finish_failed(self) -> None:
+        await self.update(
+            DiscordAcademicProgressEvent(
+                phase="failed",
+                attempt_number=self._attempt_number,
+                attempt_limit=self._attempt_limit,
+                terminal=True,
+            )
+        )
+
+    async def flush(self) -> None:
+        async with self._lock:
+            await self._flush_locked()
+
+    async def _start_locked(
+        self,
+        event: DiscordAcademicProgressEvent | Mapping[str, object] | object | None,
+    ) -> DiscordAcademicProgressHandle | None:
+        if self._disabled:
+            return None
+        if self._handle is not None:
+            return self._handle
+        progress_event = _coerce_progress_event(
+            event or "runtime_waking",
+            attempt_number=self._attempt_number,
+            attempt_limit=self._attempt_limit,
+        )
+        self._append_stage(
+            _progress_stage_text(progress_event),
+            _progress_stage_key(progress_event),
+        )
+        try:
+            if self._existing_message_id is not None:
+                self._handle = await self._delivery.adopt_progress(
+                    root_event_id=self._root_event_id,
+                    message_id=self._existing_message_id,
+                )
+                self._pending_updates = 1
+                await self._flush_locked()
+            else:
+                self._handle = await self._delivery.start_progress(
+                    root_event_id=self._root_event_id,
+                    content=_render_progress_content(self._stages),
+                )
+        except (LifeAgentError, ValueError):
+            self._disabled = True
+            return None
+        return self._handle
+
+    def _append_stage(self, stage: str, stage_key: tuple[object, ...]) -> None:
+        if self._stages and self._stages[-1] == stage:
+            self._last_stage_key = stage_key
+            return
+        self._stages.append(stage)
+        if len(self._stages) > 8:
+            self._stages = self._stages[-8:]
+        self._last_stage_key = stage_key
+
+    async def _flush_locked(self) -> None:
+        if self._disabled or self._handle is None or not self._pending_updates:
+            return
+        try:
+            await self._delivery.edit_progress(
+                self._handle,
+                content=_render_progress_content(self._stages),
+            )
+            self._pending_updates = 0
+        except (LifeAgentError, ValueError):
+            self._disabled = True
+
+
+def _coerce_progress_event(
+    event: DiscordAcademicProgressEvent | Mapping[str, object] | object,
+    *,
+    attempt_number: int,
+    attempt_limit: int,
+) -> DiscordAcademicProgressEvent:
+    if isinstance(event, DiscordAcademicProgressEvent):
+        return event
+    if isinstance(event, str):
+        return DiscordAcademicProgressEvent(
+            phase=_progress_phase(event),
+            attempt_number=attempt_number,
+            attempt_limit=attempt_limit,
+            terminal=event in _TERMINAL_PROGRESS_PHASES,
+        )
+    phase_value = _event_value(event, "phase")
+    phase = _progress_phase(phase_value)
+    coerced_attempt_limit = _bounded_progress_int(
+        _event_value(event, "attempt_limit"),
+        default=attempt_limit,
+        lower=1,
+        upper=3,
+    )
+    coerced_attempt_number = min(
+        _bounded_progress_int(
+            _event_value(event, "attempt_number"),
+            default=attempt_number,
+            lower=1,
+            upper=3,
+        ),
+        coerced_attempt_limit,
+    )
+    model_turn_limit = _optional_progress_int(
+        _event_value(event, "model_turn_limit"),
+        lower=1,
+        upper=4,
+    )
+    raw_model_turn = _event_value(event, "model_turn_number")
+    if raw_model_turn is None:
+        raw_model_turn = _event_value(event, "model_turn")
+    model_turn_number = _optional_progress_int(raw_model_turn, lower=1, upper=4)
+    if model_turn_number is not None and model_turn_limit is not None:
+        model_turn_number = min(model_turn_number, model_turn_limit)
+    return DiscordAcademicProgressEvent(
+        phase=phase,
+        attempt_number=coerced_attempt_number,
+        attempt_limit=coerced_attempt_limit,
+        model_turn_number=model_turn_number,
+        model_turn_limit=model_turn_limit,
+        lookup_kind=_progress_lookup_kind(_event_value(event, "lookup_kind")),
+        result_count=_optional_progress_int(
+            _event_value(event, "result_count"),
+            lower=0,
+            upper=20,
+        ),
+        terminal=bool(_event_value(event, "terminal")) or phase in _TERMINAL_PROGRESS_PHASES,
+    )
+
+
+def _event_value(event: Mapping[str, object] | object, field: str) -> object:
+    if isinstance(event, Mapping):
+        return cast(Mapping[str, object], event).get(field)
+    return getattr(event, field, None)
+
+
+def _progress_phase(value: object) -> DiscordAcademicProgressPhase:
+    raw = getattr(value, "value", value)
+    normalized = str(raw) if raw is not None else ""
+    if normalized == "waiting_for_clarification":
+        normalized = "clarification_needed"
+    if normalized in _ACADEMIC_PROGRESS_PHASES:
+        return cast(DiscordAcademicProgressPhase, normalized)
+    return "proposal_validation"
+
+
+def _progress_lookup_kind(value: object) -> Literal["course", "assessment"] | None:
+    raw = getattr(value, "value", value)
+    if raw in {"course", "assessment"}:
+        return cast(Literal["course", "assessment"], raw)
+    return None
+
+
+def _bounded_progress_int(value: object, *, default: int, lower: int, upper: int) -> int:
+    parsed = _optional_progress_int(value, lower=lower, upper=upper)
+    return default if parsed is None else parsed
+
+
+def _optional_progress_int(value: object, *, lower: int, upper: int) -> int | None:
+    if not isinstance(value, int):
+        return None
+    if value < lower or value > upper:
+        return None
+    return value
+
+
+def _progress_stage_key(event: DiscordAcademicProgressEvent) -> tuple[object, ...]:
+    return (
+        event.phase,
+        event.attempt_number,
+        event.attempt_limit,
+        event.model_turn_number,
+        event.model_turn_limit,
+        event.lookup_kind,
+        event.result_count,
+        event.terminal,
+    )
+
+
+def _progress_stage_text(event: DiscordAcademicProgressEvent) -> str:
+    if event.phase == "runtime_waking":
+        return "Waking Qwen."
+    if event.phase == "model_turn":
+        turn = event.model_turn_number or 1
+        limit = event.model_turn_limit or 10
+        return f"Qwen is interpreting your request (agent turn {turn} of {limit})."
+    if event.phase == "course_lookup":
+        return _lookup_stage("Looking up matching courses.", event.result_count)
+    if event.phase == "assessment_lookup":
+        return _lookup_stage("Looking up matching assessments.", event.result_count)
+    if event.phase == "proposal_validation":
+        return "Validating a safe proposal."
+    if event.phase == "proposal_ready":
+        return "Proposal ready."
+    if event.phase == "completed":
+        return "Completed."
+    if event.phase == "clarification_needed":
+        return "Waiting for your clarification."
+    return "Academic request stopped safely."
+
+
+def _lookup_stage(prefix: str, count: int | None) -> str:
+    if count is None:
+        return prefix
+    noun = "result" if count == 1 else "results"
+    return f"{prefix} ({count} {noun}.)"
+
+
+def _render_progress_content(stages: Sequence[str]) -> str:
+    content = "\n".join(f"- {stage}" for stage in stages)
+    return _bounded_discord_content(content or "- Waking Qwen.")
+
+
+def _message_id_from_delivery(delivery: Delivery) -> str | None:
+    external_url = delivery.external_url
+    if external_url is None:
+        return None
+    candidate = external_url.rstrip("/").rsplit("/", 1)[-1]
+    if _DISCORD_ID_PATTERN.fullmatch(candidate) is None:
+        return None
+    return candidate
+
+
 def _academic_proposal_preview(proposal: Any) -> str:
     proposal_id = str(proposal.proposal_id)
     changes = tuple(proposal.changes)[:20]
@@ -830,6 +1588,13 @@ def _academic_proposal_preview(proposal: Any) -> str:
         if change.field == "create_assessment":
             kind = getattr(change.assessment_type, "value", change.assessment_type) or "event"
             course = change.course_code or change.course_id or "the selected course"
+            ends_at = getattr(change, "ends_at", None)
+            if kind == "studying_block" and change.due_at is not None and ends_at is not None:
+                lines.append(
+                    f"- Create `{change.title}` in {course}, "
+                    f"{_academic_date_range(change.due_at, ends_at)}."
+                )
+                continue
             due = change.due_at.isoformat() if change.due_at is not None else "an unset date"
             lines.append(f"- Create {kind} `{change.title}` in {course}, due {due}.")
             continue
@@ -862,6 +1627,35 @@ def _academic_proposal_preview(proposal: Any) -> str:
         )
     )
     return _bounded_discord_content("\n".join(lines))
+
+
+def _academic_date_range(starts_at: datetime, ends_at: datetime) -> str:
+    duration_minutes = _elapsed_minutes(starts_at, ends_at)
+    start = starts_at.astimezone(_ACADEMIC_TIMEZONE)
+    end = ends_at.astimezone(_ACADEMIC_TIMEZONE)
+    start_date = f"{start.strftime('%B')} {start.day}, {start.year}"
+    start_clock = _clock_label(start, include_meridiem=start.strftime("%p") != end.strftime("%p"))
+    end_clock = _clock_label(end, include_meridiem=True)
+    if start.date() == end.date():
+        date_and_time = f"{start_date}, {start_clock}\N{EN DASH}{end_clock}"
+    else:
+        end_date = f"{end.strftime('%B')} {end.day}, {end.year}"
+        date_and_time = f"{start_date}, {start_clock}\N{EN DASH}{end_date}, {end_clock}"
+    return f"{date_and_time} {_ACADEMIC_TIMEZONE_NAME} ({duration_minutes} minutes)"
+
+
+def _elapsed_minutes(starts_at: datetime, ends_at: datetime) -> int:
+    if starts_at.tzinfo is None or starts_at.utcoffset() is None:
+        raise ValueError("academic preview start time must be timezone-aware")
+    if ends_at.tzinfo is None or ends_at.utcoffset() is None:
+        raise ValueError("academic preview end time must be timezone-aware")
+    return int((ends_at.timestamp() - starts_at.timestamp()) // 60)
+
+
+def _clock_label(value: datetime, *, include_meridiem: bool) -> str:
+    hour = value.hour % 12 or 12
+    label = f"{hour}:{value.minute:02d}"
+    return f"{label} {value.strftime('%p')}" if include_meridiem else label
 
 
 class FinanceDiscordBriefingMessage(BaseModel):
@@ -1542,6 +2336,10 @@ __all__ = [
     "DailyReviewSummary",
     "DiscordAcademicPlannerAdapter",
     "DiscordAcademicPlannerDelivery",
+    "DiscordAcademicProgressEvent",
+    "DiscordAcademicProgressHandle",
+    "DiscordAcademicProgressPhase",
+    "DiscordAcademicProgressReporter",
     "DiscordAcademicResponseDelivery",
     "DiscordDailyReviewAdapter",
     "DiscordDeliveryReceipt",

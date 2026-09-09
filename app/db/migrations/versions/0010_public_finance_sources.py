@@ -585,9 +585,7 @@ def upgrade() -> None:
 def downgrade() -> None:
     """Refuse destructive rollback; switch the configured allowlist to v1."""
 
-    raise RuntimeError(
-        "0010 is history-preserving; rollback with FINANCE_SOURCE_ALLOWLIST_VERSION"
-    )
+    raise RuntimeError("0010 is history-preserving; rollback with FINANCE_SOURCE_ALLOWLIST_VERSION")
 
 
 def _audit_events_table() -> sa.Table:

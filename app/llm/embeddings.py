@@ -122,6 +122,16 @@ class AcademicEmbeddingGateway:
         typed failure.
         """
 
+        return await self.embed_academic_text(text)
+
+    async def embed_academic_text(self, text: str) -> EmbeddingResult:
+        """Embed private academic text without copying it into telemetry.
+
+        This neutral boundary is shared by reflection memory and assessment
+        material ingestion so model identity, timeouts, and validation cannot
+        drift between two embedding clients.
+        """
+
         request_id = uuid4()
         started_at = datetime.now(UTC)
         started_monotonic = time.monotonic()

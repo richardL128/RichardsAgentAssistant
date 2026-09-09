@@ -5,14 +5,16 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import json
+import re
 from collections.abc import Awaitable, Callable
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
-from typing import Any, Protocol
+from typing import Any, Literal, Protocol, cast
 from uuid import UUID
 
 import httpx
 from procrastinate import JobContext
+from procrastinate.exceptions import AlreadyEnqueued
 from sqlalchemy import select
 from sqlalchemy.engine import Engine
 from sqlalchemy.orm import Session
@@ -44,9 +46,34 @@ from app.queue.idempotency import build_idempotency_key, validate_idempotency_ke
 from app.queue.periodic import PeriodicOccurrence, TorontoPeriodicSchedule, stable_period_key
 
 TaskHandler = Callable[[str, str], Awaitable[dict[str, Any]]]
+AcademicClarificationAction = Literal[
+    "quiz",
+    "assignment",
+    "tutorial",
+    "lab",
+    "studying_block",
+    "ignore",
+]
+AcademicClarificationHandler = Callable[
+    [str, AcademicClarificationAction, str, int, int],
+    Awaitable[dict[str, Any]],
+]
+AcademicClarificationStatusHandler = Callable[
+    [str, AcademicClarificationAction, int, int],
+    Awaitable[dict[str, Any]],
+]
+AcademicMaterialIngestionHandler = Callable[[str, str], Awaitable[dict[str, object]]]
+DiscordWakeHandler = Callable[[str, int, int], Awaitable[dict[str, Any]]]
 _handlers: dict[str, TaskHandler] = {}
+_academic_clarification_handler: AcademicClarificationHandler | None = None
+_academic_clarification_status_handler: AcademicClarificationStatusHandler | None = None
+_academic_material_ingestion_handler: AcademicMaterialIngestionHandler | None = None
+_discord_wake_handler: DiscordWakeHandler | None = None
 _database = Database(get_settings())
 _MODEL_LOCK = "ollama:exclusive"
+_ACADEMIC_CLARIFICATION_LOCK_PREFIX = "academic-clarification"
+_MATERIAL_PAGE_ID = re.compile(r"\A[A-Za-z0-9_-]{1,128}\Z")
+_SHA256_HEX = re.compile(r"\A[0-9a-f]{64}\Z")
 
 
 class FailureAlertSender(Protocol):
@@ -71,6 +98,83 @@ def register_task_handler(job_kind: str, handler: TaskHandler) -> None:
     if job_kind not in JOB_KINDS:
         raise ValueError(f"unknown job kind: {job_kind}")
     _handlers[job_kind] = handler
+
+
+def register_academic_clarification_handler(handler: AcademicClarificationHandler) -> None:
+    """Register the Discord clarification apply handler during worker startup."""
+
+    if JOB_KINDS.get("academic_clarification") != "academic_planner":
+        raise ValueError("academic clarification job is not routed to academic_planner")
+    global _academic_clarification_handler
+    _academic_clarification_handler = handler
+
+
+def register_academic_clarification_status_handler(
+    handler: AcademicClarificationStatusHandler,
+) -> None:
+    """Register the Discord clarification status-edit handler during worker startup."""
+
+    if JOB_KINDS.get("academic_clarification_status") != "academic_planner":
+        raise ValueError("academic clarification status job is not routed to academic_planner")
+    global _academic_clarification_status_handler
+    _academic_clarification_status_handler = handler
+
+
+def register_academic_material_ingestion_handler(
+    handler: AcademicMaterialIngestionHandler,
+) -> None:
+    """Register the private assessment-material ingestion boundary."""
+
+    if JOB_KINDS.get("academic_material_ingestion") != "academic_planner":
+        raise ValueError("academic material ingestion is not routed to academic_planner")
+    global _academic_material_ingestion_handler
+    _academic_material_ingestion_handler = handler
+
+
+def register_discord_wake_handler(handler: DiscordWakeHandler) -> None:
+    """Register the durable ID-only Discord worker boundary."""
+
+    if JOB_KINDS.get("discord_academic") != "academic_planner":
+        raise ValueError("Discord academic wake job is not routed to academic_planner")
+    global _discord_wake_handler
+    _discord_wake_handler = handler
+
+
+async def defer_discord_wake(wake_id: str) -> Any:
+    """Enqueue one durable inbound row without raw content or credentials."""
+
+    parsed_wake_id = str(UUID(wake_id))
+    queueing_lock = f"discord-wake:{parsed_wake_id}"
+    try:
+        return await discord_wake_task.configure(
+            lock=_MODEL_LOCK,
+            queueing_lock=queueing_lock,
+        ).defer_async(wake_id=parsed_wake_id)
+    except AlreadyEnqueued:
+        return {"status": "already_enqueued", "wake_id": parsed_wake_id}
+
+
+async def defer_academic_material_ingestion(
+    assessment_page_id: str,
+    source_fingerprint: str,
+) -> Any:
+    """Queue an ingestion using only a page ID and stable metadata fingerprint."""
+
+    if _MATERIAL_PAGE_ID.fullmatch(assessment_page_id) is None:
+        raise ValueError("assessment page ID is invalid")
+    if _SHA256_HEX.fullmatch(source_fingerprint) is None:
+        raise ValueError("assessment material fingerprint is invalid")
+    lock = f"academic-material:{assessment_page_id}:{source_fingerprint}"
+    try:
+        return await academic_material_ingestion_task.configure(
+            lock=_MODEL_LOCK,
+            queueing_lock=lock,
+        ).defer_async(
+            assessment_page_id=assessment_page_id,
+            source_fingerprint=source_fingerprint,
+        )
+    except AlreadyEnqueued:
+        return {"status": "already_enqueued", "assessment_page_id": assessment_page_id}
 
 
 async def _dispatch(
@@ -140,6 +244,85 @@ async def defer_idempotent_async(
     )
 
 
+def _academic_clarification_args(
+    clarification_id: str,
+    action: str,
+) -> tuple[str, AcademicClarificationAction, str]:
+    parsed_clarification_id = str(UUID(str(clarification_id)))
+    if action not in {
+        "quiz",
+        "assignment",
+        "tutorial",
+        "lab",
+        "studying_block",
+        "ignore",
+    }:
+        raise ValueError("academic clarification action is invalid")
+    queueing_lock = f"{_ACADEMIC_CLARIFICATION_LOCK_PREFIX}:{parsed_clarification_id}"
+    return parsed_clarification_id, cast(AcademicClarificationAction, action), queueing_lock
+
+
+async def defer_academic_clarification(
+    *,
+    clarification_id: str,
+    action: str,
+    user_id: str,
+) -> Any:
+    """Queue one Discord clarification decision without taking the model lock."""
+
+    parsed_clarification_id, parsed_action, queueing_lock = _academic_clarification_args(
+        clarification_id,
+        action,
+    )
+    if not user_id.strip():
+        raise ValueError("user_id must not be empty")
+    try:
+        return await academic_clarification_task.configure(
+            lock=queueing_lock,
+            queueing_lock=queueing_lock,
+        ).defer_async(
+            clarification_id=parsed_clarification_id,
+            action=parsed_action,
+            user_id=user_id,
+        )
+    except AlreadyEnqueued:
+        return {
+            "status": "already_enqueued",
+            "clarification_id": parsed_clarification_id,
+        }
+
+
+async def defer_academic_clarification_status(
+    *,
+    clarification_id: str,
+    action: str,
+) -> Any:
+    """Queue the terminal Discord message edit with its own retry budget."""
+
+    parsed_clarification_id, parsed_action, queueing_lock = _academic_clarification_args(
+        clarification_id,
+        action,
+    )
+    status_lock = queueing_lock.replace(
+        f"{_ACADEMIC_CLARIFICATION_LOCK_PREFIX}:",
+        f"{_ACADEMIC_CLARIFICATION_LOCK_PREFIX}:status:",
+        1,
+    )
+    try:
+        return await academic_clarification_status_task.configure(
+            lock=status_lock,
+            queueing_lock=status_lock,
+        ).defer_async(
+            clarification_id=parsed_clarification_id,
+            action=parsed_action,
+        )
+    except AlreadyEnqueued:
+        return {
+            "status": "already_enqueued",
+            "clarification_id": parsed_clarification_id,
+        }
+
+
 @procrastinate_app.task(
     name="lifeagent.code_review",
     queue="code_review",
@@ -181,15 +364,84 @@ async def code_review_ingest_task(
 
 
 @procrastinate_app.task(
-    name="lifeagent.academic_planner",
+    name="lifeagent.discord_academic",
     queue="academic_planner",
     retry=default_retry_strategy,
     pass_context=True,
 )
-async def academic_planner_task(
-    context: JobContext, run_id: str, idempotency_key: str, kind: str = ""
+async def discord_wake_task(context: JobContext, wake_id: str) -> dict[str, Any]:
+    """Run one accepted Discord event by durable row ID under the model lock."""
+
+    if _discord_wake_handler is None:
+        raise RuntimeError("no handler registered for discord_academic")
+    return await _discord_wake_handler(
+        str(UUID(wake_id)),
+        context.job.attempts + 1,
+        default_retry_strategy.policy.max_attempts,
+    )
+
+
+@procrastinate_app.task(
+    name="lifeagent.academic_clarification",
+    queue="academic_planner",
+    retry=default_retry_strategy,
+    pass_context=True,
+)
+async def academic_clarification_task(
+    context: JobContext,
+    clarification_id: str,
+    action: AcademicClarificationAction,
+    user_id: str,
 ) -> dict[str, Any]:
-    return await _dispatch(context, "academic_planner", run_id, idempotency_key, kind)
+    if _academic_clarification_handler is None:
+        raise RuntimeError("no handler registered for academic_clarification")
+    return await _academic_clarification_handler(
+        str(UUID(str(clarification_id))),
+        action,
+        user_id,
+        context.job.attempts + 1,
+        default_retry_strategy.policy.max_attempts,
+    )
+
+
+@procrastinate_app.task(
+    name="lifeagent.academic_clarification_status",
+    queue="academic_planner",
+    retry=default_retry_strategy,
+    pass_context=True,
+)
+async def academic_clarification_status_task(
+    context: JobContext,
+    clarification_id: str,
+    action: AcademicClarificationAction,
+) -> dict[str, Any]:
+    if _academic_clarification_status_handler is None:
+        raise RuntimeError("no handler registered for academic_clarification_status")
+    return await _academic_clarification_status_handler(
+        str(UUID(str(clarification_id))),
+        action,
+        context.job.attempts + 1,
+        default_retry_strategy.policy.max_attempts,
+    )
+
+
+@procrastinate_app.task(
+    name="lifeagent.academic_material_ingestion",
+    queue="academic_planner",
+    retry=default_retry_strategy,
+    pass_context=True,
+)
+async def academic_material_ingestion_task(
+    context: JobContext,
+    assessment_page_id: str,
+    source_fingerprint: str,
+) -> dict[str, object]:
+    """Refresh and ingest one assessment page without raw queue arguments."""
+
+    del context
+    if _academic_material_ingestion_handler is None:
+        raise RuntimeError("no handler registered for academic_material_ingestion")
+    return await _academic_material_ingestion_handler(assessment_page_id, source_fingerprint)
 
 
 @procrastinate_app.task(
@@ -451,7 +703,6 @@ async def _maybe_send_shared_services_alert(
 _settings = get_settings()
 
 
-@procrastinate_app.periodic(cron="* * * * *", periodic_id="code-review-dynamic")
 @procrastinate_app.task(name="lifeagent.schedule.code_review", queue="code_review")
 async def code_review_periodic(timestamp: int) -> dict[str, object]:
     return await _periodic_tick(
@@ -463,31 +714,6 @@ async def code_review_periodic(timestamp: int) -> dict[str, object]:
     )
 
 
-@procrastinate_app.periodic(cron="* * * * *", periodic_id="academic-morning-dynamic")
-@procrastinate_app.task(name="lifeagent.schedule.academic_morning", queue="academic_planner")
-async def academic_morning_periodic(timestamp: int) -> dict[str, object]:
-    return await _periodic_tick(
-        timestamp=timestamp,
-        job_kind="academic_planner",
-        schedule_name="academic-morning",
-        schedule=TorontoPeriodicSchedule.from_time(_settings.academic_morning_schedule),
-        task=academic_planner_task,
-    )
-
-
-@procrastinate_app.periodic(cron="* * * * *", periodic_id="academic-eod-dynamic")
-@procrastinate_app.task(name="lifeagent.schedule.academic_eod", queue="academic_planner")
-async def academic_eod_periodic(timestamp: int) -> dict[str, object]:
-    return await _periodic_tick(
-        timestamp=timestamp,
-        job_kind="academic_planner",
-        schedule_name="academic-end-of-day",
-        schedule=TorontoPeriodicSchedule.from_time(_settings.academic_end_of_day_schedule),
-        task=academic_planner_task,
-    )
-
-
-@procrastinate_app.periodic(cron="* * * * *", periodic_id="finance-market-open-dynamic")
 @procrastinate_app.task(name="lifeagent.schedule.finance", queue="finance")
 async def finance_periodic(timestamp: int) -> dict[str, object]:
     return await _periodic_tick(
@@ -592,14 +818,25 @@ async def shared_services_periodic(timestamp: int) -> dict[str, object]:
 
 
 __all__ = [
-    "academic_planner_task",
+    "academic_clarification_status_task",
+    "academic_clarification_task",
+    "academic_material_ingestion_task",
     "artifact_retention_periodic",
     "code_review_daily_task",
     "code_review_ingest_task",
     "code_review_task",
+    "defer_academic_clarification",
+    "defer_academic_clarification_status",
+    "defer_academic_material_ingestion",
+    "defer_discord_wake",
     "defer_idempotent",
     "defer_idempotent_async",
+    "discord_wake_task",
     "finance_task",
+    "register_academic_clarification_handler",
+    "register_academic_clarification_status_handler",
+    "register_academic_material_ingestion_handler",
+    "register_discord_wake_handler",
     "register_task_handler",
     "shared_services_periodic",
 ]

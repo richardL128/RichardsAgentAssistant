@@ -282,9 +282,7 @@ def test_source_endpoints_and_cache_state_round_trip(engine) -> None:
         etag='"def"',
         last_not_modified_at=NOW,
     )
-    updated = store.load_source_cache_state(
-        source_id="sec_edgar", endpoint_id="sec_submissions"
-    )
+    updated = store.load_source_cache_state(source_id="sec_edgar", endpoint_id="sec_submissions")
     assert updated is not None
     assert updated.etag == '"def"'
     assert updated.last_not_modified_at == NOW

@@ -949,8 +949,10 @@ class FinanceRepository:
         error_code: str | None,
         not_modified: bool,
     ) -> FinanceSourceRequestAudit:
-        outcome = "failed" if error_code is not None else (
-            "not_modified" if not_modified else "succeeded"
+        outcome = (
+            "failed"
+            if error_code is not None
+            else ("not_modified" if not_modified else "succeeded")
         )
         record = FinanceSourceRequestAudit(
             allowlist_version=allowlist_version,

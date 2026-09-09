@@ -30,6 +30,7 @@ from app.db.models import (
     AcademicDocumentChunk,
     AcademicLearningFocus,
     AcademicLearningFocusEvent,
+    AcademicProposalOperationJournal,
     AcademicProposedChange,
     AcademicReflectionMemory,
     AcademicSetupReminder,
@@ -53,7 +54,39 @@ ProposalRejectionStatus = Literal[
     "in_progress",
     "not_pending",
 ]
+ProposalOperationStatus = Literal["ready", "already_applied", "in_progress", "uncertain", "failed"]
 LearningFocusReminderStatus = Literal["remind", "snoozed_and_remind", "delete"]
+LearningFocusMutationStatus = Literal["applied", "not_found", "stale"]
+AcademicDocumentSourceKind = Literal[
+    "notion_page_body",
+    "notion_property_file",
+    "notion_block_file",
+]
+AcademicDocumentExtractionStatus = Literal[
+    "pending",
+    "extracted",
+    "partial",
+    "ocr_required",
+    "ocr_processing",
+    "unsupported",
+    "failed",
+    "inactive",
+]
+AcademicClarificationWriteAction = Literal[
+    "quiz",
+    "assignment",
+    "tutorial",
+    "lab",
+    "studying_block",
+]
+AcademicClarificationAction = Literal[
+    "quiz",
+    "assignment",
+    "tutorial",
+    "lab",
+    "studying_block",
+    "ignore",
+]
 CommitmentKind = Literal[
     "class",
     "test",
@@ -68,8 +101,36 @@ CommitmentKind = Literal[
 ]
 CHUNK_MAX_CHARS = 20_000
 BOUNDED_TEXT_CHARS = 255
+AGENT_CLARIFICATION_SESSION_KIND = "agent_clarification"
 _SHA256 = re.compile(r"^[0-9a-f]{64}$")
 _TORONTO = ZoneInfo("America/Toronto")
+_ACADEMIC_CLARIFICATION_WRITE_ACTIONS = frozenset(
+    ("quiz", "assignment", "tutorial", "lab", "studying_block")
+)
+_ACADEMIC_CLARIFICATION_ACTIONS = _ACADEMIC_CLARIFICATION_WRITE_ACTIONS | {"ignore"}
+_ACADEMIC_DOCUMENT_SOURCE_KINDS = frozenset(
+    ("notion_page_body", "notion_property_file", "notion_block_file")
+)
+_ACADEMIC_DOCUMENT_STATUSES = frozenset(
+    (
+        "pending",
+        "extracted",
+        "partial",
+        "ocr_required",
+        "ocr_processing",
+        "unsupported",
+        "failed",
+        "inactive",
+    )
+)
+_ACADEMIC_DOCUMENT_USABLE_STATUSES = frozenset(("extracted", "partial"))
+_SIGNED_NOTION_URL_MARKERS = (
+    "prod-files-secure.s3.",
+    "prod-files-secure.notion-static.com",
+    "x-amz-signature=",
+    "x-amz-credential=",
+    "x-amz-security-token=",
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -102,6 +163,8 @@ class DocumentChunkInput:
     heading: str | None = None
     token_count: int | None = None
     content_hash: str | None = None
+    embedding: Sequence[float] | None = None
+    embedding_model: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -172,6 +235,9 @@ class ClarificationInput:
     expected_edited_at: datetime
     expires_at: datetime
     idempotency_key: str
+    tutorial_preview_title: str | None = None
+    lab_preview_title: str | None = None
+    studying_block_preview_title: str | None = None
     course_id: uuid.UUID | None = None
     assessment_id: uuid.UUID | None = None
     raw_label: str | None = None
@@ -331,6 +397,7 @@ class AcademicRepository:
         assessment_type: str,
         due_at: datetime | None,
         grade_weight_percent: float | None,
+        ends_at: datetime | None = None,
         estimated_minutes: int = 60,
         confidence_gap: float = 0.5,
         scope_size: float = 0.0,
@@ -345,6 +412,10 @@ class AcademicRepository:
         _validate_fact(confidence, fact_state)
         if due_at is not None:
             due_at = _utc(due_at, "due_at")
+        if ends_at is not None:
+            ends_at = _utc(ends_at, "ends_at")
+            if due_at is None or ends_at <= due_at:
+                raise ValueError("assessment end must be after its start")
         if grade_weight_percent is not None and not 0 <= grade_weight_percent <= 100:
             raise ValueError("grade weight must be between 0 and 100")
         if estimated_minutes <= 0 or not 0 <= confidence_gap <= 1 or not 0 <= scope_size <= 100:
@@ -355,6 +426,7 @@ class AcademicRepository:
             "title": title,
             "assessment_type": assessment_type,
             "due_at": due_at,
+            "ends_at": ends_at,
             "grade_weight_percent": grade_weight_percent,
             "estimated_minutes": estimated_minutes,
             "confidence_gap": confidence_gap,
@@ -382,6 +454,79 @@ class AcademicRepository:
                 }
             )
         return _upsert(session, Assessment, [Assessment.notion_id == notion_id], values)
+
+    @staticmethod
+    def begin_proposal_operation(
+        session: Session,
+        *,
+        proposal_id: uuid.UUID,
+        ordinal: int,
+        payload_hash: str,
+        operation_id: str,
+    ) -> tuple[ProposalOperationStatus, AcademicProposalOperationJournal]:
+        if ordinal < 0:
+            raise ValueError("proposal operation ordinal must be nonnegative")
+        if not _SHA256.fullmatch(payload_hash):
+            raise ValueError("proposal operation payload hash must be SHA-256 hex")
+        normalized_operation_id = _bounded(operation_id, 255)
+        row = session.scalar(
+            select(AcademicProposalOperationJournal)
+            .where(
+                AcademicProposalOperationJournal.proposal_id == proposal_id,
+                AcademicProposalOperationJournal.ordinal == ordinal,
+            )
+            .with_for_update()
+        )
+        if row is not None:
+            if row.payload_hash != payload_hash:
+                raise ValueError("proposal operation payload hash changed")
+            if row.state == "applied":
+                return "already_applied", row
+            return cast(ProposalOperationStatus, row.state), row
+        row = AcademicProposalOperationJournal(
+            proposal_id=proposal_id,
+            ordinal=ordinal,
+            operation_id=normalized_operation_id,
+            payload_hash=payload_hash,
+            state="in_progress",
+            receipt=None,
+            error_code=None,
+        )
+        session.add(row)
+        session.flush()
+        return "ready", row
+
+    @staticmethod
+    def mark_proposal_operation_applied(
+        session: Session,
+        *,
+        proposal_id: uuid.UUID,
+        ordinal: int,
+        payload_hash: str,
+        receipt: Mapping[str, Any],
+    ) -> AcademicProposalOperationJournal:
+        row = _lock_proposal_operation(session, proposal_id, ordinal, payload_hash)
+        row.state = "applied"
+        row.receipt = _bounded_receipt(receipt)
+        row.error_code = None
+        session.flush()
+        return row
+
+    @staticmethod
+    def mark_proposal_operation_uncertain(
+        session: Session,
+        *,
+        proposal_id: uuid.UUID,
+        ordinal: int,
+        payload_hash: str,
+        error_code: str,
+    ) -> AcademicProposalOperationJournal:
+        row = _lock_proposal_operation(session, proposal_id, ordinal, payload_hash)
+        if row.state != "applied":
+            row.state = "uncertain"
+            row.error_code = _bounded_optional(error_code, 128)
+        session.flush()
+        return row
 
     @staticmethod
     def reconcile_assessment_source(
@@ -436,6 +581,11 @@ class AcademicRepository:
             "raw_label": _bounded_optional(request.raw_label, 1_024),
             "quiz_preview_title": _bounded(request.quiz_preview_title, 1_024),
             "assignment_preview_title": _bounded(request.assignment_preview_title, 1_024),
+            "tutorial_preview_title": _bounded_optional(request.tutorial_preview_title, 1_024),
+            "lab_preview_title": _bounded_optional(request.lab_preview_title, 1_024),
+            "studying_block_preview_title": _bounded_optional(
+                request.studying_block_preview_title, 1_024
+            ),
             "expected_edited_at": expected,
             "title_property_id": _bounded_optional(request.title_property_id),
             "idempotency_key": request.idempotency_key,
@@ -489,10 +639,12 @@ class AcademicRepository:
         session: Session,
         *,
         clarification_id: uuid.UUID,
-        action: Literal["quiz", "assignment", "ignore"],
+        action: AcademicClarificationAction,
         actor_id: int,
         now: datetime,
     ) -> tuple[str, AcademicClarification]:
+        if action not in _ACADEMIC_CLARIFICATION_ACTIONS:
+            raise ValueError("academic clarification action is invalid")
         row = session.scalar(
             select(AcademicClarification)
             .where(AcademicClarification.id == clarification_id)
@@ -535,7 +687,7 @@ class AcademicRepository:
             raise NoResultFound(f"academic clarification {clarification_id} was not found")
         if row.state == "applied":
             return row
-        if row.state != "claimed" or row.decision not in {"quiz", "assignment"}:
+        if row.state != "claimed" or row.decision not in _ACADEMIC_CLARIFICATION_WRITE_ACTIONS:
             raise ValueError("clarification must be claimed for a write before applying")
         row.state = "applied"
         row.write_status = "applied"
@@ -678,6 +830,14 @@ class AcademicRepository:
         active_assessments = session.scalar(
             select(func.count()).select_from(Assessment).where(Assessment.active.is_(True))
         )
+        material_status_counts = {
+            status: int(count)
+            for status, count in session.execute(
+                select(AcademicDocument.extraction_status, func.count())
+                .where(AcademicDocument.assessment_id.is_not(None))
+                .group_by(AcademicDocument.extraction_status)
+            )
+        }
         return {
             "course_count": session.scalar(select(func.count()).select_from(Course)) or 0,
             "calendar_count": len(calendars),
@@ -687,8 +847,14 @@ class AcademicRepository:
             "write_failure_count": write_failures or 0,
             "setup_reminder_count": len(reminder_rows),
             "setup_condition_codes": sorted({row.condition for row in reminder_rows})[:10],
+            "material_pending_count": material_status_counts.get("pending", 0)
+            + material_status_counts.get("ocr_processing", 0),
+            "material_failed_count": material_status_counts.get("failed", 0)
+            + material_status_counts.get("unsupported", 0)
+            + material_status_counts.get("ocr_required", 0),
+            "material_partial_count": material_status_counts.get("partial", 0),
             "last_sync_at": _aware_db(last_sync).isoformat() if last_sync is not None else None,
-            "migration": "0009_notion_course_calendars",
+            "migration": "0014_academic_materials",
         }
 
     @staticmethod
@@ -770,11 +936,30 @@ class AcademicRepository:
         content_hash: str,
         source_url: str | None = None,
         course_id: uuid.UUID | None = None,
+        assessment_id: uuid.UUID | None = None,
+        source_kind: AcademicDocumentSourceKind | str | None = None,
+        source_page_id: str | None = None,
+        source_block_id: str | None = None,
+        source_property_id: str | None = None,
+        source_key: str | None = None,
+        original_filename: str | None = None,
+        media_type: str | None = None,
+        source_last_edited_at: datetime | None = None,
         access_classification: str = "private",
-        extraction_status: str = "pending",
+        extraction_status: AcademicDocumentExtractionStatus | str = "pending",
+        active: bool = True,
+        extraction_error_code: str | None = None,
+        extraction_error_detail: str | None = None,
     ) -> AcademicDocument:
         if not _SHA256.fullmatch(artifact_key) or not _SHA256.fullmatch(content_hash):
             raise ValueError("artifact_key and content_hash must be SHA-256 hex values")
+        normalized_source_kind = _document_source_kind(source_kind)
+        normalized_status = _document_extraction_status(extraction_status)
+        normalized_source_key = _bounded_optional(source_key, 512)
+        if normalized_source_kind is not None and normalized_source_key is None:
+            raise ValueError("source_key is required for assessment material documents")
+        if normalized_source_key is not None and not normalized_source_key.strip():
+            raise ValueError("source_key must not be empty")
         values = {
             "notion_id": notion_id,
             "document_version": document_version,
@@ -783,18 +968,42 @@ class AcademicRepository:
             "retrieved_at": _utc(retrieved_at, "retrieved_at"),
             "artifact_key": artifact_key,
             "content_hash": content_hash,
-            "source_url": source_url,
+            "source_url": _durable_source_url(source_url),
             "course_id": course_id,
+            "assessment_id": assessment_id,
+            "source_kind": normalized_source_kind,
+            "source_page_id": _bounded_optional(source_page_id),
+            "source_block_id": _bounded_optional(source_block_id),
+            "source_property_id": _bounded_optional(source_property_id),
+            "source_key": normalized_source_key,
+            "original_filename": _bounded_optional(original_filename, 500),
+            "media_type": _bounded_optional(media_type, 255),
+            "source_last_edited_at": (
+                _utc(source_last_edited_at, "source_last_edited_at")
+                if source_last_edited_at is not None
+                else None
+            ),
             "access_classification": access_classification,
-            "extraction_status": extraction_status,
+            "extraction_status": normalized_status,
+            "active": active,
+            "extraction_error_code": _bounded_optional(extraction_error_code, 128),
+            "extraction_error_detail": _bounded_optional(extraction_error_detail, 1_000),
         }
+        filters = (
+            [
+                AcademicDocument.source_key == normalized_source_key,
+                AcademicDocument.document_version == document_version,
+            ]
+            if normalized_source_key is not None
+            else [
+                AcademicDocument.notion_id == notion_id,
+                AcademicDocument.document_version == document_version,
+            ]
+        )
         return _upsert(
             session,
             AcademicDocument,
-            [
-                AcademicDocument.notion_id == notion_id,
-                AcademicDocument.document_version == document_version,
-            ],
+            filters,
             values,
         )
 
@@ -826,6 +1035,10 @@ class AcademicRepository:
             digest = chunk.content_hash or _sha256(chunk.content)
             if not _SHA256.fullmatch(digest):
                 raise ValueError("chunk content_hash must be SHA-256 hex")
+            embedding = _embedding_vector(chunk.embedding)
+            embedding_model = _bounded_optional(chunk.embedding_model, 255)
+            if embedding is not None and embedding_model is None:
+                raise ValueError("embedding_model is required when an embedding is stored")
             values = {
                 "document_id": document_id,
                 "ordinal": chunk.ordinal,
@@ -833,6 +1046,9 @@ class AcademicRepository:
                 "content": chunk.content,
                 "token_count": chunk.token_count,
                 "content_hash": digest,
+                "embedding": embedding,
+                "embedding_model": embedding_model,
+                "embedding_dimensions": len(embedding) if embedding is not None else None,
                 **chunk.citation.values(),
             }
             result.append(
@@ -856,7 +1072,9 @@ class AcademicRepository:
         course_id: uuid.UUID | None = None,
         term: str | None = None,
         document_type: str | None = None,
+        assessment_id: uuid.UUID | None = None,
         access_classification: str = "private",
+        active_only: bool = False,
         limit: int = 12,
     ) -> list[AcademicDocumentChunk]:
         """Run bounded lexical retrieval with source-scope filters.
@@ -878,6 +1096,10 @@ class AcademicRepository:
             statement = statement.where(Course.term == term)
         if document_type is not None:
             statement = statement.where(AcademicDocument.document_type == document_type)
+        if assessment_id is not None:
+            statement = statement.where(AcademicDocument.assessment_id == assessment_id)
+        if active_only:
+            statement = statement.where(AcademicDocument.active.is_(True))
         statement = statement.where(AcademicDocument.access_classification == access_classification)
         if session.get_bind().dialect.name == "postgresql":
             from sqlalchemy import func
@@ -900,6 +1122,180 @@ class AcademicRepository:
             AcademicDocumentChunk.document_id, AcademicDocumentChunk.ordinal
         )
         return list(session.scalars(statement.limit(limit)))
+
+    @staticmethod
+    def activate_document_version(
+        session: Session,
+        *,
+        document_id: uuid.UUID,
+    ) -> AcademicDocument:
+        """Mark one usable source-keyed document as latest active and preserve history."""
+
+        document = session.scalar(
+            select(AcademicDocument).where(AcademicDocument.id == document_id).with_for_update()
+        )
+        if document is None:
+            raise NoResultFound(f"academic document {document_id} was not found")
+        if document.source_key is None:
+            raise ValueError("only source-keyed material documents can be activated")
+        if document.extraction_status not in _ACADEMIC_DOCUMENT_USABLE_STATUSES:
+            raise ValueError("only extracted or partial documents can be activated")
+        session.execute(
+            update(AcademicDocument)
+            .where(
+                AcademicDocument.source_key == document.source_key,
+                AcademicDocument.id != document.id,
+            )
+            .values(active=False)
+        )
+        document.active = True
+        session.flush()
+        return document
+
+    @staticmethod
+    def mark_document_source_inactive(
+        session: Session,
+        *,
+        source_key: str,
+        error_code: str | None = None,
+        error_detail: str | None = None,
+    ) -> int:
+        """Deactivate all current versions for a removed material source."""
+
+        key = _bounded(source_key, 512)
+        document_ids = list(
+            session.scalars(
+                select(AcademicDocument.id).where(
+                    AcademicDocument.source_key == key,
+                    AcademicDocument.active.is_(True),
+                )
+            )
+        )
+        if not document_ids:
+            return 0
+        session.execute(
+            update(AcademicDocument)
+            .where(AcademicDocument.id.in_(document_ids))
+            .values(
+                active=False,
+                extraction_status="inactive",
+                extraction_error_code=_bounded_optional(error_code, 128),
+                extraction_error_detail=_bounded_optional(error_detail, 1_000),
+            )
+        )
+        return len(document_ids)
+
+    @staticmethod
+    def list_assessment_materials(
+        session: Session,
+        *,
+        assessment_id: uuid.UUID,
+        active_only: bool = True,
+        access_classification: str = "private",
+        limit: int = 50,
+    ) -> list[AcademicDocument]:
+        """Return bounded material metadata for one assessment only."""
+
+        if limit < 1 or limit > 100:
+            raise ValueError("material list limit must be between 1 and 100")
+        statement = (
+            select(AcademicDocument)
+            .where(
+                AcademicDocument.assessment_id == assessment_id,
+                AcademicDocument.access_classification == access_classification,
+            )
+            .order_by(
+                AcademicDocument.source_key,
+                AcademicDocument.retrieved_at.desc(),
+                AcademicDocument.id,
+            )
+            .limit(limit)
+        )
+        if active_only:
+            statement = statement.where(AcademicDocument.active.is_(True))
+        return list(session.scalars(statement))
+
+    @staticmethod
+    def read_assessment_material_chunks(
+        session: Session,
+        *,
+        assessment_id: uuid.UUID,
+        chunk_ids: Sequence[uuid.UUID],
+        access_classification: str = "private",
+        active_only: bool = True,
+        limit: int = 50,
+    ) -> list[AcademicDocumentChunk]:
+        """Read explicitly selected chunks after enforcing assessment ownership."""
+
+        if limit < 1 or limit > 100:
+            raise ValueError("chunk read limit must be between 1 and 100")
+        ids = tuple(dict.fromkeys(chunk_ids))
+        if not ids:
+            return []
+        if len(ids) > limit:
+            raise ValueError("too many chunk ids requested")
+        statement = (
+            select(AcademicDocumentChunk)
+            .join(AcademicDocument, AcademicDocument.id == AcademicDocumentChunk.document_id)
+            .where(
+                AcademicDocumentChunk.id.in_(ids),
+                AcademicDocument.assessment_id == assessment_id,
+                AcademicDocument.access_classification == access_classification,
+            )
+        )
+        if active_only:
+            statement = statement.where(AcademicDocument.active.is_(True))
+        rows_by_id = {row.id: row for row in session.scalars(statement)}
+        return [rows_by_id[chunk_id] for chunk_id in ids if chunk_id in rows_by_id]
+
+    @staticmethod
+    def search_semantic_document_chunks(
+        session: Session,
+        *,
+        assessment_id: uuid.UUID,
+        query_embedding: Sequence[float],
+        embedding_model: str,
+        access_classification: str = "private",
+        limit: int = 8,
+    ) -> list[tuple[AcademicDocumentChunk, float]]:
+        """Run assessment-scoped exact cosine search over chunk embeddings."""
+
+        vector = _embedding_vector(query_embedding)
+        if vector is None:
+            return []
+        if limit < 1 or limit > 100:
+            raise ValueError("semantic retrieval limit must be between 1 and 100")
+        model = _bounded(embedding_model, 255)
+        statement = (
+            select(AcademicDocumentChunk)
+            .join(AcademicDocument, AcademicDocument.id == AcademicDocumentChunk.document_id)
+            .where(
+                AcademicDocument.assessment_id == assessment_id,
+                AcademicDocument.active.is_(True),
+                AcademicDocument.access_classification == access_classification,
+                AcademicDocumentChunk.embedding.is_not(None),
+                AcademicDocumentChunk.embedding_model == model,
+                AcademicDocumentChunk.embedding_dimensions == len(vector),
+            )
+        )
+        if session.get_bind().dialect.name == "postgresql":
+            distance = AcademicDocumentChunk.embedding.cosine_distance(vector).label("distance")
+            rows = session.execute(statement.add_columns(distance).order_by(distance).limit(limit))
+            return [
+                (chunk, max(0.0, min(1.0, 1.0 - float(distance_value))))
+                for chunk, distance_value in rows
+            ]
+
+        chunks = list(session.scalars(statement))
+        ranked = sorted(
+            (
+                (_cosine_similarity(vector, cast(Sequence[float], chunk.embedding)), chunk)
+                for chunk in chunks
+            ),
+            key=lambda item: item[0],
+            reverse=True,
+        )[:limit]
+        return [(chunk, score) for score, chunk in ranked]
 
     @staticmethod
     def upsert_sync_cursor(
@@ -1121,11 +1517,12 @@ class AcademicRepository:
         discord_channel_id: str,
         discord_user_id: str,
         now: datetime,
+        session_kind: str | None = None,
     ) -> AcademicDiscourseSession | None:
         """Return the owner's latest unexpired clarification session."""
 
         current = _utc(now, "now")
-        return session.scalar(
+        statement = (
             select(AcademicDiscourseSession)
             .where(
                 AcademicDiscourseSession.state == "open",
@@ -1139,6 +1536,11 @@ class AcademicRepository:
             .order_by(AcademicDiscourseSession.last_turn_at.desc())
             .limit(1)
         )
+        if session_kind is not None:
+            statement = statement.where(
+                AcademicDiscourseSession.session_kind == _bounded(session_kind, 64)
+            )
+        return session.scalar(statement)
 
     @staticmethod
     def complete_discourse_session(
@@ -1182,9 +1584,135 @@ class AcademicRepository:
             external_event_id=event_id,
             received_at=_utc(received_at, "received_at"),
         )
-        session.add(row)
-        session.flush()
+        try:
+            with session.begin_nested():
+                session.add(row)
+                session.flush()
+        except IntegrityError:
+            existing = session.scalar(
+                select(AcademicDiscourseTurn).where(
+                    AcademicDiscourseTurn.external_event_id == event_id
+                )
+            )
+            if existing is None:
+                raise
+            return existing, False
         return row, True
+
+    @staticmethod
+    def find_discourse_turn(
+        session: Session,
+        *,
+        external_event_id: str,
+    ) -> AcademicDiscourseTurn | None:
+        return session.scalar(
+            select(AcademicDiscourseTurn).where(
+                AcademicDiscourseTurn.external_event_id == _bounded(external_event_id)
+            )
+        )
+
+    @staticmethod
+    def lock_open_agent_clarification_session(
+        session: Session,
+        *,
+        discord_channel_id: str,
+        discord_user_id: str,
+        now: datetime,
+    ) -> AcademicDiscourseSession | None:
+        current = _utc(now, "now")
+        return session.scalar(
+            select(AcademicDiscourseSession)
+            .where(
+                AcademicDiscourseSession.state == "open",
+                AcademicDiscourseSession.session_kind == AGENT_CLARIFICATION_SESSION_KIND,
+                AcademicDiscourseSession.discord_channel_id == _bounded(discord_channel_id, 24),
+                AcademicDiscourseSession.discord_user_id == _bounded(discord_user_id, 24),
+                or_(
+                    AcademicDiscourseSession.expires_at.is_(None),
+                    AcademicDiscourseSession.expires_at > current,
+                ),
+            )
+            .order_by(AcademicDiscourseSession.last_turn_at.desc(), AcademicDiscourseSession.id)
+            .limit(1)
+            .with_for_update()
+        )
+
+    @staticmethod
+    def create_agent_clarification_session(
+        session: Session,
+        *,
+        external_event_id: str,
+        discord_channel_id: str,
+        discord_user_id: str,
+        started_at: datetime,
+        expires_at: datetime,
+        partial_state: Mapping[str, Any],
+    ) -> AcademicDiscourseSession:
+        return AcademicRepository.create_discourse_session(
+            session,
+            external_event_id=external_event_id,
+            discord_channel_id=discord_channel_id,
+            discord_user_id=discord_user_id,
+            session_kind=AGENT_CLARIFICATION_SESSION_KIND,
+            partial_state=partial_state,
+            started_at=started_at,
+            expires_at=expires_at,
+        )
+
+    @staticmethod
+    def replace_agent_clarification_state(
+        session: Session,
+        *,
+        session_id: uuid.UUID,
+        now: datetime,
+        partial_state: Mapping[str, Any],
+    ) -> AcademicDiscourseSession:
+        row = session.scalar(
+            select(AcademicDiscourseSession)
+            .where(
+                AcademicDiscourseSession.id == session_id,
+                AcademicDiscourseSession.session_kind == AGENT_CLARIFICATION_SESSION_KIND,
+            )
+            .with_for_update()
+        )
+        if row is None:
+            raise NoResultFound(f"academic agent clarification {session_id} was not found")
+        current = _utc(now, "now")
+        if row.expires_at is not None and _aware_db(row.expires_at) <= current:
+            row.state = "expired"
+            row.partial_state = {}
+        elif row.state == "open":
+            row.partial_state = dict(partial_state)
+            row.last_turn_at = current
+        session.flush()
+        return row
+
+    @staticmethod
+    def close_agent_clarification_session(
+        session: Session,
+        *,
+        session_id: uuid.UUID,
+        completed_at: datetime,
+        final_state: Mapping[str, Any],
+    ) -> AcademicDiscourseSession:
+        row = session.scalar(
+            select(AcademicDiscourseSession)
+            .where(
+                AcademicDiscourseSession.id == session_id,
+                AcademicDiscourseSession.session_kind == AGENT_CLARIFICATION_SESSION_KIND,
+            )
+            .with_for_update()
+        )
+        if row is None:
+            raise NoResultFound(f"academic agent clarification {session_id} was not found")
+        current = _utc(completed_at, "completed_at")
+        if row.state == "open":
+            row.state = "completed"
+            row.completed_at = current
+        row.last_turn_at = current
+        row.partial_state = dict(final_state)
+        session.flush()
+        return row
 
     @staticmethod
     def expire_discourse_sessions(session: Session, *, now: datetime) -> int:
@@ -1222,6 +1750,8 @@ class AcademicRepository:
         practice_minutes: int | None = None,
         memory: LearningFocusMemoryInput | None = None,
         actor: str = "academic_planner",
+        owner_user_id: str | None = None,
+        owner_channel_id: str | None = None,
     ) -> AcademicLearningFocus:
         current = _utc(now, "now")
         event_id = _bounded_optional(source_external_event_id)
@@ -1244,12 +1774,26 @@ class AcademicRepository:
                     return replayed
         if practice_minutes is not None and practice_minutes <= 0:
             raise ValueError("practice_minutes must be positive")
+        source_session = (
+            session.get(AcademicDiscourseSession, source_session_id)
+            if source_session_id is not None
+            else None
+        )
+        resolved_owner_user_id = owner_user_id or (
+            source_session.discord_user_id if source_session is not None else None
+        )
+        resolved_owner_channel_id = owner_channel_id or (
+            source_session.discord_channel_id if source_session is not None else None
+        )
         focus = AcademicLearningFocus(
             course_id=course_id,
             assessment_id=assessment_id,
             course_code=_bounded_optional(course_code, 64),
             topic=_bounded(topic),
             status="active",
+            owner_user_id=_bounded_optional(resolved_owner_user_id, 24),
+            owner_channel_id=_bounded_optional(resolved_owner_channel_id, 24),
+            revision=1,
             source_session_id=source_session_id,
             source_external_event_id=event_id,
             reinforcement_count=1,
@@ -1299,6 +1843,9 @@ class AcademicRepository:
         practice_minutes: int | None = None,
         memory: LearningFocusMemoryInput | None = None,
         actor: str = "academic_planner",
+        owner_user_id: str | None = None,
+        owner_channel_id: str | None = None,
+        expected_revision: int | None = None,
     ) -> AcademicLearningFocus:
         event_id = _bounded_optional(external_event_id)
         if event_id is not None:
@@ -1314,19 +1861,23 @@ class AcademicRepository:
                 if existing_focus is None:
                     raise NoResultFound(f"academic learning focus {focus_id} was not found")
                 return existing_focus
-        focus = session.scalar(
-            select(AcademicLearningFocus)
-            .where(AcademicLearningFocus.id == focus_id)
-            .with_for_update()
-        )
+        filters = [AcademicLearningFocus.id == focus_id]
+        if owner_user_id is not None:
+            filters.append(AcademicLearningFocus.owner_user_id == _bounded(owner_user_id, 24))
+        if owner_channel_id is not None:
+            filters.append(AcademicLearningFocus.owner_channel_id == _bounded(owner_channel_id, 24))
+        focus = session.scalar(select(AcademicLearningFocus).where(*filters).with_for_update())
         if focus is None:
             raise NoResultFound(f"academic learning focus {focus_id} was not found")
+        if expected_revision is not None and focus.revision != expected_revision:
+            raise NoResultFound("academic learning focus revision changed")
         if practice_minutes is not None and practice_minutes <= 0:
             raise ValueError("practice_minutes must be positive")
         current = _utc(now, "now")
         focus.status = "active"
         focus.snoozed_at = None
         focus.reinforcement_count += 1
+        focus.revision += 1
         focus.last_reinforced_at = current
         focus.last_reviewed_at = current
         focus.last_review_prompted_at = None
@@ -1378,6 +1929,8 @@ class AcademicRepository:
         course_id: uuid.UUID | None = None,
         include_snoozed: bool = False,
         limit: int = 50,
+        owner_user_id: str | None = None,
+        owner_channel_id: str | None = None,
     ) -> list[AcademicLearningFocus]:
         if limit < 1:
             return []
@@ -1390,6 +1943,14 @@ class AcademicRepository:
         )
         if course_id is not None:
             statement = statement.where(AcademicLearningFocus.course_id == course_id)
+        if owner_user_id is not None:
+            statement = statement.where(
+                AcademicLearningFocus.owner_user_id == _bounded(owner_user_id, 24)
+            )
+        if owner_channel_id is not None:
+            statement = statement.where(
+                AcademicLearningFocus.owner_channel_id == _bounded(owner_channel_id, 24)
+            )
         return list(session.scalars(statement))
 
     @staticmethod
@@ -1423,12 +1984,23 @@ class AcademicRepository:
         now: datetime,
         actor: str = "academic_planner",
         reason: str | None = None,
+        owner_user_id: str | None = None,
+        owner_channel_id: str | None = None,
+        expected_revision: int | None = None,
     ) -> AcademicLearningFocus:
-        focus = session.get(AcademicLearningFocus, focus_id)
+        filters = [AcademicLearningFocus.id == focus_id]
+        if owner_user_id is not None:
+            filters.append(AcademicLearningFocus.owner_user_id == _bounded(owner_user_id, 24))
+        if owner_channel_id is not None:
+            filters.append(AcademicLearningFocus.owner_channel_id == _bounded(owner_channel_id, 24))
+        focus = session.scalar(select(AcademicLearningFocus).where(*filters).with_for_update())
         if focus is None:
             raise NoResultFound(f"academic learning focus {focus_id} was not found")
+        if expected_revision is not None and focus.revision != expected_revision:
+            raise NoResultFound("academic learning focus revision changed")
         current = _utc(now, "now")
         focus.status = "snoozed"
+        focus.revision += 1
         focus.snoozed_at = current
         focus.practice_due_on = None
         focus.practice_minutes = None
@@ -1459,6 +2031,7 @@ class AcademicRepository:
             raise NoResultFound(f"academic learning focus {focus_id} was not found")
         current = _utc(now, "now")
         focus.last_review_prompted_at = current
+        focus.revision += 1
         focus.next_review_at = _utc(next_review_at, "next_review_at")
         _append_learning_focus_event(
             session,
@@ -1488,11 +2061,127 @@ class AcademicRepository:
         session.execute(
             update(StudyBlock)
             .where(StudyBlock.learning_focus_id == focus_id)
-            .values(learning_focus_id=None)
+            .values(learning_focus_id=None, block_kind="practice")
         )
         session.delete(focus)
         session.flush()
         return True
+
+    @staticmethod
+    def hard_delete_owned_learning_focus(
+        session: Session,
+        *,
+        focus_id: uuid.UUID,
+        owner_user_id: str,
+        owner_channel_id: str,
+        expected_revision: int,
+    ) -> LearningFocusMutationStatus:
+        """Lock, owner-check, and hard-delete one focus at the expected revision."""
+
+        focus = session.scalar(
+            select(AcademicLearningFocus)
+            .where(
+                AcademicLearningFocus.id == focus_id,
+                AcademicLearningFocus.owner_user_id == _bounded(owner_user_id, 24),
+                AcademicLearningFocus.owner_channel_id == _bounded(owner_channel_id, 24),
+            )
+            .with_for_update()
+        )
+        if focus is None:
+            return "not_found"
+        if focus.revision != expected_revision:
+            return "stale"
+        AcademicRepository.hard_delete_learning_focus(session, focus_id=focus.id)
+        return "applied"
+
+    @staticmethod
+    def replace_owned_learning_focus(
+        session: Session,
+        *,
+        focus_id: uuid.UUID,
+        owner_user_id: str,
+        owner_channel_id: str,
+        expected_revision: int,
+        topic: str,
+        raw_text: str,
+        memory: LearningFocusMemoryInput,
+        now: datetime,
+        source_session_id: uuid.UUID,
+        external_event_id: str,
+        next_review_at: datetime,
+        practice_due_on: date,
+        practice_minutes: int,
+        course_id: uuid.UUID | None,
+        assessment_id: uuid.UUID | None,
+        course_code: str | None,
+        actor: str,
+    ) -> tuple[LearningFocusMutationStatus, AcademicLearningFocus | None]:
+        """Replace canonical focus text and all semantic reflection memory atomically."""
+
+        focus = session.scalar(
+            select(AcademicLearningFocus)
+            .where(
+                AcademicLearningFocus.id == focus_id,
+                AcademicLearningFocus.owner_user_id == _bounded(owner_user_id, 24),
+                AcademicLearningFocus.owner_channel_id == _bounded(owner_channel_id, 24),
+            )
+            .with_for_update()
+        )
+        if focus is None:
+            return "not_found", None
+        if focus.revision != expected_revision:
+            return "stale", focus
+        if raw_text != memory.raw_text:
+            raise ValueError("replacement raw text must match the persisted memory text")
+        if practice_minutes <= 0:
+            raise ValueError("practice_minutes must be positive")
+        current = _utc(now, "now")
+        session.execute(
+            delete(AcademicReflectionMemory).where(AcademicReflectionMemory.focus_id == focus.id)
+        )
+        session.execute(
+            delete(AcademicLearningFocusEvent).where(
+                AcademicLearningFocusEvent.focus_id == focus.id
+            )
+        )
+        focus.topic = _bounded(topic)
+        focus.course_id = course_id
+        focus.assessment_id = assessment_id
+        focus.course_code = _bounded_optional(course_code, 64)
+        focus.status = "active"
+        focus.revision += 1
+        focus.reinforcement_count = 1
+        focus.next_review_at = _utc(next_review_at, "next_review_at")
+        focus.practice_due_on = practice_due_on
+        focus.practice_minutes = practice_minutes
+        focus.last_reviewed_at = current
+        focus.last_review_prompted_at = None
+        focus.last_reinforced_at = current
+        focus.missed_review_count = 0
+        focus.reminder_count = 0
+        focus.last_reminded_at = None
+        focus.snoozed_at = None
+        focus.source_session_id = source_session_id
+        _append_learning_focus_event(
+            session,
+            focus_id=focus.id,
+            session_id=source_session_id,
+            external_event_id=_bounded(external_event_id),
+            event_type="rewritten",
+            actor=actor,
+            occurred_at=current,
+            payload={"rewrite": True, "revision": focus.revision},
+        )
+        _persist_reflection_memory(
+            session,
+            focus_id=focus.id,
+            session_id=source_session_id,
+            external_event_id=_bounded(external_event_id),
+            memory=memory,
+            recorded_at=current,
+        )
+        session.flush()
+        return "applied", focus
 
     @staticmethod
     def advance_learning_focus_reminder(
@@ -1536,6 +2225,7 @@ class AcademicRepository:
         current = _utc(now, "now")
         focus.missed_review_count += 1
         focus.reminder_count += 1
+        focus.revision += 1
         focus.last_reminded_at = current
         if focus.source_session_id is not None:
             discourse_session = session.get(AcademicDiscourseSession, focus.source_session_id)
@@ -1860,6 +2550,36 @@ def _embedding_vector(value: Sequence[float] | None) -> list[float] | None:
     return result
 
 
+def _document_source_kind(value: str | None) -> str | None:
+    if value is None:
+        return None
+    normalized = value.strip()
+    if normalized not in _ACADEMIC_DOCUMENT_SOURCE_KINDS:
+        raise ValueError("academic document source kind is invalid")
+    return normalized
+
+
+def _document_extraction_status(value: str) -> str:
+    normalized = value.strip()
+    if normalized not in _ACADEMIC_DOCUMENT_STATUSES:
+        raise ValueError("academic document extraction status is invalid")
+    return normalized
+
+
+def _durable_source_url(value: str | None) -> str | None:
+    """Drop temporary signed Notion attachment URLs before relational persistence."""
+
+    if value is None:
+        return None
+    normalized = value.strip()
+    if not normalized:
+        return None
+    lowered = normalized.lower()
+    if any(marker in lowered for marker in _SIGNED_NOTION_URL_MARKERS):
+        return None
+    return _bounded(normalized, 1_000)
+
+
 def _checkin_proposal_from_row(
     proposal_type: Any,
     proposal_id: uuid.UUID,
@@ -1890,6 +2610,58 @@ def _resolve_study_plan_id(
     return plan.id if plan is not None else None
 
 
+def _lock_proposal_operation(
+    session: Session,
+    proposal_id: uuid.UUID,
+    ordinal: int,
+    payload_hash: str,
+) -> AcademicProposalOperationJournal:
+    if ordinal < 0:
+        raise ValueError("proposal operation ordinal must be nonnegative")
+    if not _SHA256.fullmatch(payload_hash):
+        raise ValueError("proposal operation payload hash must be SHA-256 hex")
+    row = session.scalar(
+        select(AcademicProposalOperationJournal)
+        .where(
+            AcademicProposalOperationJournal.proposal_id == proposal_id,
+            AcademicProposalOperationJournal.ordinal == ordinal,
+        )
+        .with_for_update()
+    )
+    if row is None:
+        raise NoResultFound(f"academic proposal operation {proposal_id}:{ordinal} was not found")
+    if row.payload_hash != payload_hash:
+        raise ValueError("proposal operation payload hash changed")
+    return row
+
+
+def _bounded_receipt(receipt: Mapping[str, Any]) -> dict[str, Any]:
+    allowed = {
+        "proposal_id": 255,
+        "page_id": 255,
+        "url": 1_000,
+        "property_id": 255,
+    }
+    result: dict[str, Any] = {}
+    for key, limit in allowed.items():
+        value = receipt.get(key)
+        if isinstance(value, str) and value.strip():
+            result[key] = value.strip()[:limit]
+    return result
+
+
+def _proposal_operation_snapshot(row: AcademicProposalOperationJournal) -> dict[str, Any]:
+    return {
+        "proposal_id": str(row.proposal_id),
+        "ordinal": row.ordinal,
+        "operation_id": row.operation_id,
+        "payload_hash": row.payload_hash,
+        "state": row.state,
+        "receipt": dict(row.receipt or {}),
+        "error_code": row.error_code,
+    }
+
+
 def _learning_focus_option(session: Session, focus: AcademicLearningFocus) -> Any:
     from app.agents.academic_planner.contracts import (
         AcademicLearningFocusOption,
@@ -1898,6 +2670,12 @@ def _learning_focus_option(session: Session, focus: AcademicLearningFocus) -> An
 
     assessment = (
         session.get(Assessment, focus.assessment_id) if focus.assessment_id is not None else None
+    )
+    latest_memory = session.scalar(
+        select(AcademicReflectionMemory)
+        .where(AcademicReflectionMemory.focus_id == focus.id)
+        .order_by(AcademicReflectionMemory.recorded_at.desc())
+        .limit(1)
     )
     return AcademicLearningFocusOption(
         focus_id=str(focus.id),
@@ -1913,6 +2691,12 @@ def _learning_focus_option(session: Session, focus: AcademicLearningFocus) -> An
         ),
         missed_checkin_count=focus.missed_review_count,
         snoozed_until=None,
+        revision=focus.revision,
+        current_reflection_summary=(
+            latest_memory.redacted_summary[:500]
+            if latest_memory is not None and latest_memory.redacted_summary
+            else None
+        ),
     )
 
 
@@ -1951,11 +2735,11 @@ class SQLAlchemyAcademicPlannerStore:
         self.default_practice_minutes = default_practice_minutes
 
     def search_courses(self, query: str) -> Sequence[Any]:
-        """Return bounded writable course options for the model's read-only tool."""
+        """Return a bounded writable course inventory for semantic model selection."""
 
         from app.agents.academic_planner.contracts import AcademicCourseOption
 
-        needle = _academic_search_text(query)
+        del query
         with Session(self.engine) as session:
             rows = session.execute(
                 select(Course, AcademicCourseCalendar)
@@ -1968,7 +2752,7 @@ class SQLAlchemyAcademicPlannerStore:
                     AcademicCourseCalendar.date_property_id.is_not(None),
                 )
                 .order_by(Course.course_code, Course.term, Course.id)
-                .limit(200)
+                .limit(20)
             )
             options = [
                 AcademicCourseOption(
@@ -1977,29 +2761,22 @@ class SQLAlchemyAcademicPlannerStore:
                     title=course.title,
                 )
                 for course, _calendar in rows
-                if _academic_option_matches(
-                    needle,
-                    str(course.id),
-                    course.course_code,
-                    course.title,
-                    course.term,
-                )
             ]
-        return tuple(options[:20])
+        return tuple(options)
 
     def search_assessments(
         self,
         query: str,
         course_id: str | None = None,
     ) -> Sequence[Any]:
-        """Return bounded active assessment options for the model's read-only tool."""
+        """Return a bounded active assessment inventory for semantic model selection."""
 
         from app.agents.academic_planner.contracts import (
             AcademicAssessmentOption,
             AssessmentType,
         )
 
-        needle = _academic_search_text(query)
+        del query
         selected_course_id = _parse_uuid(course_id) if course_id is not None else None
         if course_id is not None and selected_course_id is None:
             return ()
@@ -2018,7 +2795,7 @@ class SQLAlchemyAcademicPlannerStore:
                     AcademicCourseCalendar.date_property_id.is_not(None),
                 )
                 .order_by(Assessment.due_at, Assessment.title, Assessment.id)
-                .limit(500)
+                .limit(20)
             )
             if selected_course_id is not None:
                 statement = statement.where(Course.id == selected_course_id)
@@ -2039,20 +2816,16 @@ class SQLAlchemyAcademicPlannerStore:
                     expected_last_edited_at=_aware_db(assessment.notion_last_edited_at),
                 )
                 for assessment, course in rows
-                if _academic_option_matches(
-                    needle,
-                    str(assessment.id),
-                    assessment.notion_id,
-                    assessment.title,
-                    course.course_code,
-                )
             ]
-        return tuple(options[:20])
+        return tuple(options)
 
     def search_learning_focuses(
         self,
         query: str | None,
         statuses: Sequence[Any],
+        *,
+        owner_user_id: str | None = None,
+        owner_channel_id: str | None = None,
     ) -> Sequence[Any]:
         """Return bounded active/snoozed focus options for model-selected reads."""
 
@@ -2066,17 +2839,24 @@ class SQLAlchemyAcademicPlannerStore:
             return ()
         needle = _academic_search_text(query or "")
         with Session(self.engine) as session:
-            rows = list(
-                session.scalars(
-                    select(AcademicLearningFocus)
-                    .where(AcademicLearningFocus.status.in_(sorted(allowed)))
-                    .order_by(
-                        AcademicLearningFocus.next_review_at,
-                        AcademicLearningFocus.topic,
-                    )
-                    .limit(100)
+            statement = (
+                select(AcademicLearningFocus)
+                .where(AcademicLearningFocus.status.in_(sorted(allowed)))
+                .order_by(
+                    AcademicLearningFocus.next_review_at,
+                    AcademicLearningFocus.topic,
                 )
+                .limit(100)
             )
+            if owner_user_id is not None:
+                statement = statement.where(
+                    AcademicLearningFocus.owner_user_id == _bounded(owner_user_id, 24)
+                )
+            if owner_channel_id is not None:
+                statement = statement.where(
+                    AcademicLearningFocus.owner_channel_id == _bounded(owner_channel_id, 24)
+                )
+            rows = list(session.scalars(statement))
             return tuple(
                 _learning_focus_option(session, row)
                 for row in rows
@@ -2088,7 +2868,37 @@ class SQLAlchemyAcademicPlannerStore:
                 )
             )[:20]
 
-    async def search_semantic_focuses(self, query: str, *, limit: int) -> Sequence[Any]:
+    def list_memory_focuses_for_owner(
+        self,
+        *,
+        owner_user_id: str,
+        owner_channel_id: str,
+        limit: int = 20,
+    ) -> tuple[tuple[Any, ...], bool]:
+        """Return bounded active/snoozed facts and a host-computed truncation flag."""
+
+        if limit < 1 or limit > 20:
+            raise ValueError("memory focus limit must be between 1 and 20")
+        with Session(self.engine) as session:
+            rows = AcademicRepository.list_active_learning_focuses(
+                session,
+                include_snoozed=True,
+                limit=limit + 1,
+                owner_user_id=owner_user_id,
+                owner_channel_id=owner_channel_id,
+            )
+            return tuple(_learning_focus_option(session, row) for row in rows[:limit]), (
+                len(rows) > limit
+            )
+
+    async def search_semantic_focuses(
+        self,
+        query: str,
+        *,
+        limit: int,
+        owner_user_id: str | None = None,
+        owner_channel_id: str | None = None,
+    ) -> Sequence[Any]:
         """Embed a query and run owner-local exact cosine search in pgvector."""
 
         from app.agents.academic_planner.contracts import AcademicSemanticCandidate
@@ -2105,7 +2915,7 @@ class SQLAlchemyAcademicPlannerStore:
                 distance = AcademicReflectionMemory.embedding.cosine_distance(vector).label(
                     "distance"
                 )
-                rows = session.execute(
+                statement = (
                     select(AcademicReflectionMemory, AcademicLearningFocus, distance)
                     .join(
                         AcademicLearningFocus,
@@ -2119,6 +2929,15 @@ class SQLAlchemyAcademicPlannerStore:
                     .order_by(distance)
                     .limit(limit)
                 )
+                if owner_user_id is not None:
+                    statement = statement.where(
+                        AcademicLearningFocus.owner_user_id == _bounded(owner_user_id, 24)
+                    )
+                if owner_channel_id is not None:
+                    statement = statement.where(
+                        AcademicLearningFocus.owner_channel_id == _bounded(owner_channel_id, 24)
+                    )
+                rows = session.execute(statement)
                 candidates = [
                     AcademicSemanticCandidate(
                         candidate_id=str(memory.id),
@@ -2132,7 +2951,7 @@ class SQLAlchemyAcademicPlannerStore:
                 ]
                 return tuple(candidates)
 
-            rows = session.execute(
+            statement = (
                 select(AcademicReflectionMemory, AcademicLearningFocus)
                 .join(
                     AcademicLearningFocus,
@@ -2144,6 +2963,15 @@ class SQLAlchemyAcademicPlannerStore:
                     AcademicLearningFocus.status.in_(["active", "snoozed"]),
                 )
             )
+            if owner_user_id is not None:
+                statement = statement.where(
+                    AcademicLearningFocus.owner_user_id == _bounded(owner_user_id, 24)
+                )
+            if owner_channel_id is not None:
+                statement = statement.where(
+                    AcademicLearningFocus.owner_channel_id == _bounded(owner_channel_id, 24)
+                )
+            rows = session.execute(statement)
             ranked = sorted(
                 (
                     (
@@ -2415,6 +3243,7 @@ class SQLAlchemyAcademicPlannerStore:
                 artifact_key=sha256(document.text.encode()).hexdigest(),
                 content_hash=sha256(document.text.encode()).hexdigest(),
                 course_id=course_id,
+                source_page_id=source_page_id,
             )
             return str(row.id)
 
@@ -2436,6 +3265,7 @@ class SQLAlchemyAcademicPlannerStore:
     async def search_document_chunks(self, *, query: Any) -> list[dict[str, Any]]:
         params = query.parameters
         course_id = params.get("course_id")
+        assessment_id = params.get("assessment_id")
         with Session(self.engine) as session:
             rows = AcademicRepository.search_document_chunks(
                 session,
@@ -2443,7 +3273,9 @@ class SQLAlchemyAcademicPlannerStore:
                 course_id=uuid.UUID(str(course_id)) if course_id else None,
                 term=params.get("term"),
                 document_type=params.get("document_type"),
+                assessment_id=uuid.UUID(str(assessment_id)) if assessment_id else None,
                 access_classification=str(params.get("access_classification", "private")),
+                active_only=bool(params.get("active_only", False)),
                 limit=int(params.get("limit", 8)),
             )
             results: list[dict[str, Any]] = []
@@ -2456,14 +3288,181 @@ class SQLAlchemyAcademicPlannerStore:
                         "document_id": str(row.document_id),
                         "ordinal": row.ordinal,
                         "content": row.content,
+                        "chunk_id": str(row.id),
                         "source_page": row.source_page,
                         "source_block": row.source_block,
                         "heading": row.heading,
                         "document_version": document.document_version,
+                        "assessment_id": str(document.assessment_id)
+                        if document.assessment_id is not None
+                        else None,
+                        "source_key": document.source_key,
+                        "source_kind": document.source_kind,
                         "access_classification": document.access_classification,
                     }
                 )
             return results
+
+    def list_assessment_materials(
+        self,
+        assessment_id: uuid.UUID | str,
+        *,
+        active_only: bool = True,
+        limit: int = 50,
+    ) -> list[dict[str, Any]]:
+        """Return safe material metadata for one assessment without raw text."""
+
+        with Session(self.engine) as session:
+            scope = _resolve_assessment_scope(session, assessment_id)
+            if scope is None:
+                return []
+            internal_assessment_id, public_assessment_id = scope
+            rows = AcademicRepository.list_assessment_materials(
+                session,
+                assessment_id=internal_assessment_id,
+                active_only=active_only,
+                limit=limit,
+            )
+            return [
+                {
+                    "document_id": str(row.id),
+                    "assessment_id": public_assessment_id,
+                    "source_kind": row.source_kind,
+                    "source_page_id": row.source_page_id,
+                    "source_block_id": row.source_block_id,
+                    "source_property_id": row.source_property_id,
+                    "source_key": row.source_key,
+                    "document_version": row.document_version,
+                    "title": row.title,
+                    "document_type": row.document_type,
+                    "media_type": row.media_type,
+                    "retrieved_at": _aware_db(row.retrieved_at).isoformat(),
+                    "source_last_edited_at": (
+                        _aware_db(row.source_last_edited_at).isoformat()
+                        if row.source_last_edited_at is not None
+                        else None
+                    ),
+                    "active": row.active,
+                    "extraction_status": row.extraction_status,
+                    "extraction_error_code": row.extraction_error_code,
+                    "chunk_count": int(
+                        session.scalar(
+                            select(func.count())
+                            .select_from(AcademicDocumentChunk)
+                            .where(AcademicDocumentChunk.document_id == row.id)
+                        )
+                        or 0
+                    ),
+                }
+                for row in rows
+            ]
+
+    def read_assessment_material_chunks(
+        self,
+        assessment_id: uuid.UUID | str,
+        chunk_ids: Sequence[uuid.UUID | str],
+        *,
+        limit: int = 50,
+    ) -> list[dict[str, Any]]:
+        """Read owned material chunks for model tools after host-side ID checks."""
+
+        parsed_ids = [uuid.UUID(str(chunk_id)) for chunk_id in chunk_ids]
+        with Session(self.engine) as session:
+            scope = _resolve_assessment_scope(session, assessment_id)
+            if scope is None:
+                return []
+            internal_assessment_id, public_assessment_id = scope
+            rows = AcademicRepository.read_assessment_material_chunks(
+                session,
+                assessment_id=internal_assessment_id,
+                chunk_ids=parsed_ids,
+                limit=limit,
+            )
+            results: list[dict[str, Any]] = []
+            for row in rows:
+                document = session.get(AcademicDocument, row.document_id)
+                if document is None:
+                    continue
+                results.append(
+                    {
+                        "chunk_id": str(row.id),
+                        "document_id": str(row.document_id),
+                        "assessment_id": public_assessment_id,
+                        "ordinal": row.ordinal,
+                        "content": row.content,
+                        "source_page": row.source_page,
+                        "source_block": row.source_block,
+                        "source_url": _durable_source_url(row.source_url),
+                        "heading": row.heading,
+                        "document_version": document.document_version,
+                        "source_key": document.source_key,
+                    }
+                )
+            return results
+
+    async def search_semantic_assessment_materials(
+        self,
+        assessment_id: uuid.UUID | str,
+        query: str,
+        *,
+        limit: int = 8,
+    ) -> list[dict[str, Any]]:
+        """Embed a query and search only active chunks owned by one assessment."""
+
+        from app.llm.embeddings import EmbeddingStatus
+
+        if self.embedding_gateway is None or limit < 1:
+            return []
+        result = await self.embedding_gateway.embed_academic_text(query)
+        if result.status is not EmbeddingStatus.VALID or result.embedding is None:
+            return []
+        with Session(self.engine) as session:
+            scope = _resolve_assessment_scope(session, assessment_id)
+            if scope is None:
+                return []
+            internal_assessment_id, public_assessment_id = scope
+            rows = AcademicRepository.search_semantic_document_chunks(
+                session,
+                assessment_id=internal_assessment_id,
+                query_embedding=result.embedding.vector,
+                embedding_model=result.model_identity,
+                limit=limit,
+            )
+            output: list[dict[str, Any]] = []
+            for row, score in rows:
+                document = session.get(AcademicDocument, row.document_id)
+                if document is None:
+                    continue
+                output.append(
+                    {
+                        "chunk_id": str(row.id),
+                        "document_id": str(row.document_id),
+                        "assessment_id": public_assessment_id,
+                        "ordinal": row.ordinal,
+                        "content": row.content,
+                        "source_page": row.source_page,
+                        "source_block": row.source_block,
+                        "heading": row.heading,
+                        "document_version": document.document_version,
+                        "source_key": document.source_key,
+                        "score": score,
+                    }
+                )
+            return output
+
+    async def semantic_search_assessment_materials(
+        self,
+        assessment_id: uuid.UUID | str,
+        query: str,
+        limit: int = 8,
+    ) -> list[dict[str, Any]]:
+        """Material-agent alias with a positional bounded limit."""
+
+        return await self.search_semantic_assessment_materials(
+            assessment_id,
+            query,
+            limit=limit,
+        )
 
     def load_planner_facts(self, *, now: datetime, horizon_days: int) -> Any:
         from app.agents.academic_planner.contracts import (
@@ -2880,7 +3879,11 @@ class SQLAlchemyAcademicPlannerStore:
             return _checkin_proposal_from_row(CheckinProposal, proposal_id, row, changes)
 
     def prepare_checkin_application(
-        self, proposal_id: uuid.UUID, confirmation_event: str
+        self,
+        proposal_id: uuid.UUID,
+        confirmation_event: str,
+        *,
+        now: datetime | None = None,
     ) -> tuple[str, Any | None]:
         """Validate, expire, and claim a proposal before its Notion write."""
 
@@ -2898,6 +3901,7 @@ class SQLAlchemyAcademicPlannerStore:
                 session,
                 proposal_id=row.id,
                 confirmation_event=confirmation_event,
+                now=now,
             )
             changes = tuple(ProposedChange(**value) for value in row.payload.get("changes", []))
             proposal = _checkin_proposal_from_row(CheckinProposal, proposal_id, row, changes)
@@ -2932,7 +3936,11 @@ class SQLAlchemyAcademicPlannerStore:
             )
 
     def reject_checkin_proposal(
-        self, proposal_id: uuid.UUID, *, actor: str = "academic_planner"
+        self,
+        proposal_id: uuid.UUID,
+        *,
+        actor: str = "academic_planner",
+        now: datetime | None = None,
     ) -> tuple[ProposalRejectionStatus, Any | None]:
         from app.agents.academic_planner.contracts import CheckinProposal, ProposedChange
 
@@ -2948,6 +3956,7 @@ class SQLAlchemyAcademicPlannerStore:
                 session,
                 proposal_id=row.id,
                 actor=actor,
+                now=now,
             )
             changes = tuple(ProposedChange(**value) for value in row.payload.get("changes", []))
             proposal = _checkin_proposal_from_row(CheckinProposal, proposal_id, row, changes)
@@ -3015,6 +4024,9 @@ class SQLAlchemyAcademicPlannerStore:
         with Session(self.engine) as session, session.begin():
             course_row = _resolve_course(session, course)
             due_at = _field_datetime(assessment, "due_at", "date", "start")
+            ends_at = _field_datetime(assessment, "ends_at", "end_at", "date_end", "end")
+            if ends_at is not None and (due_at is None or ends_at <= due_at):
+                ends_at = None
             source_id = str(
                 _field(assessment, "source_id", "assessments_source_id", "data_source_id") or ""
             )
@@ -3043,6 +4055,7 @@ class SQLAlchemyAcademicPlannerStore:
                 title=str(_field(assessment, "title", "current_title") or "Untitled assessment"),
                 assessment_type=kind,
                 due_at=due_at,
+                ends_at=ends_at,
                 grade_weight_percent=_field_number(assessment, "grade_weight_percent", "weight"),
                 estimated_minutes=int(_field_number(assessment, "estimated_minutes") or 60),
                 scope=_field(assessment, "scope"),
@@ -3056,6 +4069,60 @@ class SQLAlchemyAcademicPlannerStore:
                 trace=trace,
             )
             return str(row.id)
+
+    def begin_proposal_operation(
+        self,
+        *,
+        proposal_id: uuid.UUID,
+        ordinal: int,
+        payload_hash: str,
+        operation_id: str,
+    ) -> tuple[ProposalOperationStatus, Mapping[str, Any]]:
+        with Session(self.engine) as session, session.begin():
+            status, row = AcademicRepository.begin_proposal_operation(
+                session,
+                proposal_id=proposal_id,
+                ordinal=ordinal,
+                payload_hash=payload_hash,
+                operation_id=operation_id,
+            )
+            return status, _proposal_operation_snapshot(row)
+
+    def mark_proposal_operation_applied(
+        self,
+        *,
+        proposal_id: uuid.UUID,
+        ordinal: int,
+        payload_hash: str,
+        receipt: Mapping[str, Any],
+    ) -> Mapping[str, Any]:
+        with Session(self.engine) as session, session.begin():
+            row = AcademicRepository.mark_proposal_operation_applied(
+                session,
+                proposal_id=proposal_id,
+                ordinal=ordinal,
+                payload_hash=payload_hash,
+                receipt=receipt,
+            )
+            return _proposal_operation_snapshot(row)
+
+    def mark_proposal_operation_uncertain(
+        self,
+        *,
+        proposal_id: uuid.UUID,
+        ordinal: int,
+        payload_hash: str,
+        error_code: str,
+    ) -> Mapping[str, Any]:
+        with Session(self.engine) as session, session.begin():
+            row = AcademicRepository.mark_proposal_operation_uncertain(
+                session,
+                proposal_id=proposal_id,
+                ordinal=ordinal,
+                payload_hash=payload_hash,
+                error_code=error_code,
+            )
+            return _proposal_operation_snapshot(row)
 
     def reconcile_assessment_source(
         self,
@@ -3080,6 +4147,21 @@ class SQLAlchemyAcademicPlannerStore:
                 raw_label=kwargs.get("raw_label"),
                 quiz_preview_title=str(kwargs["quiz_preview_title"]),
                 assignment_preview_title=str(kwargs["assignment_preview_title"]),
+                tutorial_preview_title=(
+                    str(kwargs["tutorial_preview_title"])
+                    if kwargs.get("tutorial_preview_title") is not None
+                    else None
+                ),
+                lab_preview_title=(
+                    str(kwargs["lab_preview_title"])
+                    if kwargs.get("lab_preview_title") is not None
+                    else None
+                ),
+                studying_block_preview_title=(
+                    str(kwargs["studying_block_preview_title"])
+                    if kwargs.get("studying_block_preview_title") is not None
+                    else None
+                ),
                 expected_edited_at=_utc(kwargs["expected_edited_at"], "expected_edited_at"),
                 expires_at=_utc(kwargs["expires_at"], "expires_at"),
                 idempotency_key=str(kwargs["idempotency_key"]),
@@ -3097,7 +4179,7 @@ class SQLAlchemyAcademicPlannerStore:
     def claim_clarification(
         self,
         clarification_id: uuid.UUID | str,
-        action: Literal["quiz", "assignment", "ignore"],
+        action: AcademicClarificationAction,
         actor_id: int,
         *,
         now: datetime | None = None,
@@ -3219,6 +4301,22 @@ class SQLAlchemyAcademicPlannerStore:
 
     def mark_checkin(self, proposal_id: uuid.UUID) -> None:
         self.mark_checkin_applied(proposal_id)
+
+
+def _resolve_assessment_scope(
+    session: Session,
+    assessment_id: uuid.UUID | str,
+) -> tuple[uuid.UUID, str] | None:
+    """Resolve planner-facing Notion IDs without weakening the internal FK scope."""
+
+    raw_id = _bounded(str(assessment_id))
+    parsed_id = _parse_uuid(raw_id)
+    row = session.get(Assessment, parsed_id) if parsed_id is not None else None
+    if row is None:
+        row = session.scalar(select(Assessment).where(Assessment.notion_id == raw_id))
+    if row is None:
+        return None
+    return row.id, row.notion_id
 
 
 def _aware_db(value: datetime) -> datetime:
@@ -3457,6 +4555,13 @@ def _resolve_course(session: Session, value: Any) -> Course:
 
 
 def _clarification_public(row: AcademicClarification) -> dict[str, Any]:
+    preview_titles = {
+        "quiz": row.quiz_preview_title,
+        "assignment": row.assignment_preview_title,
+        "tutorial": row.tutorial_preview_title,
+        "lab": row.lab_preview_title,
+        "studying_block": row.studying_block_preview_title,
+    }
     return {
         "id": str(row.id),
         "event_notion_id": row.event_notion_id,
@@ -3465,6 +4570,12 @@ def _clarification_public(row: AcademicClarification) -> dict[str, Any]:
         "original_title": row.original_title,
         "quiz_preview_title": row.quiz_preview_title,
         "assignment_preview_title": row.assignment_preview_title,
+        "tutorial_preview_title": row.tutorial_preview_title,
+        "lab_preview_title": row.lab_preview_title,
+        "studying_block_preview_title": row.studying_block_preview_title,
+        "preview_titles": {
+            action: title for action, title in preview_titles.items() if title is not None
+        },
         "expected_edited_at": _aware_db(row.expected_edited_at).isoformat(),
         "title_property_id": row.title_property_id,
         "decision": row.decision,

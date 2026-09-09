@@ -277,11 +277,22 @@ def check_academic_notion_status(
     pending = int(snapshot.get("pending_clarification_count", 0))
     write_failures = int(snapshot.get("write_failure_count", 0))
     reminders = int(snapshot.get("setup_reminder_count", 0))
+    material_pending = int(snapshot.get("material_pending_count", 0))
+    material_failed = int(snapshot.get("material_failed_count", 0))
+    material_partial = int(snapshot.get("material_partial_count", 0))
     setup_codes = snapshot.get("setup_condition_codes", [])
     setup_summary = ",".join(str(code) for code in setup_codes) if setup_codes else "none"
     state = (
         HealthState.ATTENTION
-        if invalid or pending or write_failures or reminders
+        if (
+            invalid
+            or pending
+            or write_failures
+            or reminders
+            or material_pending
+            or material_failed
+            or material_partial
+        )
         else HealthState.HEALTHY
     )
     return HealthCheck(
@@ -296,55 +307,49 @@ def check_academic_notion_status(
             f"write failures {write_failures}; "
             f"setup reminders {reminders}; "
             f"setup conditions {setup_summary}; "
+            f"materials pending {material_pending}; "
+            f"materials failed {material_failed}; "
+            f"materials partial {material_partial}; "
             f"last sync {snapshot.get('last_sync_at') or 'never'}; "
             f"migration {snapshot.get('migration', 'unknown')}"
         ),
     )
 
 
-def check_academic_discord_gateway(settings: Settings, runtime_state: str | None) -> HealthCheck:
-    """Expose Gateway/message-content setup without account or credential details."""
+def check_academic_discord_handoff(settings: Settings) -> HealthCheck:
+    """Expose backend handoff readiness separately from native host ingress."""
 
-    if not settings.discord_academic_gateway_enabled:
-        if settings.discord_academic_message_content_enabled:
-            return HealthCheck(
-                name="academic_discord_gateway",
-                state=HealthState.ATTENTION,
-                diagnostic=(
-                    "Academic Discord free-text is enabled but the Gateway listener is disabled; "
-                    "enable the Gateway or disable free-text"
-                ),
-            )
-        return HealthCheck(
-            name="academic_discord_gateway",
-            state=HealthState.HEALTHY,
-            diagnostic="Academic Discord Gateway listener is disabled",
-        )
     configured = (
         settings.discord_bot_token is not None
         and settings.discord_academic_channel_id is not None
+        and settings.discord_application_id is not None
         and bool(settings.discord_academic_authorized_user_ids)
+        and settings.discord_host_handoff_secret is not None
+        and settings.discord_academic_message_content_enabled
     )
-    if not configured or runtime_state == "setup_required":
+    if not configured:
         return HealthCheck(
-            name="academic_discord_gateway",
+            name="academic_discord_handoff",
             state=HealthState.ATTENTION,
-            diagnostic="Academic Discord Gateway setup is incomplete",
-        )
-    state = runtime_state or "unknown"
-    if state == "message_content_intent_unavailable":
-        return HealthCheck(
-            name="academic_discord_gateway",
-            state=HealthState.FAILED,
-            diagnostic=(
-                "Discord rejected the Message Content privileged intent; enable it in the "
-                "Developer Portal or disable academic free-text"
-            ),
+            diagnostic="Academic Discord host handoff setup is incomplete",
         )
     return HealthCheck(
-        name="academic_discord_gateway",
-        state=HealthState.HEALTHY if state == "running" else HealthState.ATTENTION,
-        diagnostic=f"Academic Discord Gateway listener state: {state}",
+        name="academic_discord_handoff",
+        state=HealthState.HEALTHY,
+        diagnostic="Academic Discord backend handoff is configured",
+    )
+
+
+def check_academic_discord_host_ingress() -> HealthCheck:
+    """Describe the independently supervised host listener without guessing its state."""
+
+    return HealthCheck(
+        name="academic_discord_host_ingress",
+        state=HealthState.ATTENTION,
+        diagnostic=(
+            "Discord Gateway ingress is external to Compose and cannot be verified here; "
+            "inspect it with scripts/lifeagent_host_runtime.sh status"
+        ),
     )
 
 

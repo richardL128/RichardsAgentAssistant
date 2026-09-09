@@ -2,158 +2,164 @@
 
 ## Symptom
 
-The operations console shows the shared-services health card as `Attention`
-with `ollama=attention`. The `/health/ready` readiness endpoint returns
-`attention` with a diagnostic message such as `Ollama unavailable`, `configured
-Ollama model is not installed`, or `configured Ollama model digest does not
-match`.
+An authorized Discord mention has its existing wake acknowledgement edited to
+the bounded unavailable response:
 
-When the model is unavailable, agents cannot generate code review feedback,
-academic plans, or finance briefings. Active queue jobs may pile up in `doing`
-status while waiting for model calls to succeed.
+```text
+Qwen is unavailable on this Mac; run scripts/ollama_qwen_start.sh and try again.
+```
+
+The operations console or `/health/ready` may also show `ollama=attention` with
+a diagnostic such as `Ollama unavailable`, `configured Ollama model is not
+installed`, or `configured Ollama model digest does not match`.
+
+In the default runtime, Qwen-powered work starts only from an authorized bot
+mention in the configured private Discord academic channel. Replies to an open
+academic clarification also require a verified mention. Startup, health checks,
+all unmentioned prose, and every schedule must not load Qwen.
 
 ## Diagnosis
 
-Check the API readiness endpoint to confirm the health state:
+Check the API readiness endpoint:
 
 ```bash
 curl http://127.0.0.1:8000/health/ready | jq .
 ```
 
-Look for `status: "attention"` or `status: "failed"` and the corresponding
-`ollama` diagnostic message in the `checks` array.
+The readiness probe checks Ollama's non-secret `/api/tags` endpoint only. It can
+observe whether the host API is reachable and whether the configured model and
+optional digest are present; it must not send a generation request or load Qwen.
 
-Verify Ollama is running on the macOS host:
-
-```bash
-ollama ps
-ollama list
-```
-
-If Ollama is running, check whether it can respond to requests:
+Check the host-managed Ollama state from the repository root:
 
 ```bash
-curl http://127.0.0.1:11434/api/tags | jq '.models[] | {name, digest}'
+scripts/ollama_qwen_status.sh
 ```
 
-Verify that Docker containers can reach the Ollama endpoint. Run a test from
-inside the API container:
+The status script reports, with meaningful exit codes, whether the local Ollama
+API is reachable, whether the configured model is installed, whether the
+optional digest matches, and whether Qwen is currently resident according to
+`/api/ps`. It does not print prompts, Discord messages, unrelated model
+metadata, or secrets.
+
+Verify Docker can reach the host endpoint without loading Qwen:
 
 ```bash
-docker compose exec api python -c "
-import httpx
-try:
-    response = httpx.get('http://host.docker.internal:11434/api/tags', timeout=5)
-    print(f'Status: {response.status_code}')
-    print(response.json())
-except Exception as e:
-    print(f'Error: {e}')
-"
+docker compose exec api python -c "import httpx; r=httpx.get('http://host.docker.internal:11434/api/tags', timeout=5); print(r.status_code); print(r.text[:500])"
 ```
 
-Check the procrastinate queue to see if jobs are accumulating while waiting for
-model responses. A growing count of `doing` jobs with old timestamps suggests
-model processing is stalled:
-
-```bash
-docker compose exec -T postgres sh -lc 'psql -U "$POSTGRES_USER" -d "$POSTGRES_DB" -c "
-SELECT status, COUNT(*) as count
-FROM procrastinate_jobs
-GROUP BY status
-ORDER BY status;"'
-```
-
-Look at the `shared_services` health check row in the database to see what the
-health system recorded:
-
-```bash
-docker compose exec -T postgres sh -lc 'psql -U "$POSTGRES_USER" -d "$POSTGRES_DB" -c "
-SELECT check_name, state, rule, diagnostic, checked_at
-FROM health_checks
-WHERE check_name = '\''shared_services'\''
-ORDER BY checked_at DESC
-LIMIT 1;"'
-```
+Use queue inspection only to diagnose operational backlog. Queue and health
+checks should not be treated as permission to start scheduled model workflows in
+the current runtime.
 
 ## Fix
 
-Start Ollama on the host if it is not running:
+Start or verify the host Ollama server with the fixed operator script:
 
 ```bash
-ollama serve
+scripts/ollama_qwen_start.sh
 ```
 
-If Ollama is running but the model is missing, download the configured model
-using the exact name specified in the environment or `compose.yaml` (default:
-`qwen3-32gb:latest`):
+The script is idempotent. It probes `http://127.0.0.1:11434/api/tags`, then
+loads or kickstarts the fixed `com.lifeagent.ollama` LaunchAgent when needed.
+It writes non-secret diagnostics under `~/Library/Logs/LifeAgent` and exits
+nonzero if readiness does not succeed within the configured bounded timeout.
+There is no `nohup` or PID-file fallback.
+
+For Docker reachability, Ollama uses `OLLAMA_HOST=0.0.0.0:11434`. That bind can
+be reachable from the host network/LAN unless protected. Keep the Mac on a
+trusted network, protect the port with the macOS firewall, never add a router
+port-forward, and never publish port 11434 from Compose.
+
+If the model is missing, the script still must not pull it by default. Pull only
+when the operator explicitly requests the large download:
 
 ```bash
-ollama pull qwen3-32gb:latest
+scripts/ollama_qwen_start.sh --pull
 ```
 
-If the model is present but responding slowly, reduce concurrency to one worker
-and one Ollama process to avoid contention:
+If the digest does not match, first confirm the configured `OLLAMA_MODEL` and
+the installed model returned by:
 
 ```bash
-WORKER_CONCURRENCY=1 OLLAMA_MAX_CONCURRENCY=1 docker compose up -d api worker-code-review worker-academic-planner worker-finance
+scripts/ollama_qwen_status.sh
 ```
 
-If you intentionally changed the model version and the digest now differs from
-the configured value, update both `OLLAMA_MODEL` and `OLLAMA_MODEL_DIGEST` in
-the deployment environment together after benchmarking the new model's
-performance.
+If the new digest is intentional, update `OLLAMA_MODEL_DIGEST` in the deployment
+environment after benchmarking the model. If it is not intentional, reinstall or
+pull the expected model with `--pull`.
 
-## Expected health and Discord behavior
+After changing `.env`, deploy the shared image and restart the native runtime:
 
-The shared-services periodic task runs every five minutes. After you fix Ollama
-or restore the model, the next periodic run should record the ollama check as
-`healthy` and update the shared-services health state accordingly.
+```bash
+scripts/lifeagent_host_runtime.sh deploy
+```
 
-If the shared-services health state transitions to `healthy`, the health row's
-`rule` field will reflect `ollama=healthy` alongside any other component states.
-The operations console card will show `Healthy` status.
+Do not give the API container a Docker socket, SSH key, or environment command
+that can start host processes. Only the native coordinator runs the fixed
+Docker, Compose, launchctl, and Ollama command arrays.
 
-An Ollama-unreachable `attention` state is UI health only. It should not send a
-Discord failure alert by itself. The shared-services alert policy sends an
-alert only when overall shared-services health is `failed`, when an agent health
-rule is `run_overdue` or `waiting_for_retry`, or when the queue check is
-`attention` because work is failing or stalled. If one of those escalation
-conditions is present and Ollama is also unhealthy, the alert uses the
-allowlisted failure-alert payload: component, state, error code, retry count,
-and run ID only. It must not include model outputs, prompts, or other sensitive
-content.
+## Slow Cold Starts
+
+Qwen is host-managed and lazily loaded. The host Ollama server may already be
+running while the Qwen model is absent from `ollama ps`; this is expected after
+idle unload or a manual unload.
+
+The first authorized mention creates exactly one Discord acknowledgement:
+
+```text
+I’m waking up LifeAgent and Qwen. Please give me a little time to respond.
+```
+
+The host edits that same message as it observes model, catalog lookup,
+validation, and terminal stages. These updates are best-effort semantic status,
+not token output or hidden reasoning; the separate durable proposal,
+clarification, or failure response remains authoritative. A progress PATCH
+failure must not suppress that response.
+
+That first real structured request loads the model and can be noticeably slower
+than later warm requests. `OLLAMA_MODEL_KEEP_ALIVE_SECONDS=300` keeps Qwen
+resident across one bounded academic loop and lets Ollama unload it after about
+five idle minutes. To unload immediately without deleting model files:
+
+```bash
+scripts/ollama_qwen_unload.sh
+```
+
+## Gateway and local handoff
+
+The configured inbound Discord path is the sole Gateway connection in the
+native `com.lifeagent.discord-wake` LaunchAgent. The Mac needs no public URL.
+After Docker is ready, the daemon sends an HMAC-signed, reference-only request
+to the backend's loopback endpoint. The backend refetches the Discord message,
+validates its channel, author, timestamp, mention metadata, and acknowledgement,
+then durably queues the row ID.
 
 ## Verify
 
+Confirm the host server and configured model:
+
 ```bash
+scripts/ollama_qwen_status.sh
 curl http://127.0.0.1:8000/health/ready | jq '.status'
 ```
 
-Confirm the response is `"healthy"` or, if another non-model check is still
-degraded, confirm the `ollama` diagnostic is no longer the cause. Then verify
-the latest health check:
+For live validation on the Mac:
 
-```bash
-docker compose exec -T postgres sh -lc 'psql -U "$POSTGRES_USER" -d "$POSTGRES_DB" -c "
-SELECT state, diagnostic
-FROM health_checks
-WHERE check_name = '\''shared_services'\''
-ORDER BY checked_at DESC
-LIMIT 1;"'
-```
+1. Run `scripts/ollama_qwen_unload.sh`.
+2. Confirm `scripts/ollama_qwen_status.sh` reports Qwen is not resident.
+3. Send an unmentioned Discord message, including as a reply to a pending
+   clarification, and confirm Qwen remains unloaded.
+4. Mention the bot once from an authorized user.
+5. Confirm one progress message appears, advances in place, and Qwen appears
+   resident.
+6. Confirm the bounded loop sends one separate final response. For an ambiguous
+   request, reply with another verified mention and confirm the pending
+   clarification continues. No more than three model attempts may occur.
+   Operational failures must not consume a clarification attempt.
+7. Confirm Qwen unloads after the configured 300-second idle interval.
 
-The diagnostic should no longer mention `ollama=attention`.
-
-If the row still shows only `ollama=attention`, verify that no delivery was
-created for a shared-services alert:
-
-```bash
-docker compose exec -T postgres sh -lc 'psql -U "$POSTGRES_USER" -d "$POSTGRES_DB" -c "
-SELECT id, idempotency_key, status, error_code
-FROM deliveries
-WHERE idempotency_key LIKE '\''shared-services-alert:%'\''
-ORDER BY created_at DESC
-LIMIT 10;"'
-```
-
-No new alert delivery should appear for an Ollama-only attention state.
+No Discord alert should be created for an Ollama-only attention state. Alerts
+remain limited to the documented shared-services failure policy and must not
+include model outputs, prompts, Discord message bodies, URLs, stack traces, or
+secret values.

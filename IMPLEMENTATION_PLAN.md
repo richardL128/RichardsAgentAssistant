@@ -2,11 +2,24 @@
 
 ## Decision summary
 
-Build one Python application with three separately deployed, Dockerized worker services: `code_review`, `academic_planner`, and `finance`. They share a small API, one database, one task queue, one local model endpoint, schemas, audit records, and deployment configuration. They are separate workers for fault isolation and independent schedules; they are **not** three independent codebases.
+Build one Python application with a default `api` service, PostgreSQL, one task
+queue, one local model endpoint, schemas, audit records, and deployment
+configuration. Code review, academic planner, and finance remain separate
+workflow domains. Scheduled code-review and finance Qwen workers remain
+non-executable in the current runtime. Academic Qwen has one configured path:
+authorized Discord mentions received by the native host wake daemon.
 
-Run Ollama natively on the Mac, not in Docker. The Dockerized workers use `http://host.docker.internal:11434` to call it. This preserves Apple Metal acceleration and lets the model weights live once on the M2 Max instead of being copied into images. Never expose port 11434 beyond the Mac.
+Run Ollama natively on the Mac, not in Docker. The Dockerized API uses
+`http://host.docker.internal:11434` to call it. This preserves Apple Metal
+acceleration and lets the model weights live once on the M2 Max instead of
+being copied into images. Never expose port 11434 beyond the Mac.
 
-The requested tag exists: `qwen3.8:27b` is currently an 18 GB Ollama model. Pin that exact tag/digest after the model-quality benchmark in Phase 1; do not use a floating `latest` tag. With 32 GB unified memory, begin with one concurrent model request and a modest context limit (8–16K tokens), then raise either only after measuring latency and memory pressure. Three agent containers are safe; three simultaneous model generations are not a sensible default on this machine.
+The configured local reasoning model is `qwen3-32gb:latest` with a pinned
+digest in normal deployments. Keep one concurrent physical model request and a
+modest context limit until latency and memory pressure justify a change. Qwen is
+not preloaded at startup: the first authorized mention causes the first real
+structured request, and `OLLAMA_MODEL_KEEP_ALIVE_SECONDS=300` lets Ollama unload
+the model after a short idle period.
 
 The build is deliberately Python-first. FastAPI serves both the API and the read-only console (Jinja templates with small HTMX interactions), so there is no React/Node frontend application to maintain.
 
@@ -17,12 +30,12 @@ The build is deliberately Python-first. FastAPI serves both the API and the read
 | Language and package management | Python 3.12, `uv`, `pyproject.toml` | One modern, fast Python toolchain and a reproducible lockfile. |
 | Web/API/UI | FastAPI, Pydantic v2, Jinja2, HTMX, Tailwind CSS | FastAPI is a strong fit for webhooks, typed APIs, and internal pages. Server-rendered templates keep the small, read-only console in the same Python service; HTMX adds filtering/acknowledgement without a SPA; Tailwind produces the responsive, accessible static CSS at build time. |
 | Agent orchestration | LangGraph + LangChain + `langchain-ollama` (`ChatOllama`) | LangGraph makes every workflow step, retry, checkpoint, and approval boundary explicit. LangChain supplies the stable Ollama client and Pydantic-oriented structured outputs. Use graphs/workflows, not unrestricted ReAct agents. |
-| Model runtime | Native Ollama, `qwen3.8:27b` | Local, private inference on Apple Silicon. Qwen handles extraction, prioritization, explanation, and critique; deterministic Python code collects facts and performs writes. |
-| Relational data | PostgreSQL 16 with optional `pgvector`, SQLAlchemy 2, Alembic | One durable source for domain data, schedules, idempotency keys, audit events, run metadata, and dashboard queries. `pgvector` is an extension in this existing database, not a second database. Alembic makes every schema change reviewable. |
-| Background work | Procrastinate (PostgreSQL-backed Python task queue) | The queue, locks, retries, worker heartbeats, and periodic jobs are durable in PostgreSQL—the database already required by the product. This removes Redis, Dramatiq, and APScheduler from a single-Mac deployment. |
+| Model runtime | Native Ollama, `qwen3-32gb:latest` | Local, private inference on Apple Silicon. Qwen is lazily loaded only by an authorized Discord mention; deterministic Python code collects facts and performs writes. |
+| Relational data | PostgreSQL 16 with optional `pgvector`, SQLAlchemy 2, Alembic | One durable source for domain data, idempotency keys, audit events, run metadata, and dashboard queries. `pgvector` is an extension in this existing database, not a second database. Alembic makes every schema change reviewable. |
+| Background work | Procrastinate (PostgreSQL-backed Python task queue) | The queue retains deterministic task, lock, retry, and audit contracts. The Discord academic wake job is the only configured model job. |
 | Long artifacts | Local Docker volume behind an `ArtifactStore` interface | Keeps phase-one local and simple while separating raw logs, PDFs, source extracts, and reports from dashboard tables. The interface can later switch to S3-compatible storage without changing agents. |
 | External HTTP | `httpx` with typed, narrow connector adapters | Avoids an SDK per vendor. Each adapter has an allowlisted base URL, timeouts, rate limits, retry policy, and redaction rules. |
-| Document extraction | PyMuPDF first; OCR only when a PDF has no extractable text | Fast deterministic text/page extraction and page-level citations. Do not add a broad document-AI platform. |
+| Document extraction | PyMuPDF first; bounded local OCR for pages with insufficient text | Fast deterministic text/page extraction and page-level citations. Do not add a broad document-AI platform. |
 | Code-review tools | `git`, GitHub REST API, Semgrep, Gitleaks, Trivy, repository-native test/lint commands | Deterministic tools find and substantiate issues; Qwen receives their compact results plus relevant diffs, rather than being asked to guess from a whole repository. |
 | Quality | pytest, pytest-asyncio, Testcontainers, Ruff, Pyright, pre-commit | Test the system at unit, connector-contract, database, and Compose integration levels using the same tools locally and in CI. |
 | Observability | JSON `structlog`, PostgreSQL audit/run tables, `/health` endpoints | Structured logs plus queryable business records provide enough visibility locally without adding a separate telemetry platform on day one. |
@@ -31,7 +44,7 @@ The build is deliberately Python-first. FastAPI serves both the API and the read
 ### Explicitly not selected yet
 
 - **No Kubernetes, microservice-per-connector, or separate frontend repository.** Docker Compose and one Python codebase suit a single Mac deployment.
-- **No separate vector-database service.** Course-document retrieval will use PostgreSQL full-text search first and can add the `pgvector` extension inside the same database when semantic retrieval proves useful. It does not replace structured assessment fields or source citations.
+- **No separate vector-database service.** PostgreSQL full-text search remains available for exact course-document lookup, while assessment material uses active, assessment-scoped exact `pgvector` retrieval in the same database. Neither path replaces structured assessment fields or source citations.
 - **No autonomous browser/search tool.** Finance retrieval is exactly the approved, versioned source adapters; code and school connectors have narrowly specified operations.
 - **No LangSmith dependency.** Local structured logs and persisted runs are sufficient initially; tracing can be added later without changing graph logic.
 - **No custom authentication in the first local-only deployment.** Bind the UI/API to `127.0.0.1`. If remote access is needed, put it behind the user's existing identity-aware network/proxy (for example Tailscale) before exposing it; do not invent a password system.
@@ -41,34 +54,40 @@ The build is deliberately Python-first. FastAPI serves both the API and the read
 
 ```text
                            macOS host (not a container)
-                         Ollama + qwen3.8:27b
-                                      ^
-                                      | host.docker.internal:11434
-                                      |
+          Discord Gateway LaunchAgent     Ollama LaunchAgent + Qwen
+                    | signed loopback ref          ^
+                    v                              | host.docker.internal:11434
  Docker Compose ---------------------------------------------------------------
  |  api + server-rendered UI                                                 |
  |          |                                                                 |
- |          +---------------- PostgreSQL (data + task queue + schedules)    |
+ |          +---------------- PostgreSQL (data + task queue + audit)        |
  |                     ^   ^                                                  |
  |                     |   |                                                  |
  |        artifact volume  |                                                  |
  |                     |   |                                                  |
- |   code-review worker   planner worker       finance worker                  |
- |        GitHub             Notion/Discord      approved source adapters      |
- |        Discord             Discord             Discord                      |
  ------------------------------------------------------------------------------
 ```
 
-Use one image, such as `lifeagent-app`, for `api` and all three workers. Compose selects the command and queue only. Procrastinate's workers schedule their durable periodic tasks through PostgreSQL, so a separate scheduler container is unnecessary. This avoids drift between the services and means shared validation/redaction code has one implementation.
+Use one image, such as `lifeagent-app`, for the `api`. The default Compose
+operation starts `postgres`, `api`, and the academic planner worker; the
+Discord academic wake job is the sole model path.
+No code-review or finance Qwen workers are runtime options. The academic worker
+is isolated to Discord academic work, ingestion, and model-free confirmations.
 
-Suggested service names:
+Default service names:
 
 ```text
-postgres, api,
-worker-code-review, worker-academic-planner, worker-finance
+postgres, api, worker-academic-planner
 ```
 
-`docker compose` never starts an Ollama container. The `api` health page must report “Ollama unavailable” when its host health check fails, rather than causing every worker to crash-loop.
+`docker compose` never starts an Ollama container or the Discord Gateway. The
+native LaunchAgents remain available while Compose is stopped. The `api` health page must
+report “Ollama unavailable” when its host health check fails. Operators start,
+inspect, and unload the host runtime with `scripts/ollama_qwen_start.sh`,
+`scripts/ollama_qwen_status.sh`, and `scripts/ollama_qwen_unload.sh`.
+For Docker reachability, the host script uses `OLLAMA_HOST=0.0.0.0:11434`;
+operators must protect that LAN-reachable bind with the macOS firewall/trusted
+network controls. Compose must not publish port 11434.
 
 ## Application shape
 
@@ -109,13 +128,22 @@ Keep prompt text and output Pydantic models next to the corresponding graph. Pro
 
 Tools must be ordinary Python functions behind the graph, each with one purpose and least privilege. Do not give Qwen shell access, database credentials, filesystem roots, arbitrary URLs, arbitrary GitHub methods, or a generic “send Discord message” function.
 
-All model calls go through `llm.gateway`. The gateway supplies the exact model identifier, low temperature for factual extraction/review, timeouts, token limits, an asyncio semaphore of one, request IDs, and usage/latency telemetry. Make queue and model concurrency separately configurable. Start workers at concurrency `1`; the model semaphore is still required because all three workers share Ollama.
+All model calls go through `llm.gateway`. The gateway supplies the exact model
+identifier, low temperature for factual extraction/review, timeouts, token
+limits, `keep_alive`, an asyncio semaphore of one, request IDs, and
+usage/latency telemetry. The Discord mention path calls the narrow Ollama
+runtime readiness boundary, which probes only `/api/tags`, validates model name
+and optional digest, coalesces simultaneous readiness checks, and never spawns a
+shell or accepts a host command from configuration.
 
 ### Time, retries, and idempotency
 
 - Store all timestamps as timezone-aware UTC. Convert to `America/Toronto` only at scheduling and display boundaries.
-- Procrastinate's periodic tasks enqueue recurring jobs once per period in PostgreSQL. Its locks prevent duplicate enqueueing when more than one worker is available. A dynamic schedule loader reads the user-configured Toronto-time schedule and defers the applicable run.
-- Every scheduled work item has a deterministic idempotency key, for example `finance:2026-09-02:market-open:v1` or `review:<repo-id>:<sha>`.
+- Procrastinate jobs use locks to prevent duplicate enqueueing. Academic
+  material embeddings and morning reasoning share the exclusive local-model
+  lock; other periodic Qwen jobs are non-executable.
+- Every work item has a deterministic idempotency key, for example
+  `academic-discord-message:<message-id>:proposal:v1`.
 - Procrastinate retries transient connector/model failures with capped exponential backoff and jitter. It never retries authorization failures until credentials change.
 - Publishers use provider-side idempotency where available, otherwise persist a delivery intent before sending and reconcile an uncertain send before retrying.
 - A job is complete only when required processing, persistence, and delivery all have durable success records.
@@ -128,19 +156,22 @@ Use this retrieval design when the planner needs it:
 
 ```text
 PDF/Notion document -> text + heading/page chunks -> metadata + PostgreSQL full-text index
-                                       -> optional local embedding -> pgvector
+                                       -> local assessment embedding -> pgvector
 user/planner question -> course/term/type filter -> hybrid lexical + semantic retrieval
                        -> cited chunks only -> Qwen answer/proposal
 ```
 
 - Chunk by heading/page where possible (target 400–700 tokens, about 10% overlap); preserve document ID, course, term, page/block, heading, document version, and access classification on every chunk.
-- Start with PostgreSQL full-text search plus metadata filtering. It is more transparent and usually better for exact course codes, dates, grading weights, and rubric wording.
-- Add an asynchronous embedding column/table when the corpus reaches roughly **500 chunks** *or* when semantic questions are frequent enough that full-text search misses relevant paraphrases. This is a product-quality threshold, not a storage limit: embeddings can be valuable with only 20 documents if their terminology varies.
-- Use the local `qwen3-embedding:0.6b` model initially (currently about 639 MB), through Ollama's embedding endpoint. It is separate from the 27B reasoning model and should be benchmarked/pinned; batch ingestion runs at low priority and does not compete with interactive/scheduled Qwen reasoning.
+- Use PostgreSQL full-text search plus metadata filtering for transparent exact course-policy lookup. Assessment-material interpretation uses assessment-scoped semantic retrieval as its sole active meaning-selection path.
+- Embed assessment-material chunks asynchronously during identifier-only ingestion. Store model identity and dimensions so model changes trigger re-embedding instead of mixing incomparable vectors.
+- Use the local `qwen3-embedding:0.6b` model initially (currently about 639 MB),
+  through Ollama's embedding endpoint. It is separate from the Qwen reasoning
+  model and should be benchmarked/pinned; batch ingestion runs at low priority
+  and does not compete with mention-triggered Qwen reasoning.
 - Up to about **5,000 chunks**, exact `pgvector` similarity search is simple and sufficient on this machine. Add an HNSW index only when the corpus reaches roughly **10,000 chunks** or measured p95 retrieval latency exceeds 200 ms. Evaluate answer grounding/recall before and after indexing because approximate indexes trade recall for speed.
 - Retrieve a small, diverse set (for example 8–12 chunks), always filtered to the relevant course/term unless the user explicitly asks cross-course. Return citations and have the planner say when no supporting chunk was found; never let retrieved text override structured confirmed fields.
 
-This means a typical student with 5–10 courses, a few outlines, and tens of assignment documents can start with full-text search. Embeddings become worthwhile as soon as the assistant is expected to synthesize across those documents, rather than merely display known deadlines. A separate vector database would remain unjustified even at tens of thousands of chunks; PostgreSQL plus `pgvector` is enough for this single-user workload.
+This means a typical student with 5–10 courses, a few outlines, and tens of assignment documents can use exact full-text lookup and semantic assessment guidance without another database service. PostgreSQL plus `pgvector` is enough for this single-user workload.
 
 ### Shared data model
 
@@ -177,7 +208,7 @@ Raw source bodies, PDFs, tool logs, model prompts/responses, and rendered report
 The code-review graph is an evidence pipeline, not a code-writing agent:
 
 ```text
-discover/receive push -> deduplicate SHA -> checkout exact SHA -> classify risk
+future architecture change required -> deduplicate SHA -> checkout exact SHA -> classify risk
 -> collect diff/context -> run configured tools/tests -> focused Qwen review
 -> validate/merge findings -> approval policy -> GitHub/Discord delivery -> audit
 ```
@@ -186,15 +217,19 @@ Initial large-batch ingestion is a separate, rate-limited queue job per reposito
 
 The model sees only changed files, bounded surrounding code, manifest/config diffs, native test/lint/scanner output, and the applicable repository profile. It proposes findings in a Pydantic schema containing severity, file/line, explanation, reproduction/missing test, confidence, assumptions, and evidence references. Deterministic validation rejects line locations not in the review packet, duplicate findings, unsupported claims, and speculative/no-actionable findings.
 
-Default publishing policy: Qwen creates a report draft; high-confidence findings require an explicit policy gate before inline GitHub publication. Start with Discord-only summaries and report artifacts until the finding-quality evaluation passes. The agent never commits, pushes, changes issues, or applies fixes.
+This is historical/planned capability context only. The current
+Discord-mentions-only runtime cannot schedule or trigger this model path; making
+Qwen create code-review drafts would require a future architecture change and a
+separate publication policy. The agent never commits, pushes, changes issues, or
+applies fixes.
 
 ### Academic planner
 
 ```text
 Notion delta sync -> PDF/page extraction -> uncertainty detection
--> deterministic constraints and priority scores -> Qwen work breakdown/critic
--> deterministic allocation of study blocks -> morning Discord plan
--> end-of-day reply -> proposed Notion changes -> explicit confirmation -> write/audit
+-> deterministic constraints and priority scores -> deterministic allocation
+-> authorized Discord mention -> bounded Qwen planner response
+-> proposed Notion changes -> explicit confirmation -> write/audit
 ```
 
 Represent fixed commitments, sleep, commute, deadlines, availability, and buffers as typed constraints. The schedule allocator is deterministic Python: it allocates finite work blocks over the next 7–14 days and never moves fixed deadlines/tests. Qwen may propose a breakdown, estimates, explanations, and a critique of the candidate plan, but cannot directly alter calendar/Notion state.
@@ -209,7 +244,14 @@ validate approved allowlist vN -> exactly eight scoped fetches -> normalize/dedu
 -> deterministic source/claim validation -> daily Discord briefing -> thesis audit
 ```
 
-Do not implement this agent until the user approves the exact eight source records, entitlement/API method, and licences. Each source adapter receives only the allowed source/date/window/tickers/themes. It must neither search the web nor substitute an unapproved outlet. Store links and short licensed excerpts only when permitted; the briefing links to original sources.
+This is historical/planned capability context only. The current runtime cannot
+execute the scheduled finance model path; adding it requires a future
+architecture change after the user approves the exact eight source records,
+entitlement/API method, and licences. Each source adapter receives only the
+allowed source/date/window/tickers/themes. It
+must neither search the web nor substitute an unapproved outlet. Store links and
+short licensed excerpts only when permitted; the briefing links to original
+sources.
 
 Portfolio data is manually managed in PostgreSQL or a reviewed import—not from a broker. Qwen must use the event-card schema in the architecture file, label derived calculations/formulas and forecasts, describe uncertainty/counter-case, and use `monitor`, `revisit thesis`, or `no action`; no buy/sell/position-size directives. “Potential investments” is a watchlist research lead with source evidence and risks, never an execution recommendation.
 
@@ -222,7 +264,8 @@ Each phase ends with a pull request-sized change, migrations, fixtures, and auto
 **Build**
 
 - Create the Python project, locked dependencies, formatting/type/test configuration, conventional `.env.example`, and pre-commit hooks. Add a pinned Tailwind CLI build stage that emits `app/static/app.css`; the browser receives only compiled CSS, never a Tailwind runtime.
-- Add the single application image and Compose services for PostgreSQL, `api`, and three idle named workers.
+- Add the single application image and Compose services for PostgreSQL, `api`,
+  and the sole `worker-academic-planner` scheduled-model runtime.
 - Create `/health/live` and `/health/ready`; ready verifies PostgreSQL, Procrastinate's required schema, artifact-volume writability, and the non-secret Ollama `/api/tags` probe.
 - Bind application ports to `127.0.0.1`; mount named volumes for PostgreSQL and artifacts.
 
@@ -232,7 +275,7 @@ Each phase ends with a pull request-sized change, migrations, fixtures, and auto
 uv run ruff check .
 uv run pyright app
 uv run pytest -q
-docker compose up -d --build
+docker compose up -d --build postgres api
 curl --fail http://127.0.0.1:<api-port>/health/ready
 docker compose ps
 ```
@@ -243,26 +286,38 @@ docker compose ps
 
 **Build**
 
-- Install/pull the exact model once on the macOS host: `ollama pull qwen3.8:27b`.
-- Implement `llm.gateway` with `ChatOllama`, model/config version capture, timeout, token budget, one-request semaphore, JSON/Pydantic validation, and a bounded repair retry.
+- Install/pull the exact configured model once on the macOS host through
+  `scripts/ollama_qwen_start.sh --pull`.
+- Implement `llm.gateway` with `ChatOllama`, model/config version capture,
+  timeout, token budget, one-request semaphore, `keep_alive`, JSON/Pydantic
+  validation, and a bounded repair retry.
+- Implement `llm.ollama_runtime` so authorized Discord mentions check
+  `/api/tags`, the configured model, and optional digest before the first real
+  model request.
 - Create a small, versioned evaluation fixture set: code finding triage, finance fact-versus-inference, academic extraction, and invalid JSON/tool-output cases.
 - Record latency, input/output token estimates, response validity, and model identity for every evaluation.
 
 **Acceptance tests**
 
-- A container reaches Ollama through `host.docker.internal` without a host port being published externally.
+- A container reaches Ollama through `host.docker.internal` while Compose does
+  not publish port 11434, and the operator docs warn that
+  `OLLAMA_HOST=0.0.0.0:11434` must be firewall-protected on trusted networks.
 - All fixture outputs validate against their Pydantic schemas, or are visibly marked failed after the bounded repair path.
 - Baseline results document p50/p95 latency and peak memory under one request. Set the initial context/token/concurrency settings from that measurement.
 - Run two queued tasks concurrently and verify that only one model invocation is active at once and both complete without corruption.
 
-**Gate**: pin the exact Ollama model identifier/digest and settings only after the benchmark is saved as an artifact. If 27B does not leave enough system headroom, lower the context window before changing model.
+**Gate**: pin the exact Ollama model identifier/digest and settings only after
+the benchmark is saved as an artifact. If the configured model does not leave
+enough system headroom, lower the context window before changing model.
 
 ### Phase 2 — Shared durable core
 
 **Build**
 
 - Add Alembic migrations for shared tables, repositories, artifact storage, redaction, `RunContext`, and standardized errors.
-- Add Procrastinate task definitions, idempotency, retry classification, failed/stalled-job visibility, and Toronto-time periodic scheduling.
+- Add Procrastinate task definitions, idempotency, retry classification, and
+  failed/stalled-job visibility. Periodic Qwen scheduling is non-executable in
+  the current runtime.
 - Implement structured audit events, deterministic health calculation, and Discord failure-alert adapter (not normal-status spam).
 - Add base LangGraph run/checkpoint support backed by PostgreSQL. Graph nodes must be idempotent at their side-effect boundary.
 
@@ -296,7 +351,9 @@ docker compose ps
 **Build**
 
 - Add GitHub repository discovery and one-at-a-time initial ingestion, resumable from persisted state.
-- Add nightly Toronto daily consolidation (6–7 p.m.) and optional catch-up policy, plus webhook-triggered high-risk quick scan.
+- Preserve nightly Toronto daily consolidation, catch-up, and webhook-triggered
+  high-risk quick scan as historical/planned capability context only; these
+  model paths are non-executable until a future architecture change.
 - Add review history, dismissed finding reasons, project-profile review/refresh, and report format aimed at a coding harness proposing a fix.
 
 **Acceptance tests**
@@ -310,8 +367,13 @@ docker compose ps
 **Build**
 
 - Configure a scoped Notion integration and map the three required databases.
-- Implement Notion delta sync, attachment download, PyMuPDF extraction with page citations, PostgreSQL full-text document retrieval, and uncertainty queue. Do **not** create embeddings or enable `pgvector` in this phase; semantic retrieval is a deferred enhancement defined below.
-- Implement deterministic priority scores, constraint-aware 7–14 day allocator, Qwen breakdown/critic, morning plan, end-of-day Discord check-in, and confirmation-only Notion writes.
+- Implement Notion delta sync, private assessment-body/attachment ingestion,
+  bounded PyMuPDF/OCR extraction with page or block citations, PostgreSQL
+  full-text lookup, assessment-scoped local embeddings, and uncertainty queue.
+- Implement deterministic priority scores, a constraint-aware 7–14 day
+  allocator, mention-triggered grounded Qwen academic responses, the grounded
+  scheduled `MorningBriefing`, model-free reminders, and confirmation-only
+  Notion writes. The former fixed morning formatter is non-executable.
 
 **Acceptance tests**
 
@@ -319,7 +381,10 @@ docker compose ps
 - Retrieval fixtures show exact course/policy questions answered from full-text search with citations; once embeddings are enabled, paraphrased queries return only chunks from the requested course/term and retain their citations.
 - The allocator never moves a test/deadline/fixed commitment, preserves configured buffer, and carries incomplete work forward visibly.
 - An ambiguous fact sends a question and does not become a hard constraint.
-- A natural-language check-in creates a proposal but makes no Notion write until the exact confirmation event is supplied.
+- A mentioned natural-language Discord check-in checks Ollama readiness, creates
+  a proposal, and makes no Notion write until the exact confirmation event is
+  supplied. Unmentioned prose does not persist, deliver, check readiness, or
+  call Qwen.
 
 ### Phase 6 — Finance briefing (only after source approval)
 
@@ -327,7 +392,10 @@ docker compose ps
 
 - Add migrations/UI-visible records for holdings, watchlist, ETFs, theses, approved source version, and source entitlement/health.
 - Implement exactly eight adapter calls, normalization, freshness/language/licence validation, event deduplication, exposure mapping, event-card graph, and thesis journal updates.
-- Schedule at a configurable Toronto market-open time (default 09:00) and deliver an evidence-linked Discord briefing.
+- Preserve the Toronto market-open schedule as historical/planned capability
+  context only. It is non-executable in the current runtime; adding an
+  evidence-linked scheduled Discord briefing requires a future architecture
+  change.
 
 **Acceptance tests**
 
@@ -336,7 +404,9 @@ docker compose ps
 - Cards distinguish verified facts, uncertainty, counter-case, and permitted impact labels; a prohibited trade directive fails schema/content validation.
 - No raw licensed article appears in the persisted UI payload or Discord summary beyond approved excerpts/links.
 
-**Gate**: record the approved sources, licences/subscriptions, and compliance boundaries before enabling the schedule. Do not turn on this phase merely because code is complete.
+**Gate**: record the approved sources, licences/subscriptions, and compliance
+boundaries before any future architecture change. Do not add a scheduled model
+path merely because code is complete.
 
 ### Phase 7 — Read-only operations console
 
@@ -367,25 +437,25 @@ docker compose ps
 - Kill a worker during a non-side-effecting graph step and confirm safe retry/resume; kill it during a delivery intent and confirm no duplicate message/comment.
 - Simulate unavailable Ollama, PostgreSQL, a stalled worker, and each connector; health state and Discord failure policy match the documented rules.
 
-## Deferred enhancement — semantic course-document retrieval
+## Implemented enhancement — semantic assessment-material retrieval
 
-This is intentionally **not part of the initial build**. The first planner release uses extracted, typed assessment fields for dates/weights/scope and PostgreSQL full-text search for source documents. That is simpler, faster to validate, and gives precise source citations.
+Semantic retrieval is active for arbitrary assessment-page body text and
+supported PDF attachments. Typed dates and commitments remain authoritative;
+full-text search remains available for exact lookup.
 
-Implement this enhancement only after the planner is being used with real documents and at least one of these conditions is true:
+The implementation uses exact assessment-scoped similarity now because morning
+guidance requires meaning-based selection from heterogeneous material even for a
+small corpus. It does not wait for a document-count threshold.
 
-- There are about **500 or more document chunks** (a chunk is roughly a heading or 400–700 tokens), and the planner often needs to search across them.
-- The user regularly asks meaning-based questions such as “what requirements from all my documents apply to this?” and ordinary full-text search misses relevant material because the documents use different wording.
-- A small retrieval evaluation—20 real questions with known supporting pages—shows that full-text search fails to return a supporting chunk in at least 20% of cases.
+Do not expand this into a universal rubric schema or approximate index merely
+because documents exist.
 
-Do **not** implement it merely because documents exist. It is not needed to store course files, extract deadlines, schedule work, or answer exact keyword/policy questions.
-
-When the trigger is met, add this as one isolated implementation phase:
-
-1. Enable the `pgvector` extension in the existing PostgreSQL database; do not introduce a separate vector-database service.
-2. Create `documents`, `document_chunks`, and `document_embeddings` tables. Preserve course, term, page/block, heading, document version, and access metadata on every chunk.
-3. Backfill embeddings asynchronously and at low priority with a separately pinned local embedding model, initially `qwen3-embedding:0.6b`. Keep its work from delaying Qwen reasoning jobs.
-4. Query with course/term metadata filters plus PostgreSQL full-text and vector results. Send only 8–12 cited chunks to Qwen; no retrieved content may override confirmed structured facts.
-5. Compare the same 20-question evaluation before and after the feature. Keep it only if cited-answer recall improves without returning irrelevant cross-course material.
+The active path extends `academic_documents` and `academic_document_chunks`,
+embeds assessment material with the separately pinned local embedding model,
+and sends at most a bounded set of assessment-owned cited chunks to Qwen. The
+shared model lock keeps embedding ingestion from competing with scheduled or
+mention-triggered reasoning. Retrieved content never overrides confirmed
+structured facts.
 
 Use exact `pgvector` similarity search initially. Add an HNSW approximate index only after approximately **10,000 chunks** or a measured p95 retrieval latency over 200 ms. The index improves speed, but can slightly reduce recall, so re-run the retrieval evaluation after adding it.
 
@@ -396,9 +466,12 @@ Document these settings and validate them on startup; values shown are names, no
 ```dotenv
 APP_TIMEZONE=America/Toronto
 OLLAMA_BASE_URL=http://host.docker.internal:11434
-OLLAMA_MODEL=qwen3.8:27b
+OLLAMA_MODEL=qwen3-32gb:latest
+MODEL_TRIGGER_MODE=discord_mentions_only
+OLLAMA_MODEL_KEEP_ALIVE_SECONDS=300
+OLLAMA_STARTUP_TIMEOUT_SECONDS=30
 OLLAMA_MAX_CONCURRENCY=1
-OLLAMA_NUM_CTX=8192
+OLLAMA_NUM_CTX=2048
 EMBEDDING_MODEL=qwen3-embedding:0.6b
 DATABASE_URL=postgresql+psycopg://...
 ARTIFACT_ROOT=/var/lib/lifeagent/artifacts
@@ -411,17 +484,29 @@ NOTION_TOKEN=
 FINANCE_SOURCE_ALLOWLIST_VERSION=
 ```
 
-Add explicit settings for schedule times, retry cap, per-connector timeouts, repository allowlist, Discord targets, artefact retention, and each finance source. Settings that broaden access (repository list, Notion database ID, source base URL) must be versioned/audited.
+`MODEL_TRIGGER_MODE` is closed to the authorized Discord-mention path. There is
+no separately configured periodic model path.
+
+Add explicit settings for retry cap, per-connector timeouts, repository
+allowlist, Discord targets, artifact retention, and each finance source.
+Settings that broaden access must be versioned/audited. Any scheduled Qwen
+trigger requires a future architecture change.
 
 ## Delivery order and first implementation ticket
 
-Start with **Phase 0**, then Phase 1 and Phase 2 before building agent functionality. The first feature is the code-review agent because it has the most objective quality signals. The planner follows; finance waits for explicit source/entitlement approval. Build the UI only after shared records exist, so it reports real operations rather than placeholders.
+Start with **Phase 0**, then Phase 1 and Phase 2 before building agent functionality.
+The executable model path is the Discord-mentioned academic assistant.
+Scheduled academic, code-review, and finance model
+flows remain historical/planned context; finance also waits for explicit
+source/entitlement approval. Build the UI only after shared records exist, so
+it reports real operations rather than placeholders.
 
 The first ticket should create `pyproject.toml`, `app/core/config.py`, the Compose topology, health endpoints, a minimal migration, and the CI-quality commands from Phase 0—nothing agent-specific. Its definition of done is the Phase 0 acceptance block above.
 
 ## Reference links
 
-- [Ollama Qwen3.8 27B model tag](https://ollama.com/library/qwen3.8:27b) — confirms the requested model tag and current model artifact size.
+- [Ollama Qwen model tags](https://ollama.com/library/qwen3) — source for the
+  host-managed local Qwen reasoning model.
 - [Ollama Qwen3 Embedding tags](https://ollama.com/library/qwen3-embedding/tags) — documents the separate, lightweight local embedding-model option.
 - [LangChain ChatOllama integration](https://docs.langchain.com/oss/python/integrations/chat/ollama) — `langchain-ollama` supports tool calling, structured output, and native async.
 - [LangGraph overview](https://docs.langchain.com/oss/python/langgraph/overview) — supports the selected durable, stateful orchestration and human-approval boundary.

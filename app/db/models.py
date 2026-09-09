@@ -21,6 +21,7 @@ from sqlalchemy import (
     CheckConstraint,
     Date,
     DateTime,
+    FetchedValue,
     Float,
     ForeignKey,
     Index,
@@ -30,6 +31,7 @@ from sqlalchemy import (
     UniqueConstraint,
     text,
 )
+from sqlalchemy.dialects.postgresql import TSVECTOR
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
 
 
@@ -198,6 +200,67 @@ class Delivery(TimestampMixin, Base):
     external_url: Mapped[str | None] = mapped_column(String(2048))
     receipt_artifact_key: Mapped[str | None] = mapped_column(String(512))
     error_code: Mapped[str | None] = mapped_column(String(128))
+
+
+class DiscordWakeInbound(TimestampMixin, Base):
+    """Durable Discord wake handoff metadata; raw inbound content stays in artifacts."""
+
+    __tablename__ = "discord_wake_inbound"
+    __table_args__ = (
+        UniqueConstraint("discord_event_id", name="uq_discord_wake_event"),
+        UniqueConstraint("handoff_nonce", name="uq_discord_wake_nonce"),
+        CheckConstraint("length(discord_event_id) > 0", name="discord_event_id_nonempty"),
+        CheckConstraint(
+            "length(handoff_nonce) > 0 AND length(handoff_nonce) <= 64",
+            name="handoff_nonce_bounded",
+        ),
+        CheckConstraint(
+            "event_kind IN ('message','interaction')",
+            name="event_kind_valid",
+        ),
+        CheckConstraint(
+            "action IN "
+            "('academic_checkin','academic_continuation','agent_clarification','proposal_confirmation',"
+            "'proposal_rejection')",
+            name="action_valid",
+        ),
+        CheckConstraint(
+            "state IN ('queued','running','completed','failed')",
+            name="state_valid",
+        ),
+        CheckConstraint(
+            "interaction_action IS NULL OR interaction_action IN "
+            "('quiz','assignment','tutorial','lab','studying_block','ignore')",
+            name="interaction_action_valid",
+        ),
+        CheckConstraint("retry_count >= 0", name="retry_count_nonnegative"),
+        CheckConstraint("length(content_artifact_key) > 0", name="content_artifact_key_nonempty"),
+        Index("ix_discord_wake_state_created", "state", "created_at"),
+        Index("ix_discord_wake_received", "received_at"),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(primary_key=True, default=uuid.uuid4)
+    discord_event_id: Mapped[str] = mapped_column(String(255), nullable=False)
+    handoff_nonce: Mapped[str] = mapped_column(String(64), nullable=False)
+    event_kind: Mapped[str] = mapped_column(String(32), nullable=False)
+    action: Mapped[str] = mapped_column(String(64), nullable=False)
+    action_id: Mapped[uuid.UUID | None] = mapped_column()
+    clarification_id: Mapped[uuid.UUID | None] = mapped_column()
+    interaction_action: Mapped[str | None] = mapped_column(String(32))
+    discord_channel_id: Mapped[str | None] = mapped_column(String(32))
+    discord_user_id: Mapped[str | None] = mapped_column(String(32))
+    discord_message_id: Mapped[str | None] = mapped_column(String(32))
+    discord_interaction_id: Mapped[str | None] = mapped_column(String(32))
+    ack_message_id: Mapped[str | None] = mapped_column(String(32))
+    content_artifact_key: Mapped[str] = mapped_column(String(512), nullable=False)
+    state: Mapped[str] = mapped_column(String(32), nullable=False, default="queued")
+    retry_count: Mapped[int] = mapped_column(nullable=False, default=0)
+    last_error_code: Mapped[str | None] = mapped_column(String(128))
+    received_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    enqueued_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    started_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    completed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    failed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
 
 
 class EvidenceRef(TimestampMixin, Base):
@@ -596,6 +659,10 @@ class Assessment(TimestampMixin, Base):
         CheckConstraint("estimated_minutes > 0", name="estimated_minutes_positive"),
         CheckConstraint("confidence_gap >= 0 AND confidence_gap <= 1", name="confidence_gap_valid"),
         CheckConstraint("scope_size >= 0 AND scope_size <= 100", name="scope_size_valid"),
+        CheckConstraint(
+            "ends_at IS NULL OR due_at IS NULL OR ends_at > due_at",
+            name="assessment_date_range_valid",
+        ),
         Index("ix_assessments_course_due", "course_id", "due_at"),
         Index("ix_assessments_fact_state", "fact_state", "due_at"),
         Index("ix_assessments_source_active", "source_id", "active"),
@@ -609,6 +676,7 @@ class Assessment(TimestampMixin, Base):
     title: Mapped[str] = mapped_column(String(255), nullable=False)
     assessment_type: Mapped[str] = mapped_column(String(64), nullable=False)
     due_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    ends_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     grade_weight_percent: Mapped[float | None] = mapped_column(Float)
     estimated_minutes: Mapped[int] = mapped_column(nullable=False, default=60)
     confidence_gap: Mapped[float] = mapped_column(Float, nullable=False, default=0.5)
@@ -684,7 +752,8 @@ class AcademicClarification(TimestampMixin, Base):
             name="state_valid",
         ),
         CheckConstraint(
-            "decision IS NULL OR decision IN ('quiz','assignment','ignore')",
+            "decision IS NULL OR decision IN "
+            "('quiz','assignment','tutorial','lab','studying_block','ignore')",
             name="decision_valid",
         ),
         CheckConstraint(
@@ -707,6 +776,9 @@ class AcademicClarification(TimestampMixin, Base):
     raw_label: Mapped[str | None] = mapped_column(String(1_024))
     quiz_preview_title: Mapped[str] = mapped_column(String(1_024), nullable=False)
     assignment_preview_title: Mapped[str] = mapped_column(String(1_024), nullable=False)
+    tutorial_preview_title: Mapped[str | None] = mapped_column(String(1_024))
+    lab_preview_title: Mapped[str | None] = mapped_column(String(1_024))
+    studying_block_preview_title: Mapped[str | None] = mapped_column(String(1_024))
     expected_edited_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
     title_property_id: Mapped[str | None] = mapped_column(String(255))
     idempotency_key: Mapped[str] = mapped_column(String(512), nullable=False)
@@ -766,6 +838,29 @@ class AcademicDiscourseSession(TimestampMixin, Base):
         Index("ix_academic_discourse_state_expiry", "state", "expires_at"),
         Index("ix_academic_discourse_last_turn", "state", "last_turn_at"),
         Index(
+            "ix_academic_discourse_owner_kind_state_expiry",
+            "discord_user_id",
+            "discord_channel_id",
+            "session_kind",
+            "state",
+            "expires_at",
+        ),
+        Index(
+            "uq_academic_discourse_open_agent_clarification_owner",
+            "discord_user_id",
+            "discord_channel_id",
+            "session_kind",
+            unique=True,
+            sqlite_where=text(
+                "state = 'open' AND session_kind = 'agent_clarification' "
+                "AND discord_user_id IS NOT NULL AND discord_channel_id IS NOT NULL"
+            ),
+            postgresql_where=text(
+                "state = 'open' AND session_kind = 'agent_clarification' "
+                "AND discord_user_id IS NOT NULL AND discord_channel_id IS NOT NULL"
+            ),
+        ),
+        Index(
             "ix_academic_discourse_discord_owner",
             "discord_channel_id",
             "discord_user_id",
@@ -800,12 +895,27 @@ class AcademicLearningFocus(TimestampMixin, Base):
         CheckConstraint("reinforcement_count >= 1", name="reinforcement_count_positive"),
         CheckConstraint("missed_review_count >= 0", name="missed_review_count_nonnegative"),
         CheckConstraint("reminder_count >= 0", name="reminder_count_nonnegative"),
+        CheckConstraint("revision >= 1", name="revision_positive"),
         CheckConstraint(
             "practice_minutes IS NULL OR practice_minutes > 0",
             name="practice_minutes_positive",
         ),
         Index("ix_academic_focus_status_review", "status", "next_review_at"),
         Index("ix_academic_focus_course_status", "course_id", "status"),
+        Index(
+            "ix_academic_focus_owner_status_review",
+            "owner_user_id",
+            "owner_channel_id",
+            "status",
+            "next_review_at",
+        ),
+        Index(
+            "ix_academic_focus_owner_course_status",
+            "owner_user_id",
+            "owner_channel_id",
+            "course_id",
+            "status",
+        ),
     )
 
     id: Mapped[uuid.UUID] = mapped_column(primary_key=True, default=uuid.uuid4)
@@ -818,6 +928,9 @@ class AcademicLearningFocus(TimestampMixin, Base):
     course_code: Mapped[str | None] = mapped_column(String(64))
     topic: Mapped[str] = mapped_column(String(255), nullable=False)
     status: Mapped[str] = mapped_column(String(32), nullable=False, default="active")
+    owner_user_id: Mapped[str | None] = mapped_column(String(24))
+    owner_channel_id: Mapped[str | None] = mapped_column(String(24))
+    revision: Mapped[int] = mapped_column(nullable=False, default=1)
     source_session_id: Mapped[uuid.UUID | None] = mapped_column(
         ForeignKey("academic_discourse_sessions.id", ondelete="SET NULL")
     )
@@ -827,9 +940,7 @@ class AcademicLearningFocus(TimestampMixin, Base):
     practice_due_on: Mapped[date | None] = mapped_column(Date)
     practice_minutes: Mapped[int | None] = mapped_column()
     last_reviewed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
-    last_review_prompted_at: Mapped[datetime | None] = mapped_column(
-        DateTime(timezone=True)
-    )
+    last_review_prompted_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     last_reinforced_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
     missed_review_count: Mapped[int] = mapped_column(nullable=False, default=0)
     reminder_count: Mapped[int] = mapped_column(nullable=False, default=0)
@@ -905,9 +1016,7 @@ class AcademicReflectionMemory(TimestampMixin, Base):
     external_event_id: Mapped[str | None] = mapped_column(String(255))
     raw_text: Mapped[str] = mapped_column(Text, nullable=False)
     redacted_summary: Mapped[str | None] = mapped_column(String(2_000))
-    embedding: Mapped[list[float] | None] = mapped_column(
-        Vector().with_variant(JSON, "sqlite")
-    )
+    embedding: Mapped[list[float] | None] = mapped_column(Vector().with_variant(JSON, "sqlite"))
     embedding_model: Mapped[str | None] = mapped_column(String(255))
     embedding_dimensions: Mapped[int | None] = mapped_column()
     embedding_metadata: Mapped[dict[str, Any]] = mapped_column(JSON, nullable=False, default=dict)
@@ -1036,19 +1145,54 @@ class AcademicDocument(TimestampMixin, Base):
 
     __tablename__ = "academic_documents"
     __table_args__ = (
-        UniqueConstraint("notion_id", "document_version", name="uq_academic_documents_version"),
+        UniqueConstraint(
+            "source_key", "document_version", name="uq_academic_documents_source_version"
+        ),
         CheckConstraint("length(content_hash) = 64", name="content_hash_length"),
+        CheckConstraint(
+            "source_kind IS NULL OR source_kind IN "
+            "('notion_page_body','notion_property_file','notion_block_file')",
+            name="academic_document_source_kind_valid",
+        ),
+        CheckConstraint("source_key IS NULL OR length(source_key) > 0", name="source_key_nonempty"),
+        CheckConstraint(
+            "extraction_status IN "
+            "('pending','extracted','partial','ocr_required','ocr_processing',"
+            "'unsupported','failed','inactive')",
+            name="academic_document_extraction_status_valid",
+        ),
         Index("ix_academic_documents_course_version", "course_id", "document_version"),
+        Index(
+            "uq_academic_documents_legacy_version",
+            "notion_id",
+            "document_version",
+            unique=True,
+            postgresql_where=text("source_key IS NULL"),
+            sqlite_where=text("source_key IS NULL"),
+        ),
+        Index("ix_academic_documents_assessment_active", "assessment_id", "active"),
+        Index("ix_academic_documents_source_active", "source_key", "active", "retrieved_at"),
     )
 
     id: Mapped[uuid.UUID] = mapped_column(primary_key=True, default=uuid.uuid4)
     course_id: Mapped[uuid.UUID | None] = mapped_column(
         ForeignKey("courses.id", ondelete="SET NULL")
     )
+    assessment_id: Mapped[uuid.UUID | None] = mapped_column(
+        ForeignKey("assessments.id", ondelete="SET NULL")
+    )
     notion_id: Mapped[str] = mapped_column(String(255), nullable=False)
     document_version: Mapped[str] = mapped_column(String(128), nullable=False)
     title: Mapped[str] = mapped_column(String(500), nullable=False)
     document_type: Mapped[str] = mapped_column(String(64), nullable=False)
+    source_kind: Mapped[str | None] = mapped_column(String(64))
+    source_page_id: Mapped[str | None] = mapped_column(String(255))
+    source_block_id: Mapped[str | None] = mapped_column(String(255))
+    source_property_id: Mapped[str | None] = mapped_column(String(255))
+    source_key: Mapped[str | None] = mapped_column(String(512))
+    original_filename: Mapped[str | None] = mapped_column(String(500))
+    media_type: Mapped[str | None] = mapped_column(String(255))
+    source_last_edited_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     source_url: Mapped[str | None] = mapped_column(String(1_000))
     retrieved_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
     artifact_key: Mapped[str] = mapped_column(String(64), nullable=False)
@@ -1057,6 +1201,9 @@ class AcademicDocument(TimestampMixin, Base):
         String(64), nullable=False, default="private"
     )
     extraction_status: Mapped[str] = mapped_column(String(32), nullable=False, default="pending")
+    active: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
+    extraction_error_code: Mapped[str | None] = mapped_column(String(128))
+    extraction_error_detail: Mapped[str | None] = mapped_column(String(1_000))
 
 
 class AcademicDocumentChunk(TimestampMixin, Base):
@@ -1067,7 +1214,16 @@ class AcademicDocumentChunk(TimestampMixin, Base):
         UniqueConstraint("document_id", "ordinal", name="uq_academic_chunks_document_ordinal"),
         CheckConstraint("ordinal >= 0", name="ordinal_nonnegative"),
         CheckConstraint("source_page IS NULL OR source_page >= 1", name="source_page_positive"),
+        CheckConstraint(
+            "embedding_dimensions IS NULL OR embedding_dimensions > 0",
+            name="academic_chunk_embedding_dimensions_positive",
+        ),
         Index("ix_academic_chunks_document_page", "document_id", "source_page", "ordinal"),
+        Index(
+            "ix_academic_chunks_embedding_model",
+            "embedding_model",
+            "embedding_dimensions",
+        ),
     )
 
     id: Mapped[uuid.UUID] = mapped_column(primary_key=True, default=uuid.uuid4)
@@ -1082,7 +1238,12 @@ class AcademicDocumentChunk(TimestampMixin, Base):
     source_url: Mapped[str | None] = mapped_column(String(1_000))
     token_count: Mapped[int | None] = mapped_column()
     content_hash: Mapped[str] = mapped_column(String(64), nullable=False)
-    search_vector: Mapped[str | None] = mapped_column(Text)
+    search_vector: Mapped[str | None] = mapped_column(
+        TSVECTOR().with_variant(Text, "sqlite"), server_default=FetchedValue()
+    )
+    embedding: Mapped[list[float] | None] = mapped_column(Vector().with_variant(JSON, "sqlite"))
+    embedding_model: Mapped[str | None] = mapped_column(String(255))
+    embedding_dimensions: Mapped[int | None] = mapped_column()
 
 
 class AcademicSyncCursor(TimestampMixin, Base):
@@ -1157,6 +1318,35 @@ class AcademicProposedChange(TimestampMixin, Base):
     applied_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
 
 
+class AcademicProposalOperationJournal(TimestampMixin, Base):
+    """Durable per-operation receipt state for non-transactional proposal batches."""
+
+    __tablename__ = "academic_proposal_operation_journal"
+    __table_args__ = (
+        UniqueConstraint("proposal_id", "ordinal", name="uq_academic_proposal_operation"),
+        CheckConstraint("ordinal >= 0", name="academic_proposal_operation_ordinal_nonnegative"),
+        CheckConstraint("length(payload_hash) = 64", name="academic_proposal_payload_hash_valid"),
+        CheckConstraint(
+            "state IN ('in_progress','applied','uncertain','failed')",
+            name="academic_proposal_operation_state_valid",
+        ),
+        Index(
+            "ix_academic_proposal_operation_state",
+            "proposal_id",
+            "state",
+        ),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(primary_key=True, default=uuid.uuid4)
+    proposal_id: Mapped[uuid.UUID] = mapped_column(nullable=False)
+    ordinal: Mapped[int] = mapped_column(nullable=False)
+    operation_id: Mapped[str] = mapped_column(String(255), nullable=False)
+    payload_hash: Mapped[str] = mapped_column(String(64), nullable=False)
+    state: Mapped[str] = mapped_column(String(32), nullable=False, default="in_progress")
+    receipt: Mapped[dict[str, Any] | None] = mapped_column(JSON)
+    error_code: Mapped[str | None] = mapped_column(String(128))
+
+
 # Short aliases keep the storage contract convenient for document workers while
 # retaining explicit academic names for callers that prefer them.
 Document = AcademicDocument
@@ -1164,6 +1354,7 @@ DocumentChunk = AcademicDocumentChunk
 SyncCursor = AcademicSyncCursor
 CheckIn = AcademicCheckIn
 ProposedChange = AcademicProposedChange
+ProposalOperationJournal = AcademicProposalOperationJournal
 
 
 __all__ = [
@@ -1176,6 +1367,7 @@ __all__ = [
     "AcademicDocumentChunk",
     "AcademicLearningFocus",
     "AcademicLearningFocusEvent",
+    "AcademicProposalOperationJournal",
     "AcademicProposedChange",
     "AcademicReflectionMemory",
     "AcademicSetupReminder",
@@ -1192,6 +1384,7 @@ __all__ = [
     "DailyReviewReport",
     "Delivery",
     "DeliveryStatus",
+    "DiscordWakeInbound",
     "Document",
     "DocumentChunk",
     "EvidenceClassification",

@@ -64,8 +64,8 @@ def _store() -> tuple[SQLAlchemyAcademicPlannerStore, str, str]:
 def test_catalog_search_returns_only_opaque_writable_targets() -> None:
     store, course_id, assessment_id = _store()
 
-    courses = store.search_courses("ece202")
-    assessments = store.search_assessments("lab", course_id)
+    courses = store.search_courses("my circuits thing")
+    assessments = store.search_assessments("study sessions for tomorrow", course_id)
 
     assert [(item.course_id, item.course_code) for item in courses] == [(course_id, "ECE 202")]
     assert [(item.assessment_id, item.title) for item in assessments] == [

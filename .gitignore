@@ -43,3 +43,9 @@ htmlcov/
 
 # Local operational checklists and rollout notes.
 /to-do/
+
+# Local incident notes and proposed remediation plans.
+/fix history/
+
+# resume description preview - live in local repo to leverage codebase context to enhance description strength
+/resume

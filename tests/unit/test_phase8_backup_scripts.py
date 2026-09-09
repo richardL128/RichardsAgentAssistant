@@ -5,11 +5,14 @@ import subprocess
 from pathlib import Path
 
 BASH = "/bin/bash"
+REPOSITORY_ROOT = Path(__file__).resolve().parents[2]
+BACKUP_SCRIPT = REPOSITORY_ROOT / "scripts/backup_database.sh"
+RESTORE_SCRIPT = REPOSITORY_ROOT / "scripts/restore_database.sh"
 
 
 def test_backup_and_restore_scripts_parse_and_fail_closed(tmp_path: Path) -> None:
-    backup = Path("scripts/backup_database.sh")
-    restore = Path("scripts/restore_database.sh")
+    backup = BACKUP_SCRIPT
+    restore = RESTORE_SCRIPT
     subprocess.run([BASH, "-n", str(backup)], check=True)  # noqa: S603
     subprocess.run([BASH, "-n", str(restore)], check=True)  # noqa: S603
 
@@ -68,7 +71,7 @@ def test_restore_script_refuses_equivalent_current_database_urls(tmp_path: Path)
     refused = subprocess.run(  # noqa: S603
         [
             BASH,
-            "scripts/restore_database.sh",
+            str(RESTORE_SCRIPT),
             "--backup-file",
             str(backup_file),
             "--identity-file",
@@ -138,7 +141,7 @@ exit 1
     allowed = subprocess.run(  # noqa: S603
         [
             BASH,
-            "scripts/restore_database.sh",
+            str(RESTORE_SCRIPT),
             "--backup-file",
             str(backup_file),
             "--identity-file",
@@ -171,7 +174,7 @@ def test_restore_script_rejects_old_target_db_interface(tmp_path: Path) -> None:
     result = subprocess.run(  # noqa: S603
         [
             BASH,
-            "scripts/restore_database.sh",
+            str(RESTORE_SCRIPT),
             "--backup",
             str(backup_file),
             "--target-db",

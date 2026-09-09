@@ -235,6 +235,7 @@ class LLMGateway:
         result = invoker(
             prompt,
             format=response_schema,
+            keep_alive=f"{self.settings.ollama_model_keep_alive_seconds}s",
             options={
                 "num_ctx": self.settings.ollama_num_ctx,
                 "num_batch": self.settings.ollama_num_batch,
@@ -257,6 +258,7 @@ class LLMGateway:
             seed=self.settings.ollama_seed,
             reasoning=self.settings.ollama_reasoning,
             format="json",
+            keep_alive=f"{self.settings.ollama_model_keep_alive_seconds}s",
             async_client_kwargs={"timeout": self.settings.ollama_timeout_seconds},
         )
 
@@ -279,6 +281,7 @@ class LLMGateway:
             "temperature": 0.0,
             "seed": self.settings.ollama_seed,
             "reasoning": self.settings.ollama_reasoning,
+            "keep_alive_seconds": self.settings.ollama_model_keep_alive_seconds,
         }
         serialized = json.dumps(config, sort_keys=True, separators=(",", ":"))
         return hashlib.sha256(serialized.encode("utf-8")).hexdigest()

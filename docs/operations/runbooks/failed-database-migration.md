@@ -4,11 +4,10 @@
 
 The `api` container fails to start or remains in an unhealthy state after
 startup. Container logs show `alembic upgrade head` failing with a SQL error or
-schema validation error. Workers cannot start because they depend on the API
-healthcheck. The `/health/ready` endpoint is unavailable or returns a failed
-database schema state.
+schema validation error. The `/health/ready` endpoint is unavailable or returns
+a failed database schema state.
 
-When the migration fails, no agents can process runs and the system is offline.
+When the migration fails, the current API plus PostgreSQL runtime is offline.
 
 ## Diagnosis
 
@@ -62,11 +61,14 @@ ORDER BY table_name;"' | head -50
 
 ## Fix
 
-**Step 1: Stop workers to prevent processing against a partially migrated schema**
+**Step 1: Stop the API to prevent processing against a partially migrated schema**
 
 ```bash
-docker compose stop worker-code-review worker-academic-planner worker-finance
+docker compose stop api
 ```
+
+There are no separate legacy agent services in the current Compose runtime to
+stop or restart.
 
 **Step 2: Inspect the failing migration**
 
@@ -139,7 +141,8 @@ sleep 10
 curl http://127.0.0.1:8000/health/ready | jq '.status'
 ```
 
-Wait for the status to become `healthy` before restarting workers.
+Wait for the status to become `healthy` before treating the runtime as back
+online.
 
 ## Expected health and Discord behavior
 
@@ -174,8 +177,5 @@ services are running:
 docker compose ps
 ```
 
-All services should show `Up` status. Only then restart workers:
-
-```bash
-docker compose up -d worker-code-review worker-academic-planner worker-finance
-```
+All services should show `Up` status. For the current architecture this means
+`postgres` and `api` only.

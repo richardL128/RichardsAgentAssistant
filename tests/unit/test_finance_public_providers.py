@@ -102,8 +102,7 @@ def test_defense_rss_parser_preserves_canonical_url_time_and_short_excerpt() -> 
     assert document.published_at == datetime(2026, 9, 4, 13, 5, tzinfo=UTC)
     assert document.retrieved_at == NOW
     assert (
-        document.excerpt
-        == "Official summary of a Defense Department aircraft sustainment award."
+        document.excerpt == "Official summary of a Defense Department aircraft sustainment award."
     )
 
 
@@ -112,7 +111,9 @@ def test_feed_parser_rejects_malformed_xml_and_unreviewed_hosts() -> None:
     with pytest.raises(ProviderParseError, match="malformed"):
         parse_defense_gov_rss(b"<rss><channel>", query, NOW)
 
-    payload = _fixture("defense_gov_rss.xml").replace(b"https://www.war.gov/", b"https://example.com/")
+    payload = _fixture("defense_gov_rss.xml").replace(
+        b"https://www.war.gov/", b"https://example.com/"
+    )
     with pytest.raises(ProviderParseError, match="host"):
         parse_defense_gov_rss(payload, query, NOW)
 
@@ -148,9 +149,7 @@ def test_eia_bulk_zip_reads_only_reviewed_series_without_extracting_files() -> N
 
     documents = parse_eia_bulk_zip(archive_bytes.getvalue(), query, NOW)
 
-    assert [document.external_id for document in documents] == [
-        "PET.RWTC.D:2026-09-04"
-    ]
+    assert [document.external_id for document in documents] == ["PET.RWTC.D:2026-09-04"]
     assert documents[0].numbers[0].unit == "dollars per barrel"
 
 
@@ -194,8 +193,7 @@ def test_sec_parser_filters_to_relevant_forms_and_builds_canonical_filing_url() 
     assert document.external_id == "0000936468:0000936468-26-000120"
     assert "8-K" in document.title
     assert str(document.url) == (
-        "https://www.sec.gov/Archives/edgar/data/936468/"
-        "000093646826000120/lmt-20260904.htm"
+        "https://www.sec.gov/Archives/edgar/data/936468/000093646826000120/lmt-20260904.htm"
     )
     assert document.tickers == ("LMT",)
     assert document.excerpt is None
@@ -214,8 +212,7 @@ def test_company_ir_feed_uses_registry_and_exposes_missing_mapping_diagnostic() 
     assert documents[0].excerpt is None
     assert documents[0].issuer == "Lockheed Martin Corporation"
     assert str(documents[0].feed_endpoint) == (
-        "https://news.lockheedmartin.com/news-releases"
-        "?category=788&pagetemplate=rss"
+        "https://news.lockheedmartin.com/news-releases?category=788&pagetemplate=rss"
     )
     assert [diagnostic.ticker for diagnostic in diagnostics] == ["MSFT"]
 

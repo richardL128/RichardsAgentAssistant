@@ -9,7 +9,8 @@ from app import __version__
 from app.health.checks import (
     HealthResponse,
     HealthState,
-    check_academic_discord_gateway,
+    check_academic_discord_handoff,
+    check_academic_discord_host_ingress,
     readiness,
 )
 
@@ -28,10 +29,10 @@ async def ready(request: Request) -> HealthResponse | Response:
         request.app.state.database,
         version=__version__,
     )
-    result.checks.append(
-        check_academic_discord_gateway(
-            request.app.state.settings,
-            getattr(request.app.state, "discord_academic_gateway_state", None),
+    result.checks.extend(
+        (
+            check_academic_discord_host_ingress(),
+            check_academic_discord_handoff(request.app.state.settings),
         )
     )
     if any(check.state is HealthState.FAILED for check in result.checks):

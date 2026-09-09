@@ -1,0 +1,37 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
+  "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>com.lifeagent.discord-wake</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>__SCRIPT_DIR__/lifeagent_discord_wake_daemon.sh</string>
+    <string>--env-file</string>
+    <string>__ENV_FILE__</string>
+    <string>--hmac-secret-file</string>
+    <string>__HMAC_SECRET_FILE__</string>
+    <string>--python</string>
+    <string>__PYTHON_BIN__</string>
+    <string>--docker</string>
+    <string>__DOCKER_BIN__</string>
+    <string>--launchctl</string>
+    <string>__LAUNCHCTL_BIN__</string>
+    <string>--ollama</string>
+    <string>__OLLAMA_BIN__</string>
+  </array>
+  <key>WorkingDirectory</key>
+  <string>__REPO_DIR__</string>
+  <key>RunAtLoad</key>
+  <true/>
+  <key>KeepAlive</key>
+  <true/>
+  <key>ThrottleInterval</key>
+  <integer>10</integer>
+  <key>StandardOutPath</key>
+  <string>__LOG_DIR__/discord-wake.stdout.log</string>
+  <key>StandardErrorPath</key>
+  <string>__LOG_DIR__/discord-wake.stderr.log</string>
+</dict>
+</plist>

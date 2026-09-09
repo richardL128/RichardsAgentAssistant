@@ -70,7 +70,7 @@ def test_github_token_check_name_is_not_an_agent_check_name() -> None:
 
 
 def test_github_token_not_configured_is_healthy() -> None:
-    settings = Settings()
+    settings = Settings(_env_file=None)
 
     result = asyncio.run(check_github_installation_token(settings, now=NOW))
 
@@ -170,7 +170,7 @@ def test_github_token_transient_failure_is_attention() -> None:
 
 
 def test_discord_authentication_not_configured_is_healthy() -> None:
-    settings = Settings()
+    settings = Settings(_env_file=None)
 
     result = asyncio.run(check_discord_authentication(settings))
 

@@ -157,6 +157,30 @@ def _legacy_properties() -> dict[str, dict[str, str]]:
     }
 
 
+def _text_block(
+    block_id: str,
+    block_type: str,
+    text: str,
+    *,
+    has_children: bool = False,
+) -> dict[str, object]:
+    return {
+        "id": block_id,
+        "type": block_type,
+        "has_children": has_children,
+        block_type: {"rich_text": [{"plain_text": text}]},
+    }
+
+
+def _pdf_block(block_id: str, url: str, name: str = "rubric.pdf") -> dict[str, object]:
+    return {
+        "id": block_id,
+        "type": "pdf",
+        "has_children": False,
+        "pdf": {"type": "file", "name": name, "file": {"url": url}},
+    }
+
+
 @pytest.mark.asyncio
 async def test_discovers_nested_assessments_with_pagination_and_normalization() -> None:
     requests: list[httpx.Request] = []
@@ -507,6 +531,170 @@ async def test_one_course_discovery_failure_does_not_discard_other_courses() -> 
 
 
 @pytest.mark.asyncio
+async def test_retrieves_assessment_body_material_with_nesting_pagination_and_files() -> None:
+    requests: list[httpx.Request] = []
+    property_url = "https://prod-files-secure.s3.us-west-2.amazonaws.com/property-old"
+    body_url = "https://prod-files-secure.notion-static.com/body-rubric"
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        if request.url.path == "/v1/pages/assessment-1":
+            return httpx.Response(
+                200,
+                json={
+                    "id": "assessment-1",
+                    "last_edited_time": EDITED,
+                    "url": "https://www.notion.so/assessment-1",
+                    "properties": {
+                        "Name": _title_property("ECE 222 Assignment 1"),
+                        "Files": {
+                            "id": "files-prop",
+                            "type": "files",
+                            "files": [
+                                {
+                                    "name": "instructions.pdf",
+                                    "type": "file",
+                                    "file": {"url": property_url},
+                                },
+                                {
+                                    "name": "bad.pdf",
+                                    "type": "external",
+                                    "external": {"url": "https://example.invalid/bad.pdf"},
+                                },
+                            ],
+                        },
+                    },
+                },
+            )
+        if request.url.path == "/v1/blocks/assessment-1/children":
+            if request.url.params.get("start_cursor") == "next-body":
+                return httpx.Response(
+                    200,
+                    json={
+                        "results": [
+                            {
+                                "id": "row-1",
+                                "type": "table_row",
+                                "has_children": False,
+                                "table_row": {
+                                    "cells": [
+                                        [{"plain_text": "Circuit analysis"}],
+                                        [{"plain_text": "AC/DC comparison"}],
+                                    ]
+                                },
+                            },
+                            _pdf_block("pdf-1", body_url),
+                        ],
+                        "has_more": False,
+                        "next_cursor": None,
+                    },
+                )
+            return httpx.Response(
+                200,
+                json={
+                    "results": [
+                        _text_block(
+                            "para-1",
+                            "paragraph",
+                            "10% quiz; quiz is on linear circuits and DC circuits.",
+                        ),
+                        _text_block("toggle-1", "toggle", "Work steps", has_children=True),
+                    ],
+                    "has_more": True,
+                    "next_cursor": "next-body",
+                },
+            )
+        if request.url.path == "/v1/blocks/toggle-1/children":
+            return httpx.Response(
+                200,
+                json={
+                    "results": [
+                        _text_block("child-1", "bulleted_list_item", "Solve linear circuits first.")
+                    ],
+                    "has_more": False,
+                    "next_cursor": None,
+                },
+            )
+        return httpx.Response(404, json={"message": "unexpected"})
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+        connector = NotionConnector(token="secret", courses_database_id="courses-db", client=client)
+        materials = await connector.retrieve_assessment_materials("assessment-1", page_size=2)
+
+    assert materials.assessment_page_id == "assessment-1"
+    assert [block.source_block_id for block in materials.text_blocks] == [
+        "para-1",
+        "toggle-1",
+        "child-1",
+        "row-1",
+    ]
+    assert "ECE 222 Assignment 1" not in "\n".join(block.text for block in materials.text_blocks)
+    assert materials.text_blocks[0].source_key == "assessment-1:body:para-1"
+    assert materials.text_blocks[-1].text == "Circuit analysis | AC/DC comparison"
+    assert [(file.source_kind, file.source_key) for file in materials.files] == [
+        ("notion_property_file", "assessment-1:property:files-prop:file:0"),
+        ("notion_block_file", "assessment-1:block:pdf-1:file"),
+    ]
+    assert materials.files[0].mime_type == "application/pdf"
+    assert {diagnostic.code for diagnostic in materials.diagnostics} == {"notion_file_url_rejected"}
+    assert any(
+        request.url.path == "/v1/blocks/assessment-1/children"
+        and request.url.params.get("start_cursor") == "next-body"
+        for request in requests
+    )
+
+
+@pytest.mark.asyncio
+async def test_refresh_assessment_material_file_refetches_current_signed_url() -> None:
+    calls = 0
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal calls
+        if request.url.path == "/v1/pages/assessment-1":
+            calls += 1
+            return httpx.Response(
+                200,
+                json={
+                    "id": "assessment-1",
+                    "last_edited_time": EDITED,
+                    "properties": {
+                        "Name": _title_property("Assignment"),
+                        "Files": {
+                            "id": "files-prop",
+                            "type": "files",
+                            "files": [
+                                {
+                                    "name": "instructions.pdf",
+                                    "type": "file",
+                                    "file": {
+                                        "url": (
+                                            "https://prod-files-secure.s3.us-west-2.amazonaws.com/"
+                                            f"fresh-{calls}"
+                                        )
+                                    },
+                                }
+                            ],
+                        },
+                    },
+                },
+            )
+        if request.url.path == "/v1/blocks/assessment-1/children":
+            return httpx.Response(200, json={"results": [], "has_more": False, "next_cursor": None})
+        return httpx.Response(404, json={"message": "unexpected"})
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+        connector = NotionConnector(token="secret", courses_database_id="courses-db", client=client)
+        original = await connector.retrieve_assessment_materials("assessment-1")
+        refreshed = await connector.refresh_assessment_material_file(
+            assessment_page_id="assessment-1",
+            source_key=original.files[0].source_key,
+        )
+
+    assert original.files[0].url.endswith("fresh-1")
+    assert refreshed.url.endswith("fresh-2")
+
+
+@pytest.mark.asyncio
 async def test_guarded_title_rename_patches_only_title_property() -> None:
     requests: list[httpx.Request] = []
 
@@ -551,6 +739,45 @@ async def test_guarded_title_rename_patches_only_title_property() -> None:
 
 
 @pytest.mark.asyncio
+async def test_guarded_title_rename_already_desired_title_is_idempotent_success() -> None:
+    requests: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        if request.method == "GET":
+            return httpx.Response(
+                200,
+                json={
+                    "id": "assessment-1",
+                    "last_edited_time": "2026-09-03T12:01:00.000Z",
+                    "url": "https://www.notion.so/assessment-1",
+                    "archived": False,
+                    "in_trash": False,
+                    "properties": {
+                        "Name": _title_property("Quiz - Chapter 4"),
+                        "Date": _date_property("2026-10-01"),
+                    },
+                },
+            )
+        return httpx.Response(500, json={"message": "PATCH should not be retried"})
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+        connector = NotionConnector(token="secret", courses_database_id="courses-db", client=client)
+        receipt = await connector.rename_assessment_title(
+            page_id="assessment-1",
+            title_property_id="title-prop",
+            expected_title="Chapter 4",
+            expected_last_edited_at=EDITED_AT,
+            new_title="Quiz - Chapter 4",
+        )
+
+    assert receipt.page_id == "assessment-1"
+    assert receipt.url == "https://www.notion.so/assessment-1"
+    assert receipt.property_id == "title-prop"
+    assert [request.method for request in requests] == ["GET"]
+
+
+@pytest.mark.asyncio
 async def test_guarded_title_rename_rejects_concurrent_edit_without_patch() -> None:
     requests: list[httpx.Request] = []
 
@@ -582,6 +809,8 @@ async def test_guarded_title_rename_rejects_concurrent_edit_without_patch() -> N
 @pytest.mark.asyncio
 async def test_attachment_download_is_bounded_and_rejects_other_hosts() -> None:
     async def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/redirect":
+            return httpx.Response(302, headers={"location": "https://example.invalid/file"})
         return httpx.Response(200, content=b"pdf")
 
     async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
@@ -592,6 +821,13 @@ async def test_attachment_download_is_bounded_and_rejects_other_hosts() -> None:
                 url="https://prod-files-secure.s3.us-west-2.amazonaws.com/a",
             )
         )
+        with pytest.raises(LifeAgentError, match="input_invalid"):
+            await connector.download_attachment(
+                NotionAttachment(
+                    name="redirect.pdf",
+                    url="https://prod-files-secure.s3.us-west-2.amazonaws.com/redirect",
+                )
+            )
     assert body == b"pdf"
     with pytest.raises(LifeAgentError, match="input_invalid"):
         await connector.download_attachment(

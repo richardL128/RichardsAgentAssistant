@@ -56,9 +56,7 @@ class EndpointSelection:
 
 type PayloadParser = Callable[[RawSourcePayload, SourceQuery], ParsedSourcePayload]
 type EndpointSelector = Callable[[SourceQuery, SourceDefinition], EndpointSelection]
-type RequestParameters = Callable[
-    [SourceEndpointDefinition, SourceQuery], Mapping[str, str]
-]
+type RequestParameters = Callable[[SourceEndpointDefinition, SourceQuery], Mapping[str, str]]
 type RequestHeaders = Callable[[SourceEndpointDefinition], Mapping[str, str]]
 type RequestAuditSink = Callable[[EndpointRequestAudit], None]
 
@@ -67,9 +65,7 @@ def _all_endpoints(_: SourceQuery, definition: SourceDefinition) -> EndpointSele
     return EndpointSelection(definition.endpoints)
 
 
-def _no_parameters(
-    _: SourceEndpointDefinition, __: SourceQuery
-) -> Mapping[str, str]:
+def _no_parameters(_: SourceEndpointDefinition, __: SourceQuery) -> Mapping[str, str]:
     return {}
 
 
@@ -191,12 +187,13 @@ class PublicSourceAdapter:
         failure = None
         actual_requests = tuple(audit for audit in audits if audit.request_counted)
         if (
-            (not selection.endpoints and endpoint_failures)
-            or (
-                actual_requests
-                and all(audit.failure is not None for audit in actual_requests)
+            (
+                (not selection.endpoints and endpoint_failures)
+                or (actual_requests and all(audit.failure is not None for audit in actual_requests))
             )
-        ) and not documents and not exposures:
+            and not documents
+            and not exposures
+        ):
             failure = SourceFailure(
                 source_id=self.source_id,
                 error_code="source_unavailable",

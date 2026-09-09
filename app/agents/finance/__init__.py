@@ -35,6 +35,7 @@ def __getattr__(name: str) -> object:
         return run_finance_briefing
     raise AttributeError(name)
 
+
 __all__ = [
     "BriefingPayload",
     "EventCard",

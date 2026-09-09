@@ -25,6 +25,7 @@ class FakeChatModel:
         self.prompts: list[str] = []
         self.formats: list[dict[str, object]] = []
         self.options: list[dict[str, object]] = []
+        self.keep_alive: list[object] = []
 
     async def ainvoke(self, prompt: str, **kwargs: object) -> object:
         self.prompts.append(prompt)
@@ -34,6 +35,7 @@ class FakeChatModel:
         options = kwargs.get("options")
         assert isinstance(options, dict)
         self.options.append(options)
+        self.keep_alive.append(kwargs.get("keep_alive"))
         if self.delay:
             await asyncio.sleep(self.delay)
         return next(self.responses)
@@ -64,6 +66,7 @@ async def test_valid_response_records_estimated_and_reported_telemetry() -> None
     assert result.telemetry[0].estimated_output_tokens == 4
     assert fake.formats[0]["title"] == "Answer"
     assert fake.options[0]["num_batch"] == 32
+    assert fake.keep_alive == ["300s"]
 
 
 @pytest.mark.asyncio
@@ -77,6 +80,7 @@ async def test_invalid_response_uses_exactly_one_repair_call() -> None:
     assert result.output == Answer(answer="repaired")
     assert len(fake.prompts) == 2
     assert [item.attempt for item in result.telemetry] == [1, 2]
+    assert fake.keep_alive == ["300s", "300s"]
 
 
 @pytest.mark.asyncio

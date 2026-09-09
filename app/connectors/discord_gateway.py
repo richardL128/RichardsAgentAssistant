@@ -15,9 +15,17 @@ from uuid import UUID
 import httpx
 from pydantic import BaseModel, ConfigDict, Field, SecretStr, field_validator
 
-DiscordClarificationAction = Literal["quiz", "assignment", "ignore"]
+DiscordClarificationAction = Literal[
+    "quiz",
+    "assignment",
+    "tutorial",
+    "lab",
+    "studying_block",
+    "ignore",
+]
 DiscordInteractionStatus = Literal[
     "handled",
+    "queued",
     "ignored",
     "duplicate",
     "unauthorized",
@@ -29,11 +37,12 @@ _CUSTOM_ID_PATTERN = re.compile(
     r"^academic_clarify:"
     r"(?P<clarification_id>[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-"
     r"[0-9a-fA-F]{4}-[0-9a-fA-F]{12}):"
-    r"(?P<action>quiz|assignment|ignore)$"
+    r"(?P<action>quiz|assignment|tutorial|lab|studying_block|ignore)$"
 )
 _DISCORD_ID_PATTERN = re.compile(r"^[0-9]{5,24}$")
 _DISCORD_MESSAGE_COMPONENT_TYPE = 3
 _DISCORD_INTERACTION_CALLBACK_CHANNEL_MESSAGE = 4
+_DISCORD_INTERACTION_CALLBACK_UPDATE_MESSAGE = 7
 _DISCORD_INTENT_GUILD_MESSAGES = 1 << 9
 _DISCORD_INTENT_MESSAGE_CONTENT = 1 << 15
 _DISCORD_MESSAGE_CONTENT_INTENTS = _DISCORD_INTENT_GUILD_MESSAGES | _DISCORD_INTENT_MESSAGE_CONTENT
@@ -72,6 +81,7 @@ class DiscordAcademicMessageCreate(BaseModel):
     timestamp: datetime
     content: SecretStr = Field(repr=False)
     mentioned_user_ids: tuple[str, ...] = Field(default=(), max_length=20)
+    progress_message_id: str | None = Field(default=None, pattern=r"^[0-9]{5,24}$")
 
     @field_validator("timestamp")
     @classmethod
@@ -88,6 +98,20 @@ class DiscordAcademicMessageCreate(BaseModel):
             raise ValueError("Discord message content must be present and bounded")
         return value
 
+    def has_verified_mention(self, application_id: str) -> bool:
+        """Require both Discord mention metadata and canonical mention text."""
+
+        if _DISCORD_ID_PATTERN.fullmatch(application_id) is None:
+            return False
+        return (
+            application_id in self.mentioned_user_ids
+            and re.search(
+                rf"<@!?{re.escape(application_id)}>",
+                self.content.get_secret_value(),
+            )
+            is not None
+        )
+
 
 class DiscordMessageCallbackResult(BaseModel):
     """Bounded callback result safe to log or persist by callers."""
@@ -97,7 +121,7 @@ class DiscordMessageCallbackResult(BaseModel):
     status: DiscordInteractionStatus
 
 
-class DiscordClarificationHandler(Protocol):
+class DiscordClarificationEnqueuer(Protocol):
     async def __call__(
         self,
         interaction: DiscordClarificationInteraction,
@@ -171,7 +195,7 @@ class DiscordGatewayListener:
         api_base_url: str,
         allowed_channel_ids: set[str],
         authorized_user_ids: set[str],
-        handler: DiscordClarificationHandler,
+        clarification_enqueuer: DiscordClarificationEnqueuer,
         message_content_enabled: bool = False,
         message_handler: DiscordMessageHandler | None = None,
         http_client: DiscordGatewayHttpClient | None = None,
@@ -184,7 +208,7 @@ class DiscordGatewayListener:
         self._api_base_url = api_base_url.rstrip("/")
         self._allowed_channel_ids = frozenset(allowed_channel_ids)
         self._authorized_user_ids = frozenset(authorized_user_ids)
-        self._handler = handler
+        self._clarification_enqueuer = clarification_enqueuer
         self._message_handler = message_handler
         self._message_content_enabled = message_content_enabled
         self._http_client = http_client
@@ -313,29 +337,27 @@ class DiscordGatewayListener:
                 self._allowed_channel_ids,
                 self._authorized_user_ids,
             )
-            await self._acknowledge_interaction(
-                interaction_id,
-                token,
-                content=_interaction_confirmation_content(action, status, initial=True),
-            )
             self._remember_interaction(interaction_id)
             return status
 
-        await self._acknowledge_interaction(
-            interaction_id,
-            token,
-            content=_interaction_confirmation_content(action, "handled", initial=True),
-        )
         try:
-            result = await self._handler(parsed)
+            result = await self._clarification_enqueuer(parsed)
         except Exception:
             result = DiscordClarificationCallbackResult(status="failed")
+
         try:
-            await self._complete_interaction(
-                application_id,
-                token,
-                content=_interaction_confirmation_content(action, result.status),
-            )
+            if result.status == "failed":
+                await self._acknowledge_interaction(
+                    interaction_id,
+                    token,
+                    content=_interaction_confirmation_content(action, result.status),
+                )
+            else:
+                await self._update_source_message_interaction(
+                    interaction_id,
+                    token,
+                    content=_interaction_confirmation_content(action, result.status),
+                )
         except httpx.HTTPError:
             self._remember_interaction(parsed.interaction_id)
             return "failed"
@@ -459,31 +481,6 @@ class DiscordGatewayListener:
             if owns_client:
                 await cast(httpx.AsyncClient, client).aclose()
 
-    async def _complete_interaction(
-        self,
-        application_id: str,
-        token: str,
-        *,
-        content: str,
-    ) -> None:
-        owns_client = self._http_client is None
-        client = self._http_client or httpx.AsyncClient(
-            base_url=self._api_base_url,
-            timeout=httpx.Timeout(10.0),
-        )
-        try:
-            response = await client.patch(
-                f"/webhooks/{application_id}/{token}/messages/@original",
-                json={
-                    "content": content,
-                    "allowed_mentions": {"parse": []},
-                },
-            )
-            response.raise_for_status()
-        finally:
-            if owns_client:
-                await cast(httpx.AsyncClient, client).aclose()
-
     def _capture_ready_session(self, payload: Mapping[str, object]) -> None:
         if payload.get("t") != "READY":
             return
@@ -555,6 +552,35 @@ class DiscordGatewayListener:
         except Exception:
             return DiscordMessageCallbackResult(status="failed")
 
+    async def _update_source_message_interaction(
+        self,
+        interaction_id: str,
+        token: str,
+        *,
+        content: str,
+    ) -> None:
+        owns_client = self._http_client is None
+        client = self._http_client or httpx.AsyncClient(
+            base_url=self._api_base_url,
+            timeout=httpx.Timeout(10.0),
+        )
+        try:
+            response = await client.post(
+                f"/interactions/{interaction_id}/{token}/callback",
+                json={
+                    "type": _DISCORD_INTERACTION_CALLBACK_UPDATE_MESSAGE,
+                    "data": {
+                        "content": content,
+                        "allowed_mentions": {"parse": []},
+                        "components": [],
+                    },
+                },
+            )
+            response.raise_for_status()
+        finally:
+            if owns_client:
+                await cast(httpx.AsyncClient, client).aclose()
+
 
 def _interaction_confirmation_content(
     action: DiscordClarificationAction,
@@ -562,13 +588,13 @@ def _interaction_confirmation_content(
     *,
     initial: bool = False,
 ) -> str:
-    label = action.capitalize()
+    label = _clarification_action_label(action)
     if initial:
         if status == "unauthorized":
             return f"Choice not accepted: {label}. This Discord user is not authorized."
-        return f"Choice received: {label}. Processing this decision now."
-    if status == "handled":
-        return f"Confirmed choice: {label}. The Notion assessment was updated once."
+        return f"Choice received: {label}. Queueing this decision now."
+    if status in {"handled", "queued"}:
+        return f"Choice queued: {label}. I will update this message when Notion finishes."
     if status == "ignored":
         return "Confirmed choice: Ignore. No Notion change was made."
     if status == "duplicate":
@@ -584,9 +610,20 @@ def _interaction_confirmation_content(
             "no Notion change was made."
         )
     return (
-        f"Choice received: {label}, but LifeAgent could not apply it. "
-        "No duplicate Notion change was made."
+        f"Choice not queued: {label}. LifeAgent could not queue this update; "
+        "no Notion change was made."
     )
+
+
+def _clarification_action_label(action: DiscordClarificationAction) -> str:
+    return {
+        "quiz": "Quiz",
+        "assignment": "Assignment",
+        "tutorial": "Tutorial",
+        "lab": "Lab",
+        "studying_block": "Studying Block",
+        "ignore": "Ignore",
+    }[action]
 
 
 def parse_clarification_custom_id(
@@ -780,7 +817,7 @@ __all__ = [
     "DiscordAcademicMessageCreate",
     "DiscordClarificationAction",
     "DiscordClarificationCallbackResult",
-    "DiscordClarificationHandler",
+    "DiscordClarificationEnqueuer",
     "DiscordClarificationInteraction",
     "DiscordGatewayConfigurationError",
     "DiscordGatewayConnect",

@@ -6,6 +6,7 @@ from types import SimpleNamespace
 
 import httpx
 import pytest
+from procrastinate.exceptions import AlreadyEnqueued
 from sqlalchemy import create_engine
 from sqlalchemy.orm import Session
 
@@ -14,7 +15,12 @@ from app.core.errors import ErrorCode, authorization_error, transient_error
 from app.db.models import HealthCheck as PersistedHealthCheck
 from app.health.checks import HealthCheck, HealthState
 from app.queue import tasks
-from app.queue.app import QUEUE_NAMES, create_procrastinate_app, postgres_conninfo
+from app.queue.app import (
+    QUEUE_NAMES,
+    create_procrastinate_app,
+    postgres_conninfo,
+    procrastinate_app,
+)
 from app.queue.idempotency import (
     IdempotencyKeyError,
     build_idempotency_key,
@@ -168,7 +174,7 @@ def test_procrastinate_app_is_configured_without_opening_connections() -> None:
     assert QUEUE_NAMES == ("code_review", "academic_planner", "finance")
     assert {
         tasks.code_review_task.queue,
-        tasks.academic_planner_task.queue,
+        tasks.discord_wake_task.queue,
         tasks.finance_task.queue,
     } == set(QUEUE_NAMES)
 
@@ -242,4 +248,241 @@ def test_task_deferral_uses_global_model_lock_and_per_item_queueing_lock() -> No
     assert task.arguments == {
         "run_id": "run-id",
         "idempotency_key": "review:repo:sha",
+    }
+
+
+@pytest.mark.asyncio
+async def test_academic_clarification_deferral_uses_per_clarification_lock_without_model_lock(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class FakeTask:
+        def __init__(self) -> None:
+            self.configuration: dict[str, str] = {}
+            self.arguments: dict[str, str] = {}
+
+        def configure(self, **kwargs: str) -> FakeTask:
+            self.configuration = kwargs
+            return self
+
+        async def defer_async(self, **kwargs: str) -> int:
+            self.arguments = kwargs
+            return 43
+
+    task = FakeTask()
+    clarification_id = "11111111-1111-4111-8111-111111111111"
+    monkeypatch.setattr(tasks, "academic_clarification_task", task)
+
+    result = await tasks.defer_academic_clarification(
+        clarification_id=clarification_id,
+        action="studying_block",
+        user_id="123456789012345678",
+    )
+
+    assert result == 43
+    assert task.configuration == {
+        "lock": f"academic-clarification:{clarification_id}",
+        "queueing_lock": f"academic-clarification:{clarification_id}",
+    }
+    assert task.arguments == {
+        "clarification_id": clarification_id,
+        "action": "studying_block",
+        "user_id": "123456789012345678",
+    }
+
+
+@pytest.mark.asyncio
+async def test_academic_clarification_status_deferral_has_independent_lock(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class FakeTask:
+        def __init__(self) -> None:
+            self.configuration: dict[str, str] = {}
+            self.arguments: dict[str, str] = {}
+
+        def configure(self, **kwargs: str) -> FakeTask:
+            self.configuration = kwargs
+            return self
+
+        async def defer_async(self, **kwargs: str) -> int:
+            self.arguments = kwargs
+            return 44
+
+    task = FakeTask()
+    clarification_id = "22222222-2222-4222-8222-222222222222"
+    monkeypatch.setattr(tasks, "academic_clarification_status_task", task)
+
+    result = await tasks.defer_academic_clarification_status(
+        clarification_id=clarification_id,
+        action="tutorial",
+    )
+
+    assert result == 44
+    assert task.configuration == {
+        "lock": f"academic-clarification:status:{clarification_id}",
+        "queueing_lock": f"academic-clarification:status:{clarification_id}",
+    }
+    assert task.arguments == {
+        "clarification_id": clarification_id,
+        "action": "tutorial",
+    }
+
+
+@pytest.mark.asyncio
+async def test_academic_clarification_locks_are_per_clarification(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class FakeTask:
+        def __init__(self) -> None:
+            self.configurations: list[dict[str, str]] = []
+
+        def configure(self, **kwargs: str) -> FakeTask:
+            self.configurations.append(kwargs)
+            return self
+
+        async def defer_async(self, **kwargs: str) -> int:
+            del kwargs
+            return len(self.configurations)
+
+    task = FakeTask()
+    first_id = "33333333-3333-4333-8333-333333333333"
+    second_id = "44444444-4444-4444-8444-444444444444"
+    monkeypatch.setattr(tasks, "academic_clarification_task", task)
+
+    await tasks.defer_academic_clarification(
+        clarification_id=first_id,
+        action="quiz",
+        user_id="123456789012345678",
+    )
+    await tasks.defer_academic_clarification(
+        clarification_id=second_id,
+        action="quiz",
+        user_id="123456789012345678",
+    )
+
+    assert task.configurations == [
+        {
+            "lock": f"academic-clarification:{first_id}",
+            "queueing_lock": f"academic-clarification:{first_id}",
+        },
+        {
+            "lock": f"academic-clarification:{second_id}",
+            "queueing_lock": f"academic-clarification:{second_id}",
+        },
+    ]
+
+
+@pytest.mark.asyncio
+async def test_academic_clarification_duplicate_queueing_lock_is_idempotent_success(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class FakeTask:
+        def configure(self, **kwargs: str) -> FakeTask:
+            self.configuration = kwargs
+            return self
+
+        async def defer_async(self, **kwargs: str) -> int:
+            self.arguments = kwargs
+            raise AlreadyEnqueued("duplicate queueing lock")
+
+    task = FakeTask()
+    clarification_id = "55555555-5555-4555-8555-555555555555"
+    monkeypatch.setattr(tasks, "academic_clarification_task", task)
+
+    result = await tasks.defer_academic_clarification(
+        clarification_id=clarification_id,
+        action="quiz",
+        user_id="123456789012345678",
+    )
+
+    assert result == {
+        "status": "already_enqueued",
+        "clarification_id": clarification_id,
+    }
+    assert task.configuration == {
+        "lock": f"academic-clarification:{clarification_id}",
+        "queueing_lock": f"academic-clarification:{clarification_id}",
+    }
+    assert task.arguments == {
+        "clarification_id": clarification_id,
+        "action": "quiz",
+        "user_id": "123456789012345678",
+    }
+
+
+@pytest.mark.asyncio
+async def test_academic_clarification_deferral_still_rejects_invalid_input(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class FakeTask:
+        def configure(self, **kwargs: str) -> FakeTask:
+            raise AssertionError("invalid input must fail before task configuration")
+
+    monkeypatch.setattr(tasks, "academic_clarification_task", FakeTask())
+
+    with pytest.raises(ValueError, match="badly formed hexadecimal UUID string"):
+        await tasks.defer_academic_clarification(
+            clarification_id="not-a-uuid",
+            action="quiz",
+            user_id="123456789012345678",
+        )
+    with pytest.raises(ValueError, match="academic clarification action is invalid"):
+        await tasks.defer_academic_clarification(
+            clarification_id="66666666-6666-4666-8666-666666666666",
+            action="paper",
+            user_id="123456789012345678",
+        )
+
+
+@pytest.mark.asyncio
+async def test_material_ingestion_queue_payload_is_identifier_only(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class FakeTask:
+        def configure(self, **kwargs: str) -> FakeTask:
+            self.configuration = kwargs
+            return self
+
+        async def defer_async(self, **kwargs: str) -> int:
+            self.arguments = kwargs
+            return 17
+
+    task = FakeTask()
+    fingerprint = "a" * 64
+    monkeypatch.setattr(tasks, "academic_material_ingestion_task", task)
+
+    result = await tasks.defer_academic_material_ingestion("assessment-page", fingerprint)
+
+    assert result == 17
+    assert task.configuration == {
+        "lock": "ollama:exclusive",
+        "queueing_lock": f"academic-material:assessment-page:{fingerprint}",
+    }
+    assert task.arguments == {
+        "assessment_page_id": "assessment-page",
+        "source_fingerprint": fingerprint,
+    }
+
+
+def test_worker_registers_discord_wake_and_ingestion_handlers() -> None:
+    import importlib
+
+    from app.queue import worker
+
+    importlib.reload(worker)
+
+    assert tasks._academic_clarification_handler is not None
+    assert tasks._academic_clarification_status_handler is not None
+    assert tasks._academic_material_ingestion_handler is not None
+    assert tasks._discord_wake_handler is not None
+    assert "academic_planner" not in tasks._handlers
+
+
+def test_default_periodic_registry_has_no_academic_model_schedule() -> None:
+    registered = {
+        task.task.name for task in procrastinate_app.periodic_registry.periodic_tasks.values()
+    }
+
+    assert registered == {
+        "lifeagent.artifacts.retention",
+        "lifeagent.health.shared_services",
     }

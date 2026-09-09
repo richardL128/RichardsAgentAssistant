@@ -6,7 +6,7 @@ import hashlib
 import re
 import uuid
 from collections import defaultdict
-from collections.abc import Mapping, Sequence
+from collections.abc import Awaitable, Callable, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import UTC, date, datetime, time, timedelta
 from typing import Any, Literal, Protocol
@@ -25,6 +25,7 @@ from app.connectors.discord import (
     DiscordDeliveryReceipt,
 )
 from app.connectors.discord_gateway import (
+    DiscordClarificationAction,
     DiscordClarificationCallbackResult,
     DiscordClarificationInteraction,
 )
@@ -35,10 +36,25 @@ from app.connectors.notion import (
     NotionDiscoveryDiagnostic,
     NotionWriteConflict,
 )
-from app.core.errors import LifeAgentError
+from app.core.errors import ErrorCode, LifeAgentError
+from app.queue.retry import RetryClassification, classify_retry_error
 
 _DELIVERY_NAMESPACE = uuid.UUID("b31aee13-f134-4980-93bd-6e86d493f36a")
 _SAFE_COURSE_CODE = re.compile(r"[A-Za-z0-9._ -]{1,40}")
+_CLARIFICATION_ACTIONS: tuple[DiscordClarificationAction, ...] = (
+    "quiz",
+    "assignment",
+    "tutorial",
+    "lab",
+    "studying_block",
+)
+_CLARIFICATION_LABELS: dict[str, str] = {
+    "quiz": "Quiz",
+    "assignment": "Assignment",
+    "tutorial": "Tutorial",
+    "lab": "Lab",
+    "studying_block": "Studying Block",
+}
 _SETUP_LABELS: dict[str, str] = {
     "notion_configuration_missing": "missing Notion token or Courses database ID",
     "notion_configuration_invalid": "invalid Courses database configuration",
@@ -107,7 +123,7 @@ class AcademicSyncStore(Protocol):
     def claim_clarification(
         self,
         clarification_id: uuid.UUID | str,
-        action: Literal["quiz", "assignment", "ignore"],
+        action: DiscordClarificationAction,
         actor_id: int,
         *,
         now: datetime | None = None,
@@ -164,6 +180,7 @@ class AcademicNotionSyncResult:
     assessment_count: int = 0
     archived_count: int = 0
     clarification_count: int = 0
+    material_job_count: int = 0
     invalid_calendar_count: int = 0
     diagnostic_codes: tuple[str, ...] = ()
 
@@ -175,6 +192,7 @@ class AcademicNotionSyncResult:
             "assessment_count": self.assessment_count,
             "archived_count": self.archived_count,
             "clarification_count": self.clarification_count,
+            "material_job_count": self.material_job_count,
             "invalid_calendar_count": self.invalid_calendar_count,
             "diagnostic_codes": list(self.diagnostic_codes),
         }
@@ -208,6 +226,7 @@ class _AssessmentRecord:
     title: str
     current_title: str
     due_at: datetime | None
+    ends_at: datetime | None
     weight: float | None
     estimated_minutes: int
     status: str | None
@@ -238,6 +257,7 @@ class AcademicNotionSync:
         timezone: str = "America/Toronto",
         clarification_ttl_hours: int = 24,
         setup_condition_code: str = "notion_configuration_missing",
+        material_enqueuer: Callable[[str, str], Awaitable[object]] | None = None,
     ) -> None:
         self._connector = connector
         self._store = store
@@ -246,6 +266,7 @@ class AcademicNotionSync:
         self._timezone = ZoneInfo(timezone)
         self._clarification_ttl = timedelta(hours=clarification_ttl_hours)
         self._setup_condition_code = setup_condition_code
+        self._material_enqueuer = material_enqueuer
 
     @property
     def connector(self) -> NotionConnector | None:
@@ -292,6 +313,7 @@ class AcademicNotionSync:
         assessment_count = 0
         archived_count = 0
         clarification_count = 0
+        material_job_count = 0
         invalid_calendars = 0
         for course in result.courses:
             course_record = _course_record(course)
@@ -321,16 +343,37 @@ class AcademicNotionSync:
                     assessment_row_id = self._store.upsert_synced_assessment(
                         course_record,
                         record,
-                        kind=(
-                            classification.kind.value
-                            if classification.kind is not AssessmentKind.UNKNOWN
-                            else "event"
-                        ),
+                        kind=_synced_kind_value(classification.kind),
                         label_source=classification.source,
                     )
                     assessment_count += 1
+                    if self._material_enqueuer is not None and record.active:
+                        from app.agents.academic_planner.material_ingestion import (
+                            assessment_material_fingerprint,
+                        )
+
+                        try:
+                            await self._material_enqueuer(
+                                assessment.page_id,
+                                assessment_material_fingerprint(
+                                    assessment.page_id,
+                                    assessment.last_edited_at,
+                                ),
+                            )
+                            material_job_count += 1
+                        except Exception:
+                            diagnostics.append(
+                                NotionDiscoveryDiagnostic(
+                                    code="assessment_material_enqueue_failed",
+                                    severity="warning",
+                                    message="Assessment material ingestion could not be queued",
+                                    course_page_id=course.course_page_id,
+                                    course_title=course.course_title,
+                                )
+                            )
                     if (
-                        classification.kind is AssessmentKind.UNKNOWN
+                        _classification_kind_value(classification.kind)
+                        == AssessmentKind.UNKNOWN.value
                         and record.active
                         and record.current_title
                     ):
@@ -386,6 +429,7 @@ class AcademicNotionSync:
             assessment_count=assessment_count,
             archived_count=archived_count,
             clarification_count=clarification_count,
+            material_job_count=material_job_count,
             invalid_calendar_count=invalid_calendars,
             diagnostic_codes=codes,
         )
@@ -398,7 +442,7 @@ class AcademicNotionSync:
         assessment_row_id: str,
         now: datetime,
     ) -> bool:
-        previews = canonical_title_previews(assessment.current_title)
+        previews = _canonical_clarification_previews(assessment.current_title)
         idempotency_key = (
             "academic-label:"
             + hashlib.sha256(
@@ -416,8 +460,11 @@ class AcademicNotionSync:
             event_notion_id=assessment.page_id,
             original_title=assessment.current_title,
             raw_label=assessment.current_title,
-            quiz_preview_title=previews[AssessmentKind.QUIZ],
-            assignment_preview_title=previews[AssessmentKind.ASSIGNMENT],
+            quiz_preview_title=previews["quiz"],
+            assignment_preview_title=previews["assignment"],
+            tutorial_preview_title=previews["tutorial"],
+            lab_preview_title=previews["lab"],
+            studying_block_preview_title=previews["studying_block"],
             expected_edited_at=assessment.last_edited_at,
             expires_at=now + self._clarification_ttl,
             idempotency_key=idempotency_key,
@@ -440,8 +487,11 @@ class AcademicNotionSync:
                     clarification_id=clarification_uuid,
                     channel_id=self._discord_channel_id,
                     current_title=assessment.current_title[:500],
-                    quiz_title_preview=previews[AssessmentKind.QUIZ][:500],
-                    assignment_title_preview=previews[AssessmentKind.ASSIGNMENT][:500],
+                    quiz_title_preview=previews["quiz"][:500],
+                    assignment_title_preview=previews["assignment"][:500],
+                    tutorial_title_preview=previews["tutorial"][:500],
+                    lab_title_preview=previews["lab"][:500],
+                    studying_block_title_preview=previews["studying_block"][:500],
                 )
             )
         except LifeAgentError:
@@ -540,22 +590,45 @@ class AcademicClarificationService:
         self,
         interaction: DiscordClarificationInteraction,
     ) -> DiscordClarificationCallbackResult:
+        return await self.apply_choice(
+            clarification_id=str(interaction.clarification_id),
+            action=interaction.action,
+            user_id=interaction.user_id,
+        )
+
+    async def apply_choice(
+        self,
+        *,
+        clarification_id: str,
+        action: DiscordClarificationAction,
+        user_id: str,
+        attempt: int = 1,
+        attempt_limit: int = 1,
+    ) -> DiscordClarificationCallbackResult:
+        if attempt < 1 or attempt_limit < 1:
+            raise ValueError("attempt and attempt_limit must be positive")
+        try:
+            actor_id = int(user_id)
+        except ValueError:
+            return DiscordClarificationCallbackResult(status="invalid")
         try:
             status, request = self._store.claim_clarification(
-                interaction.clarification_id,
-                interaction.action,
-                int(interaction.user_id),
+                clarification_id,
+                action,
+                actor_id,
             )
         except (KeyError, ValueError, NoResultFound):
             return DiscordClarificationCallbackResult(status="invalid")
         if status == "ignored":
             return DiscordClarificationCallbackResult(status="ignored")
+        if status == "claimed" and request.get("decision") == action:
+            status = "ready"
         if status != "ready":
             return DiscordClarificationCallbackResult(status="duplicate")
         title_property_id = request.get("title_property_id")
         original_title = request.get("original_title")
         expected_edited_at = request.get("expected_edited_at")
-        new_title = request.get(f"{interaction.action}_preview_title")
+        new_title = _clarification_preview_title(request, action)
         page_id = request.get("event_notion_id")
         if not (
             isinstance(title_property_id, str)
@@ -568,7 +641,7 @@ class AcademicClarificationService:
             and page_id
         ):
             self._store.mark_clarification_failed(
-                interaction.clarification_id,
+                clarification_id,
                 error_code="clarification_state_invalid",
             )
             return DiscordClarificationCallbackResult(status="failed")
@@ -578,7 +651,7 @@ class AcademicClarificationService:
             )
         except ValueError:
             self._store.mark_clarification_failed(
-                interaction.clarification_id,
+                clarification_id,
                 error_code="clarification_state_invalid",
             )
             return DiscordClarificationCallbackResult(status="failed")
@@ -590,21 +663,38 @@ class AcademicClarificationService:
                 expected_last_edited_at=edited_at,
                 new_title=new_title,
             )
-        except NotionWriteConflict:
+        except NotionWriteConflict as exc:
+            if exc.current is not None and exc.current.current_title == new_title:
+                self._store.mark_clarification_applied(clarification_id)
+                return DiscordClarificationCallbackResult(status="handled")
             self._store.mark_clarification_conflict(
-                interaction.clarification_id,
+                clarification_id,
                 error_code="notion_precondition_failed",
             )
             return DiscordClarificationCallbackResult(status="failed")
         except LifeAgentError as exc:
+            if (
+                classify_retry_error(exc) is RetryClassification.TRANSIENT
+                and attempt < attempt_limit
+            ):
+                raise
             self._store.mark_clarification_failed(
-                interaction.clarification_id,
+                clarification_id,
                 error_code=exc.record.code.value,
             )
             return DiscordClarificationCallbackResult(status="failed")
-        self._store.mark_clarification_applied(interaction.clarification_id)
-        if self._syncer is not None:
-            await self._syncer.sync()
+        except Exception as exc:
+            if (
+                classify_retry_error(exc) is RetryClassification.TRANSIENT
+                and attempt < attempt_limit
+            ):
+                raise
+            self._store.mark_clarification_failed(
+                clarification_id,
+                error_code=ErrorCode.INTERNAL.value,
+            )
+            return DiscordClarificationCallbackResult(status="failed")
+        self._store.mark_clarification_applied(clarification_id)
         return DiscordClarificationCallbackResult(status="handled")
 
 
@@ -644,11 +734,21 @@ def _assessment_record(
         trusted_existing_kind=existing_kind if isinstance(existing_kind, str) else None,
     )
     due_at = _parse_due(assessment, timezone=timezone)
+    ends_at = _parse_end(assessment, timezone=timezone)
     reasons: list[str] = []
-    if classification.kind is AssessmentKind.UNKNOWN:
-        reasons.append("Confirm whether this assessment is a Quiz or Assignment.")
+    if _classification_kind_value(classification.kind) == AssessmentKind.UNKNOWN.value:
+        reasons.append(
+            "Confirm whether this assessment is a Quiz, Assignment, Tutorial, Lab, "
+            "or Studying Block."
+        )
     if due_at is None:
         reasons.append("Confirm the assessment deadline in Notion.")
+        ends_at = None
+    elif ends_at is not None and ends_at <= due_at:
+        reasons.append(
+            "Confirm the assessment date range in Notion; the end must be after the start."
+        )
+        ends_at = None
     ambiguous = bool(reasons)
     estimated = _bounded_number(
         assessment.estimated_minutes,
@@ -665,6 +765,7 @@ def _assessment_record(
             title=assessment.current_title,
             current_title=assessment.current_title,
             due_at=due_at,
+            ends_at=ends_at,
             weight=weight,
             estimated_minutes=int(estimated),
             status=assessment.status,
@@ -685,10 +786,79 @@ def _assessment_record(
     )
 
 
+def _classification_kind_value(kind: Any) -> str:
+    value = getattr(kind, "value", kind)
+    return str(value)
+
+
+def _synced_kind_value(kind: Any) -> str:
+    value = _classification_kind_value(kind)
+    return "event" if value == AssessmentKind.UNKNOWN.value else value
+
+
+def _canonical_clarification_previews(label: str) -> dict[str, str]:
+    previews: dict[str, str] = {}
+    try:
+        raw_previews = canonical_title_previews(label)
+    except Exception:
+        raw_previews = {}
+    for key, value in getattr(raw_previews, "items", lambda: ())():
+        preview_key = _classification_kind_value(key)
+        if preview_key in _CLARIFICATION_LABELS:
+            previews[preview_key] = str(value)[:500]
+    body = _clarification_title_body(label)
+    for action in _CLARIFICATION_ACTIONS:
+        previews.setdefault(action, f"{_CLARIFICATION_LABELS[action]} — {body}"[:500])
+    return previews
+
+
+def _clarification_preview_title(
+    request: Mapping[str, Any],
+    action: DiscordClarificationAction,
+) -> str | None:
+    if action == "ignore":
+        return None
+    preview = request.get(f"{action}_preview_title")
+    if isinstance(preview, str) and preview:
+        return preview
+    original_title = request.get("original_title")
+    if not isinstance(original_title, str) or not original_title:
+        return None
+    return _canonical_clarification_previews(original_title)[action]
+
+
+def _clarification_title_body(label: str) -> str:
+    prefixes = "|".join(re.escape(value) for value in _CLARIFICATION_LABELS.values())
+    without_prefix = re.sub(
+        rf"^\s*(?:{prefixes})\s+[—-]\s*",
+        "",
+        label,
+        count=1,
+        flags=re.IGNORECASE,
+    ).strip()
+    return without_prefix or "Untitled assessment"
+
+
 def _parse_due(assessment: NotionAssessment, *, timezone: ZoneInfo) -> datetime | None:
     if assessment.due is None or assessment.due.start is None:
         return None
     raw = assessment.due.start
+    try:
+        if "T" not in raw:
+            parsed_date = date.fromisoformat(raw)
+            return datetime.combine(parsed_date, time(23, 59), tzinfo=timezone).astimezone(UTC)
+        parsed = datetime.fromisoformat(raw.replace("Z", "+00:00"))
+        if parsed.tzinfo is None or parsed.utcoffset() is None:
+            parsed = parsed.replace(tzinfo=timezone)
+        return parsed.astimezone(UTC)
+    except ValueError:
+        return None
+
+
+def _parse_end(assessment: NotionAssessment, *, timezone: ZoneInfo) -> datetime | None:
+    if assessment.due is None or assessment.due.end is None:
+        return None
+    raw = assessment.due.end
     try:
         if "T" not in raw:
             parsed_date = date.fromisoformat(raw)

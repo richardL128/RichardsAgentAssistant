@@ -85,9 +85,7 @@ class InMemoryEndpointStateStore:
             artifact_ref=artifact_ref or previous.artifact_ref,
             retrieved_at=_aware(payload.retrieved_at),
             not_modified_at=(
-                _aware(payload.retrieved_at)
-                if payload.not_modified
-                else previous.not_modified_at
+                _aware(payload.retrieved_at) if payload.not_modified else previous.not_modified_at
             ),
         )
         self._records[payload.endpoint_id] = record

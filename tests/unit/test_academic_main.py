@@ -2,8 +2,10 @@
 
 from pathlib import Path
 
+import pytest
 from fastapi.testclient import TestClient
 
+from app import main as app_main
 from app.core.config import Settings
 from app.db.models import Base
 from app.main import create_app
@@ -45,27 +47,58 @@ def test_main_mounts_academic_proposals_and_confirmation_fails_closed(tmp_path: 
     }
     assert rejection.status_code == 200
     assert rejection.json()["status"] == "rejected"
-    assert app.state.academic_model is not None
+    assert app.state.academic_model is None
     assert app.state.academic_delivery is None
 
 
-def test_main_wires_free_text_without_requiring_notion_mapping(tmp_path: Path) -> None:
+def test_main_wires_backend_delivery_without_starting_gateway(tmp_path: Path) -> None:
     settings = Settings(
         _env_file=None,
         database_url=f"sqlite+pysqlite:///{tmp_path / 'academic-gateway.db'}",
         artifact_root=tmp_path / "artifacts",
         discord_bot_token="test-token",
+        discord_application_id="111111111111111111",
         discord_academic_channel_id="123456789012345678",
         discord_academic_authorized_user_ids=[987654321012345678],
-        discord_academic_gateway_enabled=True,
         discord_academic_message_content_enabled=True,
     )
     app = create_app(settings)
 
     assert app.state.academic_delivery is not None
     assert app.state.notion_writer is None
-    assert app.state.discord_academic_gateway_state == "starting"
+    assert app.state.discord_host_ingress_state == "external"
     app.state.database.dispose()
+
+
+def test_application_startup_does_not_probe_or_load_qwen(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls: list[str] = []
+
+    async def unexpected_readiness(*args: object, **kwargs: object) -> object:
+        calls.append("readiness")
+        raise AssertionError("startup must not probe or load Qwen")
+
+    async def unexpected_invoke(*args: object, **kwargs: object) -> object:
+        calls.append("invoke")
+        raise AssertionError("startup must not invoke Qwen")
+
+    monkeypatch.setattr(app_main.OllamaRuntime, "ensure_ready", unexpected_readiness)
+    monkeypatch.setattr(app_main.LLMGateway, "invoke_structured", unexpected_invoke)
+    settings = Settings(
+        _env_file=None,
+        database_url=f"sqlite+pysqlite:///{tmp_path / 'model-free-startup.db'}",
+        artifact_root=tmp_path / "artifacts",
+        academic_memory_enabled=False,
+    )
+
+    app = create_app(settings)
+    with TestClient(app) as client:
+        response = client.get("/health/live")
+
+    assert response.status_code == 200
+    assert calls == []
 
 
 def test_invalid_courses_database_id_is_setup_condition_not_startup_crash(
