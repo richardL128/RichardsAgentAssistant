@@ -10,6 +10,7 @@ from typing import Any
 import httpx
 import pytest
 from pydantic import SecretStr
+from websockets.exceptions import WebSocketException
 
 from app.agents.academic_planner import discord_checkin
 from app.agents.academic_planner.contracts import AcademicRequestRouteDecision
@@ -272,6 +273,47 @@ async def test_message_content_flag_controls_gateway_intents() -> None:
     assert enabled.identity_intents == MESSAGE_CONTENT_INTENTS
     assert disabled_ws.sent[0]["d"]["intents"] == 0
     assert enabled_ws.sent[0]["d"]["intents"] == MESSAGE_CONTENT_INTENTS
+
+
+@pytest.mark.asyncio
+async def test_run_forever_reconnects_after_transient_websocket_failure() -> None:
+    connection_attempts = 0
+    sleeps: list[float] = []
+
+    class TransientWebSocket:
+        async def recv(self) -> str:
+            raise WebSocketException("synthetic network reset")
+
+        async def send(self, data: str) -> None:
+            raise AssertionError(f"transient websocket should not send: {data}")
+
+        async def close(self) -> None:
+            return None
+
+    async def connect(_url: str) -> TransientWebSocket:
+        nonlocal connection_attempts
+        connection_attempts += 1
+        return TransientWebSocket()
+
+    async def sleep(seconds: float) -> None:
+        sleeps.append(seconds)
+
+    listener = DiscordGatewayListener(
+        token=SecretStr(TOKEN),
+        api_base_url="https://discord.com/api/v10",
+        allowed_channel_ids={CHANNEL},
+        authorized_user_ids={USER},
+        clarification_enqueuer=_ClarificationHandler(),
+        message_content_enabled=True,
+        http_client=_GatewayHttp(),
+        websocket_connect=connect,
+        sleep=sleep,
+    )
+
+    await listener.run_forever(max_attempts=2)
+
+    assert connection_attempts == 2
+    assert sleeps == [1.0, 1.0]
 
 
 @pytest.mark.asyncio

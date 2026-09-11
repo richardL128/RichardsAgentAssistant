@@ -1,8 +1,9 @@
 # Phase 6 — Finance briefing
 
 Historical phase note: this closeout describes the original Phase 6 finance
-implementation. In the current configured runtime, only `postgres` and `api` are
-Compose services; Qwen is triggered solely by an authorized Discord mention, and
+implementation. In the current configured runtime, `postgres`, `api`, and the
+academic worker are Compose services; Qwen is triggered solely by an authorized
+private-channel Discord message, and
 scheduled finance execution is not a current runtime path.
 
 ## Contract and acceptance criteria

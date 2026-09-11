@@ -70,7 +70,16 @@ class DiscordWakeJob:
             raise
 
         with Session(self._database.engine) as session, session.begin():
-            DiscordWakeRepository.mark_completed(session, parsed_id)
+            if status == "failed":
+                # The handler has already delivered a bounded failure to Discord.
+                # Preserve that outcome without automatically repeating the turn.
+                DiscordWakeRepository.mark_failed(
+                    session,
+                    parsed_id,
+                    error_code="discord_wake_handler_failed",
+                )
+            else:
+                DiscordWakeRepository.mark_completed(session, parsed_id)
         return {"status": status, "wake_id": wake_id}
 
     async def _run_message(self, row: _WakeSnapshot) -> str:
@@ -81,9 +90,6 @@ class DiscordWakeJob:
         ):
             raise ValueError("Discord message handoff is incomplete")
         raw_content = self._load_content(row.content_artifact_key)
-        application_id = self._settings.discord_application_id
-        if application_id is None:
-            raise ValueError("Discord application ID is not configured")
         service = create_academic_discord_service(self._settings)
         try:
             result = await service.handler(
@@ -93,9 +99,6 @@ class DiscordWakeJob:
                     author_id=row.discord_user_id,
                     timestamp=row.received_at,
                     content=SecretStr(raw_content),
-                    mentioned_user_ids=(application_id,)
-                    if row.action == "academic_checkin"
-                    else (),
                     progress_message_id=row.ack_message_id,
                 )
             )

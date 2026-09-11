@@ -160,7 +160,7 @@ class HostWakeCoordinator:
         if row.state == "accepted":
             return "duplicate"
         acknowledgement_message_id = row.acknowledgement_message_id
-        if acknowledgement_message_id is None and request_kind != "continuation":
+        if acknowledgement_message_id is None:
             if request_kind == "command":
                 acknowledgement_message_id = await self._discord.send_acknowledgement(
                     channel_id=message.channel_id,
@@ -221,7 +221,7 @@ class HostWakeCoordinator:
         accepted = 0
         for row in self._outbox.pending_rows(limit=limit):
             acknowledgement_message_id = row.acknowledgement_message_id
-            if acknowledgement_message_id is None and row.request_kind != "continuation":
+            if acknowledgement_message_id is None:
                 if row.request_kind == "command":
                     acknowledgement_message_id = await self._discord.send_acknowledgement(
                         channel_id=row.channel_id,
@@ -350,10 +350,11 @@ class HostWakeCoordinator:
             return None
         if _EXACT_COMMAND.fullmatch(message.content.get_secret_value().strip()) is not None:
             return "command"
-        application_id = self._settings.discord_application_id
-        if message.has_verified_mention(application_id):
-            return "mention"
-        return "continuation"
+        # The private channel and owner allowlist are the application boundary.
+        # Ordinary input is deliberately not classified here: the agent harness
+        # must see it intact instead of a deterministic pre-router deciding what
+        # kind of conversation it is.
+        return "mention"
 
 
 def _failure_code(exc: Exception) -> DiscordWakeFailure:

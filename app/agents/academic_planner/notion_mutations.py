@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import json
 from collections.abc import Sequence
+from dataclasses import dataclass
 from typing import Any, Literal, Protocol
 from uuid import UUID
 
@@ -54,6 +55,31 @@ class AcademicMutationTargetStore(Protocol):
     ) -> Any: ...
 
 
+@dataclass(frozen=True, slots=True)
+class NotionMutationReview:
+    """Deterministic proof that one ordered proposal batch was reviewed."""
+
+    proposal_id: UUID
+    confirmation_event: str
+    batch_hash: str
+
+
+def review_notion_mutation_batch(
+    changes: Sequence[ProposedChange],
+    *,
+    proposal_id: UUID,
+    confirmation_event: str,
+) -> NotionMutationReview:
+    """Create the HITL review token for the exact ordered Notion mutation batch."""
+
+    _validate_confirmation(proposal_id, confirmation_event)
+    return NotionMutationReview(
+        proposal_id=proposal_id,
+        confirmation_event=confirmation_event,
+        batch_hash=_batch_hash(proposal_id, confirmation_event, changes),
+    )
+
+
 class DiscoveredAcademicNotionWriter:
     """Apply confirmed create/update/archive calls to discovered course calendars."""
 
@@ -72,9 +98,16 @@ class DiscoveredAcademicNotionWriter:
         *,
         proposal_id: UUID,
         confirmation_event: str,
+        review: NotionMutationReview | None = None,
     ) -> None:
-        if confirmation_event != f"confirm {proposal_id}":
-            raise permanent_error(ErrorCode.INPUT_INVALID, "Notion confirmation is invalid")
+        _validate_confirmation(proposal_id, confirmation_event)
+        if _requires_hitl_review(changes):
+            _validate_review(
+                review,
+                changes,
+                proposal_id=proposal_id,
+                confirmation_event=confirmation_event,
+            )
         for index, change in enumerate(changes):
             operation_id = f"{proposal_id}:{index}"
             payload_hash = _payload_hash(change)
@@ -177,17 +210,64 @@ class DiscoveredAcademicNotionWriter:
         return target
 
 
-def _payload_hash(change: ProposedChange) -> str:
-    if hasattr(change, "model_dump"):
-        payload = change.model_dump(mode="json", exclude_none=True)
-    else:
-        payload = {
-            key: _jsonable(value)
-            for key, value in vars(change).items()
-            if not key.startswith("_") and value is not None
-        }
+def _validate_confirmation(proposal_id: UUID, confirmation_event: str) -> None:
+    if confirmation_event != f"confirm {proposal_id}":
+        raise permanent_error(ErrorCode.INPUT_INVALID, "Notion confirmation is invalid")
+
+
+def _requires_hitl_review(changes: Sequence[ProposedChange]) -> bool:
+    return any(
+        getattr(change, "field", None) in {"create_assessment", "archive_assessment"}
+        for change in changes
+    )
+
+
+def _validate_review(
+    review: NotionMutationReview | None,
+    changes: Sequence[ProposedChange],
+    *,
+    proposal_id: UUID,
+    confirmation_event: str,
+) -> None:
+    if review is None:
+        raise permanent_error(ErrorCode.INPUT_INVALID, "Notion HITL review is required")
+    if (
+        review.proposal_id != proposal_id
+        or review.confirmation_event != confirmation_event
+        or review.batch_hash != _batch_hash(proposal_id, confirmation_event, changes)
+    ):
+        raise permanent_error(ErrorCode.INPUT_INVALID, "Notion HITL review does not match proposal")
+
+
+def _batch_hash(
+    proposal_id: UUID,
+    confirmation_event: str,
+    changes: Sequence[ProposedChange],
+) -> str:
+    payload = {
+        "proposal_id": str(proposal_id),
+        "confirmation_event": confirmation_event,
+        "changes": [_change_payload(change) for change in changes],
+    }
     encoded = json.dumps(payload, ensure_ascii=True, separators=(",", ":"), sort_keys=True)
     return hashlib.sha256(encoded.encode("utf-8")).hexdigest()
+
+
+def _payload_hash(change: ProposedChange) -> str:
+    encoded = json.dumps(
+        _change_payload(change), ensure_ascii=True, separators=(",", ":"), sort_keys=True
+    )
+    return hashlib.sha256(encoded.encode("utf-8")).hexdigest()
+
+
+def _change_payload(change: ProposedChange) -> dict[str, Any]:
+    if hasattr(change, "model_dump"):
+        return change.model_dump(mode="json", exclude_none=True)
+    return {
+        key: _jsonable(value)
+        for key, value in vars(change).items()
+        if not key.startswith("_") and value is not None
+    }
 
 
 def _jsonable(value: Any) -> Any:
@@ -209,4 +289,9 @@ def _error_code(exc: Exception) -> str:
     return ErrorCode.INTERNAL.value
 
 
-__all__ = ["AcademicMutationTargetStore", "DiscoveredAcademicNotionWriter"]
+__all__ = [
+    "AcademicMutationTargetStore",
+    "DiscoveredAcademicNotionWriter",
+    "NotionMutationReview",
+    "review_notion_mutation_batch",
+]

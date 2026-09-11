@@ -1,7 +1,8 @@
-"""Academic planner HTTP boundaries: check-ins propose, confirmation writes."""
+"""Academic planner HTTP boundaries: confirmation writes and manual sync."""
 
 from __future__ import annotations
 
+from datetime import datetime
 from typing import Literal, cast
 from uuid import UUID
 
@@ -9,30 +10,12 @@ from fastapi import APIRouter, Request
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, ConfigDict, Field
 
-from app.agents.academic_planner.workflow import (
+from app.agents.academic_planner.proposal_review import (
     confirm_checkin_proposal,
-    create_checkin_proposal,
     reject_checkin_proposal,
 )
 
 router = APIRouter(prefix="/academic", tags=["academic"])
-
-
-class CheckinRequest(BaseModel):
-    model_config = ConfigDict(extra="forbid")
-
-    reply: str = Field(min_length=1, max_length=4_000)
-    plan_id: UUID | None = None
-
-
-class CheckinResponse(BaseModel):
-    model_config = ConfigDict(extra="forbid")
-
-    status: Literal["proposal_pending"]
-    proposal_id: UUID
-    confirmation_event: str
-    change_count: int
-    question: str | None
 
 
 class ConfirmationRequest(BaseModel):
@@ -66,7 +49,7 @@ class RejectionResponse(BaseModel):
 class AcademicSyncResponse(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
-    status: Literal["succeeded", "partial", "setup_required"]
+    status: Literal["succeeded", "partial", "setup_required", "failed"]
     course_count: int
     valid_course_count: int
     assessment_count: int
@@ -75,37 +58,9 @@ class AcademicSyncResponse(BaseModel):
     material_job_count: int = 0
     invalid_calendar_count: int
     diagnostic_codes: list[str]
-
-
-@router.post("/checkin", response_model=CheckinResponse, status_code=202)
-async def academic_checkin(
-    request: Request, payload: CheckinRequest
-) -> CheckinResponse | JSONResponse:
-    """Persist a proposal and return its exact confirmation event."""
-
-    store = getattr(request.app.state, "academic_store", None)
-    if store is None:
-        return JSONResponse(status_code=503, content={"status": "unavailable"})
-    try:
-        proposal = await create_checkin_proposal(
-            store=store,
-            reply=payload.reply,
-            plan_id=payload.plan_id,
-            model=getattr(request.app.state, "academic_model", None),
-            delivery=getattr(request.app.state, "academic_delivery", None),
-        )
-    except ValueError:
-        return JSONResponse(
-            status_code=400,
-            content={"status": "rejected", "error_code": "input_invalid"},
-        )
-    return CheckinResponse(
-        status="proposal_pending",
-        proposal_id=proposal.proposal_id,
-        confirmation_event=proposal.confirmation_event,
-        change_count=len(proposal.changes),
-        question=proposal.question,
-    )
+    synced_at: datetime | None = None
+    error_code: str | None = None
+    retryable: bool = False
 
 
 @router.post("/confirm/{proposal_id}", response_model=ConfirmationResponse)
@@ -186,13 +141,10 @@ async def academic_sync(request: Request) -> AcademicSyncResponse | JSONResponse
 
 __all__ = [
     "AcademicSyncResponse",
-    "CheckinRequest",
-    "CheckinResponse",
     "ConfirmationRequest",
     "ConfirmationResponse",
     "RejectionRequest",
     "RejectionResponse",
-    "academic_checkin",
     "academic_confirmation",
     "academic_rejection",
     "academic_sync",

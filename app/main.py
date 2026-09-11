@@ -15,26 +15,17 @@ from starlette.middleware.base import BaseHTTPMiddleware, RequestResponseEndpoin
 from starlette.responses import Response
 
 from app import __version__
-from app.agents.academic_planner.agent_clarification import (
-    AGENT_CONTEXT_DATA_CLASS,
-    AcademicAgentClarificationService,
-)
 from app.agents.academic_planner.material_ingestion import AssessmentMaterialIngestionService
-from app.agents.academic_planner.memory_workflow import AcademicMemoryService
 from app.agents.academic_planner.notion_mutations import DiscoveredAcademicNotionWriter
 from app.agents.academic_planner.sync import AcademicNotionSync
 from app.api.academic import router as academic_router
 from app.api.discord_handoff import router as discord_handoff_router
 from app.api.finance import router as finance_router
-from app.api.github import router as github_router
 from app.api.health import router as health_router
 from app.api.operations import router as operations_router
 from app.api.pages import router as pages_router
 from app.artifacts.store import ArtifactStore
-from app.connectors.discord import (
-    DiscordAcademicPlannerAdapter,
-    DiscordAcademicResponseDelivery,
-)
+from app.connectors.discord import DiscordAcademicPlannerAdapter
 from app.connectors.notion import NotionConnector
 from app.core.config import Settings, get_settings
 from app.core.errors import LifeAgentError
@@ -110,49 +101,13 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         embedding_gateway=embedding_gateway,
         default_practice_minutes=app_settings.academic_memory_default_practice_minutes,
     )
-    agent_context_retention_days = max(
-        1,
-        (app_settings.academic_confirmation_ttl_hours + 23) // 24,
-    )
-    academic_artifact_store = ArtifactStore(
-        app_settings.artifact_root,
-        retention_days_by_class={
-            AGENT_CONTEXT_DATA_CLASS: agent_context_retention_days,
-        },
-        default_retention_days=app_settings.artifact_retention_days,
-        create_root=False,
-    )
-    academic_agent_clarification_service = AcademicAgentClarificationService(
-        engine=database.engine,
-        artifact_store=academic_artifact_store,
-        session_ttl_hours=app_settings.academic_confirmation_ttl_hours,
-    )
-    academic_memory_service = (
-        AcademicMemoryService(
-            store=academic_store,
-            model_gateway=gateway,
-            embedding_gateway=embedding_gateway,
-            timezone=app_settings.app_timezone,
-            default_practice_minutes=(app_settings.academic_memory_default_practice_minutes),
-            end_of_day_time=app_settings.academic_end_of_day_schedule,
-            session_ttl_hours=app_settings.academic_confirmation_ttl_hours,
-        )
-        if app_settings.academic_memory_enabled
-        else None
-    )
     academic_channel = app_settings.discord_academic_channel_id
     academic_discord = None
-    academic_delivery = None
     if app_settings.discord_bot_token is not None and academic_channel is not None:
         academic_discord = DiscordAcademicPlannerAdapter(
             token=app_settings.discord_bot_token,
             allowed_channel_ids={academic_channel},
             base_url=app_settings.discord_api_url,
-        )
-        academic_delivery = DiscordAcademicResponseDelivery(
-            engine=database.engine,
-            channel_id=academic_channel,
-            adapter=academic_discord,
         )
     notion_connector = None
     notion_setup_condition = "notion_configuration_missing"
@@ -203,13 +158,6 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         material_enqueuer=enqueue_academic_material if use_global_queue else None,
     )
 
-    async def enqueue_code_review(run_id: str, idempotency_key: str) -> object:
-        return await queue_tasks.defer_idempotent_async(
-            queue_tasks.code_review_task,
-            run_id,
-            idempotency_key,
-        )
-
     @asynccontextmanager
     async def lifespan(application: FastAPI) -> AsyncGenerator[None, None]:
         try:
@@ -229,16 +177,9 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     app.state.model_identity = gateway.model_identity
     app.state.model_config_version = gateway.config_version
     app.state.ollama_runtime = ollama_runtime
-    app.state.enqueue_code_review = enqueue_code_review
     app.state.academic_store = academic_store
     app.state.academic_syncer = academic_syncer
     app.state.academic_material_ingestion_factory = build_material_ingestion
-    # The legacy HTTP check-in boundary remains deterministic and model-free.
-    # Qwen is reachable only through the authenticated host handoff path.
-    app.state.academic_model = None
-    app.state.academic_memory_service = academic_memory_service
-    app.state.academic_agent_clarification_service = academic_agent_clarification_service
-    app.state.academic_delivery = academic_delivery
     # Discord Gateway ingress is a native macOS LaunchAgent. The API owns only
     # authenticated durable handoff processing and never opens a Gateway session.
     app.state.discord_host_ingress_state = "external"
@@ -258,7 +199,6 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     )
     app.mount("/static", StaticFiles(directory=str(_APP_ROOT / "static")), name="static")
     app.include_router(health_router)
-    app.include_router(github_router)
     app.include_router(academic_router)
     app.include_router(discord_handoff_router)
     app.include_router(finance_router)

@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import asyncio
 import json
 from datetime import UTC, datetime
 from typing import cast
@@ -12,7 +11,7 @@ from fastapi.responses import JSONResponse
 from pydantic import SecretStr, ValidationError
 from sqlalchemy.orm import Session
 
-from app.agents.academic_planner.discord_checkin import parse_academic_command
+from app.agents.academic_planner.commands import parse_academic_command
 from app.artifacts.store import ArtifactStore
 from app.connectors.discord import DiscordAcademicPlannerAdapter, DiscordFetchedMessage
 from app.connectors.discord_gateway import DiscordAcademicMessageCreate
@@ -70,36 +69,9 @@ async def accept_discord_handoff(request: Request) -> JSONResponse:
 
     message = await _refetch_and_validate(request, event)
     command = parse_academic_command(message.content.get_secret_value().strip())
-    is_verified_mention = message.has_verified_mention(settings.discord_application_id or "")
-    if command is None and not is_verified_mention:
-        clarification_service = getattr(
-            request.app.state,
-            "academic_agent_clarification_service",
-            None,
-        )
-        if clarification_service is None:
-            raise HTTPException(
-                status_code=503,
-                detail="Academic clarification state is unavailable",
-            )
-        try:
-            has_pending = await asyncio.to_thread(
-                clarification_service.has_pending_clarification,
-                channel_id=message.channel_id,
-                user_id=message.author_id,
-                received_at=message.timestamp,
-            )
-        except (OSError, ValueError):
-            raise HTTPException(
-                status_code=503,
-                detail="Academic clarification state is unavailable",
-            ) from None
-        if not has_pending:
-            return JSONResponse(status_code=200, content={"status": "ignored"})
-    if event.acknowledgement_message_id is None and (command is not None or is_verified_mention):
+    if event.acknowledgement_message_id is None:
         raise HTTPException(status_code=422, detail="Wake acknowledgement is required")
-    if event.acknowledgement_message_id is not None:
-        await _validate_acknowledgement(request, event)
+    await _validate_acknowledgement(request, event)
 
     artifact = ArtifactStore(
         settings.artifact_root,
@@ -112,7 +84,7 @@ async def accept_discord_handoff(request: Request) -> JSONResponse:
         if settings.discord_bot_token is not None
         else (),
     )
-    action = "academic_checkin" if is_verified_mention else "academic_continuation"
+    action = "academic_checkin"
     if command is not None:
         action = "proposal_confirmation" if command[0] == "confirm" else "proposal_rejection"
     intake = DiscordWakeInboundInput(

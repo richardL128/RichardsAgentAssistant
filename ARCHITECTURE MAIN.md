@@ -11,13 +11,32 @@ Narrowly scoped connectors → fact extraction → local Qwen reasoning
 
 The local Qwen model performs reading, reasoning, prioritization, and explanation. Deterministic tools collect facts, run tests/scanners, and perform approved writes. Credentials remain outside the model context: the orchestration layer exposes narrow tools such as “fetch today's commits” or “read an assessment page,” rather than unrestricted account access.
 
-The configured runtime has one Qwen entry point: an authorized mention in the
+The configured runtime has one Qwen entry point: an authorized message in the
 private academic Discord channel. A native macOS LaunchAgent owns the sole
-Discord Gateway connection, acknowledges the mention, wakes the fixed Compose
+Discord Gateway connection, acknowledges the message, wakes the fixed Compose
 services and Ollama API, and submits an HMAC-signed reference to the loopback
-backend. Scheduled academic, code-review, and finance model workflows are
-non-executable. Exact `confirm <proposal-id>` and `reject <proposal-id>`
+backend. Scheduled Qwen workflows for academic planning, code review, and
+finance are non-executable. Exact `confirm <proposal-id>` and `reject <proposal-id>`
 commands and clarification buttons remain model-free exceptions.
+
+The API may remain cold between conversations, but the academic worker stays
+resident with PostgreSQL. That worker owns the minute-level periodic deferrer;
+keeping it resident is what makes the configured morning occurrence executable
+without loading Qwen or waiting for an inbound Discord message.
+
+The sole automatic academic schedule is the model-free morning to-do
+notification. It runs from `ACADEMIC_MORNING_SCHEDULE` in `APP_TIMEZONE`, uses
+`ACADEMIC_MORNING_CATCHUP_GRACE_MINUTES` as its bounded catch-up window, and
+never loads Qwen. Each period is keyed as
+`academic-morning:YYYY-MM-DD:HHMM:v1`; the Discord delivery uses the same local
+period via `academic-morning-delivery:YYYY-MM-DD:HHMM:v1`.
+
+Native source, configuration, dependencies and wake state are installed under
+`~/Library/Application Support/LifeAgent`, independent of the development
+checkout. Deployment builds the application image and snapshots the native
+runtime together; the wake path does not build or download dependencies.
+Academic catalog tools refresh Notion once per conversational turn before
+searching synchronized data, while general questions do not require Notion.
 
 The system should use Toronto local time unless explicitly configured otherwise.
 
@@ -81,7 +100,7 @@ The agent must not create issues or commit fixes. Its normal delivery channels a
 A local database tracks reviewed SHAs, dismissed findings, project conventions,
 and recurring false positives. A consolidated review around 6-7 p.m. and
 webhook-triggered quick scans are planned capabilities, but they are not part of
-the current Discord-mentions-only runtime. They are non-executable today and
+the current authorized-private-channel runtime. They are non-executable today and
 would require a future architecture change before they can load Qwen or run as
 scheduled/background model workflows.
 
@@ -134,7 +153,7 @@ The final set should be explicit, versioned, and user-approved. A source tool is
 
 This market-open briefing is a planned capability and is non-executable today.
 Adding a scheduled finance model path would require a future architecture change
-outside the current Discord-mentions-only runtime.
+outside the current authorized-private-channel runtime.
 
 1. Run the eight source-specific tool calls for material published that morning as well as material published since the market closed last night(Market Open) -> This flow should run as soon as the market opens (9:00 am EST)
 2. Extract factual claims, publication time, involved companies/sectors/countries, and whether the information is primary or reported.
@@ -246,7 +265,11 @@ The agent must not connect to a brokerage, place trades, or use unqualified “b
 
 ### Goal
 
-Use Notion as the source of truth for assignments, tests, quizzes, events, rubrics, instructions, and course outlines. Convert those inputs into a realistic day-by-day work and study plan, then run an end-of-day progress check-in through Discord.
+Use Notion as the source of truth for assignments, tests, quizzes, events,
+rubrics, instructions, and course outlines. Convert those inputs into a
+realistic day-by-day work and study plan, send the model-free automatic morning
+to-do notification through Discord, and run an end-of-day progress check-in
+through Discord.
 
 ```text
 Notion assessment calendar + attached PDFs/pages
@@ -260,6 +283,19 @@ Deterministic scheduler + bounded Qwen semantic conversation reasoning
 Proposed Discord response, study blocks, carry-forward queue, model-free confirmations
 ```
 
+The automatic morning path is a deterministic branch of this system, not a
+Qwen path:
+
+```text
+ACADEMIC_MORNING_SCHEDULE in APP_TIMEZONE
+                    ↓
+fresh complete Notion sync
+                    ↓
+deterministic allocator for the intended local day
+                    ↓
+one idempotent Discord to-do notification
+```
+
 ### Suggested Notion structure
 
 Use one top-level Courses database. Each course row/page owns one seeded inline
@@ -271,23 +307,26 @@ Assessments database; its calendar is only a view over those assessment pages.
 | Per-course Assessments | Name title, Date, optional typed metadata, arbitrary body text, and supported PDF attachments |
 | PostgreSQL study/work blocks | Linked assessment, planned duration, actual duration, completion state, notes |
 
-Qwen semantically interprets unsanitized, free-form requests to create, update,
-archive, or clarify an assessment; it is not fronted by a keyword or command
-grammar. The deterministic application boundary only validates the structured
-tool schema, allowlisted/owner-scoped IDs, time and size bounds, stale-write
-preconditions, idempotency, and exact confirmation. The Notion calendar displays the underlying
+The configured Discord runtime is one native, role-separated model harness. It
+receives authorized free-form input intact, can answer unrelated questions, and
+selects tools without a semantic pre-router or command taxonomy. Before a native
+tool call, the model's own action description is passed through to Discord; the
+application does not replace it with canned tool narration. Structured tool
+results remain internal, failures are summarized safely, and hidden reasoning is
+never exposed.
+The deterministic application boundary validates only tool schemas,
+allowlisted/owner-scoped IDs, time and size bounds, stale-write preconditions,
+idempotency, and exact confirmation. The Notion calendar displays the underlying
 assessment pages; a studying-block assessment remains distinct from the
 generated study blocks that LifeAgent stores in PostgreSQL rather than exporting
 to Notion automatically.
 
 Conversation-triggered study sessions use this same per-course Assessments
-calendar as their sole current Notion write path. An authorized user must start
-the conversation with a bot mention in the private academic Discord channel. If
-the request lacks scheduling facts, the bot may open exactly one
-owner/channel-scoped clarification session; only that same user in that same
-channel may answer, and an answer may omit the mention while the session is open.
-The loopback handoff checks that owner-scoped state before persisting the reply;
-other unmentioned prose is discarded.
+calendar as their sole current Notion write path. Every message from an
+allowlisted owner in the private academic Discord channel is acknowledged,
+durably queued, and passed intact to the same harness. A mention is optional and
+is removed only as Discord transport syntax. The model may ask a natural
+follow-up without a separate deterministic clarification state machine.
 A resolved study session creates an ordered proposal, not a
 write. Its Discord preview is rendered by host code in Toronto local time and
 shows every course, canonical `Studying Block — <topic>` title, start, end, and
@@ -367,10 +406,20 @@ A low-weight quiz tomorrow covering two topics receives a short review block. A 
 ### Daily interaction and end-of-day Discord check-in
 
 The deterministic allocator remains authoritative for deadlines, planned start
-times, study durations, carry-forward, and deferred work. It may perform
-model-free maintenance, but no scheduled academic path can call Qwen in the
-configured runtime. Authorized Discord mentions are the sole Qwen path for
-academic changes and plan questions.
+times, study durations, carry-forward, and deferred work. The automatic morning
+notification is the sole executable academic schedule. It performs a fresh
+complete Notion sync, builds the intended Toronto-local day, and sends one
+model-free Discord notification. If Notion is inaccessible, incomplete, stale,
+or misconfigured, the job reports an actionable setup/source condition instead
+of sending a false light-day message. The authorized private Discord channel is
+the sole Qwen entry point; scheduled academic model work remains non-executable.
+
+Operational health persists this schedule as `health_checks.check_name =
+'academic_morning'`. Before the configured occurrence and throughout the grace
+window, an absent run is non-overdue. After the grace deadline, the health check
+reports attention for a missing run, failed/attention run, missing delivery,
+failed delivery, or uncertain delivery. A successful run advances the next
+expected time to the following occurrence plus grace.
 
 A model-free end-of-day reminder may ask in Discord:
 
@@ -378,12 +427,9 @@ A model-free end-of-day reminder may ask in Discord:
 2. How did each test or quiz taken today go?
 3. Are there any new tasks, deadlines, tests, or events that should be added to Notion?
 
-Every new natural-language request that requires Qwen must contain a verified
-bot mention in the authorized private channel. While the same authorized user
-and channel have one unexpired academic clarification awaiting an answer, that
-one continuation may omit the mention; owner-state is checked by identifiers
-before its bounded body is accepted. Exact confirmation and rejection commands
-remain deterministic, mention-free, and model-free. The
+Every message from an allowlisted owner in the authorized private channel may
+reach Qwen. Exact confirmation and rejection commands remain deterministic,
+model-free HITL hooks and are intercepted before the harness. The
 planner should update time estimates and the next-day plan only from confirmed
 progress; it must not infer that planned work was completed merely because it
 appeared on the calendar.
@@ -413,9 +459,10 @@ The frontend's complete architecture and implementation guidance lives in [front
 
 1. Build the Discord-mentioned academic assistant as the only configured
    conversation-triggered study-session path.
-2. Treat historical/planned scheduled academic, code-review, and finance Qwen workflows as
-   non-executable in the current runtime; restoring them requires a future
-   architecture change.
+2. Treat historical/planned scheduled academic Qwen, code-review Qwen, and
+   finance Qwen workflows as non-executable in the current runtime; restoring
+   them requires a future architecture change. The model-free academic morning
+   notification remains the only automatic academic schedule.
 3. Consider any future scheduled finance briefing only after selecting and
    authorizing the exact eight-source allowlist, subscriptions/data access, and a
    new runtime design.

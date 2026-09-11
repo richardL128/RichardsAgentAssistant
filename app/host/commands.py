@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import math
 from collections.abc import Sequence
 from dataclasses import dataclass
 from pathlib import Path
@@ -62,7 +63,7 @@ class AsyncSubprocessCommandRunner:
                 process.communicate(),
                 timeout=timeout_seconds,
             )
-        except TimeoutError:
+        except (TimeoutError, asyncio.CancelledError):
             process.kill()
             await process.wait()
             raise
@@ -76,15 +77,29 @@ class AsyncSubprocessCommandRunner:
 class DockerDesktop:
     """Start Docker Desktop through a fixed, no-shell command path."""
 
-    def __init__(self, settings: HostWakeSettings, runner: CommandRunner) -> None:
+    def __init__(
+        self,
+        settings: HostWakeSettings,
+        runner: CommandRunner,
+        *,
+        sleep: float = 1.0,
+    ) -> None:
+        if sleep < 0:
+            raise ValueError("sleep must be non-negative")
         self._settings = settings
         self._runner = runner
+        self._sleep = sleep
 
     async def ensure_ready(self) -> None:
-        if await self._probe():
-            return
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + self._settings.docker_desktop_timeout_seconds
         try:
-            result = await self._runner.run(
+            if await self._probe(deadline):
+                return
+        except TimeoutError as exc:
+            raise HostWakeError("docker_timeout") from exc
+        try:
+            result = await self._run_with_deadline(
                 [
                     str(self._settings.docker_executable),
                     "desktop",
@@ -92,27 +107,63 @@ class DockerDesktop:
                     "--timeout",
                     str(self._settings.docker_desktop_timeout_seconds),
                 ],
-                timeout_seconds=self._settings.docker_desktop_timeout_seconds,
+                deadline=deadline,
             )
         except TimeoutError as exc:
             raise HostWakeError("docker_timeout") from exc
-        if result.returncode != 0 or not await self._probe():
+        if result.returncode != 0:
             raise HostWakeError("docker_unavailable")
-
-    async def _probe(self) -> bool:
         try:
-            result = await self._runner.run(
+            await self._wait_for_engine(deadline)
+        except TimeoutError as exc:
+            raise HostWakeError("docker_timeout") from exc
+
+    async def _wait_for_engine(self, deadline: float) -> None:
+        while True:
+            if await self._probe(deadline):
+                return
+            remaining = deadline - asyncio.get_running_loop().time()
+            if remaining <= 0:
+                raise TimeoutError
+            await asyncio.sleep(min(self._sleep, remaining))
+
+    async def _probe(self, deadline: float) -> bool:
+        try:
+            result = await self._run_with_deadline(
                 [
                     str(self._settings.docker_executable),
                     "info",
                     "--format",
                     "{{json .ServerVersion}}",
                 ],
-                timeout_seconds=10,
+                deadline=deadline,
+                max_timeout_seconds=10,
             )
         except TimeoutError:
+            if asyncio.get_running_loop().time() >= deadline:
+                raise
             return False
         return result.returncode == 0
+
+    async def _run_with_deadline(
+        self,
+        args: Sequence[str],
+        *,
+        deadline: float,
+        max_timeout_seconds: int | None = None,
+    ) -> CommandResult:
+        remaining = deadline - asyncio.get_running_loop().time()
+        if remaining <= 0:
+            raise TimeoutError
+        timeout_seconds = math.ceil(remaining)
+        if max_timeout_seconds is not None:
+            timeout_seconds = min(timeout_seconds, max_timeout_seconds)
+        if timeout_seconds <= 0:
+            raise TimeoutError
+        return await asyncio.wait_for(
+            self._runner.run(args, timeout_seconds=timeout_seconds),
+            timeout=remaining,
+        )
 
 
 class ComposeRuntime:
@@ -201,7 +252,7 @@ class BackendLiveProbe:
             while True:
                 try:
                     response = await client.get(self._settings.backend_live_url)
-                    if response.status_code < 500:
+                    if response.status_code == 200:
                         return
                 except httpx.HTTPError:
                     pass

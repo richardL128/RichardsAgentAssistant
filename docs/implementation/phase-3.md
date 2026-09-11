@@ -1,5 +1,10 @@
 # Phase 3 — Code review: one repository end to end
 
+> Historical phase note: this describes the original Phase 3 implementation.
+> The current configured runtime does not mount the GitHub model-queue webhook,
+> register code-review tasks, or provide a code-review worker. The sole model
+> queue ingress is the authorized academic Discord handoff.
+
 ## Contract and acceptance criteria
 
 Phase 3 builds one complete code-review pipeline for a single allowlisted
@@ -169,7 +174,7 @@ threshold; otherwise Discord/report-only delivery is retained.
   extended `test_code_review_findings.py` and
   `test_code_review_repository.py`.
 
-### Worker registration boundary (verified against source)
+### Original worker registration boundary (historical)
 
 `app/queue/worker.py`:
 

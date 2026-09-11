@@ -95,6 +95,36 @@ class TorontoPeriodicSchedule:
                 return candidate
         raise RuntimeError("schedule did not yield an occurrence in the next two weeks")
 
+    def occurrence_for_local_date(self, local_date: date) -> PeriodicOccurrence | None:
+        """Resolve this schedule's unique occurrence on one local calendar date."""
+
+        if self.weekdays is not None and local_date.weekday() not in self.weekdays:
+            return None
+        return _resolve_wall_time(local_date, time(self.hour, self.minute), self.zone)
+
+    def due_within_grace(
+        self,
+        at_utc: datetime,
+        *,
+        grace: timedelta,
+    ) -> PeriodicOccurrence | None:
+        """Return today's occurrence when ``at_utc`` is due or inside catch-up grace."""
+
+        if at_utc.tzinfo is None or at_utc.utcoffset() is None:
+            raise ValueError("at_utc must be timezone-aware")
+        if grace < timedelta(0):
+            raise ValueError("grace must not be negative")
+        current = at_utc.astimezone(UTC)
+        local_current = current.astimezone(self.zone)
+        if local_current.fold == 1 and local_current.hour == self.hour:
+            return None
+        occurrence = self.occurrence_for_local_date(local_current.date())
+        if occurrence is None:
+            return None
+        if occurrence.scheduled_at <= current <= occurrence.scheduled_at + grace:
+            return occurrence
+        return None
+
 
 def stable_period_key(
     namespace: str,

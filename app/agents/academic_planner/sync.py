@@ -174,7 +174,7 @@ class AcademicInteractionDelivery(Protocol):
 class AcademicNotionSyncResult:
     """Bounded synchronization summary safe for APIs, jobs, and health logs."""
 
-    status: Literal["succeeded", "partial", "setup_required"]
+    status: Literal["succeeded", "partial", "setup_required", "failed"]
     course_count: int = 0
     valid_course_count: int = 0
     assessment_count: int = 0
@@ -183,6 +183,9 @@ class AcademicNotionSyncResult:
     material_job_count: int = 0
     invalid_calendar_count: int = 0
     diagnostic_codes: tuple[str, ...] = ()
+    synced_at: datetime | None = None
+    error_code: str | None = None
+    retryable: bool = False
 
     def as_dict(self) -> dict[str, object]:
         return {
@@ -195,6 +198,9 @@ class AcademicNotionSyncResult:
             "material_job_count": self.material_job_count,
             "invalid_calendar_count": self.invalid_calendar_count,
             "diagnostic_codes": list(self.diagnostic_codes),
+            "synced_at": self.synced_at.isoformat() if self.synced_at is not None else None,
+            "error_code": self.error_code,
+            "retryable": self.retryable,
         }
 
 
@@ -286,10 +292,25 @@ class AcademicNotionSync:
                 status="setup_required",
                 invalid_calendar_count=1,
                 diagnostic_codes=(diagnostic.code,),
+                error_code=ErrorCode.SOURCE_SETUP_REQUIRED.value,
             )
         try:
             result = await self._connector.discover_course_assessments()
-        except (LifeAgentError, ValueError, TypeError):
+        except LifeAgentError as exc:
+            diagnostic = NotionDiscoveryDiagnostic(
+                code="notion_sync_failed",
+                severity="error",
+                message="Courses database synchronization failed",
+            )
+            await self._deliver_setup_conditions((diagnostic,), current)
+            return AcademicNotionSyncResult(
+                status="failed" if exc.record.retryable else "setup_required",
+                invalid_calendar_count=1,
+                diagnostic_codes=(diagnostic.code,),
+                error_code=exc.record.code.value,
+                retryable=exc.record.retryable,
+            )
+        except (ValueError, TypeError):
             diagnostic = NotionDiscoveryDiagnostic(
                 code="notion_sync_failed",
                 severity="error",
@@ -300,6 +321,7 @@ class AcademicNotionSync:
                 status="setup_required",
                 invalid_calendar_count=1,
                 diagnostic_codes=(diagnostic.code,),
+                error_code=ErrorCode.SOURCE_SETUP_REQUIRED.value,
             )
 
         diagnostics = list(result.diagnostics)
@@ -432,6 +454,8 @@ class AcademicNotionSync:
             material_job_count=material_job_count,
             invalid_calendar_count=invalid_calendars,
             diagnostic_codes=codes,
+            synced_at=result.synced_at,
+            error_code=(ErrorCode.SOURCE_SYNC_PARTIAL.value if status == "partial" else None),
         )
 
     async def _create_and_deliver_clarification(

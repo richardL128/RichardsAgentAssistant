@@ -165,6 +165,7 @@ trap cleanup EXIT
 
 install_ollama_launch_agent
 kickstart_launch_agent "$LIFEAGENT_OLLAMA_LABEL"
+wait_for_launch_agent_running "$LIFEAGENT_OLLAMA_LABEL"
 
 if ! wait_for_api; then
   echo "Ollama API did not become reachable within ${OLLAMA_STARTUP_TIMEOUT_SECONDS_NORMALIZED}s" >&2

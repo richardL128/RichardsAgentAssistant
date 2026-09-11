@@ -5,6 +5,8 @@ DEFAULT_OLLAMA_MODEL_DIGEST="d039cde69ac1f5a43d5134182adfefa65bdb533362a625b936e
 DEFAULT_LOCAL_BASE_URL="http://127.0.0.1:11434"
 DEFAULT_OLLAMA_HOST="0.0.0.0:11434"
 DEFAULT_STARTUP_TIMEOUT_SECONDS="30"
+DEFAULT_LAUNCHD_READINESS_TIMEOUT_SECONDS="10"
+DEFAULT_LAUNCHD_STABILITY_SECONDS="2"
 LIFEAGENT_OLLAMA_LABEL="${LIFEAGENT_OLLAMA_LABEL:-com.lifeagent.ollama}"
 LIFEAGENT_DISCORD_WAKE_LABEL="${LIFEAGENT_DISCORD_WAKE_LABEL:-com.lifeagent.discord-wake}"
 
@@ -74,6 +76,41 @@ print(Path(sys.argv[1]).expanduser().resolve())
 PY
 }
 
+lexical_absolute_path() {
+  python3 - "$1" <<'PY'
+import os
+import sys
+
+print(os.path.abspath(os.path.expanduser(sys.argv[1])))
+PY
+}
+
+validate_discord_python() {
+  validation_python="$1"
+  validation_venv="$2"
+  validation_python_root="${3:-}"
+  (
+    cd "$REPO_DIR"
+    "$validation_python" - "$validation_venv" "$validation_python_root" <<'PY'
+from pathlib import Path
+import sys
+
+if sys.version_info[:2] != (3, 12):
+    raise SystemExit("Python 3.12 is required")
+if Path(sys.prefix).resolve() != Path(sys.argv[1]).resolve():
+    raise SystemExit("interpreter did not start inside the installed runtime virtualenv")
+if sys.argv[2]:
+    managed_root = Path(sys.argv[2]).resolve()
+    base_prefix = Path(sys.base_prefix).resolve()
+    if not base_prefix.is_relative_to(managed_root):
+        raise SystemExit("interpreter base is outside the installed managed Python directory")
+import app.host.daemon  # noqa: E402,F401
+import httpx  # noqa: E402,F401
+import websockets  # noqa: E402,F401
+PY
+  )
+}
+
 fetch_json() {
   curl -fsS --max-time 2 "$1" > "$2" 2>/dev/null
 }
@@ -90,8 +127,16 @@ launch_agents_dir() {
   fi
 }
 
+lifeagent_install_root() {
+  printf '%s\n' "${LIFEAGENT_INSTALL_ROOT:-${HOME:?HOME is required}/Library/Application Support/LifeAgent}"
+}
+
+installed_runtime_dir() {
+  printf '%s/runtime\n' "$(lifeagent_install_root)"
+}
+
 host_runtime_dir() {
-  printf '%s\n' "${LIFEAGENT_HOST_RUNTIME_DIR:-$REPO_DIR/.artifacts/discord-wake}"
+  printf '%s/.artifacts/discord-wake\n' "$(installed_runtime_dir)"
 }
 
 host_log_dir() {
@@ -106,16 +151,103 @@ discord_wake_hmac_secret_file() {
   printf '%s\n' "${LIFEAGENT_DISCORD_WAKE_HMAC_SECRET_FILE:-$(host_runtime_dir)/discord-wake-hmac.key}"
 }
 
+ensure_private_dir() {
+  private_dir="$1"
+  mkdir -p "$private_dir"
+  chmod 0700 "$private_dir"
+}
+
 plist_path() {
   printf '%s/%s.plist\n' "$(launch_agents_dir)" "$1"
 }
 
 launchd_status() {
-  if launchctl print "$(launchd_domain)/$1" >/dev/null 2>&1; then
-    printf 'loaded\n'
-  else
+  launchd_output="$(launchctl print "$(launchd_domain)/$1" 2>/dev/null)" || {
     printf 'unloaded\n'
+    return 0
+  }
+  launchd_raw_state="$({
+    printf '%s\n' "$launchd_output" |
+      sed -n 's/^[[:space:]]*state = //p'
+  } | head -n 1)"
+  if [ "$launchd_raw_state" = "running" ]; then
+    printf 'running\n'
+    return 0
   fi
+  launchd_exit_status="$({
+    printf '%s\n' "$launchd_output" |
+      sed -n -E 's/^[[:space:]]*last exit (code|status) = (-?[0-9]+).*$/\2/p'
+  } | head -n 1)"
+  case "$launchd_exit_status" in
+    ""|0)
+      printf 'loaded/inactive\n'
+      ;;
+    *)
+      printf 'crash-looping\n'
+      ;;
+  esac
+}
+
+launchd_last_exit_status() {
+  launchd_output="$(launchctl print "$(launchd_domain)/$1" 2>/dev/null)" || return 1
+  launchd_exit_status="$({
+    printf '%s\n' "$launchd_output" |
+      sed -n -E 's/^[[:space:]]*last exit (code|status) = (-?[0-9]+).*$/\2/p'
+  } | head -n 1)"
+  [ -n "$launchd_exit_status" ] || return 1
+  printf '%s\n' "$launchd_exit_status"
+}
+
+launchd_log_stem() {
+  case "$1" in
+    "$LIFEAGENT_DISCORD_WAKE_LABEL") printf 'discord-wake\n' ;;
+    "$LIFEAGENT_OLLAMA_LABEL") printf 'ollama\n' ;;
+    *) printf 'unknown\n' ;;
+  esac
+}
+
+report_launch_agent_failure() {
+  failed_label="$1"
+  failed_state="$(launchd_status "$failed_label")"
+  failed_last_exit="$(launchd_last_exit_status "$failed_label" 2>/dev/null || printf 'unavailable\n')"
+  failed_log_stem="$(launchd_log_stem "$failed_label")"
+  failed_log_dir="$(host_log_dir)"
+  echo "LaunchAgent $failed_label is not healthy: state=$failed_state last_exit_status=$failed_last_exit" >&2
+  echo "Inspect logs: $failed_log_dir/$failed_log_stem.stdout.log and $failed_log_dir/$failed_log_stem.stderr.log" >&2
+}
+
+wait_for_launch_agent_running() {
+  wait_label="$1"
+  wait_timeout="${LIFEAGENT_LAUNCHD_READINESS_TIMEOUT_SECONDS:-$DEFAULT_LAUNCHD_READINESS_TIMEOUT_SECONDS}"
+  wait_stability="${LIFEAGENT_LAUNCHD_STABILITY_SECONDS:-$DEFAULT_LAUNCHD_STABILITY_SECONDS}"
+  case "$wait_timeout" in
+    ""|*[!0-9]*)
+      echo "LIFEAGENT_LAUNCHD_READINESS_TIMEOUT_SECONDS must be a nonnegative integer" >&2
+      return 2
+      ;;
+  esac
+  case "$wait_stability" in
+    ""|*[!0-9]*)
+      echo "LIFEAGENT_LAUNCHD_STABILITY_SECONDS must be a nonnegative integer" >&2
+      return 2
+      ;;
+  esac
+  wait_deadline="$(( $(date +%s) + wait_timeout ))"
+  while [ "$(launchd_status "$wait_label")" != "running" ]; do
+    if [ "$(date +%s)" -ge "$wait_deadline" ]; then
+      report_launch_agent_failure "$wait_label"
+      return 1
+    fi
+    sleep 1
+  done
+  if [ "$wait_stability" -gt 0 ]; then
+    sleep "$wait_stability"
+  fi
+  if [ "$(launchd_status "$wait_label")" != "running" ]; then
+    report_launch_agent_failure "$wait_label"
+    return 1
+  fi
+  echo "LaunchAgent is running: $wait_label"
 }
 
 render_launchd_template() {
@@ -158,7 +290,8 @@ install_ollama_launch_agent() {
   command_required python3
   agents_dir="$(launch_agents_dir)"
   logs_dir="$(host_log_dir)"
-  mkdir -p "$agents_dir" "$logs_dir"
+  mkdir -p "$agents_dir"
+  ensure_private_dir "$logs_dir"
   plist="$(plist_path "$LIFEAGENT_OLLAMA_LABEL")"
   export LIFEAGENT_RENDER_REPO_DIR
   export LIFEAGENT_RENDER_SCRIPT_DIR
@@ -184,16 +317,19 @@ install_discord_wake_launch_agent() {
   command_required ollama
   python_bin="$REPO_DIR/.venv/bin/python"
   [ -x "$python_bin" ] || {
-    echo "Python 3.12 virtual environment is required at .venv/bin/python" >&2
+    echo "Python 3.12 virtual environment is required at the installed runtime .venv/bin/python" >&2
     exit 127
   }
-  "$python_bin" -c 'import sys; raise SystemExit(0 if sys.version_info[:2] == (3, 12) else 1)' || {
-    echo "Discord wake daemon requires Python 3.12" >&2
+  expected_venv="$REPO_DIR/.venv"
+  expected_python_root="$(lifeagent_install_root)/python"
+  validate_discord_python "$python_bin" "$expected_venv" "$expected_python_root" || {
+    echo "Discord wake daemon virtualenv validation failed; recreate .venv and install runtime dependencies" >&2
     exit 2
   }
   agents_dir="$(launch_agents_dir)"
   logs_dir="$(host_log_dir)"
-  mkdir -p "$agents_dir" "$logs_dir"
+  mkdir -p "$agents_dir"
+  ensure_private_dir "$logs_dir"
   plist="$(plist_path "$LIFEAGENT_DISCORD_WAKE_LABEL")"
   export LIFEAGENT_RENDER_REPO_DIR
   export LIFEAGENT_RENDER_SCRIPT_DIR
@@ -210,7 +346,7 @@ install_discord_wake_launch_agent() {
   LIFEAGENT_RENDER_ENV_FILE="$(absolute_path "$ENV_FILE")"
   LIFEAGENT_RENDER_IMAGE_ID_FILE="$(absolute_path "$(deployed_image_id_file)")"
   LIFEAGENT_RENDER_HMAC_SECRET_FILE="$(absolute_path "$(discord_wake_hmac_secret_file)")"
-  LIFEAGENT_RENDER_PYTHON_BIN="$(absolute_path "$python_bin")"
+  LIFEAGENT_RENDER_PYTHON_BIN="$(lexical_absolute_path "$python_bin")"
   LIFEAGENT_RENDER_DOCKER_BIN="$(absolute_path "$(command -v docker)")"
   LIFEAGENT_RENDER_LAUNCHCTL_BIN="$(absolute_path "$(command -v launchctl)")"
   LIFEAGENT_RENDER_OLLAMA_BIN="$(absolute_path "$(command -v ollama)")"

@@ -1,16 +1,18 @@
 # Phase 5 — Academic planner
 
 > The current replacement architecture keeps deterministic academic
-> sync/planning authoritative. Authorized Discord mentions received by the
-> native host daemon are the sole Qwen path; scheduled morning model work is
-> non-executable.
+> sync/planning authoritative. Messages from authorized owners in the private
+> Discord channel, received by the native host daemon, are the sole Qwen path;
+> the legacy model-based morning
+> briefing schedule is non-executable. The automatic academic morning to-do notification is
+> executable and model-free.
 
 ## Contract and acceptance criteria
 
 Phase 5 adds the scoped academic planner: per-course Notion assessment sync,
 private assessment-body/PDF ingestion with page or block citations, bounded OCR,
 assessment-scoped lexical and local-vector retrieval, deterministic 7-14 day allocation,
-mention-triggered academic conversation, ambiguity
+authorized private-channel academic conversation, ambiguity
 questions, and confirmation-only Notion writes.
 
 The plan's acceptance tests require that:
@@ -31,7 +33,8 @@ The plan's acceptance tests require that:
 - Added `app/agents/academic_planner/contracts.py`: strict Pydantic contracts
   for assessments, fixed commitments, availability windows, incomplete blocks,
   ambiguity questions, study blocks, daily plans, work breakdowns, critiques,
-  historical grounded morning briefing data, check-in proposals, and proposed Notion changes.
+  historical grounded morning briefing data, scheduled model-free morning
+  notification data, check-in proposals, and proposed Notion changes.
   Datetimes are required to be timezone-aware and normalized to UTC at the
   contract boundary.
 - Added `app/agents/academic_planner/allocator.py`: deterministic priority
@@ -60,21 +63,27 @@ The plan's acceptance tests require that:
   and block persistence, incomplete-block carry-forward, durable check-in
   proposals, exact confirmation claiming, replay-safe applied state, and audit
   events for confirmed Notion writes.
-- Added `app/agents/academic_planner/workflow.py`: morning plan orchestration,
+- Added `app/agents/academic_planner/workflow.py`: plan orchestration,
   advisory-only model breakdown/critique calls, deterministic briefing context
-  construction, dedicated morning-briefing model output, end-of-day check-in
-  sending, conservative fallback check-in extraction, proposal creation, exact
-  confirmation, and a worker entry point with explicit runtime injection. The
-  briefing context contains only bounded normalized facts: current Toronto-local
-  date labels, known assessment IDs, scheduled block IDs with exact durations,
-  active learning-focus labels, explicitly confirmed performance signals, and
-  deferred IDs.
-- Added `app/api/academic.py`: HTTP boundaries for check-in proposal creation
-  and exact confirmation. The check-in endpoint returns the required
-  confirmation event; the confirmation endpoint applies only through the
-  configured writer. `app/main.py` mounts this router with the durable SQL
-  store; confirmation returns a fail-closed `503` until a scoped live writer
-  is explicitly injected.
+  construction for historical tests, end-of-day check-in sending, conservative
+  fallback check-in extraction, proposal creation, exact confirmation, and a
+  worker entry point with explicit runtime injection. The briefing context
+  contains only bounded normalized facts: current Toronto-local date labels,
+  known assessment IDs, scheduled block IDs with exact durations, active
+  learning-focus labels, explicitly confirmed performance signals, and deferred
+  IDs.
+- Added `app/agents/academic_planner/morning_notification.py`: executable
+  deterministic morning to-do notification. It validates the stable period key
+  `academic-morning:YYYY-MM-DD:HHMM:v1`, refreshes Notion immediately before
+  planning, requires a fresh complete sync, builds the intended local day's
+  deterministic plan, and sends one Discord message with delivery key
+  `academic-morning-delivery:YYYY-MM-DD:HHMM:v1`. It never calls Qwen.
+- Added `app/api/academic.py`: the original phase shipped HTTP boundaries for
+  check-in proposal creation and exact confirmation. The replacement runtime
+  has removed the deterministic `/academic/checkin` creator; proposals now
+  originate only in the native Discord harness. Exact confirmation, rejection,
+  and manual sync remain mounted, and confirmation returns a fail-closed `503`
+  until a scoped live writer is explicitly injected.
 
 ## Acceptance evidence
 
@@ -103,6 +112,11 @@ The plan's acceptance tests require that:
   `.venv/bin/ruff check ...`, `.venv/bin/pyright app`, and `.venv/bin/pytest`
   over all assigned academic/Notion unit tests plus the Phase 5 acceptance
   tests.
+- Scheduled morning notification coverage includes controlled trigger,
+  duplicate/replay idempotency, successful live-delivery boundaries through the
+  injected Discord delivery adapter, source setup/failure/stale handling, and
+  health classification for missing runs, failed runs, missing delivery, failed
+  delivery, uncertain delivery, and on-time success.
 
 ## Deferred external verification
 
@@ -110,15 +124,19 @@ The plan's acceptance tests require that:
   updates require Richard's scoped Notion integration token, database IDs, and
   property mappings. Automated tests use `httpx.MockTransport` and verify the
   exact outbound method, URL path, allowlisted property ID, and payload shape.
-- Live Discord mention, ambiguity-question, confirmation, and clarification
-  deliveries require Richard's Discord credentials and channel IDs. Automated
-  tests use injected delivery recorders and verify idempotency keys and call
-  boundaries. Historical morning-briefing contracts are not registered as a
-  scheduled model job.
+- Live Discord conversation, ambiguity-question, confirmation, clarification, and
+  scheduled morning notification deliveries require Richard's Discord
+  credentials and channel IDs. Automated tests use injected delivery recorders
+  and verify idempotency keys and call boundaries. Historical morning-briefing
+  contracts are not registered as a scheduled model job; the current scheduled
+  morning notification is deterministic and model-free.
 - Qwen academic breakdown/critique quality is advisory in this phase and is not
   used to alter constraints or calendar state. Scheduled academic model calls
-  are non-executable; an authorized Discord mention is the sole Qwen trigger.
-- Authorized mention-triggered academic requests use semantic progress rather
+  are non-executable; an authorized private-channel Discord message is the sole
+  Qwen trigger.
+  The automatic morning notification must not call Qwen, even on source failure
+  or an empty day.
+- Authorized Discord-triggered academic requests use semantic progress rather
   than token streaming. The host creates one idempotent Discord progress
   message per inbound attempt and edits it through allowlisted stages such as
   runtime wake-up, model turn, catalog lookup, proposal validation, and the
@@ -129,18 +147,18 @@ The plan's acceptance tests require that:
   `agent_clarification` discourse session. The original request and authorized
   answers are kept in a redacted expiring artifact, while relational state
   retains only bounded metadata and its artifact key. The same authorized user
-  in the same Discord channel may answer attempt two or three without another
-  mention while that clarification is open; the authenticated handoff discards
-  other unmentioned prose before content persistence or model work. A third
-  unresolved attempt closes the session and requires a new complete mention;
+  in the same Discord channel may answer attempt two or three as ordinary
+  authorized messages; the authenticated handoff discards messages from other
+  users or channels before content persistence or model work. A third
+  unresolved attempt closes the session and requires a new complete request;
   runtime, connector, timeout, and invalid model-output failures close safely
   without consuming an automatic rerun.
-- Exact proposal confirmation and rejection remain model-free and do not
-  require a mention.
+- Exact proposal confirmation and rejection remain model-free.
 - Conversation-triggered study sessions are represented as explicitly
   confirmed `Studying Block — <topic>` pages in the relevant course's
-  discovered Notion Assessments calendar. The initial request must mention the
-  bot; an owner-scoped free-text clarification continuation need not. Qwen owns
+  discovered Notion Assessments calendar. The initial request and any
+  owner-scoped free-text clarification continuation may omit the bot mention.
+  Qwen owns
   semantic interpretation of raw create/update/archive intent, topics, dates,
   and clarification needs. Deterministic code is limited to authorization,
   typed schemas, bounded/known IDs, write preconditions, and confirmation. The
@@ -157,7 +175,9 @@ The plan's acceptance tests require that:
   receipt.
 - Assessment-material OCR, embeddings, and exact `pgvector` retrieval are
   active. No approximate vector index, universal rubric schema, or scheduled
-  semantic morning model job is configured.
+  semantic model-based morning briefing is configured. The configured academic
+  morning schedule is the deterministic to-do notification, not a semantic
+  model job.
 - The application deliberately does not synthesize Notion property or page
   mappings. A live `notion_writer` must be injected only after Richard supplies
   the scoped integration token and reviewed mappings; until then confirmation

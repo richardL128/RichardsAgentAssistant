@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 from collections.abc import Iterator
+from uuid import uuid4
 
 import httpx
 import pytest
@@ -12,6 +13,7 @@ from sqlalchemy.pool import StaticPool
 
 from app.agents.academic_planner.contracts import MorningBriefing
 from app.connectors.discord import (
+    AcademicDiscordMessage,
     DiscordAcademicPlannerAdapter,
     DiscordAcademicPlannerDelivery,
     DiscordAcademicProgressEvent,
@@ -22,6 +24,10 @@ from app.db.models import AgentRun, Delivery, DeliveryStatus
 from app.db.repositories import RunRepository
 
 CHANNEL = "987654321012345678"
+
+
+async def _record_sleep(sleeps: list[float], seconds: float) -> None:
+    sleeps.append(seconds)
 
 
 def test_morning_briefing_contract_enforces_discord_content_limit() -> None:
@@ -102,6 +108,321 @@ async def test_academic_delivery_uses_nonce_and_is_idempotent(engine: Engine) ->
         stored = session.scalar(select(Delivery).where(Delivery.id == first.id))
         assert stored is not None
         assert stored.status == DeliveryStatus.SENT.value
+
+
+@pytest.mark.asyncio
+async def test_scheduled_academic_notification_delivers_exact_content_once(
+    engine: Engine,
+) -> None:
+    key = "academic-morning:2026-09-10:0800:v1"
+    content = (
+        "Good morning, Richard. Today's plan:\n"
+        "- 09:00 - ECE 250 Quiz 1 review (45 minutes)\n"
+        "@everyone should remain inert.\n"
+        "Have a good day!"
+    )
+    with Session(engine) as session, session.begin():
+        run = RunRepository.create_or_get(
+            session,
+            idempotency_key=key,
+            agent_name="academic_planner",
+            trigger="schedule",
+            schedule="academic_morning",
+        )
+        run_id = run.id
+    calls: list[httpx.Request] = []
+
+    def respond(request: httpx.Request) -> httpx.Response:
+        calls.append(request)
+        return httpx.Response(200, json={"id": "123456789012345678", "guild_id": "42"})
+
+    async with httpx.AsyncClient(
+        base_url="https://discord.com/api/v10", transport=httpx.MockTransport(respond)
+    ) as client:
+        delivery = DiscordAcademicPlannerDelivery(
+            engine=engine,
+            run_id=run_id,
+            channel_id=CHANNEL,
+            adapter=DiscordAcademicPlannerAdapter(
+                token=SecretStr("academic-token"),
+                allowed_channel_ids={CHANNEL},
+                client=client,
+            ),
+        )
+        first = await delivery.send_scheduled_notification(content, idempotency_key=key)
+        second = await delivery.send_scheduled_notification(
+            "This replay must not be posted.",
+            idempotency_key=key,
+        )
+
+    assert len(calls) == 1
+    assert first.id == second.id
+    body = json.loads(calls[0].content)
+    assert body["content"] == content
+    assert body["nonce"] == first.id.hex[:25]
+    assert body["enforce_nonce"] is True
+    assert body["allowed_mentions"] == {"parse": []}
+    with Session(engine) as session:
+        stored = session.scalar(select(Delivery).where(Delivery.id == first.id))
+        assert stored is not None
+        assert stored.status == DeliveryStatus.SENT.value
+        assert stored.error_code is None
+
+
+@pytest.mark.asyncio
+async def test_scheduled_academic_notification_replay_after_transport_uncertainty(
+    engine: Engine,
+) -> None:
+    key = "academic-morning:2026-09-10:0800:v1"
+    content = "Good morning, Richard. It is a light academic day. Have a good day!"
+    with Session(engine) as session, session.begin():
+        run = RunRepository.create_or_get(
+            session,
+            idempotency_key=key,
+            agent_name="academic_planner",
+            trigger="schedule",
+            schedule="academic_morning",
+        )
+        run_id = run.id
+    calls: list[httpx.Request] = []
+
+    def respond(request: httpx.Request) -> httpx.Response:
+        calls.append(request)
+        if len(calls) == 1:
+            raise httpx.ConnectError("connection reset", request=request)
+        return httpx.Response(200, json={"id": "123456789012345678", "guild_id": "42"})
+
+    async with httpx.AsyncClient(
+        base_url="https://discord.com/api/v10", transport=httpx.MockTransport(respond)
+    ) as client:
+        delivery = DiscordAcademicPlannerDelivery(
+            engine=engine,
+            run_id=run_id,
+            channel_id=CHANNEL,
+            adapter=DiscordAcademicPlannerAdapter(
+                token=SecretStr("academic-token"),
+                allowed_channel_ids={CHANNEL},
+                client=client,
+            ),
+        )
+        with pytest.raises(LifeAgentError) as raised:
+            await delivery.send_scheduled_notification(content, idempotency_key=key)
+
+        assert raised.value.record.category is ErrorCategory.TRANSIENT
+        with Session(engine) as session:
+            uncertain = session.scalar(select(Delivery).where(Delivery.idempotency_key == key))
+            assert uncertain is not None
+            assert uncertain.status == DeliveryStatus.UNCERTAIN.value
+            assert uncertain.attempt_count == 1
+            assert uncertain.error_code == ErrorCode.DELIVERY_UNCERTAIN.value
+            delivery_id = uncertain.id
+
+        final = await delivery.send_scheduled_notification(content, idempotency_key=key)
+
+    assert final.id == delivery_id
+    assert len(calls) == 2
+    first_body = json.loads(calls[0].content)
+    second_body = json.loads(calls[1].content)
+    assert first_body == second_body
+    assert first_body["content"] == content
+    assert first_body["nonce"] == delivery_id.hex[:25]
+    assert first_body["enforce_nonce"] is True
+    assert first_body["allowed_mentions"] == {"parse": []}
+    with Session(engine) as session:
+        deliveries = list(session.scalars(select(Delivery).where(Delivery.idempotency_key == key)))
+        assert len(deliveries) == 1
+        assert deliveries[0].status == DeliveryStatus.SENT.value
+        assert deliveries[0].attempt_count == 2
+        assert deliveries[0].error_code is None
+
+
+@pytest.mark.asyncio
+async def test_academic_delivery_retries_429_with_same_nonce_and_content() -> None:
+    calls: list[httpx.Request] = []
+    sleeps: list[float] = []
+    delivery_id = uuid4()
+    content = "Final proposal preview."
+
+    def respond(request: httpx.Request) -> httpx.Response:
+        calls.append(request)
+        if len(calls) == 1:
+            return httpx.Response(
+                429,
+                headers={"Retry-After": "0.25"},
+                json={"retry_after": 99, "secret": "not exposed"},
+            )
+        return httpx.Response(200, json={"id": "123456789012345678", "guild_id": "42"})
+
+    async with httpx.AsyncClient(
+        base_url="https://discord.com/api/v10", transport=httpx.MockTransport(respond)
+    ) as client:
+        adapter = DiscordAcademicPlannerAdapter(
+            token=SecretStr("academic-token"),
+            allowed_channel_ids={CHANNEL},
+            client=client,
+            rate_limit_sleep=lambda seconds: _record_sleep(sleeps, seconds),
+        )
+        receipt = await adapter.send(
+            AcademicDiscordMessage(
+                delivery_id=delivery_id,
+                channel_id=CHANNEL,
+                content=content,
+            )
+        )
+
+    assert receipt.external_id == "123456789012345678"
+    assert sleeps == [0.25]
+    assert len(calls) == 2
+    first_body = json.loads(calls[0].content)
+    second_body = json.loads(calls[1].content)
+    assert first_body == second_body
+    assert first_body["content"] == content
+    assert first_body["nonce"] == delivery_id.hex[:25]
+    assert first_body["enforce_nonce"] is True
+    assert first_body["allowed_mentions"] == {"parse": []}
+
+
+@pytest.mark.asyncio
+async def test_academic_delivery_uses_json_retry_after_when_header_is_missing() -> None:
+    calls: list[httpx.Request] = []
+    sleeps: list[float] = []
+
+    def respond(request: httpx.Request) -> httpx.Response:
+        calls.append(request)
+        if len(calls) == 1:
+            return httpx.Response(429, json={"retry_after": 0.1})
+        return httpx.Response(200, json={"id": "123456789012345678"})
+
+    async with httpx.AsyncClient(
+        base_url="https://discord.com/api/v10", transport=httpx.MockTransport(respond)
+    ) as client:
+        adapter = DiscordAcademicPlannerAdapter(
+            token=SecretStr("academic-token"),
+            allowed_channel_ids={CHANNEL},
+            client=client,
+            rate_limit_sleep=lambda seconds: _record_sleep(sleeps, seconds),
+        )
+        await adapter.send(
+            AcademicDiscordMessage(
+                delivery_id=uuid4(),
+                channel_id=CHANNEL,
+                content="Final response.",
+            )
+        )
+
+    assert sleeps == [0.1]
+    assert len(calls) == 2
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "response",
+    [
+        httpx.Response(429, headers={"Retry-After": "not-a-number"}, json={"secret": "body"}),
+        httpx.Response(429, headers={"Retry-After": "6"}, json={"secret": "body"}),
+        httpx.Response(429, json={"retry_after": -1, "secret": "body"}),
+        httpx.Response(429, json={"retry_after": "nan", "secret": "body"}),
+    ],
+)
+async def test_academic_delivery_rate_limit_delay_must_be_bounded_and_valid(
+    response: httpx.Response,
+) -> None:
+    calls: list[httpx.Request] = []
+    sleeps: list[float] = []
+
+    def respond(request: httpx.Request) -> httpx.Response:
+        calls.append(request)
+        return response
+
+    async with httpx.AsyncClient(
+        base_url="https://discord.com/api/v10", transport=httpx.MockTransport(respond)
+    ) as client:
+        adapter = DiscordAcademicPlannerAdapter(
+            token=SecretStr("academic-token"),
+            allowed_channel_ids={CHANNEL},
+            client=client,
+            rate_limit_sleep=lambda seconds: _record_sleep(sleeps, seconds),
+        )
+        with pytest.raises(LifeAgentError) as raised:
+            await adapter.send(
+                AcademicDiscordMessage(
+                    delivery_id=uuid4(),
+                    channel_id=CHANNEL,
+                    content="Final response.",
+                )
+            )
+
+    assert raised.value.record.category is ErrorCategory.TRANSIENT
+    assert raised.value.record.code is ErrorCode.CONNECTOR_TRANSIENT
+    assert "secret" not in str(raised.value)
+    assert sleeps == []
+    assert len(calls) == 1
+
+
+@pytest.mark.asyncio
+async def test_academic_delivery_exhausted_429_remains_transient() -> None:
+    calls: list[httpx.Request] = []
+    sleeps: list[float] = []
+
+    def respond(request: httpx.Request) -> httpx.Response:
+        calls.append(request)
+        return httpx.Response(429, headers={"Retry-After": "0.1"}, json={"secret": "body"})
+
+    async with httpx.AsyncClient(
+        base_url="https://discord.com/api/v10", transport=httpx.MockTransport(respond)
+    ) as client:
+        adapter = DiscordAcademicPlannerAdapter(
+            token=SecretStr("academic-token"),
+            allowed_channel_ids={CHANNEL},
+            client=client,
+            rate_limit_sleep=lambda seconds: _record_sleep(sleeps, seconds),
+        )
+        with pytest.raises(LifeAgentError) as raised:
+            await adapter.send(
+                AcademicDiscordMessage(
+                    delivery_id=uuid4(),
+                    channel_id=CHANNEL,
+                    content="Final response.",
+                )
+            )
+
+    assert raised.value.record.category is ErrorCategory.TRANSIENT
+    assert raised.value.record.code is ErrorCode.CONNECTOR_TRANSIENT
+    assert "secret" not in str(raised.value)
+    assert sleeps == [0.1, 0.1]
+    assert len(calls) == 3
+
+
+@pytest.mark.asyncio
+async def test_academic_delivery_does_not_retry_ambiguous_5xx() -> None:
+    calls: list[httpx.Request] = []
+
+    def respond(request: httpx.Request) -> httpx.Response:
+        calls.append(request)
+        return httpx.Response(503, json={"secret": "body"})
+
+    async with httpx.AsyncClient(
+        base_url="https://discord.com/api/v10", transport=httpx.MockTransport(respond)
+    ) as client:
+        adapter = DiscordAcademicPlannerAdapter(
+            token=SecretStr("academic-token"),
+            allowed_channel_ids={CHANNEL},
+            client=client,
+            rate_limit_sleep=lambda _seconds: _record_sleep([], _seconds),
+        )
+        with pytest.raises(LifeAgentError) as raised:
+            await adapter.send(
+                AcademicDiscordMessage(
+                    delivery_id=uuid4(),
+                    channel_id=CHANNEL,
+                    content="Final response.",
+                )
+            )
+
+    assert raised.value.record.category is ErrorCategory.TRANSIENT
+    assert raised.value.record.code is ErrorCode.CONNECTOR_TRANSIENT
+    assert "secret" not in str(raised.value)
+    assert len(calls) == 1
 
 
 @pytest.mark.asyncio

@@ -7,8 +7,11 @@ root and that the current stack uses the service names in `compose.yaml`:
 
 The current configured runtime includes two native macOS LaunchAgents plus the
 Compose API, PostgreSQL, and academic worker. Qwen-powered work is triggered
-only by an authorized Discord mention; scheduled code review, academic
-planning, and finance workflows are not executable runtime paths.
+only by messages from authorized owners in the configured private Discord
+channel. The automatic academic morning
+notification is scheduled and executable, but it is model-free. Scheduled
+academic Qwen, code-review Qwen, and finance Qwen workflows are not executable
+runtime paths.
 
 For first-time setup, see [Getting started](../getting-started.md).
 
@@ -21,6 +24,7 @@ database, but they do not imply standalone services can be started.
 ## Scenario Index
 
 - [Model unavailable or slow](model-unavailable-slow.md)
+- [Academic morning notification](academic-morning-notification.md)
 - [Discord cold wake](discord-cold-wake.md)
 - [Queue backlog](queue-backlog.md)
 - [Duplicate delivery](duplicate-delivery.md)

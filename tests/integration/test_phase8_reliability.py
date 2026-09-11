@@ -25,6 +25,7 @@ from pathlib import Path
 from types import SimpleNamespace
 from typing import cast
 from urllib.parse import urlsplit, urlunsplit
+from zoneinfo import ZoneInfo
 
 import httpx
 import pytest
@@ -66,6 +67,7 @@ from app.health.checks import HealthCheck as ProbeHealthCheck
 from app.health.checks import HealthState
 from app.queue import tasks
 from app.queue.execution import execute_recorded_attempt
+from app.queue.periodic import PeriodicOccurrence, stable_period_key
 from app.queue.retry import RetryPolicy
 from app.queue.visibility import QueueJobMetadata, QueueVisibility, queue_visibility
 
@@ -465,6 +467,117 @@ async def test_sigterm_contract_and_delivery_intent_retry_are_idempotent(
     ]
 
 
+@pytest.mark.asyncio
+async def test_academic_morning_schedule_persists_once_across_duplicate_and_replay(
+    postgres_engine: Engine,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    occurrence = PeriodicOccurrence(
+        local_time=datetime(2026, 9, 10, 8, 0, tzinfo=ZoneInfo("America/Toronto")),
+        scheduled_at=datetime(2026, 9, 10, 12, 0, tzinfo=UTC),
+    )
+    period_key = stable_period_key("academic-morning", occurrence)
+    assert period_key == "academic-morning:2026-09-10:0800:v1"
+    delivery_key = period_key.replace("academic-morning:", "academic-morning-delivery:", 1)
+    queued_arguments: dict[str, str] = {}
+    defer_calls = 0
+    real_task = tasks.academic_morning_notification_task
+
+    class FakeTask:
+        def configure(self, **kwargs: str) -> FakeTask:
+            self.configuration = kwargs
+            return self
+
+        async def defer_async(self, **kwargs: str) -> int:
+            nonlocal defer_calls
+            defer_calls += 1
+            queued_arguments.update(kwargs)
+            if defer_calls > 1:
+                from procrastinate.exceptions import AlreadyEnqueued
+
+                raise AlreadyEnqueued("duplicate morning period")
+            return 801
+
+    def status_text(value: object) -> str:
+        return getattr(value, "value", str(value))
+
+    async def scheduled_handler(
+        occurrence_at_iso: str,
+        run_id: str,
+        queued_period_key: str,
+        attempt: int,
+        attempt_limit: int,
+    ) -> dict[str, object]:
+        assert occurrence_at_iso == "2026-09-10T12:00:00+00:00"
+        assert queued_period_key == period_key
+        assert attempt <= attempt_limit
+        with Session(postgres_engine) as session, session.begin():
+            delivery = DeliveryRepository.create_or_get_intent(
+                session,
+                channel="discord",
+                target=CHANNEL_ID,
+                idempotency_key=delivery_key,
+                run_id=uuid.UUID(run_id),
+            )
+            if status_text(delivery.status) not in {"sent", "acknowledged"}:
+                DeliveryRepository.record_attempt(
+                    session,
+                    delivery.id,
+                    DeliveryStatus.SENT,
+                    external_url=(
+                        "https://discord.com/channels/@me/987654321012345678/111111111111111111"
+                    ),
+                )
+        return {"status": "succeeded", "delivery_count": 1}
+
+    monkeypatch.setattr(tasks, "_database", SimpleNamespace(engine=postgres_engine))
+    monkeypatch.setattr(tasks, "academic_morning_notification_task", FakeTask())
+    monkeypatch.setattr(tasks, "_academic_morning_notification_handler", scheduled_handler)
+
+    first = await tasks.defer_academic_morning_notification(occurrence)
+    duplicate = await tasks.defer_academic_morning_notification(occurrence)
+
+    assert first["status"] == "enqueued"
+    assert first["period_key"] == period_key
+    assert duplicate == {
+        "status": "already_enqueued",
+        "run_id": first["run_id"],
+        "period_key": period_key,
+    }
+    assert queued_arguments == {
+        "occurrence_at_iso": "2026-09-10T12:00:00+00:00",
+        "run_id": first["run_id"],
+        "period_key": period_key,
+    }
+
+    context = SimpleNamespace(job=SimpleNamespace(attempts=0))
+    result = await real_task.func(context, **queued_arguments)
+    replay_context = SimpleNamespace(job=SimpleNamespace(attempts=1))
+    replay = await real_task.func(replay_context, **queued_arguments)
+
+    assert result["status"] == "succeeded"
+    assert replay["status"] == "succeeded"
+    with Session(postgres_engine) as session:
+        run = session.scalar(select(AgentRun).where(AgentRun.idempotency_key == period_key))
+        deliveries = list(
+            session.scalars(select(Delivery).where(Delivery.idempotency_key == delivery_key))
+        )
+        health = session.scalar(
+            select(HealthCheck).where(HealthCheck.check_name == "academic_morning")
+        )
+    assert run is not None
+    assert run.schedule == "academic-morning"
+    assert run.input_version == "2026-09-10T12:00:00+00:00"
+    assert run.status == RunStatus.SUCCEEDED
+    assert len(deliveries) == 1
+    assert deliveries[0].run_id == run.id
+    assert deliveries[0].status == DeliveryStatus.SENT
+    assert deliveries[0].attempt_count == 1
+    assert health is not None
+    assert health.state == "healthy"
+    assert health.rule == "processing_and_delivery_succeeded"
+
+
 def _probe(name: str, state: HealthState, diagnostic: str | None = None) -> ProbeHealthCheck:
     return ProbeHealthCheck(name=name, state=state, diagnostic=diagnostic or f"{name} {state}")
 
@@ -490,6 +603,8 @@ async def _run_shared_health(
     ollama_check: ProbeHealthCheck,
 ) -> HealthCheck:
     engine = create_engine(f"sqlite+pysqlite:///{tmp_path / uuid.uuid4().hex}.db")
+    AgentRun.__table__.create(engine)
+    Delivery.__table__.create(engine)
     HealthCheck.__table__.create(engine)
     monkeypatch.setattr(tasks, "_database", SimpleNamespace(engine=engine))
     monkeypatch.setattr(tasks, "_settings", Settings(_env_file=None))
@@ -527,7 +642,10 @@ async def _run_shared_health(
     try:
         await tasks.shared_services_periodic.func(timestamp=int(NOW.timestamp()))
         with Session(engine) as session:
-            persisted = session.query(HealthCheck).one()
+            persisted = session.scalar(
+                select(HealthCheck).where(HealthCheck.check_name == "shared_services")
+            )
+            assert persisted is not None
             session.expunge(persisted)
             return persisted
     finally:
@@ -637,8 +755,8 @@ def test_stalled_worker_projection_uses_queue_stalled_after_seconds() -> None:
         job_id=1,
         status="doing",
         heartbeat_at=NOW - timedelta(seconds=121),
-        queue_name="code_review",
-        task_name="lifeagent.code_review",
+        queue_name="academic_planner",
+        task_name="lifeagent.discord_academic",
     )
     assert (
         queue_visibility(record, now=NOW, stalled_after=timedelta(seconds=120))
@@ -713,7 +831,7 @@ def _write_compose_override(
         )
         lines.extend(
             (
-                "  worker-code-review:",
+                "  worker-academic-planner:",
                 "    environment:",
             )
         )
@@ -921,7 +1039,7 @@ def _copy_compose_script(
     *,
     path: Path,
     container_path: str,
-    service: str = "worker-code-review",
+    service: str = "worker-academic-planner",
 ) -> None:
     _run((*compose, "cp", str(path), f"{service}:{container_path}"), env=env)
 
@@ -970,7 +1088,9 @@ async def _wait_for_event(event: threading.Event, description: str) -> None:
 
 async def _wait_for_worker_exec(compose: Sequence[str], env: dict[str, str]) -> str:
     for _ in range(30):
-        container_id = _run((*compose, "ps", "-q", "worker-code-review"), env=env).stdout.strip()
+        container_id = _run(
+            (*compose, "ps", "-q", "worker-academic-planner"), env=env
+        ).stdout.strip()
         if not container_id:
             await asyncio.sleep(1)
             continue
@@ -978,7 +1098,7 @@ async def _wait_for_worker_exec(compose: Sequence[str], env: dict[str, str]) -> 
         if current["State"]["Running"]:
             return container_id
         await asyncio.sleep(1)
-    pytest.fail("worker-code-review was not running within 30 seconds")
+    pytest.fail("worker-academic-planner was not running within 30 seconds")
 
 
 def test_compose_worker_uses_exec_and_restarts_after_sigterm(tmp_path: Path) -> None:
@@ -1009,14 +1129,25 @@ def test_compose_worker_uses_exec_and_restarts_after_sigterm(tmp_path: Path) -> 
     )
     slow_ollama = None
     try:
-        _run((*compose, "up", "-d", "--build", "postgres", "api", "worker-code-review"), env=env)
+        _run(
+            (
+                *compose,
+                "up",
+                "-d",
+                "--build",
+                "postgres",
+                "api",
+                "worker-academic-planner",
+            ),
+            env=env,
+        )
         asyncio.run(_wait_for_worker_exec(compose, env))
         process_cmdline = _run(
             (
                 *compose,
                 "exec",
                 "-T",
-                "worker-code-review",
+                "worker-academic-planner",
                 "sh",
                 "-lc",
                 "tr '\\0' ' ' < /proc/1/cmdline",
@@ -1030,7 +1161,14 @@ def test_compose_worker_uses_exec_and_restarts_after_sigterm(tmp_path: Path) -> 
         ollama_url = slow_ollama.__enter__().replace("127.0.0.1", "host.docker.internal")
         env["OLLAMA_BASE_URL"] = ollama_url
         _run(
-            (*compose, "up", "-d", "--no-deps", "--force-recreate", "worker-code-review"),
+            (
+                *compose,
+                "up",
+                "-d",
+                "--no-deps",
+                "--force-recreate",
+                "worker-academic-planner",
+            ),
             env=env,
         )
         asyncio.run(_wait_for_worker_exec(compose, env))
@@ -1064,8 +1202,8 @@ def test_compose_worker_uses_exec_and_restarts_after_sigterm(tmp_path: Path) -> 
             "WHERE task_name = 'lifeagent.health.shared_services' AND status = 'doing'"
         )
         asyncio.run(_wait_for_postgres_scalar(compose, env, doing_job_sql))
-        _run((*compose, "kill", "-s", "SIGTERM", "worker-code-review"), env=env)
-        _run((*compose, "up", "-d", "worker-code-review"), env=env)
+        _run((*compose, "kill", "-s", "SIGTERM", "worker-academic-planner"), env=env)
+        _run((*compose, "up", "-d", "worker-academic-planner"), env=env)
         asyncio.run(_wait_for_worker_exec(compose, env))
         health_sql = (
             "SELECT state || ':' || rule FROM health_checks WHERE check_name = 'shared_services'"
@@ -1135,7 +1273,15 @@ def test_compose_delivery_intent_survives_sigkill_without_duplicate_discord_mess
         )
         try:
             _run(
-                (*compose, "up", "-d", "--build", "postgres", "api", "worker-code-review"),
+                (
+                    *compose,
+                    "up",
+                    "-d",
+                    "--build",
+                    "postgres",
+                    "api",
+                    "worker-academic-planner",
+                ),
                 env=env,
             )
             asyncio.run(_wait_for_worker_exec(compose, env))
@@ -1173,9 +1319,12 @@ def test_compose_delivery_intent_survives_sigkill_without_duplicate_discord_mess
             )
             asyncio.run(_wait_for_postgres_scalar(compose, env, sending_sql))
 
-            _run((*compose, "kill", "-s", "SIGKILL", "worker-code-review"), env=env)
+            _run(
+                (*compose, "kill", "-s", "SIGKILL", "worker-academic-planner"),
+                env=env,
+            )
             discord.release_first_post.set()
-            _run((*compose, "up", "-d", "worker-code-review"), env=env)
+            _run((*compose, "up", "-d", "worker-academic-planner"), env=env)
             asyncio.run(_wait_for_worker_exec(compose, env))
 
             final_delivery_sql = (

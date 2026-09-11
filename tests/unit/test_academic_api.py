@@ -1,9 +1,14 @@
 from __future__ import annotations
 
+from uuid import UUID
+
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
+from app.agents.academic_planner.contracts import CheckinProposal
 from app.api.academic import router
+
+PROPOSAL_ID = UUID("11111111-1111-4111-8111-111111111111")
 
 
 class Store:
@@ -61,14 +66,32 @@ def _app(store: Store, writer: Writer) -> FastAPI:
     return app
 
 
-def test_checkin_response_is_proposal_and_wrong_confirmation_does_not_write() -> None:
+def _seed_proposal(store: Store) -> CheckinProposal:
+    proposal = CheckinProposal(
+        proposal_id=PROPOSAL_ID,
+        confirmation_event=f"confirm {PROPOSAL_ID}",
+        changes=(),
+    )
+    store.save_checkin_proposal(proposal)
+    return proposal
+
+
+def test_legacy_checkin_creation_route_is_absent() -> None:
     store, writer = Store(), Writer()
     with TestClient(_app(store, writer)) as client:
         response = client.post("/academic/checkin", json={"reply": "completed essay"})
-        assert response.status_code == 202
-        body = response.json()
+
+    assert response.status_code == 404
+    assert store.proposal is None
+    assert writer.calls == 0
+
+
+def test_wrong_confirmation_does_not_write() -> None:
+    store, writer = Store(), Writer()
+    proposal = _seed_proposal(store)
+    with TestClient(_app(store, writer)) as client:
         wrong = client.post(
-            f"/academic/confirm/{body['proposal_id']}",
+            f"/academic/confirm/{proposal.proposal_id}",
             json={"confirmation_event": "yes"},
         )
     assert wrong.json()["status"] == "confirmation_required"
@@ -77,12 +100,11 @@ def test_checkin_response_is_proposal_and_wrong_confirmation_does_not_write() ->
 
 def test_exact_confirmation_is_the_only_write_path() -> None:
     store, writer = Store(), Writer()
+    proposal = _seed_proposal(store)
     with TestClient(_app(store, writer)) as client:
-        response = client.post("/academic/checkin", json={"reply": "completed essay"})
-        body = response.json()
         result = client.post(
-            f"/academic/confirm/{body['proposal_id']}",
-            json={"confirmation_event": body["confirmation_event"]},
+            f"/academic/confirm/{proposal.proposal_id}",
+            json={"confirmation_event": proposal.confirmation_event},
         )
     assert result.json()["status"] == "applied"
     assert writer.calls == 1
@@ -91,11 +113,11 @@ def test_exact_confirmation_is_the_only_write_path() -> None:
 
 def test_rejection_does_not_require_or_call_notion_writer() -> None:
     store, writer = Store(), Writer()
+    proposal = _seed_proposal(store)
     with TestClient(_app(store, writer)) as client:
-        proposal = client.post("/academic/checkin", json={"reply": "completed essay"}).json()
         result = client.post(
-            f"/academic/reject/{proposal['proposal_id']}",
-            json={"rejection_event": f"reject {proposal['proposal_id']}"},
+            f"/academic/reject/{proposal.proposal_id}",
+            json={"rejection_event": f"reject {proposal.proposal_id}"},
         )
 
     assert result.status_code == 200

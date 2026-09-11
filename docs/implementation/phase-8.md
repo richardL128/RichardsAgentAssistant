@@ -1,8 +1,9 @@
 # Phase 8 - Reliability, backup, and operating runbooks
 
 Historical phase note: this closeout describes the Phase 8 implementation at
-the time it shipped. The current configured runtime uses only `postgres` and
-`api`; Qwen is triggered solely by an authorized Discord mention, and the
+the time it shipped. The current configured runtime uses `postgres`, `api`, and
+the academic worker; Qwen is triggered solely by an authorized private-channel
+Discord message, and the
 legacy standalone scheduled execution described here is not current executable
 Compose services.
 

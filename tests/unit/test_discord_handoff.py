@@ -204,7 +204,7 @@ def test_handoff_rejects_refetched_message_with_changed_identity(
         assert session.scalar(select(func.count()).select_from(DiscordWakeInbound)) == 0
 
 
-def test_handoff_ignores_unmentioned_prose_without_pending_session_before_persistence(
+def test_handoff_queues_unmentioned_authorized_prose_for_general_harness(
     handoff_app, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     app, settings, engine, queued = handoff_app
@@ -221,18 +221,34 @@ def test_handoff_ignores_unmentioned_prose_without_pending_session_before_persis
     monkeypatch.setattr(
         "app.api.discord_handoff.DiscordAcademicPlannerAdapter.fetch_message", fetch
     )
+
+    async def validate_ack(_adapter, **_kwargs):
+        return DiscordFetchedMessage(
+            id=ACK_ID,
+            channel_id=CHANNEL_ID,
+            author=DiscordFetchedAuthor(id=BOT_ID, bot=True),
+            timestamp=EVENT_TIME,
+            content=SecretStr("wake acknowledgement"),
+        )
+
+    monkeypatch.setattr(
+        "app.api.discord_handoff.DiscordAcademicPlannerAdapter.validate_wake_acknowledgement",
+        validate_ack,
+    )
     body, headers = _signed_request(_message_event(), settings.discord_host_handoff_secret)
     with TestClient(app) as client:
         response = client.post("/internal/discord/academic/handoff", content=body, headers=headers)
 
-    assert response.status_code == 200
-    assert response.json() == {"status": "ignored"}
-    assert queued == []
+    assert response.status_code == 202
+    assert response.json() == {"status": "accepted"}
+    assert len(queued) == 1
     with Session(engine) as session:
-        assert session.scalar(select(func.count()).select_from(DiscordWakeInbound)) == 0
+        row = session.scalar(select(DiscordWakeInbound))
+        assert row is not None
+        assert row.action == "academic_checkin"
 
 
-def test_handoff_persists_owner_scoped_unmentioned_continuation_without_host_ack(
+def test_handoff_requires_visible_acknowledgement_for_every_message(
     handoff_app, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     app, settings, engine, queued = handoff_app
@@ -257,13 +273,10 @@ def test_handoff_persists_owner_scoped_unmentioned_continuation_without_host_ack
     with TestClient(app) as client:
         response = client.post("/internal/discord/academic/handoff", content=body, headers=headers)
 
-    assert response.status_code == 202
-    assert len(queued) == 1
+    assert response.status_code == 422
+    assert queued == []
     with Session(engine) as session:
-        row = session.scalar(select(DiscordWakeInbound))
-        assert row is not None
-        assert row.action == "academic_continuation"
-        assert row.ack_message_id is None
+        assert session.scalar(select(func.count()).select_from(DiscordWakeInbound)) == 0
 
 
 def test_signed_interaction_handoff_contains_no_token_and_queues_reference(

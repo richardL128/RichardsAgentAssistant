@@ -7,6 +7,7 @@ from pathlib import Path
 
 import httpx
 import pytest
+from fastapi.testclient import TestClient
 from pydantic import ValidationError
 from sqlalchemy import create_engine, text
 
@@ -21,6 +22,7 @@ from app.health.checks import (
     check_ollama,
     readiness,
 )
+from app.main import create_app
 
 REPOSITORY_ROOT = Path(__file__).resolve().parents[2]
 
@@ -81,7 +83,7 @@ def test_empty_finance_credentials_are_normalized() -> None:
 def test_qwen_runtime_settings_are_closed_and_bounded() -> None:
     settings = Settings(_env_file=None)
 
-    assert settings.model_trigger_mode == "discord_mentions_only"
+    assert settings.model_trigger_mode == "authorized_discord_channel"
     assert settings.ollama_model_keep_alive_seconds == 300
     assert settings.ollama_startup_timeout_seconds == 30
     with pytest.raises(ValidationError):
@@ -105,12 +107,29 @@ def test_fixed_pdf_page_limit_parses_from_container_environment(monkeypatch) -> 
 def test_default_compose_enables_only_discord_mention_model_triggers() -> None:
     compose = (REPOSITORY_ROOT / "compose.yaml").read_text(encoding="utf-8")
 
-    assert "MODEL_TRIGGER_MODE: ${MODEL_TRIGGER_MODE:-discord_mentions_only}" in compose
+    assert "MODEL_TRIGGER_MODE: ${MODEL_TRIGGER_MODE:-authorized_discord_channel}" in compose
     assert "OLLAMA_MODEL_KEEP_ALIVE_SECONDS" in compose
     assert "OLLAMA_STARTUP_TIMEOUT_SECONDS" in compose
     assert "worker-code-review:" not in compose
     assert "worker-academic-planner:" in compose
     assert "worker-finance:" not in compose
+
+
+def test_default_api_does_not_mount_legacy_model_queue_ingress(tmp_path) -> None:
+    settings = Settings(
+        _env_file=None,
+        database_url=f"sqlite+pysqlite:///{tmp_path / 'model-ingress.db'}",
+        artifact_root=tmp_path / "artifacts",
+    )
+    application = create_app(settings)
+    try:
+        with TestClient(application) as client:
+            handoff = client.post("/internal/discord/academic/handoff")
+            legacy_webhook = client.post("/webhooks/github")
+        assert handoff.status_code != 404
+        assert legacy_webhook.status_code == 404
+    finally:
+        application.state.database.dispose()
 
 
 def test_academic_notion_settings_are_setup_not_startup_requirements() -> None:

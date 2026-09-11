@@ -4,9 +4,9 @@
 # not over-subscribed.
 set -eu
 
-worker_name=${1:-unnamed}
+worker_name=${1:-academic_planner}
 case "$worker_name" in
-  code_review|academic_planner|finance) ;;
+  academic_planner) ;;
   *)
     printf '%s\n' "Unknown LifeAgent worker queue" >&2
     exit 64

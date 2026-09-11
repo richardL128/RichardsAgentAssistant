@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import inspect
 import json
 import re
 from datetime import UTC, date, datetime, timedelta
@@ -44,8 +45,13 @@ from app.agents.academic_planner.material_reasoning import (
     AssessmentMaterialToolCall,
     MorningMaterialGroundingCritique,
 )
+from app.agents.academic_planner.morning_notification import (
+    execute_scheduled_morning_notification,
+    scheduled_delivery_key,
+)
 from app.agents.academic_planner.notion_mutations import DiscoveredAcademicNotionWriter
 from app.agents.academic_planner.retrieval import retrieve_with_academic_repository
+from app.agents.academic_planner.sync import AcademicNotionSyncResult
 from app.agents.academic_planner.workflow import (
     confirm_checkin_proposal,
     create_checkin_proposal,
@@ -65,6 +71,7 @@ from app.connectors.notion import (
     NotionMaterialFile,
     NotionPageTarget,
 )
+from app.core.errors import ErrorCode
 from app.db.academic import (
     AcademicRepository,
     DocumentChunkInput,
@@ -77,15 +84,20 @@ from app.db.models import (
     AcademicProposedChange,
     Base,
     StudyBlock,
+    StudyPlan,
 )
 from app.db.models import (
     Assessment as StoredAssessment,
+)
+from app.db.models import (
+    Delivery as StoredDelivery,
 )
 from app.db.models import (
     FixedCommitment as StoredCommitment,
 )
 from app.db.repositories import RunRepository
 from app.llm.embeddings import EmbeddingStatus
+from app.queue.periodic import PeriodicOccurrence, stable_period_key
 
 TORONTO = ZoneInfo("America/Toronto")
 ACCEPTANCE_CHANNEL_ID = "987654321012345678"
@@ -228,6 +240,259 @@ def _sent_discord_contents(requests: list[httpx.Request]) -> list[str]:
         if isinstance(content, str):
             contents.append(content)
     return contents
+
+
+class _StaticAcademicSync:
+    def __init__(self, result: AcademicNotionSyncResult) -> None:
+        self.result = result
+        self.calls: list[datetime | None] = []
+
+    async def sync(self, *, now: datetime | None = None) -> AcademicNotionSyncResult:
+        self.calls.append(now)
+        return self.result
+
+
+@pytest.mark.asyncio
+async def test_scheduled_morning_notification_uses_fresh_sync_sql_plan_and_discord_once(
+    engine,
+) -> None:
+    occurrence = PeriodicOccurrence(
+        local_time=datetime(2026, 9, 10, 8, 0, tzinfo=TORONTO),
+        scheduled_at=datetime(2026, 9, 10, 8, 0, tzinfo=TORONTO).astimezone(UTC),
+    )
+    period_key = stable_period_key("academic-morning", occurrence)
+    assert "model" not in inspect.signature(execute_scheduled_morning_notification).parameters
+    with Session(engine) as session, session.begin():
+        ece = AcademicRepository.upsert_course(
+            session,
+            notion_id="course-ece250-morning",
+            course_code="ECE 250",
+            title="Data Structures and Algorithms",
+            term="2026F",
+            priority=90,
+        )
+        math = AcademicRepository.upsert_course(
+            session,
+            notion_id="course-math239-morning",
+            course_code="MATH 239",
+            title="Combinatorics",
+            term="2026F",
+            priority=70,
+        )
+        AcademicRepository.upsert_assessment(
+            session,
+            notion_id="morning-ece-quiz-review",
+            course_id=ece.id,
+            title="ECE 250 Quiz 1 review",
+            assessment_type="quiz",
+            due_at=datetime(2026, 9, 11, 10, 0, tzinfo=TORONTO),
+            grade_weight_percent=50,
+            estimated_minutes=45,
+            confidence=1.0,
+            fact_state="confirmed",
+            citation=SourceCitation(block="ece-quiz-row"),
+        )
+        AcademicRepository.upsert_assessment(
+            session,
+            notion_id="morning-math-assignment",
+            course_id=math.id,
+            title="MATH 239 Assignment 2",
+            assessment_type="assignment",
+            due_at=datetime(2026, 9, 12, 20, 0, tzinfo=TORONTO),
+            grade_weight_percent=20,
+            estimated_minutes=60,
+            confidence=1.0,
+            fact_state="confirmed",
+            citation=SourceCitation(block="math-assignment-row"),
+        )
+        AcademicRepository.upsert_preferences(
+            session,
+            scope="default",
+            timezone="America/Toronto",
+            availability={
+                "windows": [
+                    {
+                        "start_at": datetime(2026, 9, 10, 9, 0, tzinfo=TORONTO).isoformat(),
+                        "end_at": datetime(2026, 9, 10, 12, 0, tzinfo=TORONTO).isoformat(),
+                    }
+                ]
+            },
+            daily_capacity_minutes=180,
+            buffer_minutes=0,
+        )
+        run = RunRepository.create_or_get(
+            session,
+            idempotency_key=period_key,
+            agent_name="academic_morning_notification",
+            trigger="schedule",
+            schedule="academic-morning",
+            input_version="academic-morning:v1",
+        )
+        run_id = run.id
+
+    syncer = _StaticAcademicSync(
+        AcademicNotionSyncResult(
+            status="succeeded",
+            course_count=2,
+            valid_course_count=2,
+            assessment_count=2,
+            synced_at=occurrence.scheduled_at,
+        )
+    )
+    store = SQLAlchemyAcademicPlannerStore(engine)
+    requests: list[httpx.Request] = []
+
+    def respond(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        return httpx.Response(
+            200,
+            json={"id": "123456789012345678", "guild_id": "42"},
+            request=request,
+        )
+
+    async with httpx.AsyncClient(
+        base_url="https://discord.com/api/v10",
+        transport=httpx.MockTransport(respond),
+    ) as client:
+        delivery = DiscordAcademicPlannerDelivery(
+            engine=engine,
+            run_id=run_id,
+            channel_id=ACCEPTANCE_CHANNEL_ID,
+            adapter=DiscordAcademicPlannerAdapter(
+                token=SecretStr("discord-token"),
+                allowed_channel_ids={ACCEPTANCE_CHANNEL_ID},
+                client=client,
+            ),
+        )
+        result = await execute_scheduled_morning_notification(
+            store=store,
+            syncer=syncer,
+            delivery=delivery,
+            occurrence=occurrence,
+            period_key=period_key,
+            executed_at=occurrence.scheduled_at,
+            timezone_name="America/Toronto",
+        )
+        replay = await execute_scheduled_morning_notification(
+            store=store,
+            syncer=syncer,
+            delivery=delivery,
+            occurrence=occurrence,
+            period_key=period_key,
+            executed_at=occurrence.scheduled_at,
+            timezone_name="America/Toronto",
+        )
+
+    expected = (
+        "Good morning, Richard. Today's plan for Thursday, September 10, 2026:\n"
+        "- 09:00 — ECE 250 Quiz 1 review (45 minutes, assessment)\n"
+        "- 09:45 — MATH 239 Assignment 2 (60 minutes, assessment)\n"
+        "Have a good day!"
+    )
+    assert result["status"] == "succeeded"
+    assert result["block_count"] == 2
+    assert replay["status"] == "succeeded"
+    assert syncer.calls == [occurrence.scheduled_at, occurrence.scheduled_at]
+    assert len(requests) == 1
+    body = json.loads(requests[0].content)
+    assert body["content"] == expected
+    assert body["allowed_mentions"] == {"parse": []}
+    assert body["enforce_nonce"] is True
+    with Session(engine) as session:
+        plan = session.scalar(select(StudyPlan))
+        assert plan is not None
+        stored_blocks = list(
+            session.scalars(select(StudyBlock).order_by(StudyBlock.starts_at, StudyBlock.title))
+        )
+        deliveries = list(session.scalars(select(StoredDelivery)))
+    assert [row.title for row in stored_blocks] == [
+        "ECE 250 Quiz 1 review",
+        "MATH 239 Assignment 2",
+    ]
+    assert [row.allocated_minutes for row in stored_blocks] == [45, 60]
+    assert [row.block_kind for row in stored_blocks] == ["assessment", "assessment"]
+    assert len(deliveries) == 1
+    assert deliveries[0].idempotency_key == scheduled_delivery_key(period_key, occurrence)
+    assert deliveries[0].status == "sent"
+    assert deliveries[0].attempt_count == 1
+    assert body["nonce"] == deliveries[0].id.hex[:25]
+
+
+@pytest.mark.asyncio
+async def test_scheduled_morning_source_failure_sends_actionable_discord_not_light_day(
+    engine,
+) -> None:
+    occurrence = PeriodicOccurrence(
+        local_time=datetime(2026, 9, 10, 8, 0, tzinfo=TORONTO),
+        scheduled_at=datetime(2026, 9, 10, 8, 0, tzinfo=TORONTO).astimezone(UTC),
+    )
+    period_key = stable_period_key("academic-morning", occurrence)
+    with Session(engine) as session, session.begin():
+        run = RunRepository.create_or_get(
+            session,
+            idempotency_key=period_key,
+            agent_name="academic_morning_notification",
+            trigger="schedule",
+            schedule="academic-morning",
+            input_version="academic-morning:v1",
+        )
+        run_id = run.id
+
+    syncer = _StaticAcademicSync(
+        AcademicNotionSyncResult(
+            status="setup_required",
+            diagnostic_codes=("notion_configuration_missing",),
+            error_code=ErrorCode.SOURCE_SETUP_REQUIRED.value,
+            retryable=False,
+        )
+    )
+    requests: list[httpx.Request] = []
+
+    def respond(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        return httpx.Response(
+            200,
+            json={"id": "123456789012345679", "guild_id": "42"},
+            request=request,
+        )
+
+    async with httpx.AsyncClient(
+        base_url="https://discord.com/api/v10",
+        transport=httpx.MockTransport(respond),
+    ) as client:
+        result = await execute_scheduled_morning_notification(
+            store=SQLAlchemyAcademicPlannerStore(engine),
+            syncer=syncer,
+            delivery=DiscordAcademicPlannerDelivery(
+                engine=engine,
+                run_id=run_id,
+                channel_id=ACCEPTANCE_CHANNEL_ID,
+                adapter=DiscordAcademicPlannerAdapter(
+                    token=SecretStr("discord-token"),
+                    allowed_channel_ids={ACCEPTANCE_CHANNEL_ID},
+                    client=client,
+                ),
+            ),
+            occurrence=occurrence,
+            period_key=period_key,
+            executed_at=occurrence.scheduled_at,
+            timezone_name="America/Toronto",
+        )
+
+    assert result["status"] == "attention"
+    assert result["error_code"] == ErrorCode.SOURCE_SETUP_REQUIRED.value
+    assert result["delivery_count"] == 1
+    assert len(requests) == 1
+    content = json.loads(requests[0].content)["content"]
+    assert "could not refresh the Notion academic source" in content
+    assert "Please check the Notion token, Courses database, and sharing." in content
+    assert "no scheduled study blocks" not in content
+    with Session(engine) as session:
+        assert session.scalar(select(StudyPlan)) is None
+        delivery = session.scalar(select(StoredDelivery))
+    assert delivery is not None
+    assert delivery.idempotency_key.endswith(f"{ErrorCode.SOURCE_SETUP_REQUIRED.value}:v1")
+    assert delivery.status == "sent"
 
 
 @pytest.mark.asyncio

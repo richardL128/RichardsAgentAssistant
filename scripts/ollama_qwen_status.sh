@@ -158,7 +158,13 @@ command_required curl
 command_required launchctl
 command_required python3
 
-echo "ollama_launchd=$(launchd_status "$LIFEAGENT_OLLAMA_LABEL")"
+OLLAMA_LAUNCHD_STATE="$(launchd_status "$LIFEAGENT_OLLAMA_LABEL")"
+echo "ollama_launchd=$OLLAMA_LAUNCHD_STATE"
+OLLAMA_LAUNCHD_STATUS=0
+if [ "$OLLAMA_LAUNCHD_STATE" != "running" ]; then
+  report_launch_agent_failure "$LIFEAGENT_OLLAMA_LABEL"
+  OLLAMA_LAUNCHD_STATUS=1
+fi
 
 TAGS_FILE="$(mktemp -t lifeagent-ollama-tags.XXXXXX)"
 PS_FILE="$(mktemp -t lifeagent-ollama-ps.XXXXXX)"
@@ -185,4 +191,11 @@ if ! fetch_json "$LOCAL_BASE_URL/api/ps" "$PS_FILE"; then
   echo "qwen_resident=unknown"
   exit 4
 fi
+set +e
 model_residency_from_ps "$PS_FILE"
+residency_status="$?"
+set -e
+if [ "$residency_status" -ne 0 ]; then
+  exit "$residency_status"
+fi
+exit "$OLLAMA_LAUNCHD_STATUS"

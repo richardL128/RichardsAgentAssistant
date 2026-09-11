@@ -2,7 +2,7 @@
 
 ## Symptom
 
-An authorized Discord mention has its existing wake acknowledgement edited to
+An authorized private-channel Discord message has its existing wake acknowledgement edited to
 the bounded unavailable response:
 
 ```text
@@ -13,10 +13,10 @@ The operations console or `/health/ready` may also show `ollama=attention` with
 a diagnostic such as `Ollama unavailable`, `configured Ollama model is not
 installed`, or `configured Ollama model digest does not match`.
 
-In the default runtime, Qwen-powered work starts only from an authorized bot
-mention in the configured private Discord academic channel. Replies to an open
-academic clarification also require a verified mention. Startup, health checks,
-all unmentioned prose, and every schedule must not load Qwen.
+In the default runtime, Qwen-powered work starts only from a message sent by an
+authorized owner in the configured private Discord academic channel. A bot
+mention is optional. Startup, health checks, messages from other users or
+channels, and every schedule must not load Qwen.
 
 ## Diagnosis
 
@@ -105,7 +105,7 @@ Qwen is host-managed and lazily loaded. The host Ollama server may already be
 running while the Qwen model is absent from `ollama ps`; this is expected after
 idle unload or a manual unload.
 
-The first authorized mention creates exactly one Discord acknowledgement:
+The first authorized message creates exactly one Discord acknowledgement:
 
 ```text
 I’m waking up LifeAgent and Qwen. Please give me a little time to respond.

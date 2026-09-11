@@ -6,6 +6,7 @@ from datetime import datetime
 from enum import StrEnum
 from uuid import UUID
 
+from langchain_core.messages import AIMessage
 from pydantic import BaseModel, ConfigDict, Field
 
 
@@ -49,6 +50,20 @@ class InvocationResult[ResponseT: BaseModel](BaseModel):
     request_id: UUID
     status: InvocationStatus
     output: ResponseT | None = None
+    raw_text: str = Field(default="", repr=False)
+    telemetry: list[ModelCallTelemetry] = Field(default_factory=lambda: list[ModelCallTelemetry]())
+    error_code: str | None = None
+    error_diagnostic: str | None = None
+
+
+class NativeInvocationResult(BaseModel):
+    """Result of one native chat invocation, preserving model tool calls."""
+
+    model_config = ConfigDict(extra="forbid", arbitrary_types_allowed=True)
+
+    request_id: UUID
+    status: InvocationStatus
+    output: AIMessage | None = None
     raw_text: str = Field(default="", repr=False)
     telemetry: list[ModelCallTelemetry] = Field(default_factory=lambda: list[ModelCallTelemetry]())
     error_code: str | None = None
