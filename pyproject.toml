@@ -22,6 +22,7 @@ dependencies = [
   "sqlalchemy[asyncio]>=2.0.52,<2.1",
   "structlog>=25,<27",
   "uvicorn[standard]>=0.52,<1",
+  "websockets>=16,<17",
 ]
 
 [dependency-groups]

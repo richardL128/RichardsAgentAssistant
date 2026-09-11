@@ -48,7 +48,7 @@ class Settings(BaseSettings):
 
     ollama_base_url: AnyHttpUrl = AnyHttpUrl("http://host.docker.internal:11434")
     ollama_model: str = "qwen3-32gb:latest"
-    model_trigger_mode: Literal["discord_mentions_only"] = "discord_mentions_only"
+    model_trigger_mode: Literal["authorized_discord_channel"] = "authorized_discord_channel"
     ollama_max_concurrency: Annotated[int, Field(gt=0, le=128)] = 1
     ollama_num_ctx: Annotated[int, Field(gt=0)] = 2048
     ollama_num_batch: Annotated[int, Field(ge=32, le=512)] = 32
@@ -149,6 +149,7 @@ class Settings(BaseSettings):
     academic_sync_lookback_days: Annotated[int, Field(ge=0, le=30)] = 2
     academic_confirmation_ttl_hours: Annotated[int, Field(gt=0, le=168)] = 24
     academic_morning_schedule: time = time(hour=8)
+    academic_morning_catchup_grace_minutes: Annotated[int, Field(ge=1, le=180)] = 30
     academic_end_of_day_schedule: time = time(hour=21)
     finance_market_open_schedule: time = time(hour=9)
     finance_feed_poll_minutes: Annotated[int, Field(ge=5, le=10)] = 10

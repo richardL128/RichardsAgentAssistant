@@ -7,15 +7,22 @@ import hashlib
 import inspect
 import json
 import time
+from collections.abc import Mapping, Sequence
 from datetime import UTC, datetime
 from typing import Any, TypeVar
 from uuid import UUID, uuid4
 
+from langchain_core.messages import AIMessage, BaseMessage
 from langchain_ollama import ChatOllama
 from pydantic import BaseModel, ValidationError
 
 from app.core.config import Settings, get_settings
-from app.llm.contracts import InvocationResult, InvocationStatus, ModelCallTelemetry
+from app.llm.contracts import (
+    InvocationResult,
+    InvocationStatus,
+    ModelCallTelemetry,
+    NativeInvocationResult,
+)
 from app.llm.parsing import (
     estimate_tokens,
     parse_model_json,
@@ -50,8 +57,12 @@ class LLMGateway:
         self._model = chat_model if chat_model is not None else model
         if self._model is None:
             self._model = self._build_chat_model()
+            self._native_model = self._build_native_chat_model()
+        else:
+            self._native_model = self._model
         self.model_identity = self._model_identity()
         self.config_version = self._config_version()
+        self.native_config_version = self._config_version(native=True)
 
     async def invoke_structured(
         self,
@@ -149,6 +160,76 @@ class LLMGateway:
             ),
         )
 
+    async def invoke_native(
+        self,
+        *,
+        messages: Sequence[BaseMessage],
+        tools: Sequence[Mapping[str, Any]] = (),
+    ) -> NativeInvocationResult:
+        """Invoke the chat model with native messages and optional tool schemas."""
+
+        request_id = uuid4()
+        input_fingerprint = self._native_input_fingerprint(messages, tools)
+        estimated_input_tokens = estimate_tokens(input_fingerprint)
+        if estimated_input_tokens > self.settings.ollama_max_input_tokens:
+            return self._native_result(
+                request_id=request_id,
+                status=InvocationStatus.FAILED,
+                error_code="input_token_budget_exceeded",
+                error_diagnostic="Messages exceed the configured input token budget.",
+            )
+
+        telemetry: list[ModelCallTelemetry] = []
+        outcome = await self._invoke_native_once(
+            request_id=request_id,
+            attempt=1,
+            messages=messages,
+            tools=tools,
+            input_fingerprint=input_fingerprint,
+            telemetry=telemetry,
+        )
+        if outcome.error_code is not None:
+            return self._native_result(
+                request_id=request_id,
+                status=InvocationStatus.FAILED,
+                telemetry=telemetry,
+                raw_text=outcome.raw_text,
+                error_code=outcome.error_code,
+                error_diagnostic=outcome.error_diagnostic,
+            )
+        if not isinstance(outcome.message, AIMessage):
+            if telemetry:
+                telemetry[-1].error_code = "invalid_native_response"
+            return self._native_result(
+                request_id=request_id,
+                status=InvocationStatus.FAILED,
+                telemetry=telemetry,
+                raw_text=outcome.raw_text,
+                error_code="invalid_native_response",
+                error_diagnostic="Model response was not an AI message.",
+            )
+        if telemetry:
+            telemetry[-1].output_valid = True
+        return self._native_result(
+            request_id=request_id,
+            status=InvocationStatus.VALID,
+            output=outcome.message,
+            telemetry=telemetry,
+            raw_text=outcome.raw_text,
+        )
+
+    async def invoke_tools(
+        self,
+        messages: Sequence[BaseMessage],
+        tools: Sequence[Mapping[str, Any]],
+    ) -> AIMessage:
+        """Harness-facing native invocation with safe failure propagation."""
+
+        result = await self.invoke_native(messages=messages, tools=tools)
+        if result.output is None:
+            raise RuntimeError(result.error_code or "model_error")
+        return result.output
+
     async def _invoke_once(
         self,
         *,
@@ -228,6 +309,87 @@ class LLMGateway:
             error_diagnostic=error_diagnostic,
         )
 
+    async def _invoke_native_once(
+        self,
+        *,
+        request_id: UUID,
+        attempt: int,
+        messages: Sequence[BaseMessage],
+        tools: Sequence[Mapping[str, Any]],
+        input_fingerprint: str,
+        telemetry: list[ModelCallTelemetry],
+    ) -> _NativeCallOutcome:
+        started_at = datetime.now(UTC)
+        started_monotonic = time.monotonic()
+        model_started_at = started_at
+        model_finished_at = started_at
+        model_started_monotonic = started_monotonic
+        model_finished_monotonic = started_monotonic
+        raw_text = ""
+        reported_input: int | None = None
+        reported_output: int | None = None
+        error_code: str | None = None
+        error_diagnostic: str | None = None
+        message: AIMessage | None = None
+        global _active_model_calls, _max_active_model_calls
+        try:
+            async with _MODEL_SEMAPHORE:
+                model_started_at = datetime.now(UTC)
+                model_started_monotonic = time.monotonic()
+                _active_model_calls += 1
+                _max_active_model_calls = max(_max_active_model_calls, _active_model_calls)
+                try:
+                    response = await asyncio.wait_for(
+                        self._native_ainvoke(messages, tools),
+                        timeout=self.settings.ollama_timeout_seconds,
+                    )
+                finally:
+                    model_finished_at = datetime.now(UTC)
+                    model_finished_monotonic = time.monotonic()
+                    _active_model_calls -= 1
+            raw_text = response_text(response)
+            reported_input = reported_token_count(response, input_tokens=True)
+            reported_output = reported_token_count(response, input_tokens=False)
+            message = response if isinstance(response, AIMessage) else None
+        except TimeoutError:
+            error_code = "model_timeout"
+            error_diagnostic = "Model request timed out."
+        except Exception:
+            error_code = "model_error"
+            error_diagnostic = "Model request failed."
+        finished_at = datetime.now(UTC)
+        telemetry.append(
+            ModelCallTelemetry(
+                request_id=request_id,
+                attempt=attempt,
+                model_identity=self.model_identity,
+                config_version=self.native_config_version,
+                started_at=started_at,
+                finished_at=finished_at,
+                model_started_at=model_started_at,
+                model_finished_at=model_finished_at,
+                latency_ms=max(0.0, (time.monotonic() - started_monotonic) * 1000),
+                queue_wait_ms=max(0.0, (model_started_monotonic - started_monotonic) * 1000),
+                model_latency_ms=max(
+                    0.0, (model_finished_monotonic - model_started_monotonic) * 1000
+                ),
+                input_characters=len(input_fingerprint),
+                output_characters=len(raw_text),
+                estimated_input_tokens=estimate_tokens(input_fingerprint),
+                estimated_output_tokens=estimate_tokens(raw_text),
+                reported_input_tokens=reported_input,
+                reported_output_tokens=reported_output,
+                output_valid=False,
+                error_code=error_code,
+            )
+        )
+        return _NativeCallOutcome(
+            message=message,
+            raw_text=raw_text,
+            error_code=error_code,
+            error_diagnostic=error_diagnostic,
+        )
+
     async def _ainvoke(self, prompt: str, response_schema: dict[str, Any]) -> Any:
         invoker = getattr(self._model, "ainvoke", None)
         if invoker is None or not callable(invoker):
@@ -235,6 +397,35 @@ class LLMGateway:
         result = invoker(
             prompt,
             format=response_schema,
+            keep_alive=f"{self.settings.ollama_model_keep_alive_seconds}s",
+            options={
+                "num_ctx": self.settings.ollama_num_ctx,
+                "num_batch": self.settings.ollama_num_batch,
+                "num_predict": self.settings.ollama_max_output_tokens,
+                "temperature": 0.0,
+                "seed": self.settings.ollama_seed,
+            },
+        )
+        if inspect.isawaitable(result):
+            return await result
+        return result
+
+    async def _native_ainvoke(
+        self,
+        messages: Sequence[BaseMessage],
+        tools: Sequence[Mapping[str, Any]],
+    ) -> Any:
+        model = self._native_model
+        if tools:
+            binder = getattr(model, "bind_tools", None)
+            if binder is None or not callable(binder):
+                raise TypeError("chat model does not provide bind_tools")
+            model = binder([dict(tool) for tool in tools])
+        invoker = getattr(model, "ainvoke", None)
+        if invoker is None or not callable(invoker):
+            raise TypeError("chat model does not provide ainvoke")
+        result = invoker(
+            list(messages),
             keep_alive=f"{self.settings.ollama_model_keep_alive_seconds}s",
             options={
                 "num_ctx": self.settings.ollama_num_ctx,
@@ -262,11 +453,24 @@ class LLMGateway:
             async_client_kwargs={"timeout": self.settings.ollama_timeout_seconds},
         )
 
+    def _build_native_chat_model(self) -> ChatOllama:
+        return ChatOllama(
+            model=self.settings.ollama_model,
+            base_url=self.settings.ollama_url,
+            num_ctx=self.settings.ollama_num_ctx,
+            num_predict=self.settings.ollama_max_output_tokens,
+            temperature=0.0,
+            seed=self.settings.ollama_seed,
+            reasoning=self.settings.ollama_reasoning,
+            keep_alive=f"{self.settings.ollama_model_keep_alive_seconds}s",
+            async_client_kwargs={"timeout": self.settings.ollama_timeout_seconds},
+        )
+
     def _model_identity(self) -> str:
         digest = self.settings.ollama_model_digest
         return f"{self.settings.ollama_model}@{digest}" if digest else self.settings.ollama_model
 
-    def _config_version(self) -> str:
+    def _config_version(self, *, native: bool = False) -> str:
         config = {
             "base_url": self.settings.ollama_url,
             "model": self.settings.ollama_model,
@@ -278,11 +482,14 @@ class LLMGateway:
             "timeout_seconds": self.settings.ollama_timeout_seconds,
             "max_input_tokens": self.settings.ollama_max_input_tokens,
             "repair_attempts": self.settings.ollama_repair_attempts,
-            "temperature": 0.0,
-            "seed": self.settings.ollama_seed,
             "reasoning": self.settings.ollama_reasoning,
             "keep_alive_seconds": self.settings.ollama_model_keep_alive_seconds,
+            "native": native,
+            "temperature": 0.0,
+            "seed": self.settings.ollama_seed,
         }
+        if not native:
+            config["format"] = "json"
         serialized = json.dumps(config, sort_keys=True, separators=(",", ":"))
         return hashlib.sha256(serialized.encode("utf-8")).hexdigest()
 
@@ -333,6 +540,19 @@ class LLMGateway:
         )
 
     @staticmethod
+    def _native_input_fingerprint(
+        messages: Sequence[BaseMessage],
+        tools: Sequence[Mapping[str, Any]],
+    ) -> str:
+        payload = {
+            "messages": [
+                message.model_dump(mode="json", exclude_none=True) for message in messages
+            ],
+            "tools": list(tools),
+        }
+        return json.dumps(payload, ensure_ascii=False, separators=(",", ":"), sort_keys=True)
+
+    @staticmethod
     def _result(
         *,
         request_id: UUID,
@@ -353,6 +573,27 @@ class LLMGateway:
             error_diagnostic=error_diagnostic,
         )
 
+    @staticmethod
+    def _native_result(
+        *,
+        request_id: UUID,
+        status: InvocationStatus,
+        output: AIMessage | None = None,
+        telemetry: list[ModelCallTelemetry] | None = None,
+        raw_text: str = "",
+        error_code: str | None = None,
+        error_diagnostic: str | None = None,
+    ) -> NativeInvocationResult:
+        return NativeInvocationResult(
+            request_id=request_id,
+            status=status,
+            output=output,
+            telemetry=telemetry or [],
+            raw_text=raw_text,
+            error_code=error_code,
+            error_diagnostic=error_diagnostic,
+        )
+
 
 class _CallOutcome:
     def __init__(
@@ -362,6 +603,21 @@ class _CallOutcome:
         error_code: str | None,
         error_diagnostic: str | None,
     ) -> None:
+        self.raw_text = raw_text
+        self.error_code = error_code
+        self.error_diagnostic = error_diagnostic
+
+
+class _NativeCallOutcome:
+    def __init__(
+        self,
+        *,
+        message: AIMessage | None,
+        raw_text: str,
+        error_code: str | None,
+        error_diagnostic: str | None,
+    ) -> None:
+        self.message = message
         self.raw_text = raw_text
         self.error_code = error_code
         self.error_diagnostic = error_diagnostic

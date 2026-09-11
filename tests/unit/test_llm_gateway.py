@@ -6,7 +6,7 @@ import asyncio
 from collections.abc import Sequence
 
 import pytest
-from langchain_core.messages import AIMessage
+from langchain_core.messages import AIMessage, HumanMessage, SystemMessage
 from pydantic import BaseModel
 
 from app.core.config import Settings
@@ -36,6 +36,26 @@ class FakeChatModel:
         assert isinstance(options, dict)
         self.options.append(options)
         self.keep_alive.append(kwargs.get("keep_alive"))
+        if self.delay:
+            await asyncio.sleep(self.delay)
+        return next(self.responses)
+
+
+class NativeFakeChatModel:
+    def __init__(self, responses: Sequence[object], *, delay: float = 0.0) -> None:
+        self.responses = iter(responses)
+        self.delay = delay
+        self.bound_tools: list[list[dict[str, object]]] = []
+        self.messages: list[list[object]] = []
+        self.kwargs: list[dict[str, object]] = []
+
+    def bind_tools(self, tools: Sequence[dict[str, object]]) -> NativeFakeChatModel:
+        self.bound_tools.append([dict(tool) for tool in tools])
+        return self
+
+    async def ainvoke(self, messages: Sequence[object], **kwargs: object) -> object:
+        self.messages.append(list(messages))
+        self.kwargs.append(dict(kwargs))
         if self.delay:
             await asyncio.sleep(self.delay)
         return next(self.responses)
@@ -156,3 +176,129 @@ async def test_semaphore_is_shared_across_gateway_instances() -> None:
     assert all(result.status is InvocationStatus.VALID for result in results)
     assert ConcurrentFake.maximum == 1
     assert LLMGateway.concurrency_metrics() == {"active": 0, "peak": 1, "limit": 1}
+
+
+@pytest.mark.asyncio
+async def test_native_invocation_preserves_tool_calls_without_json_forcing() -> None:
+    tool_schema = {
+        "type": "function",
+        "function": {
+            "name": "search_web",
+            "description": "Search the web.",
+            "parameters": {
+                "type": "object",
+                "properties": {"query": {"type": "string"}},
+                "required": ["query"],
+            },
+        },
+    }
+    response = AIMessage(
+        content="",
+        tool_calls=[
+            {
+                "name": "search_web",
+                "args": {"query": "current weather"},
+                "id": "call_1",
+            }
+        ],
+        usage_metadata={"input_tokens": 8, "output_tokens": 4, "total_tokens": 12},
+    )
+    fake = NativeFakeChatModel([response])
+
+    result = await LLMGateway(Settings(), chat_model=fake).invoke_native(
+        messages=[
+            SystemMessage(content="You are a tool-capable assistant."),
+            HumanMessage(content="Search for current weather."),
+        ],
+        tools=[tool_schema],
+    )
+
+    assert result.status is InvocationStatus.VALID
+    assert result.output is response
+    assert result.output.tool_calls[0]["name"] == "search_web"
+    assert result.output.tool_calls[0]["args"] == {"query": "current weather"}
+    assert fake.bound_tools == [[tool_schema]]
+    assert [message.type for message in fake.messages[0]] == ["system", "human"]
+    assert "format" not in fake.kwargs[0]
+    assert fake.kwargs[0]["keep_alive"] == "300s"
+    options = fake.kwargs[0]["options"]
+    assert isinstance(options, dict)
+    assert options["num_batch"] == 32
+    assert options["temperature"] == 0.0
+    assert options["seed"] == 1729
+    assert result.telemetry[0].output_valid is True
+    assert result.telemetry[0].reported_input_tokens == 8
+    assert result.telemetry[0].reported_output_tokens == 4
+
+
+@pytest.mark.asyncio
+async def test_native_invocation_preserves_arbitrary_assistant_content() -> None:
+    content = [
+        {"type": "text", "text": "I can answer directly "},
+        {"type": "text", "text": "without a tool."},
+    ]
+    response = AIMessage(content=content)
+    fake = NativeFakeChatModel([response])
+
+    result = await LLMGateway(Settings(), chat_model=fake).invoke_native(
+        messages=[HumanMessage(content="Just answer normally.")],
+        tools=[],
+    )
+
+    assert result.status is InvocationStatus.VALID
+    assert result.output is response
+    assert result.output.content == content
+    assert result.raw_text == "I can answer directly without a tool."
+    assert fake.bound_tools == []
+
+
+@pytest.mark.asyncio
+async def test_native_input_token_budget_rejects_before_model_call() -> None:
+    fake = NativeFakeChatModel([AIMessage(content="never called")])
+
+    result = await LLMGateway(Settings(ollama_max_input_tokens=1), chat_model=fake).invoke_native(
+        messages=[HumanMessage(content="this native prompt is too long")]
+    )
+
+    assert result.status is InvocationStatus.FAILED
+    assert result.error_code == "input_token_budget_exceeded"
+    assert result.telemetry == []
+    assert fake.messages == []
+
+
+@pytest.mark.asyncio
+async def test_native_input_budget_counts_prior_tool_call_arguments() -> None:
+    fake = NativeFakeChatModel([AIMessage(content="never called")])
+    prior_tool_call = AIMessage(
+        content="I will inspect the supplied query.",
+        tool_calls=[
+            {
+                "id": "call-1",
+                "name": "search",
+                "args": {"query": "large-value " * 100},
+            }
+        ],
+    )
+
+    result = await LLMGateway(Settings(ollama_max_input_tokens=40), chat_model=fake).invoke_native(
+        messages=[HumanMessage(content="search"), prior_tool_call]
+    )
+
+    assert result.status is InvocationStatus.FAILED
+    assert result.error_code == "input_token_budget_exceeded"
+    assert fake.messages == []
+
+
+@pytest.mark.asyncio
+async def test_native_timeout_returns_safe_failure() -> None:
+    fake = NativeFakeChatModel([AIMessage(content="late")], delay=0.05)
+
+    result = await LLMGateway(
+        Settings(ollama_timeout_seconds=0.001), chat_model=fake
+    ).invoke_native(messages=[HumanMessage(content="answer")])
+
+    assert result.status is InvocationStatus.FAILED
+    assert result.error_code == "model_timeout"
+    assert result.error_diagnostic == "Model request timed out."
+    assert len(result.telemetry) == 1
+    assert result.telemetry[0].error_code == "model_timeout"

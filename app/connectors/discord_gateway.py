@@ -14,6 +14,7 @@ from uuid import UUID
 
 import httpx
 from pydantic import BaseModel, ConfigDict, Field, SecretStr, field_validator
+from websockets.exceptions import WebSocketException
 
 DiscordClarificationAction = Literal[
     "quiz",
@@ -253,7 +254,13 @@ class DiscordGatewayListener:
                 await self.run_once()
             except DiscordGatewayReconnectError:
                 await self._sleep(1.0)
-            except (ConnectionError, TimeoutError, httpx.HTTPError, ValueError):
+            except (
+                ConnectionError,
+                TimeoutError,
+                httpx.HTTPError,
+                ValueError,
+                WebSocketException,
+            ):
                 await self._sleep(1.0)
 
     async def run_once(self) -> None:

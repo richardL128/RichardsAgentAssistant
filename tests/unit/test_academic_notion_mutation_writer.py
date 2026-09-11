@@ -6,8 +6,12 @@ from uuid import UUID
 
 import pytest
 
-from app.agents.academic_planner.contracts import AssessmentType, ProposedChange
-from app.agents.academic_planner.notion_mutations import DiscoveredAcademicNotionWriter
+from app.agents.academic_planner.contracts import AssessmentType, CheckinProposal, ProposedChange
+from app.agents.academic_planner.notion_mutations import (
+    DiscoveredAcademicNotionWriter,
+    review_notion_mutation_batch,
+)
+from app.agents.academic_planner.proposal_review import confirm_checkin_proposal
 from app.connectors.notion import NotionWriteReceipt
 from app.core.errors import LifeAgentError
 from app.db.academic import (
@@ -119,6 +123,14 @@ class _Connector:
         return NotionWriteReceipt(proposal_id=str(kwargs["proposal_id"]), page_id="archived-page")
 
 
+def _review(changes):
+    return review_notion_mutation_batch(
+        changes,
+        proposal_id=PROPOSAL_ID,
+        confirmation_event=f"confirm {PROPOSAL_ID}",
+    )
+
+
 @pytest.mark.asyncio
 async def test_confirmed_batch_applies_ordered_create_update_and_archive() -> None:
     connector = _Connector()
@@ -158,6 +170,7 @@ async def test_confirmed_batch_applies_ordered_create_update_and_archive() -> No
         changes,
         proposal_id=PROPOSAL_ID,
         confirmation_event=f"confirm {PROPOSAL_ID}",
+        review=_review(changes),
     )
 
     assert [name for name, _ in connector.calls] == ["create", "update", "archive"]
@@ -191,6 +204,7 @@ async def test_study_create_passes_scheduled_end_and_records_receipt() -> None:
         (change,),  # type: ignore[arg-type]
         proposal_id=PROPOSAL_ID,
         confirmation_event=f"confirm {PROPOSAL_ID}",
+        review=_review((change,)),  # type: ignore[arg-type]
     )
 
     assert connector.calls[0][1]["due"] == starts_at
@@ -226,11 +240,13 @@ async def test_applied_journal_entry_is_not_created_again() -> None:
         (change,),
         proposal_id=PROPOSAL_ID,
         confirmation_event=f"confirm {PROPOSAL_ID}",
+        review=_review((change,)),
     )
     await writer.apply_confirmed_changes(
         (change,),
         proposal_id=PROPOSAL_ID,
         confirmation_event=f"confirm {PROPOSAL_ID}",
+        review=_review((change,)),
     )
 
     assert [name for name, _ in connector.calls] == ["create"]
@@ -276,6 +292,7 @@ async def test_failed_batch_records_completed_and_uncertain_operations() -> None
             changes,
             proposal_id=PROPOSAL_ID,
             confirmation_event=f"confirm {PROPOSAL_ID}",
+            review=_review(changes),
         )
 
     assert targets.operations[(PROPOSAL_ID, 0)]["state"] == "applied"
@@ -286,6 +303,7 @@ async def test_failed_batch_records_completed_and_uncertain_operations() -> None
             changes,
             proposal_id=PROPOSAL_ID,
             confirmation_event=f"confirm {PROPOSAL_ID}",
+            review=_review(changes),
         )
     assert len(connector.calls) == 2
 
@@ -310,9 +328,86 @@ async def test_writer_rejects_tampered_precondition_before_connector_call() -> N
             (change,),
             proposal_id=PROPOSAL_ID,
             confirmation_event=f"confirm {PROPOSAL_ID}",
+            review=_review((change,)),
         )
 
     assert connector.calls == []
+
+
+@pytest.mark.parametrize("field", ["create_assessment", "archive_assessment"])
+@pytest.mark.asyncio
+async def test_create_and_archive_require_hitl_review_before_connector_call(field: str) -> None:
+    connector = _Connector()
+    targets = _Targets()
+    writer = DiscoveredAcademicNotionWriter(
+        connector=connector,  # type: ignore[arg-type]
+        target_store=targets,
+    )
+    change = (
+        ProposedChange(
+            field="create_assessment",
+            value="Create Lab 2 in ECE 202",
+            course_id="course-1",
+            title="Lab 2",
+            due_at=datetime(2026, 9, 10, 21, tzinfo=UTC),
+            assessment_type=AssessmentType.ASSIGNMENT,
+        )
+        if field == "create_assessment"
+        else ProposedChange(
+            field="archive_assessment",
+            value="Archive Old assignment",
+            assessment_id="assessment-1",
+            expected_title="Old assignment",
+            expected_last_edited_at=EDITED_AT,
+        )
+    )
+
+    with pytest.raises(LifeAgentError):
+        await writer.apply_confirmed_changes(
+            (change,),
+            proposal_id=PROPOSAL_ID,
+            confirmation_event=f"confirm {PROPOSAL_ID}",
+        )
+
+    assert connector.calls == []
+    assert targets.operations == {}
+
+
+@pytest.mark.asyncio
+async def test_hitl_review_must_match_exact_ordered_batch_before_connector_call() -> None:
+    connector = _Connector()
+    targets = _Targets()
+    writer = DiscoveredAcademicNotionWriter(
+        connector=connector,  # type: ignore[arg-type]
+        target_store=targets,
+    )
+    create = ProposedChange(
+        field="create_assessment",
+        value="Create Lab 2 in ECE 202",
+        course_id="course-1",
+        title="Lab 2",
+        due_at=datetime(2026, 9, 10, 21, tzinfo=UTC),
+        assessment_type=AssessmentType.ASSIGNMENT,
+    )
+    archive = ProposedChange(
+        field="archive_assessment",
+        value="Archive Old assignment",
+        assessment_id="assessment-1",
+        expected_title="Old assignment",
+        expected_last_edited_at=EDITED_AT,
+    )
+    review = _review((archive, create))
+
+    with pytest.raises(LifeAgentError):
+        await writer.apply_confirmed_changes(
+            (create, archive),
+            proposal_id=PROPOSAL_ID,
+            confirmation_event=f"confirm {PROPOSAL_ID}",
+            review=review,
+        )
+
+    assert connector.calls == []
+    assert targets.operations == {}
 
 
 @pytest.mark.asyncio
@@ -329,3 +424,67 @@ async def test_writer_requires_exact_confirmation() -> None:
             proposal_id=PROPOSAL_ID,
             confirmation_event="confirm another-proposal",
         )
+
+
+@pytest.mark.parametrize("field", ["create_assessment", "archive_assessment"])
+@pytest.mark.asyncio
+async def test_confirmation_workflow_supplies_bound_review_to_configured_writer(
+    field: str,
+) -> None:
+    change = (
+        ProposedChange(
+            field="create_assessment",
+            value="Create Lab 2 in ECE 202",
+            course_id="course-1",
+            title="Lab 2",
+            due_at=datetime(2026, 9, 10, 21, tzinfo=UTC),
+            assessment_type=AssessmentType.ASSIGNMENT,
+        )
+        if field == "create_assessment"
+        else ProposedChange(
+            field="archive_assessment",
+            value="Archive Old assignment",
+            assessment_id="assessment-1",
+            expected_title="Old assignment",
+            expected_last_edited_at=EDITED_AT,
+        )
+    )
+    proposal = CheckinProposal(
+        proposal_id=PROPOSAL_ID,
+        confirmation_event=f"confirm {PROPOSAL_ID}",
+        changes=(change,),
+    )
+
+    class _ProposalStore:
+        applied = False
+
+        def prepare_checkin_application(self, proposal_id, confirmation_event, **_kwargs):
+            assert proposal_id == PROPOSAL_ID
+            assert confirmation_event == proposal.confirmation_event
+            return "ready", proposal
+
+        def mark_checkin_applied(self, proposal_id, confirmation_event=None):
+            assert proposal_id == PROPOSAL_ID
+            assert confirmation_event == proposal.confirmation_event
+            self.applied = True
+
+    connector = _Connector()
+    targets = _Targets()
+    writer = DiscoveredAcademicNotionWriter(
+        connector=connector,  # type: ignore[arg-type]
+        target_store=targets,
+    )
+    store = _ProposalStore()
+
+    result = await confirm_checkin_proposal(
+        store=store,  # type: ignore[arg-type]
+        writer=writer,
+        proposal_id=PROPOSAL_ID,
+        confirmation_event=proposal.confirmation_event,
+    )
+
+    assert result["status"] == "applied"
+    assert store.applied is True
+    assert [name for name, _ in connector.calls] == [
+        "create" if field == "create_assessment" else "archive"
+    ]

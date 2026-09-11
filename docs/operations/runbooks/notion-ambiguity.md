@@ -9,7 +9,7 @@ conflicting weights for a course. The operations console shows the academic
 planner card as `Attention` with a `waiting_for_approval` state.
 
 This runbook covers deterministic academic planning and Discord clarification
-workflow. Assessment material may improve mention-triggered guidance, but it never
+workflow. Assessment material may improve Discord-triggered guidance, but it never
 silently resolves an ambiguous deadline or conflicting weight.
 
 Ambiguous facts must not automatically become hard schedule constraints. The

@@ -7,7 +7,7 @@ import re
 import uuid
 from collections.abc import Callable
 from datetime import timedelta
-from typing import Any, Literal, Protocol, cast
+from typing import Any, Protocol, cast
 
 from app.agents.academic_planner.agent_clarification import (
     AcademicAgentClarificationService,
@@ -21,6 +21,7 @@ from app.agents.academic_planner.agent_loop import (
     route_academic_request,
     run_academic_agent_loop,
 )
+from app.agents.academic_planner.commands import AcademicCommandAction, parse_academic_command
 from app.agents.academic_planner.contracts import (
     AcademicAgentContinuationInput,
     AcademicAgentLoopOutcome,
@@ -28,7 +29,7 @@ from app.agents.academic_planner.contracts import (
     AcademicAgentProgressPhase,
     CheckinProposal,
 )
-from app.agents.academic_planner.workflow import (
+from app.agents.academic_planner.proposal_review import (
     NotionAcademicWriter,
     confirm_checkin_proposal,
     reject_checkin_proposal,
@@ -41,13 +42,6 @@ from app.connectors.discord_gateway import (
 from app.llm.ollama_runtime import OllamaRuntimeReady
 
 _PROPOSAL_NAMESPACE = uuid.UUID("6f7240e2-48d0-44bd-b9bf-a8bd8d9adccc")
-_COMMAND_PATTERN = re.compile(
-    r"(?P<action>confirm|reject) "
-    r"(?P<proposal_id>[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-"
-    r"[89ab][0-9a-f]{3}-[0-9a-f]{12})"
-)
-
-AcademicCommandAction = Literal["confirm", "reject"]
 
 
 class DiscordCheckinStore(Protocol):
@@ -100,18 +94,6 @@ class AcademicMemoryHandler(Protocol):
 
 class AcademicOllamaRuntime(Protocol):
     async def ensure_ready(self) -> OllamaRuntimeReady: ...
-
-
-def parse_academic_command(content: str) -> tuple[AcademicCommandAction, uuid.UUID] | None:
-    """Parse only a lowercase command with one canonical UUID and no extras."""
-
-    match = _COMMAND_PATTERN.fullmatch(content)
-    if match is None:
-        return None
-    proposal_id = uuid.UUID(match.group("proposal_id"))
-    if str(proposal_id) != match.group("proposal_id"):
-        return None
-    return cast(AcademicCommandAction, match.group("action")), proposal_id
 
 
 class AcademicDiscordCheckinHandler:

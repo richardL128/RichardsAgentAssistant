@@ -3,8 +3,9 @@
 from __future__ import annotations
 
 import asyncio
+import math
 import re
-from collections.abc import Mapping, Sequence
+from collections.abc import Awaitable, Callable, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import UTC, date, datetime
 from typing import TYPE_CHECKING, Any, Literal, cast
@@ -37,6 +38,8 @@ if TYPE_CHECKING:
 
 _DISCORD_CONTENT_LIMIT = 2_000
 _DISCORD_NONCE_LIMIT = 25
+_DISCORD_SEND_RATE_LIMIT_MAX_ATTEMPTS = 3
+_DISCORD_SEND_RATE_LIMIT_MAX_TOTAL_SLEEP_SECONDS = 5.0
 _DISCORD_ID_PATTERN = re.compile(r"^[0-9]{5,24}$")
 _ACADEMIC_TIMEZONE_NAME = "America/Toronto"
 _ACADEMIC_TIMEZONE = ZoneInfo(_ACADEMIC_TIMEZONE_NAME)
@@ -81,6 +84,29 @@ def _bounded_discord_content(content: str) -> str:
         return content
     marker = "\n[truncated]"
     return f"{content[: _DISCORD_CONTENT_LIMIT - len(marker)]}{marker}"
+
+
+def _discord_retry_after_seconds(response: httpx.Response) -> float | None:
+    retry_after = response.headers.get("Retry-After")
+    if retry_after is None:
+        try:
+            payload = response.json()
+        except ValueError:
+            return None
+        if not isinstance(payload, Mapping):
+            return None
+        retry_payload = cast(Mapping[str, object], payload)
+        raw_retry_after: object | None = retry_payload.get("retry_after")
+        retry_after = str(raw_retry_after) if raw_retry_after is not None else None
+    if retry_after is None:
+        return None
+    try:
+        seconds = float(retry_after)
+    except ValueError:
+        return None
+    if not math.isfinite(seconds) or seconds < 0:
+        return None
+    return seconds
 
 
 class FailureAlert(BaseModel):
@@ -612,11 +638,13 @@ class DiscordAcademicPlannerAdapter:
         allowed_channel_ids: set[str],
         base_url: str = DISCORD_API_BASE_URL,
         client: httpx.AsyncClient | None = None,
+        rate_limit_sleep: Callable[[float], Awaitable[None]] | None = None,
     ) -> None:
         self._token = token
         self._allowed_channel_ids = frozenset(allowed_channel_ids)
         self._base_url = base_url.rstrip("/")
         self._client = client
+        self._rate_limit_sleep = rate_limit_sleep or asyncio.sleep
 
     async def fetch_message(
         self,
@@ -697,31 +725,59 @@ class DiscordAcademicPlannerAdapter:
             base_url=self._base_url,
             timeout=httpx.Timeout(10.0),
         )
+        request_json: dict[str, object] = {
+            "content": message.content,
+            "nonce": _discord_nonce(message.delivery_id),
+            "enforce_nonce": True,
+            "allowed_mentions": {"parse": []},
+        }
+        slept_seconds = 0.0
         try:
-            response = await client.post(
-                f"/channels/{message.channel_id}/messages",
-                headers={"Authorization": f"Bot {self._token.get_secret_value()}"},
-                json={
-                    "content": message.content,
-                    "nonce": _discord_nonce(message.delivery_id),
-                    "enforce_nonce": True,
-                    "allowed_mentions": {"parse": []},
-                },
-            )
-            try:
-                response.raise_for_status()
-            except httpx.HTTPStatusError as exc:
-                if exc.response.status_code in {401, 403}:
-                    raise authorization_error("Discord academic authorization is invalid") from None
-                if exc.response.status_code == 429 or exc.response.status_code >= 500:
-                    raise transient_error(
-                        ErrorCode.CONNECTOR_TRANSIENT,
-                        "Discord academic endpoint is temporarily unavailable",
+            for attempt in range(1, _DISCORD_SEND_RATE_LIMIT_MAX_ATTEMPTS + 1):
+                response = await client.post(
+                    f"/channels/{message.channel_id}/messages",
+                    headers={"Authorization": f"Bot {self._token.get_secret_value()}"},
+                    json=request_json,
+                )
+                try:
+                    response.raise_for_status()
+                except httpx.HTTPStatusError as exc:
+                    if exc.response.status_code in {401, 403}:
+                        raise authorization_error(
+                            "Discord academic authorization is invalid"
+                        ) from None
+                    if exc.response.status_code == 429:
+                        retry_after = _discord_retry_after_seconds(exc.response)
+                        remaining_sleep = (
+                            _DISCORD_SEND_RATE_LIMIT_MAX_TOTAL_SLEEP_SECONDS - slept_seconds
+                        )
+                        if (
+                            retry_after is None
+                            or retry_after > remaining_sleep
+                            or attempt >= _DISCORD_SEND_RATE_LIMIT_MAX_ATTEMPTS
+                        ):
+                            raise transient_error(
+                                ErrorCode.CONNECTOR_TRANSIENT,
+                                "Discord academic endpoint is temporarily rate limited",
+                            ) from None
+                        await self._rate_limit_sleep(retry_after)
+                        slept_seconds += retry_after
+                        continue
+                    if exc.response.status_code >= 500:
+                        raise transient_error(
+                            ErrorCode.CONNECTOR_TRANSIENT,
+                            "Discord academic endpoint is temporarily unavailable",
+                        ) from None
+                    raise permanent_error(
+                        ErrorCode.INPUT_INVALID,
+                        "Discord rejected the academic message request",
                     ) from None
-                raise permanent_error(
-                    ErrorCode.INPUT_INVALID,
-                    "Discord rejected the academic message request",
-                ) from None
+                break
+            else:
+                raise transient_error(
+                    ErrorCode.CONNECTOR_TRANSIENT,
+                    "Discord academic endpoint is temporarily rate limited",
+                )
             try:
                 payload = response.json()
             except ValueError:
@@ -976,6 +1032,16 @@ class DiscordAcademicPlannerDelivery:
         """Deliver only the validated model-written morning briefing text."""
 
         return await self._send(_bounded_discord_content(briefing.message_text), idempotency_key)
+
+    async def send_scheduled_notification(
+        self,
+        content: str,
+        *,
+        idempotency_key: str,
+    ) -> Delivery:
+        """Deliver one deterministic scheduled academic notification."""
+
+        return await self._send(_bounded_discord_content(content), idempotency_key)
 
     async def send_checkin(self, *, plan: Any | None, idempotency_key: str) -> Delivery:
         content = (
@@ -1977,6 +2043,8 @@ def _record_review_attempt(
             external_url=external_url,
             error_code=error_code,
         )
+        delivery.error_code = error_code
+        session.flush()
         session.expunge(delivery)
         return delivery
 

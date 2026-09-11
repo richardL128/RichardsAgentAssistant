@@ -25,6 +25,11 @@ class ErrorCode(StrEnum):
     ANALYSIS_INVALID_OUTPUT = "analysis_invalid_output"
     DELIVERY_UNCERTAIN = "delivery_uncertain"
     SCHEDULE_LATE = "schedule_late"
+    SOURCE_SETUP_REQUIRED = "source_setup_required"
+    SOURCE_SYNC_FAILED = "source_sync_failed"
+    SOURCE_SYNC_PARTIAL = "source_sync_partial"
+    SOURCE_STALE = "source_stale"
+    DELIVERY_CONTENT_TOO_LONG = "delivery_content_too_long"
     INTERNAL = "internal"
 
 

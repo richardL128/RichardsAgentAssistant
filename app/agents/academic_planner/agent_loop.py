@@ -4,14 +4,10 @@ from __future__ import annotations
 
 import json
 from collections.abc import Mapping, Sequence
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, datetime
 from typing import Any, Protocol, cast
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
-from app.agents.academic_planner.classification import (
-    AssessmentKind,
-    canonical_assessment_title,
-)
 from app.agents.academic_planner.contracts import (
     AcademicAgentContinuationInput,
     AcademicAgentDecision,
@@ -25,7 +21,6 @@ from app.agents.academic_planner.contracts import (
     AcademicCourseOption,
     AcademicRequestRouteDecision,
     ArchiveAssessmentCall,
-    AssessmentType,
     CreateAssessmentCall,
     CreateStudySessionCall,
     ProposedChange,
@@ -33,17 +28,14 @@ from app.agents.academic_planner.contracts import (
     SearchCoursesCall,
     UpdateAssessmentCall,
 )
+from app.agents.academic_planner.proposal_validation import (
+    HOST_VALIDATION_ERRORS,
+    MAX_PROPOSED_MUTATIONS,
+    proposed_changes_from_calls,
+)
 
 MAX_AGENT_TURNS = 10
 MAX_AGENT_ATTEMPTS = 3
-MAX_PROPOSED_MUTATIONS = 20
-
-_STUDY_COURSE_UNVERIFIED = "I could not verify the course for a requested study session."
-_STUDY_ONE_COURSE_REQUIRED = "A study-session request must resolve to exactly one course."
-_STUDY_START_FUTURE_REQUIRED = "Study sessions must start in the future."
-_STUDY_DURATION_INVALID = "Study sessions must be between 5 and 240 minutes."
-_STUDY_DUPLICATE = "Duplicate study-session blocks were not accepted."
-_STUDY_ORDER_INVALID = "Study-session blocks must be ordered and must not overlap."
 
 
 class AcademicAgentCatalog(Protocol):
@@ -296,7 +288,7 @@ async def run_academic_agent_loop(
                 model_turn=turn,
                 model_turn_limit=max_turns,
             )
-            changes, question = _proposed_changes(
+            changes, question = proposed_changes_from_calls(
                 mutation_calls,
                 known_courses=known_courses,
                 known_assessments=known_assessments,
@@ -482,18 +474,7 @@ def _proposal_outcome(
 ) -> AcademicAgentLoopOutcome:
     if changes and question is None:
         return AcademicAgentLoopOutcome.PROPOSAL_READY
-    if question in {
-        "That request includes too many changes; please split it up.",
-        "I could not verify the course for a requested new assessment.",
-        "I could not verify the assessment id for a requested change.",
-        "That assessment is missing the metadata required for a safe change.",
-        _STUDY_COURSE_UNVERIFIED,
-        _STUDY_ONE_COURSE_REQUIRED,
-        _STUDY_START_FUTURE_REQUIRED,
-        _STUDY_DURATION_INVALID,
-        _STUDY_DUPLICATE,
-        _STUDY_ORDER_INVALID,
-    }:
+    if question in HOST_VALIDATION_ERRORS:
         return AcademicAgentLoopOutcome.HOST_VALIDATION_FAILED
     return AcademicAgentLoopOutcome.CLARIFICATION_REQUIRED
 
@@ -547,139 +528,6 @@ def _apply_read_calls(
             }
         )
     return None
-
-
-def _proposed_changes(
-    calls: Sequence[
-        CreateAssessmentCall | CreateStudySessionCall | UpdateAssessmentCall | ArchiveAssessmentCall
-    ],
-    *,
-    known_courses: Mapping[str, AcademicCourseOption],
-    known_assessments: Mapping[str, AcademicAssessmentOption],
-    now: datetime,
-) -> tuple[tuple[ProposedChange, ...], str | None]:
-    if len(calls) > MAX_PROPOSED_MUTATIONS:
-        return (), "That request includes too many changes; please split it up."
-
-    study_calls = tuple(call for call in calls if isinstance(call, CreateStudySessionCall))
-    if study_calls:
-        failed = _validate_study_session_calls(
-            study_calls,
-            known_courses=known_courses,
-            now=now,
-        )
-        if failed is not None:
-            return (), failed
-
-    changes: list[ProposedChange] = []
-    for call in calls:
-        if isinstance(call, CreateStudySessionCall):
-            course = known_courses[call.course_id]
-            title = canonical_assessment_title(AssessmentKind.STUDYING_BLOCK, call.topic)
-            starts_at = call.starts_at
-            changes.append(
-                ProposedChange(
-                    field="create_assessment",
-                    value=title,
-                    course_id=call.course_id,
-                    course_code=course.course_code,
-                    title=title,
-                    due_at=starts_at,
-                    ends_at=starts_at + timedelta(minutes=call.duration_minutes),
-                    assessment_type=AssessmentType.STUDYING_BLOCK,
-                )
-            )
-            continue
-
-        if isinstance(call, CreateAssessmentCall):
-            if call.course_id not in known_courses:
-                return (), "I could not verify the course for a requested new assessment."
-            title = _created_title(call)
-            changes.append(
-                ProposedChange(
-                    field="create_assessment",
-                    value=title,
-                    course_id=call.course_id,
-                    course_code=known_courses[call.course_id].course_code,
-                    title=title,
-                    due_at=call.due_at,
-                    assessment_type=AssessmentType(call.assessment_type.value),
-                )
-            )
-            continue
-
-        if call.assessment_id not in known_assessments:
-            return (), "I could not verify the assessment id for a requested change."
-        existing = known_assessments[call.assessment_id]
-        if existing.expected_last_edited_at is None:
-            return (), "That assessment is missing the metadata required for a safe change."
-        if isinstance(call, UpdateAssessmentCall):
-            changes.append(
-                ProposedChange(
-                    field="update_assessment",
-                    value="update_assessment",
-                    assessment_id=call.assessment_id,
-                    title=call.title,
-                    due_at=call.due_at,
-                    expected_title=existing.title,
-                    expected_last_edited_at=existing.expected_last_edited_at,
-                )
-            )
-            continue
-
-        changes.append(
-            ProposedChange(
-                field="archive_assessment",
-                value="archive_assessment",
-                assessment_id=call.assessment_id,
-                expected_title=existing.title,
-                expected_last_edited_at=existing.expected_last_edited_at,
-            )
-        )
-
-    if not changes:
-        return (), "I need at least one supported academic change before creating a proposal."
-    return tuple(changes), None
-
-
-def _validate_study_session_calls(
-    calls: Sequence[CreateStudySessionCall],
-    *,
-    known_courses: Mapping[str, AcademicCourseOption],
-    now: datetime,
-) -> str | None:
-    if any(call.course_id not in known_courses for call in calls):
-        return _STUDY_COURSE_UNVERIFIED
-    if len({call.course_id for call in calls}) != 1:
-        return _STUDY_ONE_COURSE_REQUIRED
-
-    seen: set[tuple[str, datetime]] = set()
-    for call in calls:
-        if call.starts_at <= now:
-            return _STUDY_START_FUTURE_REQUIRED
-        if call.duration_minutes < 5 or call.duration_minutes > 240:
-            return _STUDY_DURATION_INVALID
-        key = (" ".join(call.topic.casefold().split()), call.starts_at)
-        if key in seen:
-            return _STUDY_DUPLICATE
-        seen.add(key)
-
-    if not _calls_are_ordered_and_non_overlapping(calls):
-        return _STUDY_ORDER_INVALID
-    return None
-
-
-def _calls_are_ordered_and_non_overlapping(calls: Sequence[CreateStudySessionCall]) -> bool:
-    previous_end: datetime | None = None
-    for call in calls:
-        if previous_end is not None and call.starts_at < previous_end:
-            return False
-        previous_end = call.starts_at + timedelta(minutes=call.duration_minutes)
-    return True
-
-
-def _created_title(call: CreateAssessmentCall) -> str:
-    return canonical_assessment_title(call.assessment_type.value, call.title)
 
 
 def _build_prompt(
@@ -819,6 +667,7 @@ __all__ = [
     "AcademicAgentCatalog",
     "AcademicAgentGateway",
     "AcademicAgentProgressSink",
+    "proposed_changes_from_calls",
     "route_academic_request",
     "run_academic_agent_loop",
 ]

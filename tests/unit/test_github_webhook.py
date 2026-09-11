@@ -9,9 +9,11 @@ from pathlib import Path
 
 import httpx
 import pytest
+from pydantic import SecretStr
 from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
+from app.api.github import router as github_router
 from app.core.config import Settings
 from app.db.models import AgentRun, Base, ReviewedCommit
 from app.main import create_app
@@ -55,11 +57,19 @@ def _settings(tmp_path: Path) -> Settings:
         artifact_root=tmp_path / "artifacts",
         github_app_id=1,
         github_installation_id=12345,
-        github_private_key="configured-but-not-used-by-intake",
-        github_webhook_secret="webhook-secret",
+        github_private_key=SecretStr("configured-but-not-used-by-intake"),
+        github_webhook_secret=SecretStr("webhook-secret"),
         repository_allowlist=[REPOSITORY],
         repository_allowlist_version="fixture-v1",
     )
+
+
+def _app(settings: Settings):
+    """Mount the planned webhook explicitly; the configured app leaves it disabled."""
+
+    application = create_app(settings)
+    application.include_router(github_router)
+    return application
 
 
 @pytest.mark.asyncio
@@ -67,7 +77,7 @@ async def test_signed_push_is_durable_and_repository_sha_replay_is_deduplicated(
     tmp_path: Path,
 ) -> None:
     settings = _settings(tmp_path)
-    app = create_app(settings)
+    app = _app(settings)
     Base.metadata.create_all(app.state.database.engine)
     queued: list[tuple[str, str]] = []
 
@@ -98,7 +108,7 @@ async def test_signed_push_is_durable_and_repository_sha_replay_is_deduplicated(
 @pytest.mark.asyncio
 async def test_signature_failure_and_oversize_body_never_create_a_run(tmp_path: Path) -> None:
     settings = _settings(tmp_path).model_copy(update={"github_webhook_max_body_bytes": 64})
-    app = create_app(settings)
+    app = _app(settings)
     Base.metadata.create_all(app.state.database.engine)
     app.state.enqueue_code_review = pytest.fail
     body = _payload()
@@ -127,7 +137,7 @@ async def test_signature_failure_and_oversize_body_never_create_a_run(tmp_path: 
 
 @pytest.mark.asyncio
 async def test_unconfigured_endpoint_fails_closed(tmp_path: Path) -> None:
-    app = create_app(
+    app = _app(
         Settings(
             database_url=f"sqlite+pysqlite:///{tmp_path / 'unconfigured.db'}",
             artifact_root=tmp_path,
@@ -144,7 +154,7 @@ async def test_unconfigured_endpoint_fails_closed(tmp_path: Path) -> None:
 @pytest.mark.asyncio
 async def test_high_risk_push_is_durably_marked_for_quick_scan(tmp_path: Path) -> None:
     settings = _settings(tmp_path)
-    app = create_app(settings)
+    app = _app(settings)
     Base.metadata.create_all(app.state.database.engine)
 
     async def enqueue(_: str, __: str) -> int:

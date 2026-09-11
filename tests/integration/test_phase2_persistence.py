@@ -560,7 +560,7 @@ async def test_transient_retries_record_attempts_but_invalid_token_does_not(
     assert operational_health.rule == "connector_unauthenticated"
 
 
-async def test_finance_approval_gate_persists_attention_health(
+async def test_historical_finance_approval_gate_persists_attention_without_schedule(
     postgres_engine: Engine,
 ) -> None:
     key = f"finance:{uuid.uuid4()}:v1"
@@ -596,7 +596,9 @@ async def test_finance_approval_gate_persists_attention_health(
     assert health is not None
     assert health.state == "attention"
     assert health.rule == "waiting_for_approval"
-    assert health.next_due_at is not None
+    # Historical runs remain auditable, but the event-driven runtime does not
+    # schedule another finance model run.
+    assert health.next_due_at is None
 
 
 def test_failed_and_stalled_jobs_are_visible_without_job_arguments(

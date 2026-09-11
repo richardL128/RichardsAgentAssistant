@@ -4,14 +4,9 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
-from app.agents.academic_planner.agent_clarification import (
-    AGENT_CONTEXT_DATA_CLASS,
-    AcademicAgentClarificationService,
-)
-from app.agents.academic_planner.discord_checkin import AcademicDiscordCheckinHandler
-from app.agents.academic_planner.memory_workflow import AcademicMemoryService
+from app.agents.academic_planner.discord_harness import NativeAcademicDiscordHandler
 from app.agents.academic_planner.notion_mutations import DiscoveredAcademicNotionWriter
-from app.artifacts.store import ArtifactStore
+from app.agents.academic_planner.sync import AcademicNotionSync
 from app.connectors.discord import (
     DiscordAcademicPlannerAdapter,
     DiscordAcademicResponseDelivery,
@@ -21,7 +16,6 @@ from app.core.config import Settings, get_settings
 from app.core.errors import LifeAgentError
 from app.db.academic import SQLAlchemyAcademicPlannerStore
 from app.db.session import Database
-from app.llm.embeddings import AcademicEmbeddingGateway
 from app.llm.gateway import LLMGateway
 from app.llm.ollama_runtime import OllamaRuntime
 
@@ -30,7 +24,7 @@ from app.llm.ollama_runtime import OllamaRuntime
 class AcademicDiscordService:
     """Worker-owned handler and database lifetime."""
 
-    handler: AcademicDiscordCheckinHandler
+    handler: NativeAcademicDiscordHandler
     database: Database
 
     def close(self) -> None:
@@ -60,40 +54,10 @@ def create_academic_discord_service(
 
     database = Database(app_settings)
     gateway = LLMGateway(app_settings)
-    embedding_gateway = AcademicEmbeddingGateway(app_settings)
     store = SQLAlchemyAcademicPlannerStore(
         database.engine,
         confirmation_ttl_hours=app_settings.academic_confirmation_ttl_hours,
-        embedding_gateway=embedding_gateway,
         default_practice_minutes=app_settings.academic_memory_default_practice_minutes,
-    )
-    context_retention_days = max(
-        1,
-        (app_settings.academic_confirmation_ttl_hours + 23) // 24,
-    )
-    clarification_service = AcademicAgentClarificationService(
-        engine=database.engine,
-        artifact_store=ArtifactStore(
-            app_settings.artifact_root,
-            retention_days_by_class={
-                AGENT_CONTEXT_DATA_CLASS: context_retention_days,
-            },
-            default_retention_days=app_settings.artifact_retention_days,
-        ),
-        session_ttl_hours=app_settings.academic_confirmation_ttl_hours,
-    )
-    memory_service = (
-        AcademicMemoryService(
-            store=store,
-            model_gateway=gateway,
-            embedding_gateway=embedding_gateway,
-            timezone=app_settings.app_timezone,
-            default_practice_minutes=app_settings.academic_memory_default_practice_minutes,
-            end_of_day_time=app_settings.academic_end_of_day_schedule,
-            session_ttl_hours=app_settings.academic_confirmation_ttl_hours,
-        )
-        if app_settings.academic_memory_enabled
-        else None
     )
     adapter = DiscordAcademicPlannerAdapter(
         token=token,
@@ -105,7 +69,24 @@ def create_academic_discord_service(
         channel_id=channel_id,
         adapter=adapter,
     )
+    notion_setup_condition = "notion_configuration_missing"
     notion_connector = _create_notion_connector(app_settings)
+    if (
+        notion_connector is None
+        and app_settings.notion_token is not None
+        and app_settings.notion_courses_database_id is not None
+    ):
+        notion_setup_condition = "notion_configuration_invalid"
+    catalog_syncer = AcademicNotionSync(
+        connector=notion_connector,
+        store=store,
+        discord=None,
+        discord_channel_id=None,
+        timezone=app_settings.app_timezone,
+        clarification_ttl_hours=app_settings.academic_confirmation_ttl_hours,
+        setup_condition_code=notion_setup_condition,
+        material_enqueuer=None,
+    )
     writer = (
         DiscoveredAcademicNotionWriter(
             connector=notion_connector,
@@ -114,7 +95,7 @@ def create_academic_discord_service(
         if notion_connector is not None
         else None
     )
-    handler = AcademicDiscordCheckinHandler(
+    handler = NativeAcademicDiscordHandler(
         store=store,
         delivery=delivery,
         allowed_channel_ids={channel_id},
@@ -122,12 +103,14 @@ def create_academic_discord_service(
         writer_provider=lambda: writer,
         ollama_runtime=OllamaRuntime(app_settings),
         agent_gateway=gateway,
-        semantic_router_gateway=gateway,
         agent_catalog=store,
         assistant_user_id=application_id,
+        catalog_syncer=catalog_syncer,
+        catalog_sync_timeout_seconds=min(
+            60.0,
+            max(5.0, app_settings.connector_timeout_seconds * 3),
+        ),
         timezone=app_settings.app_timezone,
-        memory_service=memory_service,
-        agent_clarification_service=clarification_service,
     )
     return AcademicDiscordService(handler=handler, database=database)
 

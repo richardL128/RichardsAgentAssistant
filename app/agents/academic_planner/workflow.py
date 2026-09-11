@@ -30,6 +30,11 @@ from app.agents.academic_planner.contracts import (
     ProposedChange,
     WorkBreakdown,
 )
+from app.agents.academic_planner.proposal_review import (
+    NotionAcademicWriter,
+    confirm_checkin_proposal,
+    reject_checkin_proposal,
+)
 from app.core.errors import ErrorCode, transient_error
 
 TORONTO = ZoneInfo("America/Toronto")
@@ -145,18 +150,6 @@ class AcademicPlannerStore(Protocol):
         actor: str = "academic_planner",
         now: datetime | None = None,
     ) -> tuple[str, CheckinProposal | None]: ...
-
-
-class NotionAcademicWriter(Protocol):
-    """Narrow write seam; only exact confirmed changes reach this protocol."""
-
-    async def apply_confirmed_changes(
-        self,
-        changes: Sequence[ProposedChange],
-        *,
-        proposal_id: uuid.UUID,
-        confirmation_event: str,
-    ) -> None: ...
 
 
 class PlannerModelGateway(Protocol):
@@ -1019,87 +1012,6 @@ async def run_end_of_day_checkin(
         "focus_review_count": sum(item.get("kind") != "deleted" for item in focus_updates),
         "focus_deleted_count": sum(item.get("kind") == "deleted" for item in focus_updates),
     }
-
-
-async def confirm_checkin_proposal(
-    *,
-    store: AcademicPlannerStore,
-    writer: NotionAcademicWriter,
-    proposal_id: uuid.UUID,
-    confirmation_event: str,
-    now: datetime | None = None,
-) -> dict[str, object]:
-    """Apply changes only when the confirmation event matches byte-for-byte."""
-
-    if confirmation_event != f"confirm {proposal_id}":
-        return {"status": "confirmation_required", "proposal_id": str(proposal_id)}
-
-    if now is None:
-        status, proposal = store.prepare_checkin_application(proposal_id, confirmation_event)
-    else:
-        status, proposal = store.prepare_checkin_application(
-            proposal_id, confirmation_event, now=now
-        )
-    if status == "not_found" or proposal is None:
-        return {"status": "not_found", "proposal_id": str(proposal_id)}
-    if status in {"confirmation_required", "expired"}:
-        return {"status": "confirmation_required", "proposal_id": str(proposal_id)}
-    if status == "already_applied":
-        return {
-            "status": "applied",
-            "proposal_id": str(proposal_id),
-            "change_count": len(proposal.changes),
-        }
-    if status == "in_progress":
-        return {"status": "confirmation_required", "proposal_id": str(proposal_id)}
-    if status != "ready":
-        raise RuntimeError("academic proposal entered an unknown confirmation state")
-    await writer.apply_confirmed_changes(
-        proposal.changes,
-        proposal_id=proposal_id,
-        confirmation_event=confirmation_event,
-    )
-    store.mark_checkin_applied(proposal_id, confirmation_event)
-    return {
-        "status": "applied",
-        "proposal_id": str(proposal_id),
-        "change_count": len(proposal.changes),
-    }
-
-
-def reject_checkin_proposal(
-    *,
-    store: AcademicPlannerStore,
-    proposal_id: uuid.UUID,
-    rejection_event: str,
-    now: datetime | None = None,
-) -> dict[str, object]:
-    """Terminally reject exactly one pending proposal without an external write."""
-
-    if rejection_event != f"reject {proposal_id}":
-        return {"status": "rejection_required", "proposal_id": str(proposal_id)}
-    if now is None:
-        status, proposal = store.reject_checkin_proposal(
-            proposal_id,
-            actor="discord_authorized_user",
-        )
-    else:
-        status, proposal = store.reject_checkin_proposal(
-            proposal_id,
-            actor="discord_authorized_user",
-            now=now,
-        )
-    if proposal is None:
-        status = "not_found"
-    elif status not in {"rejected", "already_rejected"}:
-        status = "rejection_required"
-    result: dict[str, object] = {
-        "status": status,
-        "proposal_id": str(proposal_id),
-    }
-    if proposal is not None:
-        result["change_count"] = len(proposal.changes)
-    return result
 
 
 async def run_academic_planner(run_id: str, idempotency_key: str) -> dict[str, object]:

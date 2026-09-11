@@ -1,4 +1,4 @@
-"""Named Procrastinate task entry points for the three isolated workers."""
+"""Named Procrastinate task entry points for the academic worker."""
 
 from __future__ import annotations
 
@@ -39,13 +39,12 @@ from app.health.checks import (
 )
 from app.health.evaluator import DeliveryStatus as HealthDeliveryStatus
 from app.health.evaluator import OperationalFacts, OperationalHealth, ProcessingStatus
-from app.health.service import evaluate_and_persist
-from app.queue.app import JOB_KINDS, default_retry_strategy, procrastinate_app
+from app.health.service import evaluate_academic_morning_health, evaluate_and_persist
+from app.queue.app import default_retry_strategy, procrastinate_app
 from app.queue.execution import execute_recorded_attempt
 from app.queue.idempotency import build_idempotency_key, validate_idempotency_key
 from app.queue.periodic import PeriodicOccurrence, TorontoPeriodicSchedule, stable_period_key
 
-TaskHandler = Callable[[str, str], Awaitable[dict[str, Any]]]
 AcademicClarificationAction = Literal[
     "quiz",
     "assignment",
@@ -64,14 +63,19 @@ AcademicClarificationStatusHandler = Callable[
 ]
 AcademicMaterialIngestionHandler = Callable[[str, str], Awaitable[dict[str, object]]]
 DiscordWakeHandler = Callable[[str, int, int], Awaitable[dict[str, Any]]]
-_handlers: dict[str, TaskHandler] = {}
+AcademicMorningNotificationHandler = Callable[
+    [str, str, str, int, int],
+    Awaitable[dict[str, Any]],
+]
 _academic_clarification_handler: AcademicClarificationHandler | None = None
 _academic_clarification_status_handler: AcademicClarificationStatusHandler | None = None
 _academic_material_ingestion_handler: AcademicMaterialIngestionHandler | None = None
 _discord_wake_handler: DiscordWakeHandler | None = None
+_academic_morning_notification_handler: AcademicMorningNotificationHandler | None = None
 _database = Database(get_settings())
 _MODEL_LOCK = "ollama:exclusive"
 _ACADEMIC_CLARIFICATION_LOCK_PREFIX = "academic-clarification"
+_ACADEMIC_MORNING_SCHEDULE_NAME = "academic-morning"
 _MATERIAL_PAGE_ID = re.compile(r"\A[A-Za-z0-9_-]{1,128}\Z")
 _SHA256_HEX = re.compile(r"\A[0-9a-f]{64}\Z")
 
@@ -92,19 +96,9 @@ class FailureAlertSender(Protocol):
     ) -> Awaitable[Delivery]: ...
 
 
-def register_task_handler(job_kind: str, handler: TaskHandler) -> None:
-    """Register a workflow handler during worker startup, not module import."""
-
-    if job_kind not in JOB_KINDS:
-        raise ValueError(f"unknown job kind: {job_kind}")
-    _handlers[job_kind] = handler
-
-
 def register_academic_clarification_handler(handler: AcademicClarificationHandler) -> None:
     """Register the Discord clarification apply handler during worker startup."""
 
-    if JOB_KINDS.get("academic_clarification") != "academic_planner":
-        raise ValueError("academic clarification job is not routed to academic_planner")
     global _academic_clarification_handler
     _academic_clarification_handler = handler
 
@@ -114,8 +108,6 @@ def register_academic_clarification_status_handler(
 ) -> None:
     """Register the Discord clarification status-edit handler during worker startup."""
 
-    if JOB_KINDS.get("academic_clarification_status") != "academic_planner":
-        raise ValueError("academic clarification status job is not routed to academic_planner")
     global _academic_clarification_status_handler
     _academic_clarification_status_handler = handler
 
@@ -125,8 +117,6 @@ def register_academic_material_ingestion_handler(
 ) -> None:
     """Register the private assessment-material ingestion boundary."""
 
-    if JOB_KINDS.get("academic_material_ingestion") != "academic_planner":
-        raise ValueError("academic material ingestion is not routed to academic_planner")
     global _academic_material_ingestion_handler
     _academic_material_ingestion_handler = handler
 
@@ -134,10 +124,17 @@ def register_academic_material_ingestion_handler(
 def register_discord_wake_handler(handler: DiscordWakeHandler) -> None:
     """Register the durable ID-only Discord worker boundary."""
 
-    if JOB_KINDS.get("discord_academic") != "academic_planner":
-        raise ValueError("Discord academic wake job is not routed to academic_planner")
     global _discord_wake_handler
     _discord_wake_handler = handler
+
+
+def register_academic_morning_notification_handler(
+    handler: AcademicMorningNotificationHandler,
+) -> None:
+    """Register the focused model-free scheduled morning notifier."""
+
+    global _academic_morning_notification_handler
+    _academic_morning_notification_handler = handler
 
 
 async def defer_discord_wake(wake_id: str) -> Any:
@@ -177,71 +174,73 @@ async def defer_academic_material_ingestion(
         return {"status": "already_enqueued", "assessment_page_id": assessment_page_id}
 
 
-async def _dispatch(
-    context: JobContext,
-    queue_name: str,
-    run_id: str,
-    idempotency_key: str,
-    kind: str = "",
-) -> dict[str, Any]:
-    if not run_id.strip():
-        raise ValueError("run_id must not be empty")
-    validate_idempotency_key(idempotency_key)
-    job_kind = kind or queue_name
-    if JOB_KINDS.get(job_kind) != queue_name:
-        raise ValueError(f"job kind {job_kind} does not belong to queue {queue_name}")
-    handler = _handlers.get(job_kind)
-    if handler is None:
-        raise RuntimeError(f"no handler registered for {job_kind}")
-    parsed_run_id = UUID(run_id)
+def _run_status_value(status: object) -> str:
+    return getattr(status, "value", str(status))
 
-    async def operation() -> dict[str, object]:
-        return await handler(run_id, idempotency_key)
 
-    await execute_recorded_attempt(
-        operation,
-        engine=_database.engine,
-        run_id=parsed_run_id,
-        node_name=f"queue.{job_kind}",
-        attempt=context.job.attempts + 1,
-        retry_policy=default_retry_strategy.policy,
+def _create_academic_morning_run(
+    *,
+    period_key: str,
+    occurrence_at: datetime,
+) -> tuple[UUID, str]:
+    with Session(_database.engine) as session, session.begin():
+        run = RunRepository.create_or_get(
+            session,
+            idempotency_key=period_key,
+            agent_name="academic_morning_notification",
+            trigger="schedule",
+            schedule=_ACADEMIC_MORNING_SCHEDULE_NAME,
+            input_version=occurrence_at.isoformat(),
+        )
+        session.flush()
+        return run.id, _run_status_value(run.status)
+
+
+def _terminal_academic_morning_status(status: str) -> bool:
+    return status in {
+        RunStatus.SUCCEEDED.value,
+        RunStatus.ATTENTION.value,
+        RunStatus.FAILED.value,
+        RunStatus.CANCELLED.value,
+    }
+
+
+async def defer_academic_morning_notification(occurrence: PeriodicOccurrence) -> Any:
+    """Queue one model-free morning notification for a stable local period."""
+
+    period_key = stable_period_key(_ACADEMIC_MORNING_SCHEDULE_NAME, occurrence)
+    validate_idempotency_key(period_key)
+    run_id, status = await asyncio.to_thread(
+        _create_academic_morning_run,
+        period_key=period_key,
+        occurrence_at=occurrence.scheduled_at,
     )
-    return {"status": "succeeded", "run_id": run_id}
-
-
-def defer_idempotent(task: Any, run_id: str, idempotency_key: str, kind: str = "") -> Any:
-    """Defer a task with a per-work-item queueing lock.
-
-    Procrastinate's decorator-level lock is static.  Callers should use this
-    helper (or equivalent explicit ``configure`` call) so two periods with
-    different keys do not block one another while identical keys collapse to a
-    single waiting job.  The actual database insert occurs only when ``defer``
-    is called, never during module import.
-    """
-
-    if not run_id.strip():
-        raise ValueError("run_id must not be empty")
-    validate_idempotency_key(idempotency_key)
-    arguments: dict[str, str] = {"run_id": run_id, "idempotency_key": idempotency_key}
-    if kind:
-        arguments["kind"] = kind
-    return task.configure(lock=_MODEL_LOCK, queueing_lock=idempotency_key).defer(**arguments)
-
-
-async def defer_idempotent_async(
-    task: Any, run_id: str, idempotency_key: str, kind: str = ""
-) -> Any:
-    """Async form used by periodic deferrer tasks."""
-
-    if not run_id.strip():
-        raise ValueError("run_id must not be empty")
-    validate_idempotency_key(idempotency_key)
-    arguments: dict[str, str] = {"run_id": run_id, "idempotency_key": idempotency_key}
-    if kind:
-        arguments["kind"] = kind
-    return await task.configure(lock=_MODEL_LOCK, queueing_lock=idempotency_key).defer_async(
-        **arguments
-    )
+    if _terminal_academic_morning_status(status):
+        return {
+            "status": "already_complete",
+            "run_id": str(run_id),
+            "period_key": period_key,
+        }
+    try:
+        job_id = await academic_morning_notification_task.configure(
+            queueing_lock=period_key,
+        ).defer_async(
+            occurrence_at_iso=occurrence.scheduled_at.isoformat(),
+            run_id=str(run_id),
+            period_key=period_key,
+        )
+    except AlreadyEnqueued:
+        return {
+            "status": "already_enqueued",
+            "run_id": str(run_id),
+            "period_key": period_key,
+        }
+    return {
+        "status": "enqueued",
+        "run_id": str(run_id),
+        "period_key": period_key,
+        "job_id": job_id,
+    }
 
 
 def _academic_clarification_args(
@@ -321,46 +320,6 @@ async def defer_academic_clarification_status(
             "status": "already_enqueued",
             "clarification_id": parsed_clarification_id,
         }
-
-
-@procrastinate_app.task(
-    name="lifeagent.code_review",
-    queue="code_review",
-    retry=default_retry_strategy,
-    pass_context=True,
-)
-async def code_review_task(
-    context: JobContext, run_id: str, idempotency_key: str, kind: str = ""
-) -> dict[str, Any]:
-    return await _dispatch(context, "code_review", run_id, idempotency_key, kind)
-
-
-@procrastinate_app.task(
-    name="lifeagent.code_review_daily",
-    queue="code_review",
-    retry=default_retry_strategy,
-    pass_context=True,
-)
-async def code_review_daily_task(
-    context: JobContext, run_id: str, idempotency_key: str
-) -> dict[str, Any]:
-    """Run the one-per-Toronto-day report consolidation."""
-
-    return await _dispatch(context, "code_review", run_id, idempotency_key, "code_review_daily")
-
-
-@procrastinate_app.task(
-    name="lifeagent.code_review_ingest",
-    queue="code_review",
-    retry=default_retry_strategy,
-    pass_context=True,
-)
-async def code_review_ingest_task(
-    context: JobContext, run_id: str, idempotency_key: str
-) -> dict[str, Any]:
-    """Run one resumable repository-profile ingestion page."""
-
-    return await _dispatch(context, "code_review", run_id, idempotency_key, "code_review_ingest")
 
 
 @procrastinate_app.task(
@@ -444,61 +403,60 @@ async def academic_material_ingestion_task(
     return await _academic_material_ingestion_handler(assessment_page_id, source_fingerprint)
 
 
+def _parse_occurrence_at_iso(value: str) -> datetime:
+    try:
+        occurrence_at = datetime.fromisoformat(value)
+    except ValueError:
+        raise ValueError("occurrence_at_iso must be a valid ISO datetime") from None
+    if occurrence_at.tzinfo is None or occurrence_at.utcoffset() is None:
+        raise ValueError("occurrence_at_iso must be timezone-aware")
+    return occurrence_at.astimezone(UTC)
+
+
 @procrastinate_app.task(
-    name="lifeagent.finance",
-    queue="finance",
+    name="lifeagent.academic_morning_notification",
+    queue="academic_planner",
     retry=default_retry_strategy,
     pass_context=True,
 )
-async def finance_task(
-    context: JobContext, run_id: str, idempotency_key: str, kind: str = ""
+async def academic_morning_notification_task(
+    context: JobContext,
+    occurrence_at_iso: str,
+    run_id: str,
+    period_key: str,
 ) -> dict[str, Any]:
-    return await _dispatch(context, "finance", run_id, idempotency_key, kind)
+    """Execute one anchored model-free morning notification attempt."""
 
+    if _academic_morning_notification_handler is None:
+        raise RuntimeError("no handler registered for academic_morning_notification")
+    handler = _academic_morning_notification_handler
+    parsed_run_id = UUID(run_id)
+    parsed_period_key = validate_idempotency_key(period_key)
+    occurrence_at = _parse_occurrence_at_iso(occurrence_at_iso)
+    attempt = context.job.attempts + 1
+    attempt_limit = default_retry_strategy.policy.max_attempts
 
-def _create_scheduled_run(
-    agent_name: str,
-    key: str,
-    schedule_name: str,
-) -> tuple[UUID, str]:
-    with Session(_database.engine) as session, session.begin():
-        run = RunRepository.create_or_get(
-            session,
-            idempotency_key=key,
-            agent_name=agent_name,
-            trigger="schedule",
-            schedule=schedule_name,
+    async def operation() -> dict[str, object]:
+        return await handler(
+            occurrence_at.isoformat(),
+            str(parsed_run_id),
+            parsed_period_key,
+            attempt,
+            attempt_limit,
         )
-        session.flush()
-        return run.id, str(run.status)
 
-
-async def _periodic_tick(
-    *,
-    timestamp: int,
-    job_kind: str,
-    schedule_name: str,
-    schedule: TorontoPeriodicSchedule,
-    task: Any,
-) -> dict[str, object]:
-    if job_kind not in _handlers:
-        return {"status": "disabled_no_handler"}
-    scheduled_at = datetime.fromtimestamp(timestamp, UTC)
-    local_time = scheduled_at.astimezone(schedule.zone)
-    if not schedule.matches(local_time):
-        return {"status": "not_due"}
-    occurrence = PeriodicOccurrence(local_time=local_time, scheduled_at=scheduled_at)
-    key = stable_period_key(schedule_name, occurrence)
-    run_id, status = await asyncio.to_thread(
-        _create_scheduled_run,
-        job_kind,
-        key,
-        schedule_name,
+    result = await execute_recorded_attempt(
+        operation,
+        engine=_database.engine,
+        run_id=parsed_run_id,
+        node_name="queue.academic_morning_notification",
+        attempt=attempt,
+        retry_policy=default_retry_strategy.policy,
     )
-    if status in {RunStatus.SUCCEEDED.value, RunStatus.CANCELLED.value}:
-        return {"status": "already_complete", "run_id": str(run_id)}
-    job_id = await defer_idempotent_async(task, str(run_id), key, job_kind)
-    return {"status": "enqueued", "run_id": str(run_id), "job_id": job_id}
+    response = dict(result)
+    response.setdefault("run_id", str(parsed_run_id))
+    response.setdefault("period_key", parsed_period_key)
+    return response
 
 
 def _iter_artifact_sidecars(store: ArtifactStore) -> tuple[tuple[str, Path], ...]:
@@ -597,7 +555,10 @@ def _shared_services_alert_required(
     if health.rule in {"run_overdue", "waiting_for_retry"}:
         return True
     queue = next((check for check in checks if check.name == "queue"), None)
-    return queue is not None and queue.state is HealthState.ATTENTION
+    morning = next((check for check in checks if check.name == "academic_morning"), None)
+    return (queue is not None and queue.state is HealthState.ATTENTION) or (
+        morning is not None and morning.state is HealthState.ATTENTION
+    )
 
 
 def _shared_services_alert_error_code(checks: tuple[HealthCheck, ...]) -> ErrorCode:
@@ -614,6 +575,11 @@ def _shared_services_alert_error_code(checks: tuple[HealthCheck, ...]) -> ErrorC
     if any(check.state is not HealthState.HEALTHY and check.name == "ollama" for check in checks):
         return ErrorCode.MODEL_TRANSIENT
     if any(check.state is not HealthState.HEALTHY and check.name == "queue" for check in checks):
+        return ErrorCode.SCHEDULE_LATE
+    if any(
+        check.state is not HealthState.HEALTHY and check.name == "academic_morning"
+        for check in checks
+    ):
         return ErrorCode.SCHEDULE_LATE
     if any(
         check.state is not HealthState.HEALTHY and "connector" in check.name for check in checks
@@ -703,33 +669,28 @@ async def _maybe_send_shared_services_alert(
 _settings = get_settings()
 
 
-@procrastinate_app.task(name="lifeagent.schedule.code_review", queue="code_review")
-async def code_review_periodic(timestamp: int) -> dict[str, object]:
-    return await _periodic_tick(
-        timestamp=timestamp,
-        job_kind="code_review_daily",
-        schedule_name="code-review-daily",
-        schedule=TorontoPeriodicSchedule.from_time(_settings.code_review_schedule),
-        task=code_review_daily_task,
-    )
+@procrastinate_app.periodic(cron="* * * * *", periodic_id="academic-morning-notification")
+@procrastinate_app.task(
+    name="lifeagent.schedule.academic_morning_notification",
+    queue="academic_planner",
+)
+async def academic_morning_notification_periodic(timestamp: int) -> dict[str, object]:
+    """Defer the configured Toronto-local morning notification with bounded catch-up."""
 
-
-@procrastinate_app.task(name="lifeagent.schedule.finance", queue="finance")
-async def finance_periodic(timestamp: int) -> dict[str, object]:
-    return await _periodic_tick(
-        timestamp=timestamp,
-        job_kind="finance",
-        schedule_name="finance-market-open",
-        schedule=TorontoPeriodicSchedule.from_time(
-            _settings.finance_market_open_schedule,
-            weekdays=frozenset(range(5)),
-        ),
-        task=finance_task,
+    evaluated_at = datetime.fromtimestamp(timestamp, UTC)
+    schedule = TorontoPeriodicSchedule.from_time(
+        _settings.academic_morning_schedule,
+        timezone_name=_settings.app_timezone,
     )
+    grace = timedelta(minutes=_settings.academic_morning_catchup_grace_minutes)
+    occurrence = schedule.due_within_grace(evaluated_at, grace=grace)
+    if occurrence is None:
+        return {"status": "not_due"}
+    return await defer_academic_morning_notification(occurrence)
 
 
 @procrastinate_app.periodic(cron="* * * * *", periodic_id="artifact-retention-dynamic")
-@procrastinate_app.task(name="lifeagent.artifacts.retention", queue="code_review")
+@procrastinate_app.task(name="lifeagent.artifacts.retention", queue="academic_planner")
 async def artifact_retention_periodic(timestamp: int) -> dict[str, object]:
     """Prune expired redacted artifacts on the configured local schedule."""
 
@@ -747,7 +708,7 @@ async def artifact_retention_periodic(timestamp: int) -> dict[str, object]:
 
 
 @procrastinate_app.periodic(cron="*/5 * * * *", periodic_id="shared-services-health")
-@procrastinate_app.task(name="lifeagent.health.shared_services", queue="code_review")
+@procrastinate_app.task(name="lifeagent.health.shared_services", queue="academic_planner")
 async def shared_services_periodic(timestamp: int) -> dict[str, object]:
     """Persist deterministic shared-service health without invoking an agent or model."""
 
@@ -761,11 +722,22 @@ async def shared_services_periodic(timestamp: int) -> dict[str, object]:
             check_connector_liveness(_settings, shared_client, now=evaluated_at),
         )
     connector_configuration = check_connector_configuration(_settings)
+    with Session(_database.engine) as session, session.begin():
+        academic_morning_health = evaluate_academic_morning_health(
+            session,
+            settings=_settings,
+            evaluated_at=evaluated_at,
+        )
     checks = [
         *database_checks,
         await asyncio.to_thread(_check_queue_with_settings, _database, _settings, evaluated_at),
         await asyncio.to_thread(check_artifact_root, _settings),
         connector_configuration,
+        HealthCheck(
+            name="academic_morning",
+            state=academic_morning_health.state,
+            diagnostic=academic_morning_health.diagnostic,
+        ),
         *connector_liveness_checks,
         ollama_check,
     ]
@@ -821,22 +793,19 @@ __all__ = [
     "academic_clarification_status_task",
     "academic_clarification_task",
     "academic_material_ingestion_task",
+    "academic_morning_notification_periodic",
+    "academic_morning_notification_task",
     "artifact_retention_periodic",
-    "code_review_daily_task",
-    "code_review_ingest_task",
-    "code_review_task",
     "defer_academic_clarification",
     "defer_academic_clarification_status",
     "defer_academic_material_ingestion",
+    "defer_academic_morning_notification",
     "defer_discord_wake",
-    "defer_idempotent",
-    "defer_idempotent_async",
     "discord_wake_task",
-    "finance_task",
     "register_academic_clarification_handler",
     "register_academic_clarification_status_handler",
     "register_academic_material_ingestion_handler",
+    "register_academic_morning_notification_handler",
     "register_discord_wake_handler",
-    "register_task_handler",
     "shared_services_periodic",
 ]

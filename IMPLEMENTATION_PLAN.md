@@ -7,7 +7,10 @@ queue, one local model endpoint, schemas, audit records, and deployment
 configuration. Code review, academic planner, and finance remain separate
 workflow domains. Scheduled code-review and finance Qwen workers remain
 non-executable in the current runtime. Academic Qwen has one configured path:
-authorized Discord mentions received by the native host wake daemon.
+messages from an authorized owner in the configured private Discord channel,
+received by the native host wake daemon.
+The model-free academic morning notification is the sole automatic academic
+schedule.
 
 Run Ollama natively on the Mac, not in Docker. The Dockerized API uses
 `http://host.docker.internal:11434` to call it. This preserves Apple Metal
@@ -17,7 +20,7 @@ being copied into images. Never expose port 11434 beyond the Mac.
 The configured local reasoning model is `qwen3-32gb:latest` with a pinned
 digest in normal deployments. Keep one concurrent physical model request and a
 modest context limit until latency and memory pressure justify a change. Qwen is
-not preloaded at startup: the first authorized mention causes the first real
+not preloaded at startup: the first authorized message causes the first real
 structured request, and `OLLAMA_MODEL_KEEP_ALIVE_SECONDS=300` lets Ollama unload
 the model after a short idle period.
 
@@ -30,9 +33,9 @@ The build is deliberately Python-first. FastAPI serves both the API and the read
 | Language and package management | Python 3.12, `uv`, `pyproject.toml` | One modern, fast Python toolchain and a reproducible lockfile. |
 | Web/API/UI | FastAPI, Pydantic v2, Jinja2, HTMX, Tailwind CSS | FastAPI is a strong fit for webhooks, typed APIs, and internal pages. Server-rendered templates keep the small, read-only console in the same Python service; HTMX adds filtering/acknowledgement without a SPA; Tailwind produces the responsive, accessible static CSS at build time. |
 | Agent orchestration | LangGraph + LangChain + `langchain-ollama` (`ChatOllama`) | LangGraph makes every workflow step, retry, checkpoint, and approval boundary explicit. LangChain supplies the stable Ollama client and Pydantic-oriented structured outputs. Use graphs/workflows, not unrestricted ReAct agents. |
-| Model runtime | Native Ollama, `qwen3-32gb:latest` | Local, private inference on Apple Silicon. Qwen is lazily loaded only by an authorized Discord mention; deterministic Python code collects facts and performs writes. |
+| Model runtime | Native Ollama, `qwen3-32gb:latest` | Local, private inference on Apple Silicon. Qwen is lazily loaded only by a message from an authorized owner in the private Discord channel; deterministic Python code collects facts and performs writes. |
 | Relational data | PostgreSQL 16 with optional `pgvector`, SQLAlchemy 2, Alembic | One durable source for domain data, idempotency keys, audit events, run metadata, and dashboard queries. `pgvector` is an extension in this existing database, not a second database. Alembic makes every schema change reviewable. |
-| Background work | Procrastinate (PostgreSQL-backed Python task queue) | The queue retains deterministic task, lock, retry, and audit contracts. The Discord academic wake job is the only configured model job. |
+| Background work | Procrastinate (PostgreSQL-backed Python task queue) | The queue retains deterministic task, lock, retry, and audit contracts. The Discord academic wake job is the only configured model job; the academic morning notification is scheduled but model-free. |
 | Long artifacts | Local Docker volume behind an `ArtifactStore` interface | Keeps phase-one local and simple while separating raw logs, PDFs, source extracts, and reports from dashboard tables. The interface can later switch to S3-compatible storage without changing agents. |
 | External HTTP | `httpx` with typed, narrow connector adapters | Avoids an SDK per vendor. Each adapter has an allowlisted base URL, timeouts, rate limits, retry policy, and redaction rules. |
 | Document extraction | PyMuPDF first; bounded local OCR for pages with insufficient text | Fast deterministic text/page extraction and page-level citations. Do not add a broad document-AI platform. |
@@ -72,7 +75,8 @@ Use one image, such as `lifeagent-app`, for the `api`. The default Compose
 operation starts `postgres`, `api`, and the academic planner worker; the
 Discord academic wake job is the sole model path.
 No code-review or finance Qwen workers are runtime options. The academic worker
-is isolated to Discord academic work, ingestion, and model-free confirmations.
+is isolated to Discord academic work, ingestion, model-free confirmations, and
+the model-free automatic academic morning notification.
 
 Default service names:
 
@@ -81,7 +85,10 @@ postgres, api, worker-academic-planner
 ```
 
 `docker compose` never starts an Ollama container or the Discord Gateway. The
-native LaunchAgents remain available while Compose is stopped. The `api` health page must
+native LaunchAgents remain available if Compose is stopped. In the installed
+runtime, PostgreSQL and `worker-academic-planner` stay resident for the
+model-free morning schedule while the API may remain cold between Discord
+conversations. The `api` health page must
 report “Ollama unavailable” when its host health check fails. Operators start,
 inspect, and unload the host runtime with `scripts/ollama_qwen_start.sh`,
 `scripts/ollama_qwen_status.sh`, and `scripts/ollama_qwen_unload.sh`.
@@ -131,7 +138,7 @@ Tools must be ordinary Python functions behind the graph, each with one purpose 
 All model calls go through `llm.gateway`. The gateway supplies the exact model
 identifier, low temperature for factual extraction/review, timeouts, token
 limits, `keep_alive`, an asyncio semaphore of one, request IDs, and
-usage/latency telemetry. The Discord mention path calls the narrow Ollama
+usage/latency telemetry. The authorized Discord path calls the narrow Ollama
 runtime readiness boundary, which probes only `/api/tags`, validates model name
 and optional digest, coalesces simultaneous readiness checks, and never spawns a
 shell or accepts a host command from configuration.
@@ -140,10 +147,14 @@ shell or accepts a host command from configuration.
 
 - Store all timestamps as timezone-aware UTC. Convert to `America/Toronto` only at scheduling and display boundaries.
 - Procrastinate jobs use locks to prevent duplicate enqueueing. Academic
-  material embeddings and morning reasoning share the exclusive local-model
-  lock; other periodic Qwen jobs are non-executable.
+  material embeddings use the separate local embedding model at low priority and
+  do not compete with Discord-triggered Qwen reasoning. The automatic academic
+  morning notification is model-free and does not take the local-model lock.
 - Every work item has a deterministic idempotency key, for example
-  `academic-discord-message:<message-id>:proposal:v1`.
+  `academic-discord-message:<message-id>:proposal:v1` or
+  `academic-morning:YYYY-MM-DD:HHMM:v1`.
+- Scheduled morning Discord delivery derives from the same stable local period:
+  `academic-morning-delivery:YYYY-MM-DD:HHMM:v1`.
 - Procrastinate retries transient connector/model failures with capped exponential backoff and jitter. It never retries authorization failures until credentials change.
 - Publishers use provider-side idempotency where available, otherwise persist a delivery intent before sending and reconcile an uncertain send before retrying.
 - A job is complete only when required processing, persistence, and delivery all have durable success records.
@@ -167,7 +178,7 @@ user/planner question -> course/term/type filter -> hybrid lexical + semantic re
 - Use the local `qwen3-embedding:0.6b` model initially (currently about 639 MB),
   through Ollama's embedding endpoint. It is separate from the Qwen reasoning
   model and should be benchmarked/pinned; batch ingestion runs at low priority
-  and does not compete with mention-triggered Qwen reasoning.
+  and does not compete with Discord-triggered Qwen reasoning.
 - Up to about **5,000 chunks**, exact `pgvector` similarity search is simple and sufficient on this machine. Add an HNSW index only when the corpus reaches roughly **10,000 chunks** or measured p95 retrieval latency exceeds 200 ms. Evaluate answer grounding/recall before and after indexing because approximate indexes trade recall for speed.
 - Retrieve a small, diverse set (for example 8–12 chunks), always filtered to the relevant course/term unless the user explicitly asks cross-course. Return citations and have the planner say when no supporting chunk was found; never let retrieved text override structured confirmed fields.
 
@@ -218,7 +229,7 @@ Initial large-batch ingestion is a separate, rate-limited queue job per reposito
 The model sees only changed files, bounded surrounding code, manifest/config diffs, native test/lint/scanner output, and the applicable repository profile. It proposes findings in a Pydantic schema containing severity, file/line, explanation, reproduction/missing test, confidence, assumptions, and evidence references. Deterministic validation rejects line locations not in the review packet, duplicate findings, unsupported claims, and speculative/no-actionable findings.
 
 This is historical/planned capability context only. The current
-Discord-mentions-only runtime cannot schedule or trigger this model path; making
+authorized-private-channel runtime cannot schedule or trigger this model path; making
 Qwen create code-review drafts would require a future architecture change and a
 separate publication policy. The agent never commits, pushes, changes issues, or
 applies fixes.
@@ -228,7 +239,7 @@ applies fixes.
 ```text
 Notion delta sync -> PDF/page extraction -> uncertainty detection
 -> deterministic constraints and priority scores -> deterministic allocation
--> authorized Discord mention -> bounded Qwen planner response
+-> authorized private-channel message -> bounded Qwen planner response
 -> proposed Notion changes -> explicit confirmation -> write/audit
 ```
 
@@ -291,7 +302,7 @@ docker compose ps
 - Implement `llm.gateway` with `ChatOllama`, model/config version capture,
   timeout, token budget, one-request semaphore, `keep_alive`, JSON/Pydantic
   validation, and a bounded repair retry.
-- Implement `llm.ollama_runtime` so authorized Discord mentions check
+- Implement `llm.ollama_runtime` so authorized Discord messages check
   `/api/tags`, the configured model, and optional digest before the first real
   model request.
 - Create a small, versioned evaluation fixture set: code finding triage, finance fact-versus-inference, academic extraction, and invalid JSON/tool-output cases.
@@ -371,9 +382,10 @@ enough system headroom, lower the context window before changing model.
   bounded PyMuPDF/OCR extraction with page or block citations, PostgreSQL
   full-text lookup, assessment-scoped local embeddings, and uncertainty queue.
 - Implement deterministic priority scores, a constraint-aware 7–14 day
-  allocator, mention-triggered grounded Qwen academic responses, the grounded
-  scheduled `MorningBriefing`, model-free reminders, and confirmation-only
-  Notion writes. The former fixed morning formatter is non-executable.
+  allocator, Discord-triggered grounded Qwen academic responses, the model-free
+  scheduled academic morning notification, model-free reminders, and
+  confirmation-only Notion writes. The historical model-based MorningBriefing
+  schedule and formatter are non-executable.
 
 **Acceptance tests**
 
@@ -381,10 +393,16 @@ enough system headroom, lower the context window before changing model.
 - Retrieval fixtures show exact course/policy questions answered from full-text search with citations; once embeddings are enabled, paraphrased queries return only chunks from the requested course/term and retain their citations.
 - The allocator never moves a test/deadline/fixed commitment, preserves configured buffer, and carries incomplete work forward visibly.
 - An ambiguous fact sends a question and does not become a hard constraint.
-- A mentioned natural-language Discord check-in checks Ollama readiness, creates
-  a proposal, and makes no Notion write until the exact confirmation event is
-  supplied. Unmentioned prose does not persist, deliver, check readiness, or
-  call Qwen.
+- An authorized natural-language message in the configured private Discord
+  channel checks Ollama readiness, creates a proposal when appropriate, and
+  makes no Notion write until the exact confirmation event is supplied.
+  Messages from other channels or users do not persist, deliver, check
+  readiness, or call Qwen.
+- A controlled academic morning trigger uses
+  `ACADEMIC_MORNING_SCHEDULE` in `APP_TIMEZONE`, catches up only inside
+  `ACADEMIC_MORNING_CATCHUP_GRACE_MINUTES`, records the stable run and delivery
+  keys, sends at most one live Discord notification for the period, and is
+  replay-safe.
 
 ### Phase 6 — Finance briefing (only after source approval)
 
@@ -443,7 +461,7 @@ Semantic retrieval is active for arbitrary assessment-page body text and
 supported PDF attachments. Typed dates and commitments remain authoritative;
 full-text search remains available for exact lookup.
 
-The implementation uses exact assessment-scoped similarity now because morning
+The implementation uses exact assessment-scoped similarity now because academic
 guidance requires meaning-based selection from heterogeneous material even for a
 small corpus. It does not wait for a document-count threshold.
 
@@ -453,8 +471,8 @@ because documents exist.
 The active path extends `academic_documents` and `academic_document_chunks`,
 embeds assessment material with the separately pinned local embedding model,
 and sends at most a bounded set of assessment-owned cited chunks to Qwen. The
-shared model lock keeps embedding ingestion from competing with scheduled or
-mention-triggered reasoning. Retrieved content never overrides confirmed
+shared model lock keeps embedding ingestion from competing with
+Discord-triggered reasoning. Retrieved content never overrides confirmed
 structured facts.
 
 Use exact `pgvector` similarity search initially. Add an HNSW approximate index only after approximately **10,000 chunks** or a measured p95 retrieval latency over 200 ms. The index improves speed, but can slightly reduce recall, so re-run the retrieval evaluation after adding it.
@@ -467,12 +485,14 @@ Document these settings and validate them on startup; values shown are names, no
 APP_TIMEZONE=America/Toronto
 OLLAMA_BASE_URL=http://host.docker.internal:11434
 OLLAMA_MODEL=qwen3-32gb:latest
-MODEL_TRIGGER_MODE=discord_mentions_only
+MODEL_TRIGGER_MODE=authorized_discord_channel
 OLLAMA_MODEL_KEEP_ALIVE_SECONDS=300
 OLLAMA_STARTUP_TIMEOUT_SECONDS=30
 OLLAMA_MAX_CONCURRENCY=1
 OLLAMA_NUM_CTX=2048
 EMBEDDING_MODEL=qwen3-embedding:0.6b
+ACADEMIC_MORNING_SCHEDULE=08:00
+ACADEMIC_MORNING_CATCHUP_GRACE_MINUTES=30
 DATABASE_URL=postgresql+psycopg://...
 ARTIFACT_ROOT=/var/lib/lifeagent/artifacts
 GITHUB_APP_ID=
@@ -484,8 +504,11 @@ NOTION_TOKEN=
 FINANCE_SOURCE_ALLOWLIST_VERSION=
 ```
 
-`MODEL_TRIGGER_MODE` is closed to the authorized Discord-mention path. There is
-no separately configured periodic model path.
+`MODEL_TRIGGER_MODE` is closed to the authorized private Discord channel. There is
+no separately configured periodic model path. `ACADEMIC_MORNING_SCHEDULE` is an
+executable model-free schedule interpreted in `APP_TIMEZONE`; the default
+30-minute catch-up grace is configured by
+`ACADEMIC_MORNING_CATCHUP_GRACE_MINUTES`.
 
 Add explicit settings for retry cap, per-connector timeouts, repository
 allowlist, Discord targets, artifact retention, and each finance source.
@@ -496,10 +519,11 @@ trigger requires a future architecture change.
 
 Start with **Phase 0**, then Phase 1 and Phase 2 before building agent functionality.
 The executable model path is the Discord-mentioned academic assistant.
-Scheduled academic, code-review, and finance model
-flows remain historical/planned context; finance also waits for explicit
-source/entitlement approval. Build the UI only after shared records exist, so
-it reports real operations rather than placeholders.
+Scheduled academic Qwen, code-review Qwen, and finance Qwen flows remain
+historical/planned context; finance also waits for explicit source/entitlement
+approval. The automatic academic morning notification is the sole executable
+academic schedule and is model-free. Build the UI only after shared records
+exist, so it reports real operations rather than placeholders.
 
 The first ticket should create `pyproject.toml`, `app/core/config.py`, the Compose topology, health endpoints, a minimal migration, and the CI-quality commands from Phase 0—nothing agent-specific. Its definition of done is the Phase 0 acceptance block above.
 

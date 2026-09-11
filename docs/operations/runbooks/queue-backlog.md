@@ -11,7 +11,8 @@ failures M`). A stalled worker appears as a `procrastinate_job` with status
 `QUEUE_STALLED_AFTER_SECONDS` threshold (default: 120 seconds).
 
 When the queue is backlogged, current Discord-triggered API work can stop
-progressing. Scheduled finance, code-review, and academic paths are not
+progressing. The scheduled model-free academic morning notification can also be
+delayed. Scheduled finance, code-review, and academic Qwen/model paths are not
 executable in the current architecture.
 
 ## Diagnosis
@@ -103,8 +104,9 @@ docker compose up -d postgres api worker-academic-planner
 ```
 
 Do not start legacy code-review or finance model workers; the academic worker
-runs only durable Discord academic jobs and model-free/ingestion work. There is
-no configured scheduled model worker.
+runs only durable Discord academic jobs, the scheduled model-free academic
+morning notification, and model-free/ingestion work. There is no configured
+scheduled model worker.
 
 Do not manually delete `procrastinate_jobs` rows to clear a queue backlog.
 Deleting rows erases the job definition and retry history without creating an
@@ -112,6 +114,124 @@ audit record. The queue is the source of truth for scheduling and delivery
 guarantees. If a job is permanently invalid after you have inspected the
 corresponding run and determined no recovery is possible, create a deliberate
 remediation record through application code or a reviewed database migration.
+
+### Obsolete retired scheduled jobs
+
+During the morning-notification rollout, old failed scheduled-job rows may
+remain from retired architectures. Preserve those rows, their Procrastinate
+event history, and the audit trail. Never delete them and never cancel current
+`lifeagent.academic_morning_notification` jobs.
+
+For the retired academic planner schedule, inspect only
+`lifeagent.academic_planner` rows:
+
+```bash
+docker compose exec -T postgres sh -lc 'psql -U "$POSTGRES_USER" -d "$POSTGRES_DB" -c "
+SELECT id, queue_name, task_name, status, attempts, scheduled_at
+FROM procrastinate_jobs
+WHERE task_name = '\''lifeagent.academic_planner'\''
+  AND queue_name = '\''academic_planner'\''
+  AND status IN ('\''failed'\'', '\''aborted'\'')
+ORDER BY scheduled_at, id;"'
+```
+
+For the retired scheduled code-review job, inspect only
+`lifeagent.code_review_daily` rows on the retired `code_review` queue:
+
+```bash
+docker compose exec -T postgres sh -lc 'psql -U "$POSTGRES_USER" -d "$POSTGRES_DB" -c "
+SELECT id, queue_name, task_name, status, attempts, scheduled_at
+FROM procrastinate_jobs
+WHERE task_name = '\''lifeagent.code_review_daily'\''
+  AND queue_name = '\''code_review'\''
+  AND status IN ('\''failed'\'', '\''aborted'\'')
+ORDER BY scheduled_at, id;"'
+```
+
+If every returned row is verified obsolete and failed, paste only those exact
+job IDs into the transaction below and set the matching task, queue, and audit
+action. It locks each selected row, verifies it still matches the retired failed
+task, marks it `cancelled`, and appends an audit event per job in one
+transaction.
+
+```bash
+docker compose exec -T api python - <<'PY'
+from sqlalchemy import text
+from sqlalchemy.orm import Session
+
+from app.core.config import get_settings
+from app.db.models import AuditEvent
+from app.db.session import Database
+
+verified_job_ids = [
+    123,  # replace with inspected failed/aborted job IDs
+]
+expected_task_name = "lifeagent.academic_planner"
+expected_queue_name = "academic_planner"
+audit_action = "queue.legacy_academic_planner_cancelled"
+
+# For retired code-review cleanup, use:
+# expected_task_name = "lifeagent.code_review_daily"
+# expected_queue_name = "code_review"
+# audit_action = "queue.legacy_code_review_cancelled"
+
+database = Database(get_settings())
+try:
+    with Session(database.engine) as session, session.begin():
+        for job_id in verified_job_ids:
+            row = session.execute(
+                text(
+                    """
+                    SELECT id, queue_name, task_name, status
+                    FROM procrastinate_jobs
+                    WHERE id = :job_id
+                    FOR UPDATE
+                    """
+                ),
+                {"job_id": job_id},
+            ).mappings().one_or_none()
+            if (
+                row is None
+                or row["task_name"] != expected_task_name
+                or row["queue_name"] != expected_queue_name
+                or row["status"] not in {"failed", "aborted"}
+            ):
+                raise RuntimeError(f"job {job_id} is not a verified failed retired scheduled job")
+
+            session.execute(
+                text("UPDATE procrastinate_jobs SET status = 'cancelled' WHERE id = :job_id"),
+                {"job_id": job_id},
+            )
+            session.add(
+                AuditEvent(
+                    actor="operator",
+                    action=audit_action,
+                    target_type="procrastinate_job",
+                    target_id=str(job_id),
+                    result="cancelled",
+                )
+            )
+finally:
+    database.dispose()
+PY
+```
+
+Then verify the cleanup did not touch current morning-notification jobs and
+changed only the retired task names:
+
+```bash
+docker compose exec -T postgres sh -lc 'psql -U "$POSTGRES_USER" -d "$POSTGRES_DB" -c "
+SELECT task_name, status, COUNT(*) AS count
+FROM procrastinate_jobs
+WHERE task_name IN (
+  '\''lifeagent.academic_planner'\'',
+  '\''lifeagent.code_review_daily'\'',
+  '\''lifeagent.academic_morning_notification'\'',
+  '\''lifeagent.schedule.academic_morning_notification'\''
+)
+GROUP BY task_name, status
+ORDER BY task_name, status;"'
+```
 
 For `lifeagent.academic_material_ingestion`, job arguments must contain only
 `assessment_page_id` and `source_fingerprint`. A 403 is normally an expired

@@ -179,7 +179,7 @@ async def test_valid_mention_acknowledges_before_wake_and_handoff(tmp_path: Path
 
 
 @pytest.mark.asyncio
-async def test_authorized_unmentioned_prose_handoffs_without_host_ack_for_backend_filtering(
+async def test_authorized_unmentioned_prose_is_acknowledged_and_handed_to_harness(
     tmp_path: Path,
 ) -> None:
     settings = _settings(tmp_path)
@@ -202,10 +202,10 @@ async def test_authorized_unmentioned_prose_handoffs_without_host_ack_for_backen
     result = await coordinator.process_message(_message(mentioned=False))
 
     assert result == "handled"
-    assert discord.events == []
+    assert discord.events == ["ack"]
     assert events[-1] == "handoff"
-    assert handoff.events_submitted[0].acknowledgement_message_id is None
-    assert outbox.get("555555555555555555").request_kind == "continuation"
+    assert handoff.events_submitted[0].acknowledgement_message_id == "445555555555555555"
+    assert outbox.get("555555555555555555").request_kind == "mention"
 
 
 @pytest.mark.asyncio

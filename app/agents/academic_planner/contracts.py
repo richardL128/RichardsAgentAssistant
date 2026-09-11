@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, date, datetime, timedelta
 from enum import StrEnum
 from typing import Annotated, Literal
 from uuid import UUID
@@ -354,6 +354,40 @@ class DailyPlan(PlannerModel):
     @field_validator("created_at")
     @classmethod
     def created_at_aware(cls, value: datetime) -> datetime:
+        return _aware(value)
+
+
+class ScheduledMorningBlock(PlannerModel):
+    """One allocator-authored block rendered by the scheduled notifier."""
+
+    block_id: str = Field(min_length=1, max_length=255)
+    title: str = Field(min_length=1, max_length=500)
+    local_start: datetime
+    duration_minutes: int = Field(gt=0, le=10_080)
+    block_kind: Literal["assessment", "practice"]
+    carried_over: bool = False
+
+    @field_validator("local_start")
+    @classmethod
+    def local_start_aware(cls, value: datetime) -> datetime:
+        if value.tzinfo is None or value.utcoffset() is None:
+            raise ValueError("local_start must be timezone-aware")
+        return value
+
+
+class ScheduledMorningNotification(PlannerModel):
+    """Model-free Discord message with explicit deterministic provenance."""
+
+    period_key: str = Field(min_length=1, max_length=512)
+    intended_local_date: date
+    scheduled_at: datetime
+    source_synced_at: datetime
+    blocks: tuple[ScheduledMorningBlock, ...] = Field(max_length=100)
+    message_text: str = Field(min_length=1, max_length=2_000)
+
+    @field_validator("scheduled_at", "source_synced_at")
+    @classmethod
+    def timestamps_aware(cls, value: datetime) -> datetime:
         return _aware(value)
 
 
@@ -993,6 +1027,8 @@ __all__ = [
     "ProposedChange",
     "ReinforceLearningFocusAction",
     "ResolveLearningFocusAction",
+    "ScheduledMorningBlock",
+    "ScheduledMorningNotification",
     "SearchAssessmentsCall",
     "SearchCoursesCall",
     "SearchLearningFocusesCall",

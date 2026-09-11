@@ -11,13 +11,18 @@ LifeAgent is local-first: PostgreSQL and the application run in Compose, while
 Ollama runs on the host. Keep all credentials in `.env` or a secret manager;
 never commit them or paste them into logs, tickets, or chat.
 
-The sole configured Qwen path is an authorized Discord mention. The native
-macOS Discord wake LaunchAgent remains connected while Docker is stopped,
-acknowledges a valid mention, starts the fixed local services, and submits a
-signed reference to the backend. Health checks, startup, unmentioned prose with
-no owner-scoped pending clarification, and every scheduled task must not load
-Qwen. The single bounded reply to an open clarification is a continuation of
-the original mentioned request, not a new trigger.
+The sole configured Qwen path is the authorized private Discord channel. The
+native macOS Discord wake LaunchAgent remains connected while the API is cold,
+acknowledges an allowlisted owner's message, starts the fixed local services as
+needed, and submits a signed reference to the backend. PostgreSQL and the
+model-free academic worker stay resident so scheduled work does not depend on
+an inbound Discord message. Health checks, startup, messages outside that
+channel or owner allowlist, and every scheduled task must not load Qwen.
+
+The one executable automatic academic schedule is the morning to-do
+notification. It is deterministic and model-free: it refreshes Notion, builds
+the intended local day's academic plan, and sends one idempotent Discord
+message.
 
 ## 1. Start the platform
 
@@ -79,8 +84,9 @@ need to keep.
 
 The API container runs migrations automatically. It does not own a Discord
 Gateway listener. `worker-academic-planner` owns durable Discord academic jobs
-and assessment-material ingestion. No scheduled model job or legacy model
-worker is a runtime option.
+and assessment-material ingestion, plus the model-free academic morning
+notification. No scheduled model job or legacy model worker is a runtime
+option.
 
 ## 2. Connect host Ollama to Docker
 
@@ -108,13 +114,14 @@ Set `OLLAMA_MODEL` to the exact configured Qwen model and pin
 ```dotenv
 OLLAMA_MODEL=qwen3-32gb:latest
 OLLAMA_MODEL_DIGEST=
-MODEL_TRIGGER_MODE=discord_mentions_only
+MODEL_TRIGGER_MODE=authorized_discord_channel
 OLLAMA_MODEL_KEEP_ALIVE_SECONDS=300
 OLLAMA_STARTUP_TIMEOUT_SECONDS=30
 ```
 
-`MODEL_TRIGGER_MODE` is closed to authorized Discord mentions. Academic,
-code-review, and finance model schedules are not configured.
+`MODEL_TRIGGER_MODE` is closed to the authorized private Discord channel.
+Academic Qwen, code-review Qwen, and finance Qwen schedules are not configured.
+The academic morning schedule is separate and model-free.
 
 Clearing `OLLAMA_MODEL_DIGEST` skips digest pinning during first setup. Pin the
 actual digest later after verifying the model, by copying the digest returned
@@ -158,8 +165,8 @@ digest, then restart the API after changing `.env`:
 docker compose up -d --force-recreate api
 ```
 
-Qwen is not intentionally kept resident at startup. The first authorized bot
-mention causes the first real structured request, which lazily loads the model.
+Qwen is not intentionally kept resident at startup. The first authorized private-channel
+message causes the first real native request, which lazily loads the model.
 `OLLAMA_MODEL_KEEP_ALIVE_SECONDS=300` keeps it resident across one bounded loop
 and then lets Ollama unload it after roughly five idle minutes. To unload it
 immediately without deleting model files, run:
@@ -172,7 +179,8 @@ A cold start can take noticeably longer than a warm request because Docker may
 need to start and Ollama must map the model into memory. The host immediately
 creates exactly one message: `I’m waking up LifeAgent and Qwen. Please give me
 a little time to respond.` The backend adopts and edits that same message with
-semantic progress; it does not post a second wake message.
+runtime state, then publishes the model's own action descriptions while keeping
+structured tool results internal.
 
 ## 3. Configure Notion
 
@@ -286,11 +294,35 @@ continue syncing. If Discord is unavailable, the same actionable, non-secret
 condition remains visible in persisted health. A successful discovery clears
 the active reminder condition.
 
-Academic sync and deterministic schedule construction remain model-free.
-Scheduled academic work cannot call Qwen. Authorized Discord mentions are the
-sole Qwen trigger. Raw Notion envelopes, source document text, private unrelated
-Discord message bodies, embeddings, and unrelated memory do not cross the model
-boundary.
+Academic sync and deterministic schedule construction remain model-free. The
+automatic morning notification is executable, but it cannot call Qwen. The
+allowlisted private Discord channel is the sole Qwen trigger. Raw Notion
+envelopes, source document text, unauthorized Discord message bodies,
+embeddings, and unrelated memory do not cross the model boundary.
+
+### Automatic morning notification
+
+Configure the morning schedule in local application time:
+
+```dotenv
+APP_TIMEZONE=America/Toronto
+ACADEMIC_MORNING_SCHEDULE=08:00
+ACADEMIC_MORNING_CATCHUP_GRACE_MINUTES=30
+```
+
+`ACADEMIC_MORNING_SCHEDULE` is interpreted in `APP_TIMEZONE`. The default
+30-minute catch-up grace lets the worker recover from a short startup delay; it
+must not send a stale morning notification after that deadline. Each scheduled
+period records one run with agent `academic_morning_notification`, schedule
+`academic-morning`, and idempotency key
+`academic-morning:YYYY-MM-DD:HHMM:v1`. The Discord delivery key is derived from
+the same local period as `academic-morning-delivery:YYYY-MM-DD:HHMM:v1`.
+
+Before sending a normal morning plan, the job must complete a fresh Notion sync
+for the Courses/Assessments structure above. Missing sharing, missing child
+calendars, stale sync, partial source failure, or Discord delivery uncertainty
+is reported as an operational condition rather than converted into a false
+empty-day notification.
 
 For setup recovery or an immediate refresh after fixing a template/share
 problem, run the same idempotent boundary manually:
@@ -306,12 +338,12 @@ schedule, or attempt a Notion write.
 ## 4. Configure Discord
 
 Discord is used for allowlisted outbound messages and a required native Gateway
-connection for academic mentions, exact confirmation/rejection commands, and
+connection for authorized academic private-channel messages, exact confirmation/rejection commands, and
 clarification buttons. Discord deliveries use durable idempotency keys and the
 existing nonce, content-length, and allowed-mentions protections.
 
-For Qwen-powered assistant work, the Gateway mention path is the only configured
-entrypoint. The Gateway is an outbound WebSocket from the native
+For Qwen-powered assistant work, the authorized private-channel Gateway path is
+the only configured entrypoint. The Gateway is an outbound WebSocket from the native
 `com.lifeagent.discord-wake` LaunchAgent to Discord; it does not require a
 public URL. The daemon stores only bounded IDs and timestamps in its local
 outbox. Its backend handoff is HMAC-authenticated and bound to loopback.
@@ -332,7 +364,7 @@ DISCORD_ACADEMIC_CHANNEL_ID=...
 DISCORD_ACADEMIC_AUTHORIZED_USER_IDS=[123456789012345678]
 DISCORD_ACADEMIC_MESSAGE_CONTENT_ENABLED=true
 DISCORD_APPLICATION_ID=...
-MODEL_TRIGGER_MODE=discord_mentions_only
+MODEL_TRIGGER_MODE=authorized_discord_channel
 DISCORD_FINANCE_CHANNEL_ID=...
 DISCORD_CODE_REVIEW_CHANNEL_ID=...
 ```
@@ -342,7 +374,7 @@ outbound WebSocket connection and does not expose a public port. Button
 interactions do not require broad message collection or the privileged Message
 Content intent.
 
-To accept private planner mentions, open the application in the Discord
+To accept private planner messages, open the application in the Discord
 Developer Portal, select **Bot**, enable only **Message Content Intent** under
 Privileged Gateway Intents, and set:
 
@@ -366,17 +398,24 @@ scripts/lifeagent_host_runtime.sh status
 ```
 
 `deploy` builds `lifeagent-app:local` once, runs migrations and tests, records
-the image ID, creates a separate mode-`0600` HMAC key, and installs/restarts the
-Ollama and Discord LaunchAgents. After the native listener is loaded, deploy
-stops the API and academic worker so the next valid mention exercises the cold
-wake path. A Discord-triggered wake uses `--no-build
+the image ID, and installs a runtime snapshot under
+`~/Library/Application Support/LifeAgent/runtime`. A managed Python installation
+under `~/Library/Application Support/LifeAgent/python` provides its independent
+virtualenv. The installer requires `uv` on PATH or an absolute `LIFEAGENT_UV`
+executable path. The snapshot preserves the HMAC key and ID-only outbox and
+copies configuration privately. Neither LaunchAgent depends on the Desktop
+checkout or its temporary Python installation.
+
+After both native agents pass the startup check, deploy keeps PostgreSQL and the
+academic worker running for the morning schedule, and stops only the API so the
+next authorized message exercises the cold API wake path. A Discord-triggered wake uses `--no-build
 --pull never`; a missing or stale image marker fails safely and tells the
 operator to rerun `deploy`. Use `install` only to reinstall LaunchAgents for an
 already deployed image, and `uninstall` to stop and remove both plists without
 deleting the image, HMAC key, or outbox.
 
 An authorized message in `DISCORD_ACADEMIC_CHANNEL_ID` may use an exact
-model-free command or mention the bot with a natural-language academic request:
+model-free command or send any free-form request; mentioning the bot is optional:
 
 ```text
 completed <assessment-id>
@@ -388,44 +427,31 @@ reject <canonical-proposal-uuid>
 <@bot> I need to study for ECE 250, specifically race conditions and insertion sort.
 ```
 
-Mentioned natural-language requests run through the local Qwen agent loop after
+Free-form requests run through the local Qwen agent loop after
 the host Ollama readiness boundary verifies `/api/tags`, the configured model,
 and the optional digest. The loop can search only the synchronized course and
 assessment catalog. Create, update, and delete/archive operations are returned
 as one proposal; none is written to Notion until the exact
 `confirm <canonical-proposal-uuid>` response is received. LifeAgent implements
 delete as Notion archive and refuses stale or ambiguous targets. With
-`DISCORD_APPLICATION_ID` configured, the bot ignores unmentioned
-natural-language messages before persistence, delivery, readiness checks,
-memory handling, or model calls unless the same authorized user in the same
-channel has exactly one open, unexpired academic-agent clarification. Exact
-confirmation and rejection replies remain available without repeating the
-mention and remain model-free.
+`DISCORD_APPLICATION_ID` is still used to validate the bot identity and strip
+mention syntax, but it does not classify the request. Exact confirmation and
+rejection replies remain model-free.
 
-Each accepted model attempt creates one idempotent progress message and updates
-that message in place. The proposal or clarification is sent separately through
-the durable response path, so it remains the source of truth if a best-effort
-progress edit fails. Progress text contains only coarse host-observed stages and
-bounded counts; it never includes the request, prompt, search query or title,
-raw model/tool output, Notion records, opaque IDs, or exception text.
+Each accepted model attempt adopts the idempotent wake acknowledgement and then
+publishes the native turn through the durable response path. Tool-call narration
+is the model's own assistant content, passed through without canned action text.
+Structured tool results remain internal, failures are summarized safely, and
+hidden reasoning, secrets, and raw exception details are never published.
 
-When missing or ambiguous facts have a focused user-answerable question, the
-bot asks for one compact clarification and tells the user to reply with the
-scheduling details or say `cancel`. The same authorized user may answer in the
-same channel without mentioning the bot while the clarification is open and
-unexpired; all other unmentioned prose remains ignored. A conversation permits
-exactly three attempts total: the initial request and at most two clarification
-reruns. If attempt three is still ambiguous, the session is exhausted and a new
-fully specified bot mention is required. An exact `cancel`, `never mind`, or
-`start over` reply to an open clarification closes it model-free and confirms
-that nothing changed; send a separate mentioned message for any replacement
-request.
+When facts are missing or ambiguous, the model asks a natural follow-up through
+the same harness. The owner's next private-channel message is ordinary input;
+there is no keyword-based continuation router or fixed clarification counter.
 
 Conversation-triggered study sessions are the current user-facing path for
-placing new study time on the Notion calendar. The initial request must mention
-the bot. Qwen reasons over the unsanitized, free-form conversation to select
-create, update, archive, or clarification tools; there is no keyword workflow
-for those operations. Deterministic code validates only authorization, typed
+placing new study time on the Notion calendar. Qwen reasons over the unsanitized,
+free-form request and native tool results to select create, update, or archive
+proposal tools; there is no keyword workflow for those operations. Deterministic code validates only authorization, typed
 schemas, known owner-scoped targets, bounds, confirmation, idempotency, and
 stale-write preconditions. A create request must resolve to exactly one synchronized course. The bot may ask for the
 start time, duration, and whether multiple topics should be combined or
@@ -463,13 +489,16 @@ re-parses the user's label; it accepts only a valid enum in structured output
 and shows the canonicalized result in the confirmation preview.
 
 Confirmation and rejection commands must match exactly, with no extra spaces or
-arguments. Unsupported prose receives a clarification response and cannot write
-to Notion. Proposal previews include the proposal ID, bounded typed changes,
-expiry, and both exact commands. Replies from other users/channels and bot-authored
-messages are ignored before their content is inspected or persisted.
+arguments. Every other authorized private-channel message reaches the native
+harness as free-form input; the model may answer directly, use tools, or ask a
+natural follow-up. Proposal previews include the proposal ID, bounded typed
+changes, expiry, and both exact commands. Replies from other users/channels and
+bot-authored messages are ignored before their content is inspected or
+persisted.
 
-Do not use the local HTTP academic check-in route as a Qwen entrypoint in the
-default runtime. Treat proposal IDs and confirmation events as sensitive
+The default API does not mount the legacy HTTP check-in creator or the legacy
+GitHub model-queue webhook. New academic proposals originate only in the native
+Discord harness. Treat proposal IDs and confirmation events as sensitive
 workflow data. Do not enable broad message collection or grant unnecessary
 privileged intents.
 
@@ -571,7 +600,7 @@ disabled, confirm all eight v2 records are present and disabled, validate
 fixtures and permitted public smoke tests, record the endpoint/licence review,
 approve sources individually through the audited procedure, and run one
 delivery-disabled dry briefing. A scheduled Qwen finance briefing is
-non-executable in the current Discord-mentions-only runtime; adding it would
+non-executable in the current authorized-private-channel runtime; adding it would
 require a future architecture change, not a current runtime setting.
 
 The explicitly requested legacy rollback does not downgrade or delete v2 audit

@@ -17,6 +17,7 @@ from sqlalchemy.pool import StaticPool
 from app.agents.academic_planner.agent_clarification import (
     AcademicAgentClarificationService,
 )
+from app.agents.academic_planner.commands import parse_academic_command
 from app.agents.academic_planner.contracts import (
     AcademicAgentDecision,
     AcademicAgentWireDecision,
@@ -32,10 +33,7 @@ from app.agents.academic_planner.contracts import (
     SearchCoursesCall,
     UserCreatableAssessmentType,
 )
-from app.agents.academic_planner.discord_checkin import (
-    AcademicDiscordCheckinHandler,
-    parse_academic_command,
-)
+from app.agents.academic_planner.discord_checkin import AcademicDiscordCheckinHandler
 from app.artifacts.store import ArtifactStore
 from app.connectors.discord import (
     DiscordAcademicPlannerAdapter,
