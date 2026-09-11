@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import re
 from collections.abc import AsyncIterator, Mapping, Sequence
@@ -57,10 +58,23 @@ _ATTACHMENT_HOSTS: Final[tuple[str, ...]] = (
 _ASSESSMENT_DATABASE_TITLES: Final[frozenset[str]] = frozenset(
     {"assessments", "assessmentcalendar"}
 )
+_JOBS_PAGE_TITLE: Final[str] = "jobs"
+_INTERVIEWS_DATABASE_TITLE: Final[str] = "interviews"
+_HTTPS_URL_PATTERN: Final[re.Pattern[str]] = re.compile(r"https://[^\s<>()\"']+")
 MAX_NOTION_RESPONSE_BYTES = 5 * 1024 * 1024
 MAX_ATTACHMENT_BYTES = 25 * 1024 * 1024
 MAX_DISCOVERY_CURSOR_PAGES = 100
 MAX_DISCOVERY_RESULTS = 500
+MAX_JOB_CHILD_BLOCKS = 200
+MAX_JOB_APPLICATION_TABLES = 10
+MAX_JOB_APPLICATION_ROWS = 500
+MAX_JOB_APPLICATION_COLUMNS = 32
+MAX_JOB_APPLICATION_CELL_CHARS = 1_000
+MAX_JOB_APPLICATION_TABLE_CHARS = 50_000
+MAX_INTERVIEW_BODY_BLOCKS = 200
+MAX_INTERVIEW_BODY_REQUESTS = 50
+MAX_INTERVIEW_BODY_DEPTH = 3
+MAX_INTERVIEW_URL_CANDIDATES = 50
 MAX_ASSESSMENT_MATERIAL_BLOCKS = 500
 MAX_ASSESSMENT_MATERIAL_REQUESTS = 100
 MAX_ASSESSMENT_MATERIAL_DEPTH = 4
@@ -202,6 +216,103 @@ class NotionDiscoveryResult(BaseModel):
     synced_at: datetime
 
 
+class NotionJobTableRow(BaseModel):
+    """One normalized row from an ordinary Jobs page table block."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    table_block_id: str = Field(pattern=_ID_PATTERN.pattern)
+    row_block_id: str = Field(pattern=_ID_PATTERN.pattern)
+    row_order: int = Field(ge=0, le=MAX_JOB_APPLICATION_ROWS)
+    is_header: bool = False
+    cells: tuple[str, ...] = Field(default=(), max_length=MAX_JOB_APPLICATION_COLUMNS)
+    last_seen_at: datetime
+    content_fingerprint: str = Field(min_length=64, max_length=64)
+
+
+class NotionJobApplicationTable(BaseModel):
+    """Bounded, lossless snapshot of an ordinary Jobs application table."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    table_block_id: str = Field(pattern=_ID_PATTERN.pattern)
+    table_order: int = Field(ge=0, le=MAX_JOB_APPLICATION_TABLES)
+    has_column_header: bool = False
+    row_count: int = Field(ge=0, le=MAX_JOB_APPLICATION_ROWS)
+    column_count: int = Field(ge=0, le=MAX_JOB_APPLICATION_COLUMNS)
+    rows: tuple[NotionJobTableRow, ...] = Field(default=(), max_length=MAX_JOB_APPLICATION_ROWS)
+    last_seen_at: datetime
+    content_fingerprint: str = Field(min_length=64, max_length=64)
+
+
+class NotionInterviewUrlCandidate(BaseModel):
+    """One HTTPS candidate URL found on an interview page."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    url: str = Field(min_length=1, max_length=4_096)
+    source_kind: Literal["property", "page_body"]
+    source_id: str = Field(min_length=1, max_length=512)
+    source_property_id: str | None = Field(default=None, max_length=128)
+    source_block_id: str | None = Field(default=None, max_length=128)
+    source_name: str | None = Field(default=None, max_length=128)
+    order: int = Field(ge=0, le=MAX_INTERVIEW_URL_CANDIDATES)
+
+
+class NotionInterviewEvent(BaseModel):
+    """Normalized interview event discovered from the Jobs Interviews database."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    interview_id: str = Field(pattern=_ID_PATTERN.pattern)
+    jobs_page_id: str = Field(pattern=_ID_PATTERN.pattern)
+    interviews_database_id: str = Field(pattern=_ID_PATTERN.pattern)
+    interviews_source_id: str = Field(pattern=_ID_PATTERN.pattern)
+    interviews_source_type: NotionSourceType
+    page_id: str = Field(pattern=_ID_PATTERN.pattern)
+    source_url: str | None = Field(default=None, max_length=4_096)
+    title: str = Field(max_length=1_024)
+    title_property_id: str = Field(min_length=1, max_length=128)
+    title_property_name: str = Field(min_length=1, max_length=128)
+    date_property_id: str = Field(min_length=1, max_length=128)
+    date_property_name: str = Field(min_length=1, max_length=128)
+    date: NotionDateValue | None = None
+    last_edited_at: datetime
+    archived: bool = False
+    in_trash: bool = False
+    properties: Mapping[str, Any]
+    url_candidates: tuple[NotionInterviewUrlCandidate, ...] = Field(
+        default=(), max_length=MAX_INTERVIEW_URL_CANDIDATES
+    )
+
+
+class NotionJobsDiscoveryResult(BaseModel):
+    """Complete bounded discovery result for Jobs applications and interviews."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    courses_database_id: str = Field(pattern=_ID_PATTERN.pattern)
+    courses_source_id: str | None = Field(default=None, max_length=128)
+    courses_source_type: NotionSourceType | None = None
+    jobs_page_id: str | None = Field(default=None, max_length=128)
+    jobs_title: str | None = Field(default=None, max_length=255)
+    jobs_source_url: str | None = Field(default=None, max_length=4_096)
+    jobs_last_edited_at: datetime | None = None
+    application_tables: tuple[NotionJobApplicationTable, ...] = Field(
+        default=(), max_length=MAX_JOB_APPLICATION_TABLES
+    )
+    interviews_database_id: str | None = Field(default=None, max_length=128)
+    interviews_source_id: str | None = Field(default=None, max_length=128)
+    interviews_source_type: NotionSourceType | None = None
+    interview_title_property_id: str | None = Field(default=None, max_length=128)
+    interview_title_property_name: str | None = Field(default=None, max_length=128)
+    interview_date_property_id: str | None = Field(default=None, max_length=128)
+    interview_date_property_name: str | None = Field(default=None, max_length=128)
+    interviews: tuple[NotionInterviewEvent, ...] = Field(default=(), max_length=500)
+    diagnostics: tuple[NotionDiscoveryDiagnostic, ...] = Field(default=(), max_length=1_000)
+    synced_at: datetime
+
+
 class NotionTitlePrecondition(BaseModel):
     """Current title state used to guard a title-only Notion write."""
 
@@ -211,6 +322,20 @@ class NotionTitlePrecondition(BaseModel):
     title_property_id: str = Field(min_length=1, max_length=128)
     title_property_name: str = Field(min_length=1, max_length=128)
     current_title: str = Field(max_length=1_024)
+    last_edited_at: datetime
+    source_url: str | None = Field(default=None, max_length=4_096)
+    archived: bool = False
+    in_trash: bool = False
+
+
+class NotionInterviewWritePrecondition(BaseModel):
+    """Current interview state used by career-specific guarded writes."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    page_id: str = Field(pattern=_ID_PATTERN.pattern)
+    date_property_id: str = Field(min_length=1, max_length=128)
+    current_date: Mapping[str, Any] | None = None
     last_edited_at: datetime
     source_url: str | None = Field(default=None, max_length=4_096)
     archived: bool = False
@@ -389,6 +514,12 @@ def _validate_page_id(value: str) -> str:
     return value
 
 
+def _text_chunks(value: str, size: int) -> tuple[str, ...]:
+    if size < 1:
+        raise ValueError("text chunk size must be positive")
+    return tuple(value[index : index + size] for index in range(0, len(value), size))
+
+
 def _validate_property_reference(value: str, label: str) -> str:
     if not value or value != value.strip() or len(value) > 128:
         raise permanent_error(ErrorCode.INPUT_INVALID, f"Notion {label} is invalid")
@@ -429,6 +560,49 @@ def _parse_edited(value: Any) -> datetime:
 
 def _normalized_name(value: str) -> str:
     return re.sub(r"[^a-z0-9]+", "", value.casefold())
+
+
+def _content_fingerprint(*parts: object) -> str:
+    payload = json.dumps(parts, ensure_ascii=True, sort_keys=True, separators=(",", ":"))
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
+def _bounded_text(value: str, limit: int) -> str:
+    return re.sub(r"\s+", " ", value).strip()[:limit]
+
+
+def _https_urls_from_text(value: str) -> tuple[str, ...]:
+    found: list[str] = []
+    seen: set[str] = set()
+    for match in _HTTPS_URL_PATTERN.finditer(value):
+        url = match.group(0).rstrip(".,;:!?]}")
+        parsed = urlsplit(url)
+        if parsed.scheme != "https" or parsed.username or parsed.password or not parsed.hostname:
+            continue
+        if url not in seen:
+            found.append(url[:4_096])
+            seen.add(url)
+    return tuple(found)
+
+
+def _raw_page_title(raw_page: Mapping[str, Any]) -> str | None:
+    properties = raw_page.get("properties")
+    if not isinstance(properties, Mapping):
+        return None
+    title_property = _find_title_property(cast(Mapping[str, Any], properties))
+    if title_property is None:
+        return None
+    return _plain_text(title_property[1].get("title")) or None
+
+
+def _is_active_jobs_page(raw_page: Mapping[str, Any]) -> bool:
+    title = _raw_page_title(raw_page)
+    return (
+        title is not None
+        and _normalized_name(title) == _JOBS_PAGE_TITLE
+        and raw_page.get("archived") is not True
+        and raw_page.get("in_trash") is not True
+    )
 
 
 def _plain_text(value: Any) -> str:
@@ -594,6 +768,56 @@ def _block_text(block: Mapping[str, Any]) -> str:
             else ""
         )
     return _plain_text(value_map.get("rich_text"))[:MAX_ASSESSMENT_MATERIAL_TEXT_CHARS]
+
+
+def _rich_text_urls(value: Any) -> tuple[str, ...]:
+    if not isinstance(value, list):
+        return ()
+    urls: list[str] = []
+    for item in cast(list[Any], value):
+        if not isinstance(item, Mapping):
+            continue
+        item_map = cast(Mapping[str, Any], item)
+        href = item_map.get("href")
+        if isinstance(href, str):
+            urls.extend(_https_urls_from_text(href))
+        plain = item_map.get("plain_text")
+        if isinstance(plain, str):
+            urls.extend(_https_urls_from_text(plain))
+        text = item_map.get("text")
+        if isinstance(text, Mapping):
+            content = cast(Mapping[str, Any], text).get("content")
+            if isinstance(content, str):
+                urls.extend(_https_urls_from_text(content))
+    return tuple(dict.fromkeys(urls))
+
+
+def _block_url_values(block: Mapping[str, Any]) -> tuple[str, ...]:
+    urls = list(_https_urls_from_text(_block_text(block)))
+    block_type = block.get("type")
+    if isinstance(block_type, str):
+        value = block.get(block_type)
+        if isinstance(value, Mapping):
+            value_map = cast(Mapping[str, Any], value)
+            raw_url = value_map.get("url")
+            if isinstance(raw_url, str):
+                urls.extend(_https_urls_from_text(raw_url))
+            urls.extend(_rich_text_urls(value_map.get("rich_text")))
+            caption = value_map.get("caption")
+            urls.extend(_rich_text_urls(caption))
+    return tuple(dict.fromkeys(urls))
+
+
+def _property_url_values(value: Mapping[str, Any]) -> tuple[str, ...]:
+    kind = value.get("type")
+    urls: list[str] = []
+    if kind == "url":
+        raw_url = value.get("url")
+        if isinstance(raw_url, str):
+            urls.extend(_https_urls_from_text(raw_url))
+    elif kind in {"title", "rich_text"}:
+        urls.extend(_rich_text_urls(value.get(kind)))
+    return tuple(dict.fromkeys(urls))
 
 
 def _block_file(
@@ -1088,6 +1312,8 @@ class NotionConnector:
         async for raw_course in self._query_all_source_pages(
             courses_source[0], source_type=courses_source[1], page_size=page_size
         ):
+            if _is_active_jobs_page(raw_course):
+                continue
             try:
                 course = await self._discover_course(
                     raw_course,
@@ -1130,6 +1356,78 @@ class NotionConnector:
             courses=tuple(courses),
             diagnostics=tuple(diagnostics[:1_000]),
             synced_at=datetime.now(UTC),
+        )
+
+    async def discover_jobs_workspace(self, *, page_size: int = 100) -> NotionJobsDiscoveryResult:
+        """Discover the reserved Jobs page, application tables, and Interviews database."""
+
+        if page_size < 1 or page_size > 100:
+            raise permanent_error(ErrorCode.INPUT_INVALID, "Notion page size is invalid")
+        diagnostics: list[NotionDiscoveryDiagnostic] = []
+        synced_at = datetime.now(UTC)
+        try:
+            courses_database = await self._retrieve_database(self._courses_database_id)
+            courses_source = self._unique_source(
+                courses_database,
+                source_id=self._courses_database_id,
+                context="Courses database",
+                diagnostics=diagnostics,
+            )
+        except LifeAgentError:
+            diagnostics.append(
+                NotionDiscoveryDiagnostic(
+                    code="courses_database_unavailable",
+                    severity="error",
+                    message="Courses database is missing, inaccessible, or not shared",
+                    source_id=self._courses_database_id,
+                    source_type="database",
+                )
+            )
+            return NotionJobsDiscoveryResult(
+                courses_database_id=self._courses_database_id,
+                diagnostics=tuple(diagnostics[:1_000]),
+                synced_at=synced_at,
+            )
+        if courses_source is None:
+            return NotionJobsDiscoveryResult(
+                courses_database_id=self._courses_database_id,
+                diagnostics=tuple(diagnostics[:1_000]),
+                synced_at=synced_at,
+            )
+
+        jobs_pages = [
+            raw_page
+            async for raw_page in self._query_all_source_pages(
+                courses_source[0], source_type=courses_source[1], page_size=page_size
+            )
+            if _is_active_jobs_page(raw_page)
+        ]
+        if len(jobs_pages) != 1:
+            diagnostics.append(
+                NotionDiscoveryDiagnostic(
+                    code="jobs_page_missing" if len(jobs_pages) == 0 else "jobs_page_duplicate",
+                    severity="error",
+                    message="Courses database must contain exactly one active Jobs row",
+                    source_id=courses_source[0],
+                    source_type=courses_source[1],
+                    count=min(len(jobs_pages), 100),
+                )
+            )
+            return NotionJobsDiscoveryResult(
+                courses_database_id=self._courses_database_id,
+                courses_source_id=courses_source[0],
+                courses_source_type=courses_source[1],
+                diagnostics=tuple(diagnostics[:1_000]),
+                synced_at=synced_at,
+            )
+
+        return await self._discover_jobs_page(
+            jobs_pages[0],
+            courses_source_id=courses_source[0],
+            courses_source_type=courses_source[1],
+            diagnostics=diagnostics,
+            synced_at=synced_at,
+            page_size=page_size,
         )
 
     async def retrieve_title_precondition(
@@ -1267,6 +1565,188 @@ class NotionConnector:
             proposal_id=receipt_id,
             page_id=_validate_page_id(page_id_value),
             url=data.get("url") if isinstance(data.get("url"), str) else None,
+        )
+
+    async def retrieve_interview_write_precondition(
+        self,
+        *,
+        page_id: str,
+        date_property_id: str,
+    ) -> NotionInterviewWritePrecondition:
+        """Read only the stable Date property and edit metadata needed for a write guard."""
+
+        page = _validate_page_id(page_id)
+        date_id = _validate_property_reference(date_property_id, "date property")
+        response = await self._request("GET", f"/pages/{quote(page, safe='')}", json_body=None)
+        data = self._json_object(response, "Notion interview page")
+        properties = data.get("properties")
+        if not isinstance(properties, Mapping):
+            raise transient_error(ErrorCode.CONNECTOR_TRANSIENT, "Notion returned invalid page")
+        found = self._property_by_id(cast(Mapping[str, Any], properties), date_id)
+        if found is None or found[1].get("type") != "date":
+            raise permanent_error(ErrorCode.INPUT_INVALID, "Interview Date property is missing")
+        date_value = found[1].get("date")
+        if date_value is not None and not isinstance(date_value, Mapping):
+            raise transient_error(ErrorCode.CONNECTOR_TRANSIENT, "Notion returned invalid Date")
+        return NotionInterviewWritePrecondition(
+            page_id=page,
+            date_property_id=date_id,
+            current_date=(dict(cast(Mapping[str, Any], date_value)) if date_value else None),
+            last_edited_at=_parse_edited(data.get("last_edited_time")),
+            source_url=data.get("url") if isinstance(data.get("url"), str) else None,
+            archived=data.get("archived") is True,
+            in_trash=data.get("in_trash") is True,
+        )
+
+    async def guarded_update_interview_date(
+        self,
+        *,
+        proposal_id: str,
+        page_id: str,
+        date_property_id: str,
+        expected_last_edited_at: datetime,
+        due: datetime | str,
+    ) -> NotionWriteReceipt:
+        """Update only the discovered Date property after an exact page precondition check."""
+
+        receipt_id = _validate_proposal_id(proposal_id)
+        expected = expected_last_edited_at
+        if expected.tzinfo is None or expected.utcoffset() is None:
+            raise permanent_error(
+                ErrorCode.INPUT_INVALID,
+                "Notion interview edited timestamp must be timezone-aware",
+            )
+        current = await self.retrieve_interview_write_precondition(
+            page_id=page_id,
+            date_property_id=date_property_id,
+        )
+        if (
+            current.archived
+            or current.in_trash
+            or current.last_edited_at != expected.astimezone(UTC)
+        ):
+            raise NotionWriteConflict("Interview page changed since the Date preview")
+        response = await self._request(
+            "PATCH",
+            f"/pages/{quote(current.page_id, safe='')}",
+            json_body={"properties": {current.date_property_id: _date_property_value(due)}},
+        )
+        data = self._json_object(response, "Notion interview Date update")
+        patched_id = data.get("id")
+        if not isinstance(patched_id, str):
+            raise transient_error(
+                ErrorCode.CONNECTOR_TRANSIENT,
+                "Notion returned invalid interview write receipt",
+            )
+        return NotionWriteReceipt(
+            proposal_id=receipt_id,
+            page_id=_validate_page_id(patched_id),
+            url=data.get("url") if isinstance(data.get("url"), str) else None,
+            property_id=current.date_property_id,
+        )
+
+    async def append_interview_preparation_plan(
+        self,
+        *,
+        proposal_id: str,
+        page_id: str,
+        date_property_id: str,
+        expected_last_edited_at: datetime,
+        plan_revision: int,
+        plan_text: str,
+    ) -> NotionWriteReceipt:
+        """Append a version to the isolated LifeAgent-owned child page without replacing blocks."""
+
+        receipt_id = _validate_proposal_id(proposal_id)
+        if plan_revision < 1 or not plan_text.strip() or len(plan_text) > 12_000:
+            raise permanent_error(ErrorCode.INPUT_INVALID, "Interview preparation plan is invalid")
+        current = await self.retrieve_interview_write_precondition(
+            page_id=page_id,
+            date_property_id=date_property_id,
+        )
+        expected = expected_last_edited_at
+        if expected.tzinfo is None or expected.utcoffset() is None:
+            raise permanent_error(ErrorCode.INPUT_INVALID, "Notion precondition must be aware")
+        if (
+            current.archived
+            or current.in_trash
+            or current.last_edited_at != expected.astimezone(UTC)
+        ):
+            raise NotionWriteConflict("Interview page changed since the preparation preview")
+        batch = await self.retrieve_block_children(current.page_id, page_size=100)
+        owned = [
+            block
+            for block in batch.blocks
+            if block.get("type") == "child_page"
+            and isinstance(block.get("child_page"), Mapping)
+            and _normalized_name(str(cast(Mapping[str, Any], block["child_page"]).get("title", "")))
+            == "interviewpreparationlifeagent"
+        ]
+        if batch.has_more or len(owned) > 1:
+            raise NotionWriteConflict("LifeAgent preparation target is ambiguous")
+        if owned:
+            target_id = owned[0].get("id")
+            if not isinstance(target_id, str):
+                raise transient_error(
+                    ErrorCode.CONNECTOR_TRANSIENT,
+                    "Notion returned an invalid preparation target",
+                )
+            target_page_id = _validate_page_id(target_id)
+        else:
+            response = await self._request(
+                "PATCH",
+                f"/blocks/{quote(current.page_id, safe='')}/children",
+                json_body={
+                    "children": [
+                        {
+                            "object": "block",
+                            "type": "child_page",
+                            "child_page": {"title": "Interview Preparation — LifeAgent"},
+                        }
+                    ]
+                },
+            )
+            data = self._json_object(response, "Notion preparation child page")
+            results = data.get("results")
+            if not isinstance(results, list) or not results or not isinstance(results[0], Mapping):
+                raise transient_error(
+                    ErrorCode.CONNECTOR_TRANSIENT,
+                    "Notion did not return the preparation target",
+                )
+            first_result = cast(Mapping[str, object], results[0])
+            target_id = first_result.get("id")
+            if not isinstance(target_id, str):
+                raise transient_error(
+                    ErrorCode.CONNECTOR_TRANSIENT,
+                    "Notion did not return the preparation target",
+                )
+            target_page_id = _validate_page_id(target_id)
+        children: list[Mapping[str, Any]] = [
+            {
+                "object": "block",
+                "type": "heading_2",
+                "heading_2": {
+                    "rich_text": _title_segments(f"LifeAgent plan revision {plan_revision}")
+                },
+            }
+        ]
+        children.extend(
+            {
+                "object": "block",
+                "type": "paragraph",
+                "paragraph": {"rich_text": _title_segments(chunk)},
+            }
+            for chunk in _text_chunks(plan_text.strip(), 1_900)
+        )
+        await self._request(
+            "PATCH",
+            f"/blocks/{quote(target_page_id, safe='')}/children",
+            json_body={"children": children},
+        )
+        return NotionWriteReceipt(
+            proposal_id=receipt_id,
+            page_id=current.page_id,
+            url=current.source_url,
         )
 
     async def guarded_update_assessment_page(
@@ -1895,6 +2375,721 @@ class NotionConnector:
             assessments=assessments,
             properties=normalized_properties,
         )
+
+    async def _discover_jobs_page(
+        self,
+        raw_jobs_page: Mapping[str, Any],
+        *,
+        courses_source_id: str,
+        courses_source_type: NotionSourceType,
+        diagnostics: list[NotionDiscoveryDiagnostic],
+        synced_at: datetime,
+        page_size: int,
+    ) -> NotionJobsDiscoveryResult:
+        properties = raw_jobs_page.get("properties")
+        page_id = raw_jobs_page.get("id")
+        if not isinstance(page_id, str) or not isinstance(properties, Mapping):
+            diagnostics.append(
+                NotionDiscoveryDiagnostic(
+                    code="jobs_page_malformed",
+                    severity="error",
+                    message="Jobs row returned by Notion was malformed",
+                    source_id=courses_source_id,
+                    source_type=courses_source_type,
+                )
+            )
+            return NotionJobsDiscoveryResult(
+                courses_database_id=self._courses_database_id,
+                courses_source_id=courses_source_id,
+                courses_source_type=courses_source_type,
+                diagnostics=tuple(diagnostics[:1_000]),
+                synced_at=synced_at,
+            )
+        try:
+            jobs_page_id = _validate_page_id(page_id)
+            jobs_last_edited_at = _parse_edited(raw_jobs_page.get("last_edited_time"))
+        except (ValueError, LifeAgentError):
+            diagnostics.append(
+                NotionDiscoveryDiagnostic(
+                    code="jobs_page_malformed",
+                    severity="error",
+                    message="Jobs row returned by Notion had invalid metadata",
+                    source_id=courses_source_id,
+                    source_type=courses_source_type,
+                )
+            )
+            return NotionJobsDiscoveryResult(
+                courses_database_id=self._courses_database_id,
+                courses_source_id=courses_source_id,
+                courses_source_type=courses_source_type,
+                diagnostics=tuple(diagnostics[:1_000]),
+                synced_at=synced_at,
+            )
+
+        jobs_title = _raw_page_title(raw_jobs_page) or "Jobs"
+        child_blocks = await self._jobs_child_blocks(
+            jobs_page_id,
+            diagnostics=diagnostics,
+            page_size=page_size,
+        )
+        application_tables: list[NotionJobApplicationTable] = []
+        interview_database_ids: list[str] = []
+        for block in child_blocks:
+            block_type = block.get("type")
+            block_id = block.get("id")
+            if block_type == "table" and isinstance(block_id, str):
+                if len(application_tables) >= MAX_JOB_APPLICATION_TABLES:
+                    diagnostics.append(
+                        NotionDiscoveryDiagnostic(
+                            code="jobs_application_table_limit_reached",
+                            severity="warning",
+                            message="Jobs application table limit was reached",
+                            course_page_id=jobs_page_id,
+                            course_title=jobs_title[:255],
+                        )
+                    )
+                    continue
+                table = await self._jobs_application_table(
+                    block,
+                    table_order=len(application_tables),
+                    jobs_page_id=jobs_page_id,
+                    jobs_title=jobs_title,
+                    diagnostics=diagnostics,
+                    synced_at=synced_at,
+                    page_size=page_size,
+                )
+                if table is not None:
+                    application_tables.append(table)
+            elif block_type == "child_database":
+                child = block.get("child_database")
+                title = ""
+                if isinstance(child, Mapping):
+                    child_title = cast(Mapping[str, Any], child).get("title")
+                    title = child_title if isinstance(child_title, str) else ""
+                if _normalized_name(title) == _INTERVIEWS_DATABASE_TITLE and isinstance(
+                    block_id, str
+                ):
+                    interview_database_ids.append(_validate_page_id(block_id))
+
+        interviews_database_id: str | None = None
+        interviews_source_id: str | None = None
+        interviews_source_type: NotionSourceType | None = None
+        interview_title_property_id: str | None = None
+        interview_title_property_name: str | None = None
+        interview_date_property_id: str | None = None
+        interview_date_property_name: str | None = None
+        interviews: tuple[NotionInterviewEvent, ...] = ()
+        if len(interview_database_ids) == 0:
+            diagnostics.append(
+                NotionDiscoveryDiagnostic(
+                    code="interviews_database_missing",
+                    severity="error",
+                    message="Jobs page does not contain an Interviews database",
+                    course_page_id=jobs_page_id,
+                    course_title=jobs_title[:255],
+                )
+            )
+        elif len(interview_database_ids) > 1:
+            diagnostics.append(
+                NotionDiscoveryDiagnostic(
+                    code="interviews_database_duplicate",
+                    severity="error",
+                    message="Jobs page contains multiple Interviews databases",
+                    course_page_id=jobs_page_id,
+                    course_title=jobs_title[:255],
+                    count=min(len(interview_database_ids), 100),
+                )
+            )
+        else:
+            interviews_database_id = interview_database_ids[0]
+            source = await self._interviews_source(
+                interviews_database_id,
+                jobs_page_id=jobs_page_id,
+                jobs_title=jobs_title,
+                diagnostics=diagnostics,
+            )
+            if source is not None:
+                interviews_source_id, interviews_source_type, title_schema, date_schema = source
+                interview_title_property_id, interview_title_property_name, _ = title_schema
+                interview_date_property_id, interview_date_property_name, _ = date_schema
+                interviews = tuple(
+                    await self._interview_pages(
+                        interviews_source_id,
+                        source_type=interviews_source_type,
+                        interviews_database_id=interviews_database_id,
+                        jobs_page_id=jobs_page_id,
+                        jobs_title=jobs_title,
+                        title_schema=title_schema,
+                        date_schema=date_schema,
+                        diagnostics=diagnostics,
+                        page_size=page_size,
+                    )
+                )
+
+        return NotionJobsDiscoveryResult(
+            courses_database_id=self._courses_database_id,
+            courses_source_id=courses_source_id,
+            courses_source_type=courses_source_type,
+            jobs_page_id=jobs_page_id,
+            jobs_title=jobs_title[:255],
+            jobs_source_url=(
+                raw_jobs_page.get("url") if isinstance(raw_jobs_page.get("url"), str) else None
+            ),
+            jobs_last_edited_at=jobs_last_edited_at,
+            application_tables=tuple(application_tables),
+            interviews_database_id=interviews_database_id,
+            interviews_source_id=interviews_source_id,
+            interviews_source_type=interviews_source_type,
+            interview_title_property_id=interview_title_property_id,
+            interview_title_property_name=interview_title_property_name,
+            interview_date_property_id=interview_date_property_id,
+            interview_date_property_name=interview_date_property_name,
+            interviews=interviews,
+            diagnostics=tuple(diagnostics[:1_000]),
+            synced_at=synced_at,
+        )
+
+    async def _jobs_child_blocks(
+        self,
+        jobs_page_id: str,
+        *,
+        diagnostics: list[NotionDiscoveryDiagnostic],
+        page_size: int,
+    ) -> tuple[Mapping[str, Any], ...]:
+        blocks: list[Mapping[str, Any]] = []
+        cursor: str | None = None
+        seen_cursors: set[str] = set()
+        while True:
+            batch = await self.retrieve_block_children(
+                jobs_page_id, start_cursor=cursor, page_size=page_size
+            )
+            for block in batch.blocks:
+                if len(blocks) >= MAX_JOB_CHILD_BLOCKS:
+                    diagnostics.append(
+                        NotionDiscoveryDiagnostic(
+                            code="jobs_child_block_limit_reached",
+                            severity="warning",
+                            message="Jobs page child block limit was reached",
+                            course_page_id=jobs_page_id,
+                        )
+                    )
+                    return tuple(blocks)
+                blocks.append(block)
+            if not batch.has_more:
+                return tuple(blocks)
+            if batch.next_cursor is None or batch.next_cursor in seen_cursors:
+                raise transient_error(
+                    ErrorCode.CONNECTOR_TRANSIENT,
+                    "Notion child discovery returned invalid pagination",
+                )
+            cursor = batch.next_cursor
+            seen_cursors.add(cursor)
+
+    async def _jobs_application_table(
+        self,
+        block: Mapping[str, Any],
+        *,
+        table_order: int,
+        jobs_page_id: str,
+        jobs_title: str,
+        diagnostics: list[NotionDiscoveryDiagnostic],
+        synced_at: datetime,
+        page_size: int,
+    ) -> NotionJobApplicationTable | None:
+        table_id = block.get("id")
+        table_payload = block.get("table")
+        if not isinstance(table_id, str) or not isinstance(table_payload, Mapping):
+            diagnostics.append(
+                NotionDiscoveryDiagnostic(
+                    code="jobs_application_table_malformed",
+                    severity="warning",
+                    message="Jobs application table block was malformed and skipped",
+                    course_page_id=jobs_page_id,
+                    course_title=jobs_title[:255],
+                )
+            )
+            return None
+        table_block_id = _validate_page_id(table_id)
+        has_column_header = cast(Mapping[str, Any], table_payload).get("has_column_header") is True
+        rows: list[NotionJobTableRow] = []
+        cursor: str | None = None
+        seen_cursors: set[str] = set()
+        total_chars = 0
+        column_count = 0
+        stopped = False
+        while True:
+            batch = await self.retrieve_block_children(
+                table_block_id, start_cursor=cursor, page_size=page_size
+            )
+            for raw_row in batch.blocks:
+                if raw_row.get("type") != "table_row":
+                    continue
+                row_id = raw_row.get("id")
+                row_payload = raw_row.get("table_row")
+                if not isinstance(row_id, str) or not isinstance(row_payload, Mapping):
+                    diagnostics.append(
+                        NotionDiscoveryDiagnostic(
+                            code="jobs_application_row_malformed",
+                            severity="warning",
+                            message="Jobs application table row was malformed and skipped",
+                            course_page_id=jobs_page_id,
+                            course_title=jobs_title[:255],
+                            source_id=table_block_id,
+                        )
+                    )
+                    continue
+                if len(rows) >= MAX_JOB_APPLICATION_ROWS:
+                    diagnostics.append(
+                        NotionDiscoveryDiagnostic(
+                            code="jobs_application_row_limit_reached",
+                            severity="warning",
+                            message="Jobs application row limit was reached",
+                            course_page_id=jobs_page_id,
+                            course_title=jobs_title[:255],
+                            source_id=table_block_id,
+                        )
+                    )
+                    stopped = True
+                    break
+                raw_cells = cast(Mapping[str, Any], row_payload).get("cells")
+                if not isinstance(raw_cells, list):
+                    continue
+                cells: list[str] = []
+                for cell in cast(list[Any], raw_cells)[:MAX_JOB_APPLICATION_COLUMNS]:
+                    text = (
+                        _bounded_text(_plain_text(cell), MAX_JOB_APPLICATION_CELL_CHARS)
+                        if isinstance(cell, list)
+                        else ""
+                    )
+                    total_chars += len(text)
+                    cells.append(text)
+                if total_chars > MAX_JOB_APPLICATION_TABLE_CHARS:
+                    diagnostics.append(
+                        NotionDiscoveryDiagnostic(
+                            code="jobs_application_table_text_limit_reached",
+                            severity="warning",
+                            message="Jobs application table text limit was reached",
+                            course_page_id=jobs_page_id,
+                            course_title=jobs_title[:255],
+                            source_id=table_block_id,
+                        )
+                    )
+                    stopped = True
+                    break
+                column_count = max(column_count, len(cells))
+                is_header = has_column_header and len(rows) == 0
+                row_order = len(rows)
+                rows.append(
+                    NotionJobTableRow(
+                        table_block_id=table_block_id,
+                        row_block_id=_validate_page_id(row_id),
+                        row_order=row_order,
+                        is_header=is_header,
+                        cells=tuple(cells),
+                        last_seen_at=synced_at,
+                        content_fingerprint=_content_fingerprint(
+                            table_block_id, row_order, is_header, cells
+                        ),
+                    )
+                )
+            if stopped or not batch.has_more:
+                break
+            if batch.next_cursor is None or batch.next_cursor in seen_cursors:
+                raise transient_error(
+                    ErrorCode.CONNECTOR_TRANSIENT,
+                    "Notion table row discovery returned invalid pagination",
+                )
+            cursor = batch.next_cursor
+            seen_cursors.add(cursor)
+        return NotionJobApplicationTable(
+            table_block_id=table_block_id,
+            table_order=table_order,
+            has_column_header=has_column_header,
+            row_count=len(rows),
+            column_count=column_count,
+            rows=tuple(rows),
+            last_seen_at=synced_at,
+            content_fingerprint=_content_fingerprint(
+                table_block_id, has_column_header, [row.content_fingerprint for row in rows]
+            ),
+        )
+
+    async def _interviews_source(
+        self,
+        child_database_id: str,
+        *,
+        jobs_page_id: str,
+        jobs_title: str,
+        diagnostics: list[NotionDiscoveryDiagnostic],
+    ) -> (
+        tuple[
+            str,
+            NotionSourceType,
+            tuple[str, str, str],
+            tuple[str, str, str],
+        ]
+        | None
+    ):
+        try:
+            child_database = await self._retrieve_database(child_database_id)
+            source = self._unique_source(
+                child_database,
+                source_id=child_database_id,
+                context="Interviews child database",
+                diagnostics=diagnostics,
+                course_page_id=jobs_page_id,
+                course_title=jobs_title,
+            )
+            if source is None:
+                return None
+            source_schema = (
+                await self._retrieve_data_source(source[0])
+                if source[1] == "data_source"
+                else child_database
+            )
+        except LifeAgentError:
+            diagnostics.append(
+                NotionDiscoveryDiagnostic(
+                    code="interviews_database_inaccessible",
+                    severity="error",
+                    message="Interviews database is inaccessible or not shared",
+                    source_id=child_database_id,
+                    source_type="database",
+                    course_page_id=jobs_page_id,
+                    course_title=jobs_title[:255],
+                )
+            )
+            return None
+        properties = source_schema.get("properties")
+        if not isinstance(properties, Mapping):
+            diagnostics.append(
+                NotionDiscoveryDiagnostic(
+                    code="interviews_schema_malformed",
+                    severity="error",
+                    message="Interviews database schema is malformed",
+                    source_id=source[0],
+                    source_type=source[1],
+                    course_page_id=jobs_page_id,
+                    course_title=jobs_title[:255],
+                )
+            )
+            return None
+        title_property = _schema_property(
+            cast(Mapping[str, Any], properties), expected_name="Name", expected_type="title"
+        )
+        date_property = _schema_property(
+            cast(Mapping[str, Any], properties), expected_name="Date", expected_type="date"
+        )
+        if title_property is None:
+            diagnostics.append(
+                NotionDiscoveryDiagnostic(
+                    code="interview_name_property_invalid",
+                    severity="error",
+                    message="Interviews database must have exactly one title property named Name",
+                    source_id=source[0],
+                    source_type=source[1],
+                    course_page_id=jobs_page_id,
+                    course_title=jobs_title[:255],
+                )
+            )
+            return None
+        if date_property is None:
+            diagnostics.append(
+                NotionDiscoveryDiagnostic(
+                    code="interview_date_property_invalid",
+                    severity="error",
+                    message="Interviews database must have exactly one date property named Date",
+                    source_id=source[0],
+                    source_type=source[1],
+                    course_page_id=jobs_page_id,
+                    course_title=jobs_title[:255],
+                )
+            )
+            return None
+        return (
+            source[0],
+            source[1],
+            (title_property[0], title_property[2], "title"),
+            (date_property[0], date_property[2], "date"),
+        )
+
+    async def _interview_pages(
+        self,
+        source_id: str,
+        *,
+        source_type: NotionSourceType,
+        interviews_database_id: str,
+        jobs_page_id: str,
+        jobs_title: str,
+        title_schema: tuple[str, str, str],
+        date_schema: tuple[str, str, str],
+        diagnostics: list[NotionDiscoveryDiagnostic],
+        page_size: int,
+    ) -> list[NotionInterviewEvent]:
+        interviews: list[NotionInterviewEvent] = []
+        async for raw_page in self._query_all_source_pages(
+            source_id, source_type=source_type, page_size=page_size
+        ):
+            interview = await self._normalize_interview_page(
+                raw_page,
+                source_id=source_id,
+                source_type=source_type,
+                interviews_database_id=interviews_database_id,
+                jobs_page_id=jobs_page_id,
+                jobs_title=jobs_title,
+                title_schema=title_schema,
+                date_schema=date_schema,
+                diagnostics=diagnostics,
+                page_size=page_size,
+            )
+            if interview is not None:
+                interviews.append(interview)
+        return interviews
+
+    async def _normalize_interview_page(
+        self,
+        raw_page: Mapping[str, Any],
+        *,
+        source_id: str,
+        source_type: NotionSourceType,
+        interviews_database_id: str,
+        jobs_page_id: str,
+        jobs_title: str,
+        title_schema: tuple[str, str, str],
+        date_schema: tuple[str, str, str],
+        diagnostics: list[NotionDiscoveryDiagnostic],
+        page_size: int,
+    ) -> NotionInterviewEvent | None:
+        properties = raw_page.get("properties")
+        page_id = raw_page.get("id")
+        if not isinstance(page_id, str) or not isinstance(properties, Mapping):
+            diagnostics.append(
+                NotionDiscoveryDiagnostic(
+                    code="interview_page_malformed",
+                    severity="warning",
+                    message="Interview page returned by Notion was malformed and was skipped",
+                    source_id=source_id,
+                    source_type=source_type,
+                    course_page_id=jobs_page_id,
+                    course_title=jobs_title[:255],
+                )
+            )
+            return None
+        title_id, title_name, _ = title_schema
+        date_id, date_name, _ = date_schema
+        title_value = self._property_by_id(cast(Mapping[str, Any], properties), title_id)
+        date_value = self._property_by_id(cast(Mapping[str, Any], properties), date_id)
+        if title_value is None or date_value is None:
+            diagnostics.append(
+                NotionDiscoveryDiagnostic(
+                    code="interview_page_missing_required_property",
+                    severity="warning",
+                    message="Interview page is missing the required Name or Date property",
+                    source_id=source_id,
+                    source_type=source_type,
+                    course_page_id=jobs_page_id,
+                    course_title=jobs_title[:255],
+                )
+            )
+            return None
+        try:
+            interview_page_id = _validate_page_id(page_id)
+            date_value_normalized = _date_value(date_value[1].get("date"))
+            url_candidates = list(
+                self._interview_property_url_candidates(
+                    interview_page_id,
+                    cast(Mapping[str, Any], properties),
+                )
+            )
+            url_candidates.extend(
+                await self._interview_body_url_candidates(
+                    interview_page_id,
+                    start_order=len(url_candidates),
+                    diagnostics=diagnostics,
+                    page_size=page_size,
+                )
+            )
+            if date_value_normalized is None or date_value_normalized.start is None:
+                diagnostics.append(
+                    NotionDiscoveryDiagnostic(
+                        code="interview_date_missing",
+                        severity="warning",
+                        message="Interview page does not have a usable Date value",
+                        source_id=source_id,
+                        source_type=source_type,
+                        course_page_id=jobs_page_id,
+                        course_title=jobs_title[:255],
+                        property_id=date_id,
+                        property_name=date_name,
+                    )
+                )
+            return NotionInterviewEvent(
+                interview_id=interview_page_id,
+                jobs_page_id=jobs_page_id,
+                interviews_database_id=interviews_database_id,
+                interviews_source_id=source_id,
+                interviews_source_type=source_type,
+                page_id=interview_page_id,
+                source_url=raw_page.get("url") if isinstance(raw_page.get("url"), str) else None,
+                title=str(_normalize_value(title_value[1]))[:1_024],
+                title_property_id=title_id,
+                title_property_name=title_name,
+                date_property_id=date_id,
+                date_property_name=date_name,
+                date=date_value_normalized,
+                last_edited_at=_parse_edited(raw_page.get("last_edited_time")),
+                archived=raw_page.get("archived") is True,
+                in_trash=raw_page.get("in_trash") is True,
+                properties=_normalize_properties(cast(Mapping[str, Any], properties)),
+                url_candidates=tuple(url_candidates[:MAX_INTERVIEW_URL_CANDIDATES]),
+            )
+        except (ValueError, ValidationError, LifeAgentError):
+            diagnostics.append(
+                NotionDiscoveryDiagnostic(
+                    code="interview_page_malformed",
+                    severity="warning",
+                    message=(
+                        "Interview page returned by Notion had invalid metadata and was skipped"
+                    ),
+                    source_id=source_id,
+                    source_type=source_type,
+                    course_page_id=jobs_page_id,
+                    course_title=jobs_title[:255],
+                )
+            )
+            return None
+
+    def _interview_property_url_candidates(
+        self,
+        interview_page_id: str,
+        properties: Mapping[str, Any],
+    ) -> tuple[NotionInterviewUrlCandidate, ...]:
+        candidates: list[NotionInterviewUrlCandidate] = []
+        seen: set[tuple[str, str]] = set()
+        for property_name, property_value in properties.items():
+            if len(candidates) >= MAX_INTERVIEW_URL_CANDIDATES:
+                break
+            if not isinstance(property_value, Mapping):
+                continue
+            property_map = cast(Mapping[str, Any], property_value)
+            property_id = _property_id(property_name, property_map)
+            display_name = _property_name(property_name, property_map)
+            for url in _property_url_values(property_map):
+                key = (url, property_id)
+                if key in seen:
+                    continue
+                candidates.append(
+                    NotionInterviewUrlCandidate(
+                        url=url,
+                        source_kind="property",
+                        source_id=_source_key(interview_page_id, "property", property_id),
+                        source_property_id=property_id,
+                        source_name=display_name,
+                        order=len(candidates),
+                    )
+                )
+                seen.add(key)
+                if len(candidates) >= MAX_INTERVIEW_URL_CANDIDATES:
+                    break
+        return tuple(candidates)
+
+    async def _interview_body_url_candidates(
+        self,
+        interview_page_id: str,
+        *,
+        start_order: int,
+        diagnostics: list[NotionDiscoveryDiagnostic],
+        page_size: int,
+    ) -> tuple[NotionInterviewUrlCandidate, ...]:
+        candidates: list[NotionInterviewUrlCandidate] = []
+        seen: set[tuple[str, str]] = set()
+        request_count = 0
+        block_count = 0
+        stopped = False
+
+        async def walk(parent_id: str, depth: int) -> None:
+            nonlocal block_count, request_count, stopped
+            if stopped:
+                return
+            if depth > MAX_INTERVIEW_BODY_DEPTH:
+                diagnostics.append(
+                    NotionDiscoveryDiagnostic(
+                        code="interview_body_depth_limit_reached",
+                        severity="warning",
+                        message="Interview page body URL discovery exceeded its depth limit",
+                        course_page_id=interview_page_id,
+                    )
+                )
+                return
+            cursor: str | None = None
+            seen_cursors: set[str] = set()
+            while True:
+                if request_count >= MAX_INTERVIEW_BODY_REQUESTS:
+                    diagnostics.append(
+                        NotionDiscoveryDiagnostic(
+                            code="interview_body_request_limit_reached",
+                            severity="warning",
+                            message="Interview page body URL discovery exceeded its request limit",
+                            course_page_id=interview_page_id,
+                        )
+                    )
+                    stopped = True
+                    return
+                batch = await self.retrieve_block_children(
+                    parent_id, start_cursor=cursor, page_size=page_size
+                )
+                request_count += 1
+                for block in batch.blocks:
+                    if block_count >= MAX_INTERVIEW_BODY_BLOCKS:
+                        diagnostics.append(
+                            NotionDiscoveryDiagnostic(
+                                code="interview_body_block_limit_reached",
+                                severity="warning",
+                                message=(
+                                    "Interview page body URL discovery exceeded its block limit"
+                                ),
+                                course_page_id=interview_page_id,
+                            )
+                        )
+                        stopped = True
+                        return
+                    block_count += 1
+                    block_id = block.get("id")
+                    if not isinstance(block_id, str):
+                        continue
+                    for url in _block_url_values(block):
+                        if len(candidates) + start_order >= MAX_INTERVIEW_URL_CANDIDATES:
+                            stopped = True
+                            return
+                        key = (url, block_id)
+                        if key in seen:
+                            continue
+                        candidates.append(
+                            NotionInterviewUrlCandidate(
+                                url=url,
+                                source_kind="page_body",
+                                source_id=_source_key(interview_page_id, "body", block_id),
+                                source_block_id=_validate_page_id(block_id),
+                                order=start_order + len(candidates),
+                            )
+                        )
+                        seen.add(key)
+                    if block.get("has_children") is True:
+                        await walk(_validate_page_id(block_id), depth + 1)
+                        if stopped:
+                            return
+                if not batch.has_more:
+                    return
+                if batch.next_cursor is None or batch.next_cursor in seen_cursors:
+                    raise transient_error(
+                        ErrorCode.CONNECTOR_TRANSIENT,
+                        "Notion interview body returned invalid pagination",
+                    )
+                cursor = batch.next_cursor
+                seen_cursors.add(cursor)
+
+        await walk(interview_page_id, 0)
+        return tuple(candidates)
 
     async def _assessment_child_database_ids(
         self,
@@ -2535,6 +3730,11 @@ __all__ = [
     "NotionDateValue",
     "NotionDiscoveryDiagnostic",
     "NotionDiscoveryResult",
+    "NotionInterviewEvent",
+    "NotionInterviewUrlCandidate",
+    "NotionJobApplicationTable",
+    "NotionJobTableRow",
+    "NotionJobsDiscoveryResult",
     "NotionMaterialDiagnostic",
     "NotionMaterialFile",
     "NotionMaterialSourceKind",

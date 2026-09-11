@@ -41,19 +41,35 @@ _DISCORD_NONCE_LIMIT = 25
 _DISCORD_SEND_RATE_LIMIT_MAX_ATTEMPTS = 3
 _DISCORD_SEND_RATE_LIMIT_MAX_TOTAL_SLEEP_SECONDS = 5.0
 _DISCORD_ID_PATTERN = re.compile(r"^[0-9]{5,24}$")
+_DISCORD_PROGRESS_HISTORY_LIMIT = 7
+_DISCORD_PROGRESS_MAX_ELAPSED_SECONDS = 600
 _ACADEMIC_TIMEZONE_NAME = "America/Toronto"
 _ACADEMIC_TIMEZONE = ZoneInfo(_ACADEMIC_TIMEZONE_NAME)
 
 DiscordAcademicProgressPhase = Literal[
     "runtime_waking",
+    "runtime_checking",
+    "runtime_ready",
     "model_turn",
+    "model_turn_started",
+    "model_turn_pending",
+    "tool_activity",
     "course_lookup",
     "assessment_lookup",
     "proposal_validation",
+    "reply_preparation",
     "proposal_ready",
     "completed",
     "clarification_needed",
     "failed",
+]
+DiscordAcademicToolActivity = Literal[
+    "course_data",
+    "assessment_data",
+    "interview_data",
+    "interview_preparation",
+    "proposal_drafting",
+    "proposal_validation",
 ]
 _TERMINAL_PROGRESS_PHASES = frozenset(
     {"proposal_ready", "completed", "clarification_needed", "failed"}
@@ -61,10 +77,16 @@ _TERMINAL_PROGRESS_PHASES = frozenset(
 _ACADEMIC_PROGRESS_PHASES = frozenset(
     {
         "runtime_waking",
+        "runtime_checking",
+        "runtime_ready",
         "model_turn",
+        "model_turn_started",
+        "model_turn_pending",
+        "tool_activity",
         "course_lookup",
         "assessment_lookup",
         "proposal_validation",
+        "reply_preparation",
         "proposal_ready",
         "completed",
         "clarification_needed",
@@ -182,11 +204,26 @@ class DiscordAcademicProgressEvent(BaseModel):
     phase: DiscordAcademicProgressPhase
     attempt_number: int = Field(default=1, ge=1, le=3)
     attempt_limit: int = Field(default=3, ge=1, le=3)
-    model_turn_number: int | None = Field(default=None, ge=1, le=10)
-    model_turn_limit: int | None = Field(default=None, ge=1, le=10)
+    model_turn_number: int | None = Field(default=None, ge=1, le=50)
+    model_turn_limit: int | None = Field(default=None, ge=1, le=50)
+    elapsed_seconds: int | None = Field(
+        default=None,
+        ge=0,
+        le=_DISCORD_PROGRESS_MAX_ELAPSED_SECONDS,
+    )
+    tool_activity: DiscordAcademicToolActivity | None = None
     lookup_kind: Literal["course", "assessment"] | None = None
     result_count: int | None = Field(default=None, ge=0, le=20)
     terminal: bool = False
+
+    @field_validator("elapsed_seconds", mode="before")
+    @classmethod
+    def elapsed_seconds_is_bucketed(cls, value: object) -> int | None:
+        if value is None:
+            return None
+        if isinstance(value, bool) or not isinstance(value, int):
+            raise ValueError("elapsed_seconds must be an integer bucket")
+        return _progress_elapsed_bucket(value)
 
     def model_post_init(self, __context: object) -> None:
         if self.attempt_number > self.attempt_limit:
@@ -922,15 +959,61 @@ class DiscordAcademicPlannerAdapter:
             timeout=httpx.Timeout(10.0),
         )
         try:
-            response = await client.patch(
-                f"/channels/{channel_id}/messages/{message_id}",
-                headers={"Authorization": f"Bot {self._token.get_secret_value()}"},
-                json={
-                    "content": _bounded_discord_content(content),
-                    "allowed_mentions": {"parse": []},
-                    "components": [],
-                },
-            )
+            path = f"/channels/{channel_id}/messages/{message_id}"
+            request_json: dict[str, object] = {
+                "content": _bounded_discord_content(content),
+                "allowed_mentions": {"parse": []},
+                "components": [],
+            }
+            slept_seconds = 0.0
+            for attempt in range(1, _DISCORD_SEND_RATE_LIMIT_MAX_ATTEMPTS + 1):
+                response = await client.patch(
+                    path,
+                    headers={"Authorization": f"Bot {self._token.get_secret_value()}"},
+                    json=request_json,
+                )
+                try:
+                    response.raise_for_status()
+                except httpx.HTTPStatusError as exc:
+                    if exc.response.status_code in {401, 403}:
+                        raise authorization_error(
+                            "Discord academic message edit authorization is invalid"
+                        ) from None
+                    if exc.response.status_code == 429:
+                        retry_after = _discord_retry_after_seconds(exc.response)
+                        remaining_sleep = (
+                            _DISCORD_SEND_RATE_LIMIT_MAX_TOTAL_SLEEP_SECONDS - slept_seconds
+                        )
+                        if (
+                            retry_after is None
+                            or retry_after > remaining_sleep
+                            or attempt >= _DISCORD_SEND_RATE_LIMIT_MAX_ATTEMPTS
+                        ):
+                            raise transient_error(
+                                ErrorCode.CONNECTOR_TRANSIENT,
+                                (
+                                    "Discord academic message edit endpoint is temporarily "
+                                    "rate limited"
+                                ),
+                            ) from None
+                        await self._rate_limit_sleep(retry_after)
+                        slept_seconds += retry_after
+                        continue
+                    if exc.response.status_code >= 500:
+                        raise transient_error(
+                            ErrorCode.CONNECTOR_TRANSIENT,
+                            "Discord academic message edit endpoint is temporarily unavailable",
+                        ) from None
+                    raise permanent_error(
+                        ErrorCode.INPUT_INVALID,
+                        "Discord rejected the academic message edit request",
+                    ) from None
+                break
+            else:
+                raise transient_error(
+                    ErrorCode.CONNECTOR_TRANSIENT,
+                    "Discord academic message edit endpoint is temporarily rate limited",
+                )
             return _academic_receipt_from_response(
                 response,
                 channel_id=channel_id,
@@ -1342,10 +1425,13 @@ class DiscordAcademicProgressReporter:
         self._edit_every_n_updates = edit_every_n_updates
         self._lock = asyncio.Lock()
         self._handle: DiscordAcademicProgressHandle | None = None
-        self._stages: list[str] = []
-        self._last_stage_key: tuple[object, ...] | None = None
+        self._milestones: list[tuple[str, tuple[object, ...]]] = []
+        self._active_stage: str | None = None
+        self._active_stage_key: tuple[object, ...] | None = None
+        self._active_event: DiscordAcademicProgressEvent | None = None
         self._pending_updates = 0
         self._disabled = False
+        self._terminal = False
 
     @property
     def handle(self) -> DiscordAcademicProgressHandle | None:
@@ -1370,14 +1456,11 @@ class DiscordAcademicProgressReporter:
                 attempt_number=self._attempt_number,
                 attempt_limit=self._attempt_limit,
             )
-            stage = _progress_stage_text(progress_event)
-            stage_key = _progress_stage_key(progress_event)
-            if stage_key == self._last_stage_key:
+            if not self._apply_stage(progress_event):
                 return
             if self._handle is None:
                 await self._start_locked(progress_event)
                 return
-            self._append_stage(stage, stage_key)
             self._pending_updates += 1
             if (
                 progress_event.terminal
@@ -1443,10 +1526,7 @@ class DiscordAcademicProgressReporter:
             attempt_number=self._attempt_number,
             attempt_limit=self._attempt_limit,
         )
-        self._append_stage(
-            _progress_stage_text(progress_event),
-            _progress_stage_key(progress_event),
-        )
+        self._apply_stage(progress_event)
         try:
             if self._existing_message_id is not None:
                 self._handle = await self._delivery.adopt_progress(
@@ -1458,21 +1538,52 @@ class DiscordAcademicProgressReporter:
             else:
                 self._handle = await self._delivery.start_progress(
                     root_event_id=self._root_event_id,
-                    content=_render_progress_content(self._stages),
+                    content=_render_progress_content(self._rendered_stages()),
                 )
         except (LifeAgentError, ValueError):
             self._disabled = True
             return None
         return self._handle
 
-    def _append_stage(self, stage: str, stage_key: tuple[object, ...]) -> None:
-        if self._stages and self._stages[-1] == stage:
-            self._last_stage_key = stage_key
+    def _apply_stage(self, event: DiscordAcademicProgressEvent) -> bool:
+        if self._terminal:
+            return False
+        stage = _progress_stage_text(event)
+        stage_key = _progress_stage_key(event)
+        if stage_key == self._active_stage_key:
+            return False
+        if _is_stale_progress_update(event, self._active_event):
+            return False
+        if _is_replaceable_progress(event, self._active_event):
+            self._active_stage = stage
+            self._active_stage_key = stage_key
+            self._active_event = event
+        else:
+            self._commit_active_stage()
+            self._active_stage = stage
+            self._active_stage_key = stage_key
+            self._active_event = event
+        if event.terminal or event.phase in _TERMINAL_PROGRESS_PHASES:
+            self._terminal = True
+        return True
+
+    def _commit_active_stage(self) -> None:
+        if self._active_stage is None or self._active_stage_key is None:
             return
-        self._stages.append(stage)
-        if len(self._stages) > 8:
-            self._stages = self._stages[-8:]
-        self._last_stage_key = stage_key
+        if self._active_event is not None and _is_liveness_pulse(self._active_event):
+            return
+        self._milestones = [
+            milestone for milestone in self._milestones if milestone[1] != self._active_stage_key
+        ]
+        self._milestones.append((self._active_stage, self._active_stage_key))
+        if len(self._milestones) > _DISCORD_PROGRESS_HISTORY_LIMIT:
+            self._milestones = self._milestones[-_DISCORD_PROGRESS_HISTORY_LIMIT:]
+
+    def _rendered_stages(self) -> list[str]:
+        stages = [stage for stage, _key in self._milestones]
+        if self._active_stage is not None:
+            stages.append(self._active_stage)
+        return stages
 
     async def _flush_locked(self) -> None:
         if self._disabled or self._handle is None or not self._pending_updates:
@@ -1480,7 +1591,7 @@ class DiscordAcademicProgressReporter:
         try:
             await self._delivery.edit_progress(
                 self._handle,
-                content=_render_progress_content(self._stages),
+                content=_render_progress_content(self._rendered_stages()),
             )
             self._pending_updates = 0
         except (LifeAgentError, ValueError):
@@ -1522,12 +1633,12 @@ def _coerce_progress_event(
     model_turn_limit = _optional_progress_int(
         _event_value(event, "model_turn_limit"),
         lower=1,
-        upper=4,
+        upper=50,
     )
     raw_model_turn = _event_value(event, "model_turn_number")
     if raw_model_turn is None:
         raw_model_turn = _event_value(event, "model_turn")
-    model_turn_number = _optional_progress_int(raw_model_turn, lower=1, upper=4)
+    model_turn_number = _optional_progress_int(raw_model_turn, lower=1, upper=50)
     if model_turn_number is not None and model_turn_limit is not None:
         model_turn_number = min(model_turn_number, model_turn_limit)
     return DiscordAcademicProgressEvent(
@@ -1536,6 +1647,8 @@ def _coerce_progress_event(
         attempt_limit=coerced_attempt_limit,
         model_turn_number=model_turn_number,
         model_turn_limit=model_turn_limit,
+        elapsed_seconds=_progress_elapsed_bucket(_event_value(event, "elapsed_seconds")),
+        tool_activity=_progress_tool_activity(_event_value(event, "tool_activity")),
         lookup_kind=_progress_lookup_kind(_event_value(event, "lookup_kind")),
         result_count=_optional_progress_int(
             _event_value(event, "result_count"),
@@ -1569,6 +1682,37 @@ def _progress_lookup_kind(value: object) -> Literal["course", "assessment"] | No
     return None
 
 
+def _progress_tool_activity(value: object) -> DiscordAcademicToolActivity | None:
+    raw = getattr(value, "value", value)
+    if raw in {
+        "course_data",
+        "assessment_data",
+        "interview_data",
+        "interview_preparation",
+        "proposal_draft",
+        "proposal_drafting",
+        "proposal_validation",
+    }:
+        if raw == "proposal_draft":
+            return "proposal_drafting"
+        return cast(DiscordAcademicToolActivity, raw)
+    return None
+
+
+def _progress_elapsed_bucket(value: object) -> int | None:
+    if not isinstance(value, int) or isinstance(value, bool):
+        return None
+    bounded = min(max(value, 0), _DISCORD_PROGRESS_MAX_ELAPSED_SECONDS)
+    if bounded <= 8:
+        return bounded
+    if bounded <= 20:
+        return 20
+    if bounded <= 45:
+        return 45
+    bucket = 45 + math.ceil((bounded - 45) / 30) * 30
+    return min(bucket, _DISCORD_PROGRESS_MAX_ELAPSED_SECONDS)
+
+
 def _bounded_progress_int(value: object, *, default: int, lower: int, upper: int) -> int:
     parsed = _optional_progress_int(value, lower=lower, upper=upper)
     return default if parsed is None else parsed
@@ -1589,6 +1733,8 @@ def _progress_stage_key(event: DiscordAcademicProgressEvent) -> tuple[object, ..
         event.attempt_limit,
         event.model_turn_number,
         event.model_turn_limit,
+        event.elapsed_seconds,
+        event.tool_activity,
         event.lookup_kind,
         event.result_count,
         event.terminal,
@@ -1597,17 +1743,35 @@ def _progress_stage_key(event: DiscordAcademicProgressEvent) -> tuple[object, ..
 
 def _progress_stage_text(event: DiscordAcademicProgressEvent) -> str:
     if event.phase == "runtime_waking":
+        if event.elapsed_seconds is not None:
+            return f"Still starting LifeAgent ({event.elapsed_seconds}s elapsed)."
         return "Waking Qwen."
+    if event.phase == "runtime_checking":
+        return "Checking the local Qwen runtime."
+    if event.phase == "runtime_ready":
+        return "The Qwen runtime is ready."
     if event.phase == "model_turn":
         turn = event.model_turn_number or 1
         limit = event.model_turn_limit or 10
         return f"Qwen is interpreting your request (agent turn {turn} of {limit})."
+    if event.phase == "model_turn_started":
+        turn = event.model_turn_number or 1
+        return f"Qwen is thinking through your request (turn {turn})."
+    if event.phase == "model_turn_pending":
+        turn = event.model_turn_number or 1
+        if event.elapsed_seconds is None:
+            return f"Qwen is still working on turn {turn}."
+        return f"Qwen is still working on turn {turn} ({event.elapsed_seconds}s elapsed)."
+    if event.phase == "tool_activity":
+        return _tool_activity_stage(event.tool_activity)
     if event.phase == "course_lookup":
         return _lookup_stage("Looking up matching courses.", event.result_count)
     if event.phase == "assessment_lookup":
         return _lookup_stage("Looking up matching assessments.", event.result_count)
     if event.phase == "proposal_validation":
         return "Validating a safe proposal."
+    if event.phase == "reply_preparation":
+        return "Preparing your reply."
     if event.phase == "proposal_ready":
         return "Proposal ready."
     if event.phase == "completed":
@@ -1617,11 +1781,61 @@ def _progress_stage_text(event: DiscordAcademicProgressEvent) -> str:
     return "Academic request stopped safely."
 
 
+def _tool_activity_stage(activity: DiscordAcademicToolActivity | None) -> str:
+    if activity == "course_data":
+        return "Checking your course data."
+    if activity == "assessment_data":
+        return "Checking your assessment data."
+    if activity == "interview_data":
+        return "Syncing your Jobs and interview records."
+    if activity == "interview_preparation":
+        return "Matching the interview and checking its approved preparation sources."
+    if activity == "proposal_drafting":
+        return "Drafting a change for your review."
+    if activity == "proposal_validation":
+        return "Validating a safe proposal."
+    return "Using an approved LifeAgent tool."
+
+
 def _lookup_stage(prefix: str, count: int | None) -> str:
     if count is None:
         return prefix
     noun = "result" if count == 1 else "results"
     return f"{prefix} ({count} {noun}.)"
+
+
+def _is_replaceable_progress(
+    event: DiscordAcademicProgressEvent,
+    active: DiscordAcademicProgressEvent | None,
+) -> bool:
+    if active is None:
+        return False
+    if event.phase == "runtime_waking" and active.phase == "runtime_waking":
+        return True
+    if event.phase == "model_turn_pending" and active.phase == "model_turn_pending":
+        return (event.model_turn_number or 1) == (active.model_turn_number or 1)
+    return False
+
+
+def _is_liveness_pulse(event: DiscordAcademicProgressEvent) -> bool:
+    return event.phase == "model_turn_pending" or (
+        event.phase == "runtime_waking" and event.elapsed_seconds is not None
+    )
+
+
+def _is_stale_progress_update(
+    event: DiscordAcademicProgressEvent,
+    active: DiscordAcademicProgressEvent | None,
+) -> bool:
+    if active is None or event.phase != "model_turn_pending":
+        return False
+    event_turn = event.model_turn_number or 1
+    active_turn = active.model_turn_number or 1
+    if event_turn < active_turn:
+        return True
+    if event_turn > active_turn:
+        return False
+    return active.phase not in {"model_turn", "model_turn_started", "model_turn_pending"}
 
 
 def _render_progress_content(stages: Sequence[str]) -> str:
@@ -2409,6 +2623,7 @@ __all__ = [
     "DiscordAcademicProgressPhase",
     "DiscordAcademicProgressReporter",
     "DiscordAcademicResponseDelivery",
+    "DiscordAcademicToolActivity",
     "DiscordDailyReviewAdapter",
     "DiscordDeliveryReceipt",
     "DiscordFailureAlertAdapter",

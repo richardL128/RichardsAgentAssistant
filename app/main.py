@@ -18,10 +18,13 @@ from app import __version__
 from app.agents.academic_planner.material_ingestion import AssessmentMaterialIngestionService
 from app.agents.academic_planner.notion_mutations import DiscoveredAcademicNotionWriter
 from app.agents.academic_planner.sync import AcademicNotionSync
+from app.agents.job_interviews.notion_mutations import DiscoveredCareerNotionWriter
+from app.agents.job_interviews.sync import JobInterviewNotionSync
 from app.api.academic import router as academic_router
 from app.api.discord_handoff import router as discord_handoff_router
 from app.api.finance import router as finance_router
 from app.api.health import router as health_router
+from app.api.job_interviews import router as job_interviews_router
 from app.api.operations import router as operations_router
 from app.api.pages import router as pages_router
 from app.artifacts.store import ArtifactStore
@@ -31,6 +34,7 @@ from app.core.config import Settings, get_settings
 from app.core.errors import LifeAgentError
 from app.db.academic import SQLAlchemyAcademicPlannerStore
 from app.db.finance import SQLAlchemyFinanceStore
+from app.db.job_interviews import SQLAlchemyJobInterviewStore
 from app.db.session import Database
 from app.llm.embeddings import AcademicEmbeddingGateway
 from app.llm.gateway import LLMGateway
@@ -157,6 +161,13 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         setup_condition_code=notion_setup_condition,
         material_enqueuer=enqueue_academic_material if use_global_queue else None,
     )
+    job_interview_store = SQLAlchemyJobInterviewStore(database.engine)
+    job_interview_syncer = JobInterviewNotionSync(
+        connector=notion_connector,
+        store=job_interview_store,
+        timezone=app_settings.app_timezone,
+        setup_condition_code=notion_setup_condition,
+    )
 
     @asynccontextmanager
     async def lifespan(application: FastAPI) -> AsyncGenerator[None, None]:
@@ -180,6 +191,13 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     app.state.academic_store = academic_store
     app.state.academic_syncer = academic_syncer
     app.state.academic_material_ingestion_factory = build_material_ingestion
+    app.state.job_interview_store = job_interview_store
+    app.state.job_interview_syncer = job_interview_syncer
+    app.state.job_interview_notion_writer = (
+        DiscoveredCareerNotionWriter(engine=database.engine, connector=notion_connector)
+        if notion_connector is not None
+        else None
+    )
     # Discord Gateway ingress is a native macOS LaunchAgent. The API owns only
     # authenticated durable handoff processing and never opens a Gateway session.
     app.state.discord_host_ingress_state = "external"
@@ -201,6 +219,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     app.include_router(health_router)
     app.include_router(academic_router)
     app.include_router(discord_handoff_router)
+    app.include_router(job_interviews_router)
     app.include_router(finance_router)
     app.include_router(operations_router)
     app.include_router(pages_router)

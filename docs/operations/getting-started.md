@@ -15,14 +15,14 @@ The sole configured Qwen path is the authorized private Discord channel. The
 native macOS Discord wake LaunchAgent remains connected while the API is cold,
 acknowledges an allowlisted owner's message, starts the fixed local services as
 needed, and submits a signed reference to the backend. PostgreSQL and the
-model-free academic worker stay resident so scheduled work does not depend on
+model-free planner worker stays resident so scheduled work does not depend on
 an inbound Discord message. Health checks, startup, messages outside that
 channel or owner allowlist, and every scheduled task must not load Qwen.
 
-The one executable automatic academic schedule is the morning to-do
+The one executable automatic planner schedule is the combined morning
 notification. It is deterministic and model-free: it refreshes Notion, builds
-the intended local day's academic plan, and sends one idempotent Discord
-message.
+the intended local day's academic plan, adds due interview reminders, and sends
+one idempotent Discord message.
 
 ## 1. Start the platform
 
@@ -83,8 +83,8 @@ PostgreSQL, or reset the local `postgres_data` volume if it contains no data you
 need to keep.
 
 The API container runs migrations automatically. It does not own a Discord
-Gateway listener. `worker-academic-planner` owns durable Discord academic jobs
-and assessment-material ingestion, plus the model-free academic morning
+Gateway listener. `worker-academic-planner` owns durable planner-channel jobs,
+assessment-material ingestion, and the model-free combined morning
 notification. No scheduled model job or legacy model worker is a runtime
 option.
 
@@ -179,8 +179,13 @@ A cold start can take noticeably longer than a warm request because Docker may
 need to start and Ollama must map the model into memory. The host immediately
 creates exactly one message: `I’m waking up LifeAgent and Qwen. Please give me
 a little time to respond.` The backend adopts and edits that same message with
-runtime state, then publishes the model's own action descriptions while keeping
-structured tool results internal.
+runtime state. Unchanged host/model awaits may update at 8, 20, and 45 elapsed
+seconds and then every 30 seconds, capped at six host-wake edits and twelve
+backend edits per inbound request; each pulse replaces the active line. These
+are semantic liveness updates, not token streaming or hidden
+reasoning. Runtime-ready means the configured local runtime passed its checks,
+not that an answer is ready. The separate answer or proposal preview is sent
+before the progress message becomes terminal.
 
 ## 3. Configure Notion
 
@@ -260,6 +265,36 @@ named `Assessments` or `Assessment Calendar`, exactly one underlying data
 source, one `Name` title property, and one `Date` date property. Zero or
 multiple matches are reported as setup problems rather than guessed.
 
+### Jobs and Interviews structure
+
+Create exactly one active top-level Courses row/page titled `Jobs`. Inside it,
+keep applications in ordinary Notion table blocks. Headers such as `Company`,
+`Job`, and `Status` are optional user content: LifeAgent preserves cell order
+and asks Qwen to interpret a row with source-cell evidence, so changing headers
+or column order does not require a migration.
+
+Inside the same Jobs page, create exactly one inline database titled
+`Interviews`. Each page is one interview round. The database requires exactly
+one title property named `Name` and one date property named `Date`; other
+properties and page-body text are optional context. Put the public HTTPS
+posting URL in a supported URL property or the page body. LifeAgent discovers
+the database/data source, not a calendar view ID.
+
+Do not create an Applications database and do not add child `Assessments` to
+Jobs. The reserved Jobs page is routed exclusively to the career domain.
+
+Company research is constrained and read-only. Direct posting retrieval works
+without a search provider. Company-wide search intentionally reports
+`provider_unconfigured` until Richard approves and configures a provider. The
+bounded defaults are shown in `.env.example` under `JOB_RESEARCH_*`.
+
+Run a read-only refresh and inspect only safe counts/conditions:
+
+```bash
+curl --fail -X POST http://127.0.0.1:8000/job-interviews/sync
+curl --fail http://127.0.0.1:8000/job-interviews/health
+```
+
 The complete user-directed todo-type allowlist is `Quiz`, `Assignment`,
 `Tutorial`, `Lab`, and the complete phrase `Studying Block`. Matching is
 deterministic, case-insensitive, and respects word or phrase boundaries; the
@@ -315,14 +350,14 @@ ACADEMIC_MORNING_CATCHUP_GRACE_MINUTES=30
 must not send a stale morning notification after that deadline. Each scheduled
 period records one run with agent `academic_morning_notification`, schedule
 `academic-morning`, and idempotency key
-`academic-morning:YYYY-MM-DD:HHMM:v1`. The Discord delivery key is derived from
-the same local period as `academic-morning-delivery:YYYY-MM-DD:HHMM:v1`.
+`academic-morning:YYYY-MM-DD:HHMM:v1`. The combined academic/interview Discord
+artifact uses `planner-morning-delivery-v2:YYYY-MM-DD:HHMM:v1`.
 
-Before sending a normal morning plan, the job must complete a fresh Notion sync
-for the Courses/Assessments structure above. Missing sharing, missing child
-calendars, stale sync, partial source failure, or Discord delivery uncertainty
-is reported as an operational condition rather than converted into a false
-empty-day notification.
+Before sending a normal morning plan, the job completes the academic sync and
+then the Jobs/Interviews sync. A career failure is disclosed in the combined
+message but does not hide a valid academic plan; one invalid interview does not
+hide other valid interview reminders. Missing academic sharing, stale academic
+sync, or Discord delivery uncertainty remains fail-closed.
 
 For setup recovery or an immediate refresh after fixing a template/share
 problem, run the same idempotent boundary manually:
@@ -346,7 +381,9 @@ For Qwen-powered assistant work, the authorized private-channel Gateway path is
 the only configured entrypoint. The Gateway is an outbound WebSocket from the native
 `com.lifeagent.discord-wake` LaunchAgent to Discord; it does not require a
 public URL. The daemon stores only bounded IDs and timestamps in its local
-outbox. Its backend handoff is HMAC-authenticated and bound to loopback.
+outbox. Its backend handoff is HMAC-authenticated and bound to loopback. Gateway
+handles inbound events and its own session heartbeat; creating and editing the
+user-visible progress message uses Discord's REST API.
 
 1. Create an application in the [Discord Developer Portal](https://discord.com/developers/applications).
 2. Add a Bot user and copy its token into `DISCORD_BOT_TOKEN`.
@@ -438,11 +475,14 @@ delete as Notion archive and refuses stale or ambiguous targets. With
 mention syntax, but it does not classify the request. Exact confirmation and
 rejection replies remain model-free.
 
-Each accepted model attempt adopts the idempotent wake acknowledgement and then
-publishes the native turn through the durable response path. Tool-call narration
-is the model's own assistant content, passed through without canned action text.
-Structured tool results remain internal, failures are summarized safely, and
-hidden reasoning, secrets, and raw exception details are never published.
+Each accepted model attempt adopts the idempotent wake acknowledgement and edits
+it with host-owned runtime, turn, generic tool-activity, and reply-preparation
+states. Model-authored tool-call narration continues through the separate
+durable response path. Structured tool arguments and results remain internal,
+failures are summarized safely, and hidden reasoning, secrets, private request
+details, and raw exception details are never published. The durable final
+response or proposal preview is authoritative and is delivered before the
+progress message reports successful completion.
 
 When facts are missing or ambiguous, the model asks a natural follow-up through
 the same harness. The owner's next private-channel message is ordinary input;

@@ -739,6 +739,435 @@ class AcademicCourseCalendar(TimestampMixin, Base):
     last_synced_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
 
 
+class CareerJobsWorkspace(TimestampMixin, Base):
+    """Discovered Notion Jobs page and Interviews source state."""
+
+    __tablename__ = "career_jobs_workspaces"
+    __table_args__ = (
+        UniqueConstraint("scope", name="uq_career_jobs_workspaces_scope"),
+        UniqueConstraint("jobs_page_id", name="uq_career_jobs_workspaces_page"),
+        UniqueConstraint(
+            "interviews_data_source_id", name="uq_career_jobs_workspaces_interviews_source"
+        ),
+        CheckConstraint("length(scope) > 0", name="scope_nonempty"),
+        CheckConstraint(
+            "discovery_status IN ('valid','missing','duplicate','inaccessible','malformed')",
+            name="discovery_status_valid",
+        ),
+        Index("ix_career_jobs_workspaces_status", "discovery_status", "last_synced_at"),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(primary_key=True, default=uuid.uuid4)
+    scope: Mapped[str] = mapped_column(String(128), nullable=False, default="default")
+    jobs_page_id: Mapped[str | None] = mapped_column(String(255))
+    jobs_page_title: Mapped[str | None] = mapped_column(String(255))
+    discovery_status: Mapped[str] = mapped_column(String(32), nullable=False, default="missing")
+    diagnostic_code: Mapped[str | None] = mapped_column(String(128))
+    diagnostic_fingerprint: Mapped[str | None] = mapped_column(String(128))
+    interviews_database_id: Mapped[str | None] = mapped_column(String(255))
+    interviews_data_source_id: Mapped[str | None] = mapped_column(String(255))
+    title_property_id: Mapped[str | None] = mapped_column(String(255))
+    title_property_name: Mapped[str | None] = mapped_column(String(255))
+    date_property_id: Mapped[str | None] = mapped_column(String(255))
+    date_property_name: Mapped[str | None] = mapped_column(String(255))
+    last_discovered_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    last_synced_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    active: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
+
+
+class CareerSyncCursor(TimestampMixin, Base):
+    """Career-domain resumable source cursor."""
+
+    __tablename__ = "career_sync_cursors"
+    __table_args__ = (
+        UniqueConstraint("scope", name="uq_career_sync_cursors_scope"),
+        CheckConstraint("length(scope) > 0", name="scope_nonempty"),
+        CheckConstraint("status IN ('idle','running','succeeded','failed')", name="status_valid"),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(primary_key=True, default=uuid.uuid4)
+    scope: Mapped[str] = mapped_column(String(255), nullable=False)
+    source_version: Mapped[str] = mapped_column(String(128), nullable=False, default="notion")
+    cursor: Mapped[str | None] = mapped_column(String(512))
+    last_synced_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    status: Mapped[str] = mapped_column(String(32), nullable=False, default="idle")
+    error_code: Mapped[str | None] = mapped_column(String(128))
+
+
+class CareerApplicationTable(TimestampMixin, Base):
+    """Lossless ordinary-table snapshot under the Jobs page."""
+
+    __tablename__ = "career_application_tables"
+    __table_args__ = (
+        UniqueConstraint("table_block_id", name="uq_career_application_tables_block"),
+        CheckConstraint("length(table_block_id) > 0", name="table_block_id_nonempty"),
+        CheckConstraint("table_order >= 0", name="table_order_nonnegative"),
+        CheckConstraint("row_count >= 0", name="row_count_nonnegative"),
+        Index("ix_career_application_tables_workspace_active", "workspace_id", "active"),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(primary_key=True, default=uuid.uuid4)
+    workspace_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey("career_jobs_workspaces.id", ondelete="CASCADE"), nullable=False
+    )
+    table_block_id: Mapped[str] = mapped_column(String(255), nullable=False)
+    table_order: Mapped[int] = mapped_column(nullable=False, default=0)
+    has_column_header: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+    row_count: Mapped[int] = mapped_column(nullable=False, default=0)
+    column_count: Mapped[int] = mapped_column(nullable=False, default=0)
+    content_fingerprint: Mapped[str] = mapped_column(String(128), nullable=False)
+    last_seen_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    active: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
+
+
+class CareerApplicationRow(TimestampMixin, Base):
+    """One table_row snapshot with bounded cell text and source fingerprint."""
+
+    __tablename__ = "career_application_rows"
+    __table_args__ = (
+        UniqueConstraint("row_block_id", name="uq_career_application_rows_block"),
+        CheckConstraint("length(row_block_id) > 0", name="row_block_id_nonempty"),
+        CheckConstraint("row_order >= 0", name="row_order_nonnegative"),
+        Index("ix_career_application_rows_table_active", "table_id", "active", "row_order"),
+        Index("ix_career_application_rows_fingerprint", "content_fingerprint"),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(primary_key=True, default=uuid.uuid4)
+    table_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey("career_application_tables.id", ondelete="CASCADE"), nullable=False
+    )
+    row_block_id: Mapped[str] = mapped_column(String(255), nullable=False)
+    row_order: Mapped[int] = mapped_column(nullable=False)
+    is_header: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+    cells: Mapped[list[str]] = mapped_column(JSON, nullable=False, default=list)
+    normalized_cells: Mapped[list[str]] = mapped_column(JSON, nullable=False, default=list)
+    content_fingerprint: Mapped[str] = mapped_column(String(128), nullable=False)
+    last_seen_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    active: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
+
+
+class CareerApplicationInterpretation(TimestampMixin, Base):
+    """Optional Qwen interpretation of an application row with cited cells."""
+
+    __tablename__ = "career_application_interpretations"
+    __table_args__ = (
+        UniqueConstraint("row_id", name="uq_career_application_interpretations_row"),
+        CheckConstraint("confidence >= 0 AND confidence <= 1", name="confidence_valid"),
+        Index("ix_career_application_interpretations_company", "company_name"),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(primary_key=True, default=uuid.uuid4)
+    row_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey("career_application_rows.id", ondelete="CASCADE"), nullable=False
+    )
+    company_name: Mapped[str | None] = mapped_column(String(255))
+    role_title: Mapped[str | None] = mapped_column(String(500))
+    status: Mapped[str | None] = mapped_column(String(255))
+    confidence: Mapped[float] = mapped_column(Float, nullable=False, default=0.0)
+    evidence: Mapped[list[dict[str, Any]]] = mapped_column(JSON, nullable=False, default=list)
+    model_version: Mapped[str | None] = mapped_column(String(255))
+    interpreted_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+
+
+class CareerInterviewEvent(TimestampMixin, Base):
+    """One Notion Interviews page, with deterministic scheduling fields."""
+
+    __tablename__ = "career_interview_events"
+    __table_args__ = (
+        UniqueConstraint("interview_page_id", name="uq_career_interview_events_page"),
+        CheckConstraint("length(interview_page_id) > 0", name="interview_page_id_nonempty"),
+        CheckConstraint("length(title) > 0", name="title_nonempty"),
+        Index("ix_career_interview_events_date_active", "active", "local_date"),
+        Index("ix_career_interview_events_workspace", "workspace_id", "active"),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(primary_key=True, default=uuid.uuid4)
+    workspace_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey("career_jobs_workspaces.id", ondelete="CASCADE"), nullable=False
+    )
+    interview_page_id: Mapped[str] = mapped_column(String(255), nullable=False)
+    interviews_database_id: Mapped[str | None] = mapped_column(String(255))
+    interviews_data_source_id: Mapped[str | None] = mapped_column(String(255))
+    title: Mapped[str] = mapped_column(String(500), nullable=False)
+    date_start: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    local_date: Mapped[date | None] = mapped_column(Date)
+    is_all_day: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+    timezone: Mapped[str] = mapped_column(String(64), nullable=False, default="America/Toronto")
+    notion_last_edited_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    source_url: Mapped[str | None] = mapped_column(String(2_048))
+    tags: Mapped[list[str]] = mapped_column(JSON, nullable=False, default=list)
+    property_snapshot: Mapped[dict[str, Any]] = mapped_column(JSON, nullable=False, default=dict)
+    url_candidates: Mapped[list[dict[str, Any]]] = mapped_column(JSON, nullable=False, default=list)
+    content_fingerprint: Mapped[str] = mapped_column(String(128), nullable=False)
+    content_artifact_key: Mapped[str | None] = mapped_column(String(512))
+    active: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
+    archived: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+
+
+class CareerInterviewApplicationLink(TimestampMixin, Base):
+    """Current resolved or unresolved link from interview event to application row."""
+
+    __tablename__ = "career_interview_application_links"
+    __table_args__ = (
+        UniqueConstraint("interview_id", name="uq_career_interview_links_interview"),
+        CheckConstraint(
+            "state IN ('matched','ambiguous','needs_clarification','rejected')",
+            name="state_valid",
+        ),
+        CheckConstraint("confidence >= 0 AND confidence <= 1", name="confidence_valid"),
+        CheckConstraint("resolution_source IN ('model','user')", name="resolution_source_valid"),
+        Index("ix_career_interview_links_row", "application_row_id", "state"),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(primary_key=True, default=uuid.uuid4)
+    interview_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey("career_interview_events.id", ondelete="CASCADE"), nullable=False
+    )
+    application_row_id: Mapped[uuid.UUID | None] = mapped_column(
+        ForeignKey("career_application_rows.id", ondelete="SET NULL")
+    )
+    state: Mapped[str] = mapped_column(String(32), nullable=False)
+    confidence: Mapped[float] = mapped_column(Float, nullable=False, default=0.0)
+    rationale: Mapped[str] = mapped_column(String(1_000), nullable=False)
+    evidence: Mapped[list[dict[str, Any]]] = mapped_column(JSON, nullable=False, default=list)
+    clarification_id: Mapped[uuid.UUID | None] = mapped_column()
+    interview_content_fingerprint: Mapped[str | None] = mapped_column(String(128))
+    application_content_fingerprint: Mapped[str | None] = mapped_column(String(128))
+    resolution_source: Mapped[str] = mapped_column(String(16), nullable=False, default="model")
+    resolved_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    active: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
+
+
+class CareerResearchSnapshot(TimestampMixin, Base):
+    """Bounded research metadata and artifact references for an interview."""
+
+    __tablename__ = "career_research_snapshots"
+    __table_args__ = (
+        CheckConstraint(
+            "status IN ('pending','fetched','partial','failed','stale')",
+            name="status_valid",
+        ),
+        Index("ix_career_research_interview_time", "interview_id", "retrieved_at"),
+        Index("ix_career_research_status_freshness", "status", "freshness_expires_at"),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(primary_key=True, default=uuid.uuid4)
+    interview_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey("career_interview_events.id", ondelete="CASCADE"), nullable=False
+    )
+    source_url: Mapped[str] = mapped_column(String(2_048), nullable=False)
+    canonical_url: Mapped[str | None] = mapped_column(String(2_048))
+    company_name: Mapped[str | None] = mapped_column(String(255))
+    status: Mapped[str] = mapped_column(String(32), nullable=False, default="pending")
+    content_fingerprint: Mapped[str | None] = mapped_column(String(128))
+    excerpt_artifact_key: Mapped[str | None] = mapped_column(String(512))
+    failure_code: Mapped[str | None] = mapped_column(String(128))
+    retrieved_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    freshness_expires_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    source_metadata: Mapped[dict[str, Any]] = mapped_column(JSON, nullable=False, default=dict)
+    active: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
+
+
+class CareerPreparationPlan(TimestampMixin, Base):
+    """Current preparation plan for one interview."""
+
+    __tablename__ = "career_preparation_plans"
+    __table_args__ = (
+        UniqueConstraint("interview_id", name="uq_career_preparation_plans_interview"),
+        CheckConstraint("revision >= 1", name="revision_positive"),
+        CheckConstraint(
+            "status IN ('draft','current','stale','failed')",
+            name="status_valid",
+        ),
+        Index("ix_career_preparation_plans_status", "status", "updated_at"),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(primary_key=True, default=uuid.uuid4)
+    interview_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey("career_interview_events.id", ondelete="CASCADE"), nullable=False
+    )
+    revision: Mapped[int] = mapped_column(nullable=False, default=1)
+    status: Mapped[str] = mapped_column(String(32), nullable=False, default="current")
+    generated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    plan_hash: Mapped[str] = mapped_column(String(128), nullable=False)
+    summary: Mapped[str] = mapped_column(String(1_000), nullable=False)
+    next_actions: Mapped[list[str]] = mapped_column(JSON, nullable=False, default=list)
+    evidence: Mapped[list[str]] = mapped_column(JSON, nullable=False, default=list)
+    research_snapshot_id: Mapped[uuid.UUID | None] = mapped_column(
+        ForeignKey("career_research_snapshots.id", ondelete="SET NULL")
+    )
+    artifact_key: Mapped[str | None] = mapped_column(String(512))
+    material_change_reason: Mapped[str | None] = mapped_column(String(1_000))
+    plan_payload: Mapped[dict[str, Any]] = mapped_column(JSON, nullable=False, default=dict)
+
+
+class CareerPreparationPlanRevision(TimestampMixin, Base):
+    """Immutable revision history for interview preparation plans."""
+
+    __tablename__ = "career_preparation_plan_revisions"
+    __table_args__ = (
+        UniqueConstraint("plan_id", "revision", name="uq_career_plan_revisions_plan_revision"),
+        CheckConstraint("revision >= 1", name="revision_positive"),
+        Index("ix_career_plan_revisions_interview", "interview_id", "revision"),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(primary_key=True, default=uuid.uuid4)
+    plan_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey("career_preparation_plans.id", ondelete="CASCADE"), nullable=False
+    )
+    interview_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey("career_interview_events.id", ondelete="CASCADE"), nullable=False
+    )
+    revision: Mapped[int] = mapped_column(nullable=False)
+    status: Mapped[str] = mapped_column(String(32), nullable=False)
+    generated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    plan_hash: Mapped[str] = mapped_column(String(128), nullable=False)
+    summary: Mapped[str] = mapped_column(String(1_000), nullable=False)
+    next_actions: Mapped[list[str]] = mapped_column(JSON, nullable=False, default=list)
+    evidence: Mapped[list[str]] = mapped_column(JSON, nullable=False, default=list)
+    research_snapshot_id: Mapped[uuid.UUID | None] = mapped_column(
+        ForeignKey("career_research_snapshots.id", ondelete="SET NULL")
+    )
+    artifact_key: Mapped[str | None] = mapped_column(String(512))
+    material_change_reason: Mapped[str | None] = mapped_column(String(1_000))
+    plan_payload: Mapped[dict[str, Any]] = mapped_column(JSON, nullable=False, default=dict)
+
+
+class CareerClarification(TimestampMixin, Base):
+    """Durable career clarification and continuation state."""
+
+    __tablename__ = "career_clarifications"
+    __table_args__ = (
+        UniqueConstraint("idempotency_key", name="uq_career_clarifications_idempotency"),
+        CheckConstraint(
+            "kind IN ('jobs_configuration','application_match','interview_date','posting_url',"
+            "'preparation_context')",
+            name="kind_valid",
+        ),
+        CheckConstraint(
+            "state IN ('pending','delivered','answered','resolved','failed','expired','cancelled')",
+            name="state_valid",
+        ),
+        Index("ix_career_clarifications_state_expiry", "state", "expires_at"),
+        Index("ix_career_clarifications_subject", "subject_type", "subject_id", "state"),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(primary_key=True, default=uuid.uuid4)
+    kind: Mapped[str] = mapped_column(String(64), nullable=False)
+    subject_type: Mapped[str] = mapped_column(String(64), nullable=False)
+    subject_id: Mapped[str] = mapped_column(String(255), nullable=False)
+    question: Mapped[str] = mapped_column(String(1_000), nullable=False)
+    choices: Mapped[list[str]] = mapped_column(JSON, nullable=False, default=list)
+    idempotency_key: Mapped[str] = mapped_column(String(512), nullable=False)
+    state: Mapped[str] = mapped_column(String(32), nullable=False, default="pending")
+    partial_state: Mapped[dict[str, Any]] = mapped_column(JSON, nullable=False, default=dict)
+    response_artifact_key: Mapped[str | None] = mapped_column(String(512))
+    response_summary: Mapped[str | None] = mapped_column(String(1_000))
+    discord_channel_id: Mapped[str | None] = mapped_column(String(32))
+    discord_user_id: Mapped[str | None] = mapped_column(String(32))
+    delivery_id: Mapped[str | None] = mapped_column(String(255))
+    delivered_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    answered_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    resolved_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    expires_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    error_code: Mapped[str | None] = mapped_column(String(128))
+
+
+class CareerReminderDelivery(TimestampMixin, Base):
+    """Morning reminder idempotency keyed by local day and interview."""
+
+    __tablename__ = "career_reminder_deliveries"
+    __table_args__ = (
+        UniqueConstraint(
+            "interview_id",
+            "reminder_date",
+            "reminder_kind",
+            name="uq_career_reminder_deliveries_event_day_kind",
+        ),
+        CheckConstraint("days_until >= 0", name="days_until_nonnegative"),
+        CheckConstraint(
+            "status IN ('pending','included','sent','failed','skipped')",
+            name="status_valid",
+        ),
+        Index("ix_career_reminder_deliveries_date_status", "reminder_date", "status"),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(primary_key=True, default=uuid.uuid4)
+    interview_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey("career_interview_events.id", ondelete="CASCADE"), nullable=False
+    )
+    reminder_date: Mapped[date] = mapped_column(Date, nullable=False)
+    reminder_kind: Mapped[str] = mapped_column(String(32), nullable=False)
+    days_until: Mapped[int] = mapped_column(nullable=False)
+    delivery_id: Mapped[uuid.UUID | None] = mapped_column(
+        ForeignKey("deliveries.id", ondelete="SET NULL")
+    )
+    status: Mapped[str] = mapped_column(String(32), nullable=False, default="pending")
+    included_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    error_code: Mapped[str | None] = mapped_column(String(128))
+
+
+class CareerWriteProposal(TimestampMixin, Base):
+    """A confirmation-gated Notion write preview for career records."""
+
+    __tablename__ = "career_write_proposals"
+    __table_args__ = (
+        UniqueConstraint("idempotency_key", name="uq_career_write_proposals_idempotency"),
+        CheckConstraint(
+            "operation IN ('interview_date','preparation_plan')",
+            name="operation_valid",
+        ),
+        CheckConstraint(
+            "state IN ('pending','confirmed','applying','rejected','applied','expired','failed')",
+            name="state_valid",
+        ),
+        Index("ix_career_write_proposals_state", "state", "created_at"),
+        Index("ix_career_write_proposals_target", "target_page_id", "operation"),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(primary_key=True, default=uuid.uuid4)
+    interview_id: Mapped[uuid.UUID | None] = mapped_column(
+        ForeignKey("career_interview_events.id", ondelete="SET NULL")
+    )
+    idempotency_key: Mapped[str] = mapped_column(String(512), nullable=False)
+    operation: Mapped[str] = mapped_column(String(64), nullable=False)
+    target_page_id: Mapped[str] = mapped_column(String(255), nullable=False)
+    expected_last_edited_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    payload: Mapped[dict[str, Any]] = mapped_column(JSON, nullable=False, default=dict)
+    redacted_preview: Mapped[str] = mapped_column(String(4_000), nullable=False)
+    confirmation_token: Mapped[str] = mapped_column(String(255), nullable=False)
+    confirmation_event: Mapped[str | None] = mapped_column(String(255))
+    state: Mapped[str] = mapped_column(String(32), nullable=False, default="pending")
+    requester: Mapped[str | None] = mapped_column(String(255))
+    expires_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    applied_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+
+
+class CareerWriteReceipt(TimestampMixin, Base):
+    """Durable bounded receipt state for non-transactional career writes."""
+
+    __tablename__ = "career_write_receipts"
+    __table_args__ = (
+        UniqueConstraint("proposal_id", "operation_id", name="uq_career_write_receipts_operation"),
+        CheckConstraint("length(payload_hash) = 64", name="payload_hash_valid"),
+        CheckConstraint(
+            "state IN ('in_progress','applied','uncertain','failed')",
+            name="state_valid",
+        ),
+        Index("ix_career_write_receipts_state", "proposal_id", "state"),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(primary_key=True, default=uuid.uuid4)
+    proposal_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey("career_write_proposals.id", ondelete="CASCADE"), nullable=False
+    )
+    operation_id: Mapped[str] = mapped_column(String(255), nullable=False)
+    payload_hash: Mapped[str] = mapped_column(String(64), nullable=False)
+    state: Mapped[str] = mapped_column(String(32), nullable=False, default="in_progress")
+    receipt: Mapped[dict[str, Any] | None] = mapped_column(JSON)
+    error_code: Mapped[str | None] = mapped_column(String(128))
+
+
 class AcademicClarification(TimestampMixin, Base):
     """Durable Discord clarification state for ambiguous assessment labels."""
 
@@ -1378,6 +1807,20 @@ __all__ = [
     "Assessment",
     "AuditEvent",
     "Base",
+    "CareerApplicationInterpretation",
+    "CareerApplicationRow",
+    "CareerApplicationTable",
+    "CareerClarification",
+    "CareerInterviewApplicationLink",
+    "CareerInterviewEvent",
+    "CareerJobsWorkspace",
+    "CareerPreparationPlan",
+    "CareerPreparationPlanRevision",
+    "CareerReminderDelivery",
+    "CareerResearchSnapshot",
+    "CareerSyncCursor",
+    "CareerWriteProposal",
+    "CareerWriteReceipt",
     "CheckIn",
     "CodeRepository",
     "Course",

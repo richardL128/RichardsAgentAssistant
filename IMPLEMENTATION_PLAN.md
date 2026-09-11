@@ -4,13 +4,14 @@
 
 Build one Python application with a default `api` service, PostgreSQL, one task
 queue, one local model endpoint, schemas, audit records, and deployment
-configuration. Code review, academic planner, and finance remain separate
+configuration. Code review, academic planner, job interviews, and finance remain separate
 workflow domains. Scheduled code-review and finance Qwen workers remain
 non-executable in the current runtime. Academic Qwen has one configured path:
 messages from an authorized owner in the configured private Discord channel,
 received by the native host wake daemon.
-The model-free academic morning notification is the sole automatic academic
-schedule.
+The model-free combined planner morning notification is the sole automatic
+planner schedule; it composes academic work and interview reminders into the
+same Discord delivery.
 
 Run Ollama natively on the Mac, not in Docker. The Dockerized API uses
 `http://host.docker.internal:11434` to call it. This preserves Apple Metal
@@ -48,7 +49,11 @@ The build is deliberately Python-first. FastAPI serves both the API and the read
 
 - **No Kubernetes, microservice-per-connector, or separate frontend repository.** Docker Compose and one Python codebase suit a single Mac deployment.
 - **No separate vector-database service.** PostgreSQL full-text search remains available for exact course-document lookup, while assessment material uses active, assessment-scoped exact `pgvector` retrieval in the same database. Neither path replaces structured assessment fields or source citations.
-- **No autonomous browser/search tool.** Finance retrieval is exactly the approved, versioned source adapters; code and school connectors have narrowly specified operations.
+- **No autonomous browser/search tool.** Finance retrieval is exactly the
+  approved, versioned source adapters; code and school connectors have narrowly
+  specified operations. Career preparation has only a constrained, read-only
+  public-HTTPS posting retriever and a provider-neutral company-search boundary
+  that stays unconfigured until an approved provider exists.
 - **No LangSmith dependency.** Local structured logs and persisted runs are sufficient initially; tracing can be added later without changing graph logic.
 - **No custom authentication in the first local-only deployment.** Bind the UI/API to `127.0.0.1`. If remote access is needed, put it behind the user's existing identity-aware network/proxy (for example Tailscale) before exposing it; do not invent a password system.
 - **No brokerage connection or trading capability.** Finance outputs remain source-cited research context and thesis prompts.
@@ -74,9 +79,10 @@ The build is deliberately Python-first. FastAPI serves both the API and the read
 Use one image, such as `lifeagent-app`, for the `api`. The default Compose
 operation starts `postgres`, `api`, and the academic planner worker; the
 Discord academic wake job is the sole model path.
-No code-review or finance Qwen workers are runtime options. The academic worker
-is isolated to Discord academic work, ingestion, model-free confirmations, and
-the model-free automatic academic morning notification.
+No code-review or finance Qwen workers are runtime options. The academic planner
+worker owns authorized planner-channel academic and career work, academic
+ingestion, model-free confirmations, and the model-free combined morning
+notification.
 
 Default service names:
 
@@ -106,10 +112,11 @@ app/
   queue/               # Procrastinate tasks, retry and idempotency helpers
   llm/                 # ChatOllama factory, concurrency gate, prompts, schemas
   artifacts/           # local ArtifactStore and retention handling
-  connectors/          # github, discord, notion, finance_sources
+  connectors/          # github, discord, notion, bounded job research, finance_sources
   agents/
     code_review/       # graph, deterministic analysis, report publisher
     academic_planner/  # graph, extraction, deterministic allocator, publisher
+    job_interviews/    # flexible Jobs ingestion, matching, research, plans, reminders
     finance/           # graph, eight-source retrieval, exposure mapper, publisher
   health/              # deterministic health evaluator and alert policy
   templates/           # Jinja templates for the read-only console
@@ -153,8 +160,9 @@ shell or accepts a host command from configuration.
 - Every work item has a deterministic idempotency key, for example
   `academic-discord-message:<message-id>:proposal:v1` or
   `academic-morning:YYYY-MM-DD:HHMM:v1`.
-- Scheduled morning Discord delivery derives from the same stable local period:
-  `academic-morning-delivery:YYYY-MM-DD:HHMM:v1`.
+- Scheduled morning Discord delivery derives from the same stable local period
+  with the combined-artifact version:
+  `planner-morning-delivery-v2:YYYY-MM-DD:HHMM:v1`.
 - Procrastinate retries transient connector/model failures with capped exponential backoff and jitter. It never retries authorization failures until credentials change.
 - Publishers use provider-side idempotency where available, otherwise persist a delivery intent before sending and reconcile an uncertain send before retrying.
 - A job is complete only when required processing, persistence, and delivery all have durable success records.
@@ -493,6 +501,13 @@ OLLAMA_NUM_CTX=2048
 EMBEDDING_MODEL=qwen3-embedding:0.6b
 ACADEMIC_MORNING_SCHEDULE=08:00
 ACADEMIC_MORNING_CATCHUP_GRACE_MINUTES=30
+JOB_RESEARCH_SEARCH_PROVIDER=unconfigured
+JOB_RESEARCH_SEARCH_API_KEY=
+JOB_RESEARCH_TIMEOUT_SECONDS=10
+JOB_RESEARCH_MAX_REDIRECTS=3
+JOB_RESEARCH_MAX_RESPONSE_BYTES=1048576
+JOB_RESEARCH_MAX_PAGES=5
+JOB_RESEARCH_MAX_SEARCH_RESULTS=5
 DATABASE_URL=postgresql+psycopg://...
 ARTIFACT_ROOT=/var/lib/lifeagent/artifacts
 GITHUB_APP_ID=

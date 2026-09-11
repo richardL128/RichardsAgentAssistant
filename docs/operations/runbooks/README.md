@@ -25,6 +25,7 @@ database, but they do not imply standalone services can be started.
 
 - [Model unavailable or slow](model-unavailable-slow.md)
 - [Academic morning notification](academic-morning-notification.md)
+- [Job interviews and research](job-interviews.md)
 - [Discord cold wake](discord-cold-wake.md)
 - [Queue backlog](queue-backlog.md)
 - [Duplicate delivery](duplicate-delivery.md)

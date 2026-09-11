@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, date, datetime, timedelta
 from types import SimpleNamespace
 from typing import Literal
 from uuid import UUID
@@ -23,6 +23,11 @@ from app.agents.academic_planner.morning_notification import (
     scheduled_delivery_key,
 )
 from app.agents.academic_planner.sync import AcademicNotionSync, AcademicNotionSyncResult
+from app.agents.job_interviews.contracts import (
+    InterviewEventSnapshot,
+    InterviewReminderFact,
+    PreparationPlanSnapshot,
+)
 from app.core.errors import (
     ErrorCode,
     LifeAgentError,
@@ -74,6 +79,56 @@ class Delivery:
     ) -> object:
         self.messages.append((content, idempotency_key))
         return SimpleNamespace(status="sent")
+
+
+class CareerStore:
+    def __init__(self) -> None:
+        self.records: list[tuple[str, str, datetime]] = []
+
+    def load_upcoming_interviews(self, *, now: datetime):
+        assert now == OCCURRENCE.scheduled_at
+        return (
+            InterviewEventSnapshot(
+                interview_page_id="interview-1",
+                title="Shopify Technical Interview",
+                local_date=date(2026, 9, 17),
+                is_all_day=True,
+                last_edited_at=OCCURRENCE.scheduled_at,
+                content_fingerprint="interview-hash",
+            ),
+        )
+
+    def get_current_plan(self, interview_page_id: str):
+        assert interview_page_id == "interview-1"
+        return PreparationPlanSnapshot(
+            interview_page_id=interview_page_id,
+            revision=2,
+            generated_at=OCCURRENCE.scheduled_at,
+            plan_hash="plan-hash",
+            summary="Grounded preparation plan",
+            next_actions=("Practice the verified API-design requirement.",),
+        )
+
+    def record_reminder_delivery(
+        self,
+        reminder: InterviewReminderFact,
+        *,
+        status: str,
+        included_at: datetime,
+        delivery_id: object = None,
+    ) -> None:
+        del delivery_id
+        self.records.append((reminder.interview_page_id, status, included_at))
+
+
+class CareerSyncer:
+    def __init__(self, *, fails: bool = False) -> None:
+        self.fails = fails
+
+    async def sync(self, *, now: datetime | None = None):
+        if self.fails:
+            raise RuntimeError("career source unavailable")
+        return SimpleNamespace(status="succeeded")
 
 
 class FailureSyncStore:
@@ -201,6 +256,54 @@ async def test_successful_empty_refresh_sends_natural_light_day_message() -> Non
     assert len(store.saved) == 1
     assert "no scheduled study blocks today" in delivery.messages[0][0]
     assert delivery.messages[0][1] == scheduled_delivery_key(PERIOD_KEY, OCCURRENCE)
+
+
+async def test_combined_morning_delivers_academic_and_interview_once_with_audit() -> None:
+    career_store = CareerStore()
+    delivery = Delivery()
+    result = await execute_scheduled_morning_notification(
+        store=Store(),
+        syncer=Syncer(
+            AcademicNotionSyncResult(status="succeeded", synced_at=OCCURRENCE.scheduled_at)
+        ),
+        delivery=delivery,
+        occurrence=OCCURRENCE,
+        period_key=PERIOD_KEY,
+        executed_at=OCCURRENCE.scheduled_at,
+        career_store=career_store,
+        career_syncer=CareerSyncer(),
+    )
+
+    assert len(delivery.messages) == 1
+    message = delivery.messages[0][0]
+    assert "no scheduled study blocks today" in message
+    assert "**INTERVIEW IN 7 DAYS**" in message
+    assert "Thursday, September 17, 2026" in message
+    assert "Practice the verified API-design requirement." in message
+    assert result["interview_count"] == 1
+    assert result["reminder_audit_status"] == "recorded"
+    assert career_store.records == [("interview-1", "sent", OCCURRENCE.scheduled_at)]
+
+
+async def test_career_failure_keeps_academic_morning_delivery_honest() -> None:
+    delivery = Delivery()
+    result = await execute_scheduled_morning_notification(
+        store=Store(),
+        syncer=Syncer(
+            AcademicNotionSyncResult(status="succeeded", synced_at=OCCURRENCE.scheduled_at)
+        ),
+        delivery=delivery,
+        occurrence=OCCURRENCE,
+        period_key=PERIOD_KEY,
+        executed_at=OCCURRENCE.scheduled_at,
+        career_store=CareerStore(),
+        career_syncer=CareerSyncer(fails=True),
+    )
+
+    assert result["status"] == "succeeded"
+    assert result["career_sync_status"] == "failed"
+    assert "no scheduled study blocks today" in delivery.messages[0][0]
+    assert "academic plan is unaffected" in delivery.messages[0][0]
 
 
 async def test_allocator_output_is_authoritative_for_populated_notification() -> None:

@@ -2,16 +2,21 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 import re
 from collections.abc import Awaitable, Callable, Mapping, Sequence
+from contextlib import suppress
 from dataclasses import dataclass
+from itertools import pairwise
 from typing import Any, Literal, Protocol, cast
 
 from langchain_core.messages import AIMessage, BaseMessage, HumanMessage, SystemMessage, ToolMessage
 
 type HarnessEventKind = Literal[
     "assistant_text",
+    "model_turn_started",
+    "model_turn_pending",
     "tool_call",
     "tool_result",
     "tool_error",
@@ -30,6 +35,9 @@ MAX_EVENT_JSON_CHARS = 4_096
 MAX_JSON_STRING_CHARS = 1_024
 MAX_JSON_ITEMS = 50
 MAX_JSON_DEPTH = 6
+MODEL_PENDING_ELAPSED_SECONDS: tuple[float, ...] = (8.0, 20.0, 45.0)
+MODEL_PENDING_REPEAT_SECONDS = 30.0
+MAX_MODEL_PENDING_EVENTS = 12
 _REASONING_BLOCK_RE = re.compile(
     r"<\s*(think|thinking|reasoning)\b[^>]*>.*?<\s*/\s*\1\s*>",
     re.IGNORECASE | re.DOTALL,
@@ -90,6 +98,8 @@ class AgentHarnessEvent:
 
     kind: HarnessEventKind
     turn: int
+    turn_limit: int | None = None
+    elapsed_seconds: int | None = None
     content: str | None = None
     tool_call_id: str | None = None
     tool_name: str | None = None
@@ -116,6 +126,11 @@ class _ToolCall:
     malformed_error: str | None = None
 
 
+@dataclass(slots=True)
+class _PendingEventBudget:
+    remaining: int = MAX_MODEL_PENDING_EVENTS
+
+
 async def run_native_tool_loop(
     *,
     gateway: AgentHarnessGateway,
@@ -124,6 +139,8 @@ async def run_native_tool_loop(
     system_message: str = DEFAULT_SYSTEM_MESSAGE,
     max_turns: int = 50,
     event_sink: EventSink | None = None,
+    _model_pending_elapsed_seconds: Sequence[float] = MODEL_PENDING_ELAPSED_SECONDS,
+    _model_pending_repeat_seconds: float = MODEL_PENDING_REPEAT_SECONDS,
 ) -> AgentHarnessResult:
     """Run a bounded model/tool loop without semantic routing or keyword rules."""
 
@@ -135,9 +152,20 @@ async def run_native_tool_loop(
         SystemMessage(content=system_message),
         HumanMessage(content=user_input),
     ]
+    pending_event_budget = _PendingEventBudget()
 
     for turn in range(1, max_turns + 1):
-        assistant = await gateway.invoke_tools(tuple(messages), tool_schemas)
+        assistant = await _invoke_model_turn(
+            gateway=gateway,
+            messages=tuple(messages),
+            tools=tool_schemas,
+            turn=turn,
+            turn_limit=max_turns,
+            event_sink=event_sink,
+            pending_elapsed_seconds=_model_pending_elapsed_seconds,
+            pending_repeat_seconds=_model_pending_repeat_seconds,
+            pending_event_budget=pending_event_budget,
+        )
         messages.append(assistant)
         calls = _tool_calls(assistant, turn)
         if not calls:
@@ -185,6 +213,87 @@ async def run_native_tool_loop(
         turns=max_turns,
         messages=tuple(messages),
     )
+
+
+async def _invoke_model_turn(
+    *,
+    gateway: AgentHarnessGateway,
+    messages: Sequence[BaseMessage],
+    tools: Sequence[Mapping[str, Any]],
+    turn: int,
+    turn_limit: int,
+    event_sink: EventSink | None,
+    pending_elapsed_seconds: Sequence[float],
+    pending_repeat_seconds: float,
+    pending_event_budget: _PendingEventBudget,
+) -> AIMessage:
+    if event_sink is None:
+        return await gateway.invoke_tools(messages, tools)
+
+    await _emit(
+        event_sink,
+        AgentHarnessEvent(kind="model_turn_started", turn=turn, turn_limit=turn_limit),
+    )
+    invocation = asyncio.create_task(gateway.invoke_tools(messages, tools))
+    previous_elapsed_seconds = 0.0
+    try:
+        for elapsed_seconds in _pending_elapsed_schedule(
+            pending_elapsed_seconds,
+            pending_repeat_seconds,
+        ):
+            if pending_event_budget.remaining <= 0:
+                break
+            timeout_seconds = max(0.0, elapsed_seconds - previous_elapsed_seconds)
+            previous_elapsed_seconds = elapsed_seconds
+            try:
+                return await asyncio.wait_for(
+                    asyncio.shield(invocation),
+                    timeout=timeout_seconds,
+                )
+            except TimeoutError:
+                if invocation.done():
+                    return await invocation
+                await _emit(
+                    event_sink,
+                    AgentHarnessEvent(
+                        kind="model_turn_pending",
+                        turn=turn,
+                        turn_limit=turn_limit,
+                        elapsed_seconds=max(0, round(elapsed_seconds)),
+                    ),
+                )
+                pending_event_budget.remaining -= 1
+        return await invocation
+    except asyncio.CancelledError:
+        invocation.cancel()
+        with suppress(asyncio.CancelledError):
+            await invocation
+        raise
+    except Exception:
+        if not invocation.done():
+            invocation.cancel()
+            with suppress(asyncio.CancelledError):
+                await invocation
+        raise
+
+
+def _pending_elapsed_schedule(
+    initial_elapsed_seconds: Sequence[float],
+    repeat_seconds: float,
+) -> tuple[float, ...]:
+    if repeat_seconds <= 0:
+        raise ValueError("pending repeat seconds must be positive")
+    ordered = tuple(float(seconds) for seconds in initial_elapsed_seconds)
+    if any(seconds < 0 for seconds in ordered):
+        raise ValueError("pending elapsed seconds must be non-negative")
+    if any(later < earlier for earlier, later in pairwise(ordered)):
+        raise ValueError("pending elapsed seconds must be ordered")
+    elapsed = list(ordered)
+    next_elapsed = (elapsed[-1] if elapsed else 0.0) + repeat_seconds
+    while len(elapsed) < MAX_MODEL_PENDING_EVENTS:
+        elapsed.append(next_elapsed)
+        next_elapsed += repeat_seconds
+    return tuple(elapsed[:MAX_MODEL_PENDING_EVENTS])
 
 
 def _tool_handlers(tools: Sequence[NativeTool]) -> dict[str, NativeToolHandler]:

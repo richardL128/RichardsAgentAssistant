@@ -49,7 +49,7 @@ Keep the trailer only while Claude is drafting these; drop it from
 ## Running things
 
 ```bash
-# Application stack (Postgres, API, three workers) — from the host
+# Application stack (Postgres, API, and academic planner worker) — from the host
 docker compose up -d --build
 docker compose logs -f api
 docker compose down

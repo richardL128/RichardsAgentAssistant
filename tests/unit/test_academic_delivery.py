@@ -460,6 +460,41 @@ async def test_academic_message_edit_is_bounded_and_mention_safe() -> None:
 
 
 @pytest.mark.asyncio
+async def test_academic_message_edit_retries_429_with_same_target_and_body() -> None:
+    calls: list[httpx.Request] = []
+    sleeps: list[float] = []
+
+    def respond(request: httpx.Request) -> httpx.Response:
+        calls.append(request)
+        if len(calls) == 1:
+            return httpx.Response(429, headers={"Retry-After": "0.2"})
+        return httpx.Response(200, json={"id": "123456789012345678", "guild_id": "42"})
+
+    async with httpx.AsyncClient(
+        base_url="https://discord.com/api/v10", transport=httpx.MockTransport(respond)
+    ) as client:
+        adapter = DiscordAcademicPlannerAdapter(
+            token=SecretStr("academic-token"),
+            allowed_channel_ids={CHANNEL},
+            client=client,
+            rate_limit_sleep=lambda seconds: _record_sleep(sleeps, seconds),
+        )
+        await adapter.edit_academic_message(
+            channel_id=CHANNEL,
+            message_id="123456789012345678",
+            content="Preparing your reply.",
+        )
+
+    assert sleeps == [0.2]
+    assert len(calls) == 2
+    assert {request.method for request in calls} == {"PATCH"}
+    assert {request.url.path for request in calls} == {
+        f"/api/v10/channels/{CHANNEL}/messages/123456789012345678"
+    }
+    assert json.loads(calls[0].content) == json.loads(calls[1].content)
+
+
+@pytest.mark.asyncio
 async def test_academic_message_edit_validates_target_and_message_id() -> None:
     adapter = DiscordAcademicPlannerAdapter(
         token=SecretStr("academic-token"),
@@ -628,6 +663,148 @@ async def test_progress_reporter_posts_once_and_edits_ordered_coalesced_stages(
 
 
 @pytest.mark.asyncio
+async def test_progress_reporter_replaces_active_heartbeats_and_freezes_terminal(
+    engine: Engine,
+) -> None:
+    calls: list[httpx.Request] = []
+
+    def respond(request: httpx.Request) -> httpx.Response:
+        calls.append(request)
+        return httpx.Response(200, json={"id": "123456789012345678", "guild_id": "42"})
+
+    async with httpx.AsyncClient(
+        base_url="https://discord.com/api/v10", transport=httpx.MockTransport(respond)
+    ) as client:
+        delivery = DiscordAcademicResponseDelivery(
+            engine=engine,
+            channel_id=CHANNEL,
+            adapter=DiscordAcademicPlannerAdapter(
+                token=SecretStr("academic-token"),
+                allowed_channel_ids={CHANNEL},
+                client=client,
+            ),
+        )
+        reporter = delivery.create_progress_reporter(root_event_id="777777777777777777")
+        await reporter.start({"phase": "runtime_checking"})
+        await reporter.update({"phase": "runtime_ready"})
+        await reporter.update(
+            {
+                "phase": "model_turn_started",
+                "model_turn_number": 1,
+                "model_turn_limit": 50,
+            }
+        )
+        await reporter.update(
+            {
+                "phase": "model_turn_pending",
+                "model_turn_number": 1,
+                "elapsed_seconds": 8,
+            }
+        )
+        await reporter.update(
+            {
+                "phase": "model_turn_pending",
+                "model_turn_number": 1,
+                "elapsed_seconds": 20,
+            }
+        )
+        await reporter.update({"phase": "reply_preparation"})
+        await reporter.update(
+            {
+                "phase": "model_turn_pending",
+                "model_turn_number": 1,
+                "elapsed_seconds": 45,
+            }
+        )
+        await reporter.finish_completed()
+        await reporter.update(
+            {
+                "phase": "model_turn_pending",
+                "model_turn_number": 1,
+                "elapsed_seconds": 75,
+            }
+        )
+
+    patches = [
+        json.loads(request.content)["content"] for request in calls if request.method == "PATCH"
+    ]
+    assert patches[-1].splitlines() == [
+        "- Checking the local Qwen runtime.",
+        "- The Qwen runtime is ready.",
+        "- Qwen is thinking through your request (turn 1).",
+        "- Preparing your reply.",
+        "- Completed.",
+    ]
+    assert "8s elapsed" not in patches[-1]
+    assert "45s elapsed" not in patches[-1]
+    assert "75s elapsed" not in patches[-1]
+
+
+def test_progress_event_accepts_native_turn_limit_without_rendering_ceiling() -> None:
+    event = DiscordAcademicProgressEvent(
+        phase="model_turn_started",
+        model_turn_number=50,
+        model_turn_limit=50,
+    )
+
+    assert event.model_turn_number == 50
+    assert event.model_turn_limit == 50
+    assert "of 50" not in event.model_dump_json()
+
+    with pytest.raises(ValidationError):
+        DiscordAcademicProgressEvent(phase="model_turn_started", model_turn_number=51)
+
+
+@pytest.mark.asyncio
+async def test_progress_tool_activity_is_allowlisted_and_ignores_private_details(
+    engine: Engine,
+) -> None:
+    calls: list[httpx.Request] = []
+
+    def respond(request: httpx.Request) -> httpx.Response:
+        calls.append(request)
+        return httpx.Response(200, json={"id": "123456789012345678", "guild_id": "42"})
+
+    async with httpx.AsyncClient(
+        base_url="https://discord.com/api/v10", transport=httpx.MockTransport(respond)
+    ) as client:
+        delivery = DiscordAcademicResponseDelivery(
+            engine=engine,
+            channel_id=CHANNEL,
+            adapter=DiscordAcademicPlannerAdapter(
+                token=SecretStr("academic-token"),
+                allowed_channel_ids={CHANNEL},
+                client=client,
+            ),
+        )
+        reporter = delivery.create_progress_reporter(root_event_id="888888888888888888")
+        await reporter.start({"phase": "runtime_checking"})
+        await reporter.update(
+            {
+                "phase": "tool_activity",
+                "tool_activity": "proposal_drafting",
+                "query": "private assessment title",
+                "result_json": {"secret": "not rendered"},
+            }
+        )
+        await reporter.update(
+            {
+                "phase": "model_turn_started",
+                "model_turn_number": 2,
+                "model_turn_limit": 50,
+            }
+        )
+        await reporter.update({"phase": "tool_activity", "tool_activity": "proposal_drafting"})
+        await reporter.finish_completed()
+
+    content = json.loads(calls[-1].content)["content"]
+    assert "Drafting a change for your review." in content
+    assert content.count("Drafting a change for your review.") == 1
+    assert "private assessment title" not in content
+    assert "not rendered" not in content
+
+
+@pytest.mark.asyncio
 async def test_progress_reporter_adopts_host_ack_without_second_post(engine: Engine) -> None:
     calls: list[httpx.Request] = []
 
@@ -654,9 +831,9 @@ async def test_progress_reporter_adopts_host_ack_without_second_post(engine: Eng
         handle = await reporter.start()
         await reporter.update(
             DiscordAcademicProgressEvent(
-                phase="model_turn",
+                phase="model_turn_started",
                 model_turn_number=1,
-                model_turn_limit=10,
+                model_turn_limit=50,
             )
         )
 

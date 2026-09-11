@@ -1,18 +1,19 @@
-# Runbook: Academic Morning Notification
+# Runbook: Combined Planner Morning Notification
 
 ## Symptom
 
-The morning academic to-do message is missing, duplicated, late, or reports an
-operational failure. The operations console may show
+The combined academic to-do and interview-reminder message is missing,
+duplicated, late, or reports an operational failure. The operations console may
+show
 `health_checks.check_name = 'academic_morning'` as `Attention` or `Failed`, with
 a rule such as `run_overdue`, `required_delivery_failed`, or
 `delivery_incomplete`.
 
 ## Current architecture
 
-The academic morning notification is the only executable automatic academic
-schedule. It is deterministic and model-free. Messages from authorized owners
-in the configured private Discord channel are the only Qwen path; this
+The combined planner morning notification is the only executable automatic
+planner schedule. It is deterministic and model-free. Messages from authorized
+owners in the configured private Discord channel are the only Qwen path; this
 scheduled job must never load Qwen.
 
 The schedule is configured by:
@@ -32,7 +33,7 @@ Each occurrence uses stable identities:
 - run agent: `academic_morning_notification`;
 - run schedule: `academic-morning`;
 - run idempotency key: `academic-morning:YYYY-MM-DD:HHMM:v1`;
-- delivery idempotency key: `academic-morning-delivery:YYYY-MM-DD:HHMM:v1`;
+- delivery idempotency key: `planner-morning-delivery-v2:YYYY-MM-DD:HHMM:v1`;
 - health row: `academic_morning`.
 
 ## Diagnosis
@@ -63,7 +64,7 @@ LIMIT 10;"'
 docker compose exec -T postgres sh -lc 'psql -U "$POSTGRES_USER" -d "$POSTGRES_DB" -c "
 SELECT run_id, channel, target, idempotency_key, status, attempt_count, error_code, external_url
 FROM deliveries
-WHERE idempotency_key LIKE '\''academic-morning-delivery:%'\''
+WHERE idempotency_key LIKE '\''planner-morning-delivery-v2:%'\''
 ORDER BY created_at DESC
 LIMIT 10;"'
 ```
@@ -85,11 +86,12 @@ LIMIT 20;"'
 
 ## Source freshness requirement
 
-The normal morning message requires a fresh complete Notion sync immediately
-before planning. Missing Courses sharing, missing nested Assessments calendars,
-missing required title/date properties, partial source failure, or stale sync
-must be reported as an operational condition. Do not convert any of those states
-into an empty or light-day message.
+The normal morning message requires a fresh complete academic Notion sync
+immediately before planning, followed by a Jobs/Interviews sync. Missing Courses
+sharing, missing nested Assessments calendars, missing required title/date
+properties, partial academic source failure, or stale academic sync must be
+reported as an operational condition. A career sync failure is disclosed in the
+same message without hiding a valid academic plan.
 
 ## Expected health behavior
 
@@ -112,11 +114,13 @@ Use a controlled trigger in a non-production or explicitly approved live window:
 3. Verify the worker records one run with the expected
    `academic-morning:YYYY-MM-DD:HHMM:v1` key.
 4. Verify exactly one Discord delivery with the corresponding
-   `academic-morning-delivery:YYYY-MM-DD:HHMM:v1` key.
+   `planner-morning-delivery-v2:YYYY-MM-DD:HHMM:v1` key.
 5. Replay the same period and verify no second Discord message is sent.
 6. Temporarily break Notion sharing or use a mocked/source-failure environment
    and verify the job reports setup/source failure instead of a normal plan.
-7. Restore the real Notion sharing and confirm the next period returns healthy.
+7. Add a dated interview fixture and verify the same delivery contains its
+   deterministic reminder without sending a second Discord message.
+8. Restore the real Notion sharing and confirm the next period returns healthy.
 
 Do not test by enabling any scheduled Qwen/model job; no such job is part of the
 current runtime.

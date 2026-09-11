@@ -91,6 +91,8 @@ class Settings(BaseSettings):
     alpha_vantage_api_key: SecretValue = None
     benzinga_api_token: SecretValue = None
     fmp_api_key: SecretValue = None
+    job_research_search_provider: Literal["unconfigured"] = "unconfigured"
+    job_research_search_api_key: SecretValue = None
     repository_allowlist_version: str | None = None
 
     retry_max_attempts: Annotated[int, Field(gt=0, le=20)] = 3
@@ -151,6 +153,11 @@ class Settings(BaseSettings):
     academic_morning_schedule: time = time(hour=8)
     academic_morning_catchup_grace_minutes: Annotated[int, Field(ge=1, le=180)] = 30
     academic_end_of_day_schedule: time = time(hour=21)
+    job_research_timeout_seconds: Annotated[float, Field(gt=0, le=60)] = 10.0
+    job_research_max_redirects: Annotated[int, Field(ge=0, le=8)] = 3
+    job_research_max_response_bytes: Annotated[int, Field(ge=16_384, le=5_242_880)] = 1_048_576
+    job_research_max_pages: Annotated[int, Field(ge=1, le=10)] = 5
+    job_research_max_search_results: Annotated[int, Field(ge=1, le=10)] = 5
     finance_market_open_schedule: time = time(hour=9)
     finance_feed_poll_minutes: Annotated[int, Field(ge=5, le=10)] = 10
     finance_federal_register_poll_minutes: Annotated[int, Field(ge=15, le=1440)] = 60
@@ -175,6 +182,7 @@ class Settings(BaseSettings):
         "alpha_vantage_api_key",
         "benzinga_api_token",
         "fmp_api_key",
+        "job_research_search_api_key",
         mode="before",
     )
     @classmethod
@@ -419,6 +427,13 @@ class Settings(BaseSettings):
                     self.fmp_api_key,
                 )
             ),
+            "job_research_search_provider": self.job_research_search_provider,
+            "job_research_search_configured": self.job_research_search_api_key is not None,
+            "job_research_timeout_seconds": self.job_research_timeout_seconds,
+            "job_research_max_redirects": self.job_research_max_redirects,
+            "job_research_max_response_bytes": self.job_research_max_response_bytes,
+            "job_research_max_pages": self.job_research_max_pages,
+            "job_research_max_search_results": self.job_research_max_search_results,
             "notion_database_count": sum(
                 value is not None
                 for value in (

@@ -111,15 +111,23 @@ The first authorized message creates exactly one Discord acknowledgement:
 I’m waking up LifeAgent and Qwen. Please give me a little time to respond.
 ```
 
-The host edits that same message as it observes model, catalog lookup,
-validation, and terminal stages. These updates are best-effort semantic status,
-not token output or hidden reasoning; the separate durable proposal,
-clarification, or failure response remains authoritative. A progress PATCH
-failure must not suppress that response.
+The host and backend edit that same message through Discord REST as they observe
+startup, runtime checking/readiness, model turns, generic allowlisted tool
+activity, reply preparation, and terminal stages. The Gateway WebSocket remains
+the inbound event/session transport; it does not stream model progress. An
+unchanged host or model await may update at 8, 20, and 45 elapsed seconds and
+then every 30 seconds, capped at six host-wake edits and twelve backend edits
+per inbound request. These pulses replace the active line rather than
+accumulating repeated history. They are best-effort semantic liveness, not
+token output, completion percentages, or hidden reasoning. Runtime-ready proves
+only API/model availability. The separate
+durable answer, proposal preview, clarification, or failure response remains
+authoritative and precedes a successful terminal status; a progress `PATCH`
+failure must not suppress it.
 
 That first real structured request loads the model and can be noticeably slower
 than later warm requests. `OLLAMA_MODEL_KEEP_ALIVE_SECONDS=300` keeps Qwen
-resident across one bounded academic loop and lets Ollama unload it after about
+resident across one bounded planner loop and lets Ollama unload it after about
 five idle minutes. To unload immediately without deleting model files:
 
 ```bash
@@ -148,14 +156,18 @@ For live validation on the Mac:
 
 1. Run `scripts/ollama_qwen_unload.sh`.
 2. Confirm `scripts/ollama_qwen_status.sh` reports Qwen is not resident.
-3. Send an unmentioned Discord message, including as a reply to a pending
-   clarification, and confirm Qwen remains unloaded.
-4. Mention the bot once from an authorized user.
+3. Verify an unauthorized user, another channel, or a bot-authored message does
+   not wake Qwen. Do not use an authorized unmentioned message as the negative
+   case; mentions are optional in the configured private channel.
+4. Send one planner request from an authorized user, with or without a mention.
 5. Confirm one progress message appears, advances in place, and Qwen appears
-   resident.
-6. Confirm the bounded loop sends one separate final response. For an ambiguous
-   request, reply with another verified mention and confirm the pending
-   clarification continues. No more than three model attempts may occur.
+   resident. For a deliberately slow turn, confirm the 8-second and 20-second
+   liveness edits replace the active line without exposing request or tool data.
+6. Confirm the bounded loop sends one separate final response before progress
+   becomes terminal. For an ambiguous request, reply with another verified
+   authorized reply and confirm the pending clarification continues according
+   to the active workflow contract. No more than three model attempts may
+   occur where that contract applies.
    Operational failures must not consume a clarification attempt.
 7. Confirm Qwen unloads after the configured 300-second idle interval.
 

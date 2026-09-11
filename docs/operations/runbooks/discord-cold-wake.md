@@ -95,7 +95,7 @@ Use the results this way:
   before retrying Discord.
 
 For Ollama during a cold-wake test, `qwen_resident=no` is expected before the
-authorized academic mention. It is not an Ollama listener failure when
+authorized planner request. It is not an Ollama listener failure when
 `ollama_launchd=running`, `ollama_api=reachable`, `model_installed=yes`, and
 `digest_match=yes` are present. It is a failure if the API is unreachable, the
 model is missing, or the digest mismatches.
@@ -123,6 +123,12 @@ retry events. A worker job marked successful or a "Completed" progress edit
 does not establish acceptance: verify that the user also received a final
 answer. In particular, a retried model turn must not reuse an intermediate
 message's delivery identity for its final answer.
+
+Discord Gateway is the persistent WebSocket used for inbound events, session
+management, and Gateway heartbeats. User-visible acknowledgement creation and
+progress edits are outbound REST `POST`/`PATCH` requests; the Gateway does not
+stream agent progress automatically. Progress `PATCH` failures are best effort
+and must not suppress or duplicate the authoritative final response.
 
 The ID-only outbox and HMAC key live under the installed runtime's
 `.artifacts/discord-wake/` with
@@ -165,8 +171,8 @@ secret-bearing URLs or headers.
    other channels, or bots produce no acknowledgement, handoff or model call.
    In the configured private channel, the authorized user's prose is a valid
    request even without a mention; it must not be used as a negative test.
-5. From the authorized user in the configured private channel, send one bot
-   mention with an academic request.
+5. From the authorized user in the configured private channel, send one
+   planner request, with or without a bot mention.
 6. Confirm exactly one immediate acknowledgement appears with this text:
 
    ```text
@@ -176,6 +182,12 @@ secret-bearing URLs or headers.
 7. Confirm Docker Desktop and the three fixed Compose services become healthy,
    the acknowledgement is edited in place with semantic progress, and one
    separate answer, proposal, clarification, or bounded failure response arrives.
+   If host wake or a model turn stays pending, verify liveness at 8, 20, and 45
+   elapsed seconds and then every 30 seconds, subject to the bounded per-phase
+   cap. Pulses replace the active line rather than growing repeated history.
+   Runtime-ready means the local API/model checks passed; it does not mean an
+   answer exists. Verify the answer or proposal preview arrives before the
+   message becomes `Completed.` or `Proposal ready.`
    A failure response is evidence of honest failure handling, not successful
    acceptance of the feature. Complete three user-selected natural-language
    prompts with correct answers before declaring recovery complete.

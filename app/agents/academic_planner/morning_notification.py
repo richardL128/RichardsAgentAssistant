@@ -5,7 +5,7 @@ from __future__ import annotations
 import uuid
 from collections.abc import Callable
 from datetime import UTC, datetime, timedelta
-from typing import Protocol
+from typing import Any, Protocol
 from zoneinfo import ZoneInfo
 
 from app.agents.academic_planner.contracts import (
@@ -16,9 +16,17 @@ from app.agents.academic_planner.contracts import (
 )
 from app.agents.academic_planner.sync import AcademicNotionSync, AcademicNotionSyncResult
 from app.agents.academic_planner.workflow import build_daily_plan
+from app.agents.job_interviews.contracts import InterviewEventSnapshot, InterviewReminderFact
+from app.agents.job_interviews.morning import (
+    build_interview_reminder_facts,
+    load_reminder_inputs,
+    render_interview_reminders,
+)
+from app.agents.job_interviews.sync import JobInterviewNotionSync
 from app.core.config import Settings, get_settings
 from app.core.errors import ErrorCode, LifeAgentError, transient_error
 from app.db.academic import SQLAlchemyAcademicPlannerStore
+from app.db.job_interviews import SQLAlchemyJobInterviewStore
 from app.db.session import Database
 from app.queue.idempotency import build_idempotency_key
 from app.queue.periodic import PeriodicOccurrence, stable_period_key
@@ -29,6 +37,10 @@ _DISCORD_CONTENT_LIMIT = 2_000
 
 class ScheduledMorningSyncer(Protocol):
     async def sync(self, *, now: datetime | None = None) -> AcademicNotionSyncResult: ...
+
+
+class ScheduledCareerSyncer(Protocol):
+    async def sync(self, *, now: datetime | None = None) -> Any: ...
 
 
 class ScheduledMorningStore(Protocol):
@@ -64,7 +76,7 @@ def scheduled_delivery_key(period_key: str, occurrence: PeriodicOccurrence) -> s
     """Derive a stable delivery identity from the same local scheduled period."""
 
     local_date, local_time = _period_parts(period_key, occurrence)
-    return build_idempotency_key("academic-morning-delivery", local_date, local_time)
+    return build_idempotency_key("planner-morning-delivery-v2", local_date, local_time)
 
 
 def scheduled_attention_key(
@@ -90,6 +102,9 @@ def build_scheduled_morning_notification(
     occurrence: PeriodicOccurrence,
     source_synced_at: datetime,
     timezone_name: str,
+    interview_reminders: tuple[InterviewReminderFact, ...] = (),
+    interviews: tuple[InterviewEventSnapshot, ...] = (),
+    career_condition: str | None = None,
 ) -> ScheduledMorningNotification:
     """Select the intended local day and render every selected block exactly once."""
 
@@ -125,12 +140,23 @@ def build_scheduled_morning_notification(
             lines.append(
                 f"- {block.local_start.strftime('%H:%M')} — {block.title} ({', '.join(details)})"
             )
-        lines.append("Have a good day!")
     else:
         lines = [
             f"Good morning, Richard. Your academic plan for {date_label} is clear—there are "
-            "no scheduled study blocks today. Have a good day!"
+            "no scheduled study blocks today."
         ]
+    if interview_reminders:
+        lines.extend(("", "Upcoming interviews:"))
+        lines.append(
+            render_interview_reminders(
+                interview_reminders,
+                interviews=interviews,
+                timezone_name=timezone_name,
+            )
+        )
+    elif career_condition:
+        lines.extend(("", f"Interviews: {career_condition}"))
+    lines.append("Have a good day!")
     message = "\n".join(lines)
     if len(message) > _DISCORD_CONTENT_LIMIT:
         raise ValueError("scheduled academic notification exceeds Discord's content limit")
@@ -140,6 +166,7 @@ def build_scheduled_morning_notification(
         scheduled_at=occurrence.scheduled_at,
         source_synced_at=source_synced_at,
         blocks=tuple(selected),
+        interview_items=interview_reminders,
         message_text=message,
     )
 
@@ -219,6 +246,8 @@ async def execute_scheduled_morning_notification(
     horizon_days: int = 14,
     attempt: int = 1,
     attempt_limit: int = 3,
+    career_store: Any | None = None,
+    career_syncer: ScheduledCareerSyncer | None = None,
 ) -> dict[str, object]:
     """Refresh, allocate, persist, format, and deliver one scheduled local period."""
 
@@ -285,6 +314,42 @@ async def execute_scheduled_morning_notification(
     facts = store.load_planner_facts(now=occurrence.scheduled_at, horizon_days=horizon_days)
     plan = build_daily_plan(facts, now=occurrence.scheduled_at)
     store.save_daily_plan(plan)
+    interview_reminders: tuple[InterviewReminderFact, ...] = ()
+    interview_events: tuple[InterviewEventSnapshot, ...] = ()
+    career_condition: str | None = None
+    career_sync_status = "unconfigured"
+    if career_store is not None:
+        try:
+            if career_syncer is not None:
+                career_result = await career_syncer.sync(now=current)
+                career_sync_status = str(getattr(career_result, "status", "failed"))
+            else:
+                career_sync_status = "cached"
+            if career_sync_status in {"succeeded", "partial", "cached"}:
+                loaded_interviews, loaded_plans = load_reminder_inputs(
+                    career_store,
+                    now=occurrence.scheduled_at,
+                )
+                interview_events = tuple(loaded_interviews)
+                interview_reminders = build_interview_reminder_facts(
+                    interview_events,
+                    now=occurrence.scheduled_at,
+                    plans=loaded_plans,
+                    timezone_name=timezone_name,
+                )
+                if career_sync_status == "partial":
+                    career_condition = (
+                        "Some interview details need clarification; valid reminders are shown."
+                    )
+            else:
+                career_condition = (
+                    "I couldn't refresh Jobs safely; check the Jobs/Interviews setup."
+                )
+        except Exception:
+            career_sync_status = "failed"
+            career_condition = (
+                "I couldn't refresh interview reminders; the academic plan is unaffected."
+            )
     try:
         notification = build_scheduled_morning_notification(
             plan,
@@ -292,6 +357,9 @@ async def execute_scheduled_morning_notification(
             occurrence=occurrence,
             source_synced_at=synced_at,
             timezone_name=timezone_name,
+            interview_reminders=interview_reminders,
+            interviews=interview_events,
+            career_condition=career_condition,
         )
     except ValueError as exc:
         if "content limit" not in str(exc):
@@ -316,22 +384,43 @@ async def execute_scheduled_morning_notification(
             "sync_status": sync_result.status,
             "delivery_count": 0,
             "block_count": len(notification.blocks),
+            "interview_count": len(notification.interview_items),
             "plan_id": str(plan.plan_id),
         }
     receipt = await delivery.send_scheduled_notification(
         notification.message_text,
         idempotency_key=scheduled_delivery_key(period_key, occurrence),
     )
+    reminder_audit_status = "not_applicable"
+    if notification.interview_items and career_store is not None:
+        recorder = getattr(career_store, "record_reminder_delivery", None)
+        if callable(recorder):
+            reminder_audit_status = "recorded"
+            try:
+                raw_delivery_id = getattr(receipt, "id", None)
+                delivery_id = raw_delivery_id if isinstance(raw_delivery_id, uuid.UUID) else None
+                for item in notification.interview_items:
+                    recorder(
+                        item,
+                        status="sent",
+                        included_at=current,
+                        delivery_id=delivery_id,
+                    )
+            except Exception:
+                reminder_audit_status = "failed"
     return {
         "status": "succeeded",
         "plan_id": str(plan.plan_id),
         "block_count": len(notification.blocks),
+        "interview_count": len(notification.interview_items),
+        "career_sync_status": career_sync_status,
         "deferred_count": len(plan.deferred_assessment_ids),
         "deferred_practice_count": len(plan.deferred_practice_focus_ids),
         "ambiguous_count": len(plan.ambiguous_questions),
         "sync_status": sync_result.status,
         "delivery_count": 1,
         "delivery_status": str(getattr(receipt, "status", "sent")),
+        "reminder_audit_status": reminder_audit_status,
     }
 
 
@@ -343,12 +432,16 @@ class _Runtime:
         settings: Settings,
         store: ScheduledMorningStore,
         syncer: ScheduledMorningSyncer,
+        career_store: SQLAlchemyJobInterviewStore,
+        career_syncer: JobInterviewNotionSync,
         delivery: ScheduledMorningDelivery | None,
     ) -> None:
         self.database = database
         self.settings = settings
         self.store = store
         self.syncer = syncer
+        self.career_store = career_store
+        self.career_syncer = career_syncer
         self.delivery = delivery
 
 
@@ -386,6 +479,13 @@ def _load_runtime(run_id: uuid.UUID) -> _Runtime:
         setup_condition_code=setup_condition,
         material_enqueuer=None,
     )
+    career_store = SQLAlchemyJobInterviewStore(database.engine)
+    career_syncer = JobInterviewNotionSync(
+        connector=connector,
+        store=career_store,
+        timezone=settings.app_timezone,
+        setup_condition_code=setup_condition,
+    )
     delivery = None
     if settings.discord_bot_token is not None and settings.discord_academic_channel_id is not None:
         from app.connectors.discord import (
@@ -409,6 +509,8 @@ def _load_runtime(run_id: uuid.UUID) -> _Runtime:
         settings=settings,
         store=store,
         syncer=syncer,
+        career_store=career_store,
+        career_syncer=career_syncer,
         delivery=delivery,
     )
 
@@ -447,12 +549,15 @@ async def run_scheduled_morning_notification(
             horizon_days=runtime.settings.academic_plan_horizon_days,
             attempt=attempt,
             attempt_limit=attempt_limit,
+            career_store=runtime.career_store,
+            career_syncer=runtime.career_syncer,
         )
     finally:
         runtime.database.dispose()
 
 
 __all__ = [
+    "ScheduledCareerSyncer",
     "ScheduledMorningDelivery",
     "ScheduledMorningStore",
     "ScheduledMorningSyncer",

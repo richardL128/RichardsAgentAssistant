@@ -7,6 +7,9 @@ from dataclasses import dataclass
 from app.agents.academic_planner.discord_harness import NativeAcademicDiscordHandler
 from app.agents.academic_planner.notion_mutations import DiscoveredAcademicNotionWriter
 from app.agents.academic_planner.sync import AcademicNotionSync
+from app.agents.job_interviews.agent_loop import CareerAgentToolState
+from app.agents.job_interviews.notion_mutations import DiscoveredCareerNotionWriter
+from app.agents.job_interviews.sync import JobInterviewNotionSync
 from app.connectors.discord import (
     DiscordAcademicPlannerAdapter,
     DiscordAcademicResponseDelivery,
@@ -15,6 +18,7 @@ from app.connectors.notion import NotionConnector
 from app.core.config import Settings, get_settings
 from app.core.errors import LifeAgentError
 from app.db.academic import SQLAlchemyAcademicPlannerStore
+from app.db.job_interviews import SQLAlchemyJobInterviewStore
 from app.db.session import Database
 from app.llm.gateway import LLMGateway
 from app.llm.ollama_runtime import OllamaRuntime
@@ -87,11 +91,23 @@ def create_academic_discord_service(
         setup_condition_code=notion_setup_condition,
         material_enqueuer=None,
     )
+    career_store = SQLAlchemyJobInterviewStore(database.engine)
+    career_syncer = JobInterviewNotionSync(
+        connector=notion_connector,
+        store=career_store,
+        timezone=app_settings.app_timezone,
+        setup_condition_code=notion_setup_condition,
+    )
     writer = (
         DiscoveredAcademicNotionWriter(
             connector=notion_connector,
             target_store=store,
         )
+        if notion_connector is not None
+        else None
+    )
+    career_writer = (
+        DiscoveredCareerNotionWriter(engine=database.engine, connector=notion_connector)
         if notion_connector is not None
         else None
     )
@@ -111,6 +127,27 @@ def create_academic_discord_service(
             max(5.0, app_settings.connector_timeout_seconds * 3),
         ),
         timezone=app_settings.app_timezone,
+        career_tool_state_factory=lambda message: CareerAgentToolState(
+            store=career_store,
+            syncer=career_syncer,
+            gateway=gateway,
+            engine=database.engine,
+            requester=message.author_id,
+            external_event_id=message.message_id,
+            now=message.timestamp,
+            timezone=app_settings.app_timezone,
+            sync_timeout_seconds=min(
+                60.0,
+                max(5.0, app_settings.connector_timeout_seconds * 3),
+            ),
+            research_timeout_seconds=app_settings.job_research_timeout_seconds,
+            research_max_redirects=app_settings.job_research_max_redirects,
+            research_max_response_bytes=app_settings.job_research_max_response_bytes,
+            research_max_pages=app_settings.job_research_max_pages,
+            research_max_search_results=app_settings.job_research_max_search_results,
+        ),
+        career_engine=database.engine,
+        career_writer_provider=lambda: career_writer,
     )
     return AcademicDiscordService(handler=handler, database=database)
 

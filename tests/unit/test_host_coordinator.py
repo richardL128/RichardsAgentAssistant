@@ -11,7 +11,11 @@ from app.connectors.discord_gateway import (
     DiscordClarificationInteraction,
 )
 from app.host.commands import HostWakeError
-from app.host.coordinator import HOST_WAKE_ACKNOWLEDGEMENT, HostWakeCoordinator
+from app.host.coordinator import (
+    HOST_WAKE_ACKNOWLEDGEMENT,
+    HOST_WAKE_HANDOFF_PROGRESS,
+    HostWakeCoordinator,
+)
 from app.host.discord import HOST_COMMAND_ACKNOWLEDGEMENT
 from app.host.handoff import (
     DiscordHostHandoff,
@@ -24,11 +28,12 @@ from app.host.settings import HostWakeSettings
 
 
 class FakeDiscord:
-    def __init__(self) -> None:
+    def __init__(self, *, fail_edits: bool = False) -> None:
         self.events: list[str] = []
         self.acks: list[tuple[str, str]] = []
         self.ack_contents: list[str] = []
         self.edits: list[str] = []
+        self.fail_edits = fail_edits
 
     async def send_acknowledgement(
         self,
@@ -52,6 +57,8 @@ class FakeDiscord:
         del channel_id, acknowledgement_message_id
         self.events.append("edit")
         self.edits.append(content)
+        if self.fail_edits:
+            raise RuntimeError("private Discord transport detail")
 
 
 class FakeService:
@@ -87,6 +94,20 @@ class FakeHandoff:
         self.events.append("handoff")
         self.events_submitted.append(event)
         return DiscordHostHandoffAccepted(status="accepted")
+
+
+class FakeClock:
+    def __init__(self) -> None:
+        self.now = 0.0
+        self.delays: list[float] = []
+
+    def monotonic(self) -> float:
+        return self.now
+
+    async def sleep(self, delay: float) -> None:
+        self.delays.append(delay)
+        self.now += delay
+        await asyncio.sleep(0)
 
 
 def _settings(tmp_path: Path) -> HostWakeSettings:
@@ -202,7 +223,8 @@ async def test_authorized_unmentioned_prose_is_acknowledged_and_handed_to_harnes
     result = await coordinator.process_message(_message(mentioned=False))
 
     assert result == "handled"
-    assert discord.events == ["ack"]
+    assert discord.events[0] == "ack"
+    assert discord.edits == [HOST_WAKE_HANDOFF_PROGRESS]
     assert events[-1] == "handoff"
     assert handoff.events_submitted[0].acknowledgement_message_id == "445555555555555555"
     assert outbox.get("555555555555555555").request_kind == "mention"
@@ -282,6 +304,150 @@ async def test_concurrent_mentions_share_wake_attempt_but_handoff_each(
     assert docker.calls == 1
     assert ollama.calls == 1
     assert events.count("handoff") == 2
+
+
+@pytest.mark.asyncio
+async def test_slow_wake_edits_bounded_startup_heartbeats_and_handoff(
+    tmp_path: Path,
+) -> None:
+    settings = _settings(tmp_path)
+    events: list[str] = []
+    release = asyncio.Event()
+    clock = FakeClock()
+    discord = FakeDiscord()
+    coordinator = HostWakeCoordinator(
+        settings=settings,
+        outbox=WakeOutbox(settings.outbox_path),
+        discord=discord,
+        docker=FakeService("docker", events, release=release),
+        compose=FakeService("compose", events),
+        ollama=FakeService("ollama", events, release=release),
+        deployment=FakeService("deploy", events),
+        backend_live=FakeService("api", events),
+        handoff=FakeHandoff(events),
+        monotonic=clock.monotonic,
+        sleep=clock.sleep,
+    )
+
+    task = asyncio.create_task(coordinator.process_message(_message()))
+    for _ in range(20):
+        if len(discord.edits) >= 6:
+            break
+        await asyncio.sleep(0)
+
+    assert discord.events[0] == "ack"
+    assert discord.edits == [
+        "Still starting LifeAgent (8s elapsed).",
+        "Still starting LifeAgent (20s elapsed).",
+        "Still starting LifeAgent (45s elapsed).",
+        "Still starting LifeAgent (75s elapsed).",
+        "Still starting LifeAgent (105s elapsed).",
+        "Still starting LifeAgent (135s elapsed).",
+    ]
+    assert clock.delays == [8.0, 12.0, 25.0, 30.0, 30.0, 30.0]
+
+    release.set()
+    assert await task == "handled"
+    assert discord.edits[-1] == HOST_WAKE_HANDOFF_PROGRESS
+    assert events[-1] == "handoff"
+
+
+@pytest.mark.asyncio
+async def test_slow_wake_failure_replaces_heartbeat_with_safe_failure(
+    tmp_path: Path,
+) -> None:
+    settings = _settings(tmp_path)
+    events: list[str] = []
+    release = asyncio.Event()
+    clock = FakeClock()
+    discord = FakeDiscord()
+    coordinator = HostWakeCoordinator(
+        settings=settings,
+        outbox=WakeOutbox(settings.outbox_path),
+        discord=discord,
+        docker=FakeService(
+            "docker",
+            events,
+            release=release,
+            error=HostWakeError("docker_timeout"),
+        ),
+        compose=FakeService("compose", events),
+        ollama=FakeService("ollama", events, release=release),
+        deployment=FakeService("deploy", events),
+        backend_live=FakeService("api", events),
+        handoff=FakeHandoff(events),
+        monotonic=clock.monotonic,
+        sleep=clock.sleep,
+    )
+
+    task = asyncio.create_task(coordinator.process_message(_message()))
+    for _ in range(20):
+        if len(discord.edits) >= 6:
+            break
+        await asyncio.sleep(0)
+    release.set()
+
+    assert await task == "failed"
+    assert discord.edits[-1].startswith("LifeAgent could not start Docker Desktop.")
+
+
+@pytest.mark.asyncio
+async def test_progress_edit_failure_does_not_fail_successful_wake(tmp_path: Path) -> None:
+    settings = _settings(tmp_path)
+    events: list[str] = []
+    discord = FakeDiscord(fail_edits=True)
+    handoff = FakeHandoff(events)
+    coordinator = HostWakeCoordinator(
+        settings=settings,
+        outbox=WakeOutbox(settings.outbox_path),
+        discord=discord,
+        docker=FakeService("docker", events),
+        compose=FakeService("compose", events),
+        ollama=FakeService("ollama", events),
+        deployment=FakeService("deploy", events),
+        backend_live=FakeService("api", events),
+        handoff=handoff,
+    )
+
+    assert await coordinator.process_message(_message()) == "handled"
+    assert discord.edits == [HOST_WAKE_HANDOFF_PROGRESS]
+    assert events[-1] == "handoff"
+
+
+@pytest.mark.asyncio
+async def test_parent_cancellation_stops_wake_progress_pacer(tmp_path: Path) -> None:
+    settings = _settings(tmp_path)
+    events: list[str] = []
+    release = asyncio.Event()
+    coordinator = HostWakeCoordinator(
+        settings=settings,
+        outbox=WakeOutbox(settings.outbox_path),
+        discord=FakeDiscord(),
+        docker=FakeService("docker", events, release=release),
+        compose=FakeService("compose", events),
+        ollama=FakeService("ollama", events, release=release),
+        deployment=FakeService("deploy", events),
+        backend_live=FakeService("api", events),
+        handoff=FakeHandoff(events),
+    )
+
+    request = asyncio.create_task(coordinator.process_message(_message()))
+    for _ in range(20):
+        if coordinator._wake_task is not None:
+            break
+        await asyncio.sleep(0)
+    request.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await request
+
+    assert not any(
+        task.get_name() == "lifeagent-host-wake-progress" and not task.done()
+        for task in asyncio.all_tasks()
+    )
+    release.set()
+    wake_task = coordinator._wake_task
+    if wake_task is not None:
+        await wake_task
 
 
 @pytest.mark.asyncio

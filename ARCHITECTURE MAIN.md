@@ -2,7 +2,7 @@
 
 ## Shared design principles
 
-All three agents follow the same pattern:
+All workflow domains follow the same pattern:
 
 ```text
 Narrowly scoped connectors → fact extraction → local Qwen reasoning
@@ -24,12 +24,12 @@ resident with PostgreSQL. That worker owns the minute-level periodic deferrer;
 keeping it resident is what makes the configured morning occurrence executable
 without loading Qwen or waiting for an inbound Discord message.
 
-The sole automatic academic schedule is the model-free morning to-do
+The sole automatic planner schedule is the model-free combined morning
 notification. It runs from `ACADEMIC_MORNING_SCHEDULE` in `APP_TIMEZONE`, uses
 `ACADEMIC_MORNING_CATCHUP_GRACE_MINUTES` as its bounded catch-up window, and
 never loads Qwen. Each period is keyed as
-`academic-morning:YYYY-MM-DD:HHMM:v1`; the Discord delivery uses the same local
-period via `academic-morning-delivery:YYYY-MM-DD:HHMM:v1`.
+`academic-morning:YYYY-MM-DD:HHMM:v1`; the changed combined artifact uses the
+same local period via `planner-morning-delivery-v2:YYYY-MM-DD:HHMM:v1`.
 
 Native source, configuration, dependencies and wake state are installed under
 `~/Library/Application Support/LifeAgent`, independent of the development
@@ -261,7 +261,51 @@ The agent must not connect to a brokerage, place trades, or use unqualified “b
 
 ---
 
-## 3. University personal-assistant and academic planner
+## 3. Jobs and interview preparation
+
+Career data is a separate persistence and orchestration domain. The reserved
+active `Jobs` row in the configured Courses database is excluded from academic
+course discovery. Its ordinary Notion table blocks are ingested losslessly and
+without fixed headers. One inline `Interviews` database supplies one page per
+interview round; its unique title property named `Name` and date property named
+`Date` are the only required scheduling schema.
+
+```text
+Jobs page ordinary tables + Interviews data source
+                    ↓
+bounded source snapshots + Toronto-local interview dates
+                    ↓
+strict Qwen row interpretation/matching with quoted source evidence
+                    ↓
+constrained public-HTTPS posting/company research
+                    ↓
+one versioned preparation plan per interview
+                    ↓
+deterministic reminders in the existing planner-channel morning message
+```
+
+Host code includes every current or future interview each morning and excludes
+past, inactive, or archived events. It owns `days_until`; only 14, 7, 3, and 1
+days and interview day receive bold uppercase labels. Qwen cannot change dates,
+milestones, IDs, or source citations. Ambiguous matches, missing postings, and
+insufficient evidence create focused, durable clarification records. Missing or
+invalid dates remain unscheduled and surface as actionable sync diagnostics.
+
+Research accepts only a selected posting URL plus an allowlisted intent. It
+uses public HTTPS GETs with DNS/redirect revalidation, private-address and
+metadata blocking, content-type/size/time/request ceilings, visible-text
+extraction, and source fingerprints. Company-wide search remains fail-closed
+until an approved provider is configured; posting-only preparation must say so.
+
+Interview Date changes and preparation-plan publication are proposals. The
+host persists an immutable exact preview, requires the matching owner
+confirmation event, rechecks Notion page/property/owned-target preconditions,
+and updates only the Date property or the LifeAgent-owned preparation child
+page.
+
+---
+
+## 4. University personal-assistant and academic planner
 
 ### Goal
 
@@ -310,10 +354,10 @@ Assessments database; its calendar is only a view over those assessment pages.
 The configured Discord runtime is one native, role-separated model harness. It
 receives authorized free-form input intact, can answer unrelated questions, and
 selects tools without a semantic pre-router or command taxonomy. Before a native
-tool call, the model's own action description is passed through to Discord; the
-application does not replace it with canned tool narration. Structured tool
-results remain internal, failures are summarized safely, and hidden reasoning is
-never exposed.
+tool call, the model's own action description is passed through the durable
+response path. The editable progress message also uses bounded, host-authored
+activity labels without request details. Structured tool results remain
+internal, failures are summarized safely, and hidden reasoning is never exposed.
 The deterministic application boundary validates only tool schemas,
 allowlisted/owner-scoped IDs, time and size bounds, stale-write preconditions,
 idempotency, and exact confirmation. The Notion calendar displays the underlying
@@ -449,7 +493,7 @@ The assistant is a planner and tutor, not a mechanism for completing graded work
 
 ---
 
-## 4. Minimal operations UI
+## 5. Minimal operations UI
 
 The frontend's complete architecture and implementation guidance lives in [frontend/AGENTS.md](frontend/AGENTS.md). The UI is a read-only health and audit console for the three agents; Discord and GitHub remain the places where work and communication occur.
 

@@ -2,9 +2,12 @@
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
+import math
 import re
-from typing import Literal
+from collections.abc import Awaitable, Callable, Mapping
+from typing import Literal, NoReturn, cast
 
 import httpx
 from pydantic import SecretStr
@@ -23,6 +26,8 @@ DiscordWakeFailure = Literal[
 ]
 
 _DISCORD_ID = re.compile(r"^[0-9]{5,24}$")
+_MAX_PATCH_ATTEMPTS = 3
+_MAX_PATCH_RETRY_SLEEP_SECONDS = 5.0
 
 
 def wake_ack_nonce(message_id: str) -> str:
@@ -67,12 +72,14 @@ class DiscordWakeAckAdapter:
         allowed_channel_id: str,
         base_url: str = "https://discord.com/api/v10",
         client: httpx.AsyncClient | None = None,
+        sleep: Callable[[float], Awaitable[object]] = asyncio.sleep,
     ) -> None:
         _require_id(allowed_channel_id)
         self._token = token
         self._allowed_channel_id = allowed_channel_id
         self._base_url = base_url.rstrip("/")
         self._client = client
+        self._sleep = sleep
 
     async def send_acknowledgement(
         self,
@@ -120,13 +127,29 @@ class DiscordWakeAckAdapter:
             raise ValueError("Discord acknowledgement edit content is invalid")
         owns_client = self._client is None
         client = self._client or httpx.AsyncClient(base_url=self._base_url, timeout=10.0)
+        target = f"/channels/{channel_id}/messages/{acknowledgement_message_id}"
+        headers = {"Authorization": f"Bot {self._token.get_secret_value()}"}
+        body: dict[str, object] = {
+            "content": content,
+            "allowed_mentions": {"parse": []},
+            "components": [],
+        }
+        total_sleep = 0.0
         try:
-            response = await client.patch(
-                f"/channels/{channel_id}/messages/{acknowledgement_message_id}",
-                headers={"Authorization": f"Bot {self._token.get_secret_value()}"},
-                json={"content": content, "allowed_mentions": {"parse": []}, "components": []},
-            )
-            response.raise_for_status()
+            for attempt in range(_MAX_PATCH_ATTEMPTS):
+                response = await client.patch(target, headers=headers, json=body)
+                if response.is_success:
+                    return
+                if response.status_code != 429 or attempt == _MAX_PATCH_ATTEMPTS - 1:
+                    _raise_safe_edit_failure()
+                retry_after = _retry_after_seconds(response)
+                if (
+                    retry_after is None
+                    or total_sleep + retry_after > _MAX_PATCH_RETRY_SLEEP_SECONDS
+                ):
+                    _raise_safe_edit_failure()
+                total_sleep += retry_after
+                await self._sleep(retry_after)
         finally:
             if owns_client:
                 await client.aclose()
@@ -140,6 +163,33 @@ class DiscordWakeAckAdapter:
 def _require_id(value: str) -> None:
     if _DISCORD_ID.fullmatch(value) is None:
         raise ValueError("Discord ID is invalid")
+
+
+def _retry_after_seconds(response: httpx.Response) -> float | None:
+    retry_after = response.headers.get("Retry-After")
+    if retry_after is None:
+        try:
+            payload = response.json()
+        except ValueError:
+            return None
+        if not isinstance(payload, Mapping):
+            return None
+        retry_payload = cast(Mapping[str, object], payload)
+        raw_retry_after = retry_payload.get("retry_after")
+        retry_after = str(raw_retry_after) if raw_retry_after is not None else None
+    if retry_after is None:
+        return None
+    try:
+        seconds = float(retry_after)
+    except ValueError:
+        return None
+    if not math.isfinite(seconds) or seconds < 0:
+        return None
+    return seconds
+
+
+def _raise_safe_edit_failure() -> NoReturn:
+    raise RuntimeError("Discord acknowledgement edit failed")
 
 
 __all__ = [

@@ -34,7 +34,8 @@ The plan's acceptance tests require that:
   for assessments, fixed commitments, availability windows, incomplete blocks,
   ambiguity questions, study blocks, daily plans, work breakdowns, critiques,
   historical grounded morning briefing data, scheduled model-free morning
-  notification data, check-in proposals, and proposed Notion changes.
+  notification data, combined interview reminders, check-in proposals, and
+  proposed Notion changes.
   Datetimes are required to be timezone-aware and normalized to UTC at the
   contract boundary.
 - Added `app/agents/academic_planner/allocator.py`: deterministic priority
@@ -76,8 +77,8 @@ The plan's acceptance tests require that:
   deterministic morning to-do notification. It validates the stable period key
   `academic-morning:YYYY-MM-DD:HHMM:v1`, refreshes Notion immediately before
   planning, requires a fresh complete sync, builds the intended local day's
-  deterministic plan, and sends one Discord message with delivery key
-  `academic-morning-delivery:YYYY-MM-DD:HHMM:v1`. It never calls Qwen.
+  deterministic plan, and sends one combined planner message with delivery key
+  `planner-morning-delivery-v2:YYYY-MM-DD:HHMM:v1`. It never calls Qwen.
 - Added `app/api/academic.py`: the original phase shipped HTTP boundaries for
   check-in proposal creation and exact confirmation. The replacement runtime
   has removed the deterministic `/academic/checkin` creator; proposals now
@@ -138,11 +139,18 @@ The plan's acceptance tests require that:
   or an empty day.
 - Authorized Discord-triggered academic requests use semantic progress rather
   than token streaming. The host creates one idempotent Discord progress
-  message per inbound attempt and edits it through allowlisted stages such as
-  runtime wake-up, model turn, catalog lookup, proposal validation, and the
-  terminal ready/clarification/failure state. The separate durable proposal or
-  clarification response remains authoritative; a failed progress edit never
-  turns a safe proposal into a failure or bypasses exact confirmation.
+  message per inbound request and edits it through Discord REST while the
+  Gateway WebSocket remains responsible for inbound events and session
+  heartbeats. Semantic stages cover host wake, runtime checking/readiness,
+  model turns, generic allowlisted tool activity, reply preparation, and a
+  terminal ready/clarification/failure state. An unchanged await may produce
+  bounded liveness edits at 8, 20, and 45 elapsed seconds and then every 30
+  seconds, capped at six host-wake edits and twelve backend edits per inbound
+  request. These pulses replace the active line instead of extending history.
+  The separate durable answer, proposal preview, clarification, or failure
+  response is authoritative and must be delivered before a successful terminal
+  status. A failed progress edit never turns a safe result into a failure or
+  bypasses exact confirmation.
 - User-answerable missing or ambiguous facts open an owner/channel-scoped
   `agent_clarification` discourse session. The original request and authorized
   answers are kept in a redacted expiring artifact, while relational state

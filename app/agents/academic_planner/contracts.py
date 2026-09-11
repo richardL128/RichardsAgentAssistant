@@ -9,6 +9,8 @@ from uuid import UUID
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
+from app.agents.job_interviews.contracts import InterviewReminderFact
+
 
 class PlannerModel(BaseModel):
     model_config = ConfigDict(extra="forbid", str_strip_whitespace=True)
@@ -376,13 +378,14 @@ class ScheduledMorningBlock(PlannerModel):
 
 
 class ScheduledMorningNotification(PlannerModel):
-    """Model-free Discord message with explicit deterministic provenance."""
+    """Combined model-free planner message with deterministic provenance."""
 
     period_key: str = Field(min_length=1, max_length=512)
     intended_local_date: date
     scheduled_at: datetime
     source_synced_at: datetime
     blocks: tuple[ScheduledMorningBlock, ...] = Field(max_length=100)
+    interview_items: tuple[InterviewReminderFact, ...] = Field(default=(), max_length=100)
     message_text: str = Field(min_length=1, max_length=2_000)
 
     @field_validator("scheduled_at", "source_synced_at")

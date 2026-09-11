@@ -40,6 +40,14 @@ The host API probe also accepted redirects and client errors as healthy.
 5. Honor the user's model reconfiguration pause. Do not add input truncation or
    change model/context limits. Resume model validation after the user finishes
    selecting the model and editing configuration.
+6. Keep the existing Gateway connection dedicated to inbound events and session
+   management. Edit the single acknowledgement through Discord REST as host
+   startup and backend work change phase. For an unchanged await, emit bounded
+   liveness at 8, 20, and 45 elapsed seconds and then every 30 seconds; never
+   report percentages or hidden model reasoning.
+7. Treat runtime readiness only as proof that the Ollama API, configured model,
+   and optional digest are available. Deliver the separate answer or proposal
+   preview before marking the progress message completed or proposal-ready.
 
 ## Evidence and remaining gates
 
@@ -120,10 +128,11 @@ The host API probe also accepted redirects and client errors as healthy.
 - The final focused wake, coordinator, native-harness, delivery and wake-job
   regression suite passed all 64 tests. Lint passed for the recovery-owned
   Python files; this does not override the repository-level failures above.
-- Remaining: validate and deploy
-  the readiness and Discord delivery fixes; exercise a successful Docker cold wake;
-  confirm immediate acknowledgement, truthful progress and final delivery for
-  three random natural-language prompts submitted by the user in Discord.
+- Remaining: validate and deploy the readiness, Discord delivery, and progress
+  heartbeat fixes; exercise a successful Docker cold wake; confirm the single
+  message's fixed liveness cadence and final delivery for three random
+  natural-language prompts submitted by the user in Discord. Automated timing
+  and mocked REST checks do not complete this live acceptance gate.
 
 ## Requested 50-turn limit
 

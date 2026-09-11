@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 from collections.abc import Mapping, Sequence
 from datetime import UTC, datetime
 from types import SimpleNamespace
@@ -13,6 +14,7 @@ from app.agents.academic_planner.contracts import AcademicCourseOption
 from app.agents.academic_planner.discord_harness import (
     NativeAcademicDiscordHandler,
     _localize_wall_time,
+    _progress_for_harness_event,
     _render_event,
 )
 from app.agents.harness import AgentHarnessEvent, ToolExecutionError
@@ -36,8 +38,36 @@ class _Gateway:
         return self.messages.pop(0)
 
 
+class _BlockingGateway(_Gateway):
+    def __init__(self, events: list[str]) -> None:
+        super().__init__([])
+        self.events = events
+        self.started = asyncio.Event()
+        self.release = asyncio.Event()
+
+    async def invoke_tools(
+        self,
+        messages: Sequence[BaseMessage],
+        tools: Sequence[Mapping[str, object]],
+    ) -> AIMessage:
+        assert tools
+        self.inputs.append(tuple(messages))
+        self.events.append("gateway")
+        self.started.set()
+        await self.release.wait()
+        return AIMessage(content="The delayed answer is ready.")
+
+
 class _Runtime:
+    def __init__(self, events: list[str] | None = None, *, fail: bool = False) -> None:
+        self.events = events
+        self.fail = fail
+
     async def ensure_ready(self) -> object:
+        if self.events is not None:
+            self.events.append("runtime_check")
+        if self.fail:
+            raise RuntimeError("private runtime detail")
         return object()
 
 
@@ -111,12 +141,23 @@ class _Store:
 
 
 class _Delivery:
-    def __init__(self, *, fail_once_keys: Sequence[str] = ()) -> None:
+    def __init__(
+        self,
+        *,
+        fail_once_keys: Sequence[str] = (),
+        progress_reporter: _RecordingProgressReporter | None = None,
+        events: list[str] | None = None,
+    ) -> None:
         self.responses: list[str] = []
         self.response_keys: list[str] = []
         self.confirmations = []
         self._seen_keys: set[str] = set()
         self._fail_once_keys = set(fail_once_keys)
+        self.progress_reporter = progress_reporter
+        self.events = events
+
+    def create_progress_reporter(self, **_kwargs: object) -> object | None:
+        return self.progress_reporter
 
     async def send_response(self, content: str, *, idempotency_key: str) -> object:
         assert idempotency_key
@@ -128,12 +169,50 @@ class _Delivery:
         self._seen_keys.add(idempotency_key)
         self.response_keys.append(idempotency_key)
         self.responses.append(content)
+        if self.events is not None:
+            self.events.append("response")
         return object()
 
     async def send_confirmation(self, proposal, *, idempotency_key: str) -> object:
         assert idempotency_key
         self.confirmations.append(proposal)
+        if self.events is not None:
+            self.events.append("confirmation")
         return object()
+
+
+class _RecordingProgressReporter:
+    def __init__(self, events: list[str] | None = None) -> None:
+        self.events = events if events is not None else []
+        self.updates: list[object] = []
+        self.pending = asyncio.Event()
+
+    async def start(self, event: object | None = None) -> object:
+        self.updates.append(event)
+        self.events.append(f"progress:{_progress_phase(event)}")
+        return object()
+
+    async def update(self, event: object) -> None:
+        self.updates.append(event)
+        phase = _progress_phase(event)
+        self.events.append(f"progress:{phase}")
+        if phase == "model_turn_pending":
+            self.pending.set()
+
+    async def finish_proposal_ready(self) -> None:
+        self.events.append("progress:proposal_ready")
+
+    async def finish_completed(self) -> None:
+        self.events.append("progress:completed")
+
+    async def finish_failed(self) -> None:
+        self.events.append("progress:failed")
+
+
+def _progress_phase(event: object | None) -> str:
+    if isinstance(event, Mapping):
+        return str(event.get("phase"))
+    return str(event)
 
 
 def _message(content: str) -> DiscordAcademicMessageCreate:
@@ -154,6 +233,9 @@ def _handler(
     *,
     catalog: _Catalog | None = None,
     syncer: _Syncer | None = None,
+    runtime: _Runtime | None = None,
+    model_pending_elapsed_seconds: Sequence[float] = (8.0, 20.0, 45.0),
+    model_pending_repeat_seconds: float = 30.0,
 ):
     return NativeAcademicDiscordHandler(
         store=store,  # type: ignore[arg-type]
@@ -161,12 +243,14 @@ def _handler(
         allowed_channel_ids={"222222222222222222"},
         authorized_user_ids={"333333333333333333"},
         writer_provider=lambda: None,
-        ollama_runtime=_Runtime(),
+        ollama_runtime=runtime or _Runtime(),
         agent_gateway=gateway,  # type: ignore[arg-type]
         agent_catalog=catalog or _Catalog(),
         assistant_user_id="444444444444444444",
         catalog_syncer=syncer or _Syncer(),
         catalog_sync_timeout_seconds=1.0,
+        model_pending_elapsed_seconds=model_pending_elapsed_seconds,
+        model_pending_repeat_seconds=model_pending_repeat_seconds,
     )
 
 
@@ -185,6 +269,141 @@ async def test_configured_harness_answers_arbitrary_input_without_semantic_route
     ]
     assert store.proposals == []
     assert gateway.inputs[0][1].content == "hello"
+
+
+@pytest.mark.asyncio
+async def test_progress_lifecycle_orders_runtime_model_delivery_and_completion() -> None:
+    events: list[str] = []
+    reporter = _RecordingProgressReporter(events)
+    delivery = _Delivery(progress_reporter=reporter, events=events)
+    runtime = _Runtime(events)
+
+    result = await _handler(
+        _Gateway([AIMessage(content="Here is the answer.")]),
+        _Store(),
+        delivery,
+        runtime=runtime,
+    )(_message("Answer this."))
+
+    assert result.status == "handled"
+    assert events == [
+        "progress:runtime_checking",
+        "runtime_check",
+        "progress:runtime_ready",
+        "progress:model_turn_started",
+        "progress:reply_preparation",
+        "response",
+        "progress:completed",
+    ]
+
+
+@pytest.mark.asyncio
+async def test_blocked_direct_answer_emits_pending_progress_without_standalone_response() -> None:
+    events: list[str] = []
+    reporter = _RecordingProgressReporter(events)
+    delivery = _Delivery(progress_reporter=reporter, events=events)
+    gateway = _BlockingGateway(events)
+    handler = _handler(
+        gateway,
+        _Store(),
+        delivery,
+        model_pending_elapsed_seconds=(0.01,),
+        model_pending_repeat_seconds=10.0,
+    )
+
+    task = asyncio.create_task(handler(_message("Take your time.")))
+    await asyncio.wait_for(gateway.started.wait(), timeout=0.5)
+    await asyncio.wait_for(reporter.pending.wait(), timeout=0.5)
+    assert delivery.responses == []
+    assert "progress:model_turn_started" in events
+    assert "progress:model_turn_pending" in events
+
+    gateway.release.set()
+    result = await asyncio.wait_for(task, timeout=0.5)
+
+    assert result.status == "handled"
+    assert delivery.responses == ["The delayed answer is ready."]
+    assert delivery.response_keys == [
+        "academic-discord-message:111111111111111111:final-response:v1"
+    ]
+
+
+@pytest.mark.parametrize(
+    ("tool_name", "activity"),
+    [
+        ("search_courses", "course_data"),
+        ("search_assessments", "assessment_data"),
+        ("create_assessment", "proposal_drafting"),
+        ("create_study_session", "proposal_drafting"),
+        ("update_assessment", "proposal_drafting"),
+        ("archive_assessment", "proposal_drafting"),
+        ("search_job_interviews", "interview_data"),
+        ("prepare_job_interview", "interview_preparation"),
+        ("propose_interview_date", "proposal_drafting"),
+        ("propose_interview_plan_save", "proposal_drafting"),
+    ],
+)
+def test_tool_progress_is_allowlisted_without_arguments(tool_name: str, activity: str) -> None:
+    progress = _progress_for_harness_event(
+        AgentHarnessEvent(
+            kind="tool_call",
+            turn=1,
+            tool_name=tool_name,
+            args_json='{"private":"must-not-appear"}',
+        )
+    )
+
+    assert progress == {"phase": "tool_activity", "tool_activity": activity}
+    assert "private" not in str(progress)
+
+
+def test_unknown_tool_does_not_generate_progress_copy() -> None:
+    assert (
+        _progress_for_harness_event(
+            AgentHarnessEvent(kind="tool_call", turn=1, tool_name="untrusted_tool")
+        )
+        is None
+    )
+
+
+@pytest.mark.asyncio
+async def test_runtime_failure_response_precedes_failed_progress() -> None:
+    events: list[str] = []
+    reporter = _RecordingProgressReporter(events)
+    delivery = _Delivery(progress_reporter=reporter, events=events)
+
+    result = await _handler(
+        _Gateway([AIMessage(content="unused")]),
+        _Store(),
+        delivery,
+        runtime=_Runtime(events, fail=True),
+    )(_message("Answer this."))
+
+    assert result.status == "failed"
+    assert events[-2:] == ["response", "progress:failed"]
+    assert "private runtime detail" not in "\n".join(delivery.responses)
+
+
+@pytest.mark.asyncio
+async def test_final_delivery_failure_stops_progress_safely() -> None:
+    events: list[str] = []
+    reporter = _RecordingProgressReporter(events)
+    final_key = "academic-discord-message:111111111111111111:final-response:v1"
+    delivery = _Delivery(
+        fail_once_keys=(final_key,),
+        progress_reporter=reporter,
+        events=events,
+    )
+
+    with pytest.raises(RuntimeError, match="connector_transient"):
+        await _handler(
+            _Gateway([AIMessage(content="Answer that could not be delivered.")]),
+            _Store(),
+            delivery,
+        )(_message("Answer this."))
+
+    assert events[-1] == "progress:failed"
+    assert "progress:completed" not in events
 
 
 @pytest.mark.asyncio
@@ -566,7 +785,9 @@ async def test_tool_calls_and_results_are_visible_and_notion_create_waits_for_re
         ]
     )
     store = _Store()
-    delivery = _Delivery()
+    events: list[str] = []
+    reporter = _RecordingProgressReporter(events)
+    delivery = _Delivery(progress_reporter=reporter, events=events)
 
     result = await _handler(gateway, store, delivery)(
         _message("Please add Lab 2 to ECE 202 for Saturday at 5 PM.")
@@ -584,6 +805,7 @@ async def test_tool_calls_and_results_are_visible_and_notion_create_waits_for_re
     assert '"course_code":"ECE 202"' not in transcript
     assert '"review":"required"' not in transcript
     assert "The addition is ready for your review." in transcript
+    assert events.index("confirmation") < events.index("progress:proposal_ready")
 
 
 @pytest.mark.asyncio

@@ -5,6 +5,9 @@ from __future__ import annotations
 import asyncio
 import logging
 import re
+import time
+from collections.abc import Awaitable, Callable
+from contextlib import suppress
 from datetime import UTC, datetime, timedelta
 from typing import Literal, Protocol, cast
 from uuid import UUID
@@ -34,6 +37,10 @@ from app.host.outbox import InteractionOutboxRow, WakeOutboxRow
 from app.host.settings import HostWakeSettings
 
 logger = logging.getLogger(__name__)
+
+HOST_WAKE_HANDOFF_PROGRESS = "LifeAgent is online. Handing your request to Qwen."
+
+_HOST_WAKE_HEARTBEAT_SECONDS = (8, 20, 45, 75, 105, 135)
 
 
 class DiscordWakeDelivery(Protocol):
@@ -125,6 +132,8 @@ class HostWakeCoordinator:
         backend_live: HostReadyService,
         handoff: BackendHandoff,
         deployment: HostReadyService | None = None,
+        monotonic: Callable[[], float] = time.monotonic,
+        sleep: Callable[[float], Awaitable[object]] = asyncio.sleep,
     ) -> None:
         self._settings = settings
         self._outbox = outbox
@@ -135,6 +144,8 @@ class HostWakeCoordinator:
         self._deployment = deployment
         self._backend_live = backend_live
         self._handoff = handoff
+        self._monotonic = monotonic
+        self._sleep = sleep
         self._wake_lock = asyncio.Lock()
         self._wake_task: asyncio.Task[None] | None = None
         self._interaction_tasks: dict[str, asyncio.Task[None]] = {}
@@ -174,7 +185,10 @@ class HostWakeCoordinator:
                 )
             row = self._outbox.mark_acknowledged(message.message_id, acknowledgement_message_id)
         try:
-            await self._ensure_wake_ready()
+            await self._ensure_wake_ready_with_progress(
+                channel_id=message.channel_id,
+                acknowledgement_message_id=acknowledgement_message_id,
+            )
             await self._submit_row(row)
         except Exception as exc:
             failure = _failure_code(exc)
@@ -235,7 +249,10 @@ class HostWakeCoordinator:
                     )
                 row = self._outbox.mark_acknowledged(row.message_id, acknowledgement_message_id)
             try:
-                await self._ensure_wake_ready()
+                await self._ensure_wake_ready_with_progress(
+                    channel_id=row.channel_id,
+                    acknowledgement_message_id=acknowledgement_message_id,
+                )
                 await self._submit_row(row)
             except Exception as exc:
                 failure = _failure_code(exc)
@@ -290,6 +307,61 @@ class HostWakeCoordinator:
         await self._compose.ensure_ready()
         await self._backend_live.ensure_ready()
 
+    async def _ensure_wake_ready_with_progress(
+        self,
+        *,
+        channel_id: str,
+        acknowledgement_message_id: str | None,
+    ) -> None:
+        if acknowledgement_message_id is None:
+            await self._ensure_wake_ready()
+            return
+
+        wake_task = asyncio.create_task(
+            self._ensure_wake_ready(),
+            name="lifeagent-host-wake-await",
+        )
+        progress_task = asyncio.create_task(
+            self._pace_wake_startup(
+                channel_id=channel_id,
+                acknowledgement_message_id=acknowledgement_message_id,
+                wake_task=wake_task,
+            ),
+            name="lifeagent-host-wake-progress",
+        )
+        try:
+            await wake_task
+        finally:
+            progress_task.cancel()
+            with suppress(asyncio.CancelledError):
+                await progress_task
+
+        await self._edit_progress(
+            channel_id=channel_id,
+            acknowledgement_message_id=acknowledgement_message_id,
+            content=HOST_WAKE_HANDOFF_PROGRESS,
+        )
+
+    async def _pace_wake_startup(
+        self,
+        *,
+        channel_id: str,
+        acknowledgement_message_id: str,
+        wake_task: asyncio.Task[None],
+    ) -> None:
+        started_at = self._monotonic()
+        for elapsed_seconds in _HOST_WAKE_HEARTBEAT_SECONDS:
+            delay = elapsed_seconds - (self._monotonic() - started_at)
+            if delay > 0:
+                await self._sleep(delay)
+            if wake_task.done():
+                return
+            await self._edit_progress(
+                channel_id=channel_id,
+                acknowledgement_message_id=acknowledgement_message_id,
+                content=f"Still starting LifeAgent ({elapsed_seconds}s elapsed).",
+            )
+
     async def _submit_row(self, row: WakeOutboxRow) -> None:
         event = DiscordHostHandoffEvent(
             message_id=row.message_id,
@@ -331,11 +403,24 @@ class HostWakeCoordinator:
     ) -> None:
         if acknowledgement_message_id is None:
             return
+        await self._edit_progress(
+            channel_id=channel_id,
+            acknowledgement_message_id=acknowledgement_message_id,
+            content=safe_failure_content(failure),
+        )
+
+    async def _edit_progress(
+        self,
+        *,
+        channel_id: str,
+        acknowledgement_message_id: str,
+        content: str,
+    ) -> None:
         try:
             await self._discord.edit_acknowledgement(
                 channel_id=channel_id,
                 acknowledgement_message_id=acknowledgement_message_id,
-                content=safe_failure_content(failure),
+                content=content,
             )
         except Exception:
             return
