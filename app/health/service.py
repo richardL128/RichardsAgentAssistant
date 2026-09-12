@@ -111,7 +111,7 @@ def evaluate_academic_morning_health(
     settings: Settings,
     evaluated_at: datetime,
 ) -> OperationalHealth:
-    """Persist schedule-specific health for the model-free academic morning notifier."""
+    """Persist schedule-specific health for the host-controlled morning notifier."""
 
     if evaluated_at.tzinfo is None or evaluated_at.utcoffset() is None:
         raise ValueError("evaluated_at must be timezone-aware")
@@ -290,7 +290,7 @@ def _latest_academic_morning_success(session: Session) -> datetime | None:
 
 
 def _next_expected(settings: Settings, component: str, current: datetime) -> datetime | None:
-    """Return a due time only for the model-free scheduled morning component."""
+    """Return a due time only for the scheduled morning component."""
 
     if component != _ACADEMIC_MORNING_COMPONENT:
         return None

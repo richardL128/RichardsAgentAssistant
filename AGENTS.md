@@ -36,6 +36,14 @@
 - If the user explicitly requires temporary legacy compatibility, keep it
   isolated, label it as exceptional, and never make it the default.
 
+## Repository evidence grounding
+
+- Before answering repository-specific questions about the technology stack,
+  feature or implementation status, runtime wiring, or agent configuration and
+  specifications, read and follow `skills/codebase-grounding/SKILL.md`.
+- Do not use implementation plans, prompts, legacy Markdown, or assumptions as
+  evidence of the repository's current behavior or status.
+
 ## Frontend
 
 For work under `frontend/`, also follow `frontend/AGENTS.md`; its more specific

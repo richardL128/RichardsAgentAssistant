@@ -689,6 +689,7 @@ class Assessment(TimestampMixin, Base):
     source_block: Mapped[str | None] = mapped_column(String(255))
     source_url: Mapped[str | None] = mapped_column(String(1_000))
     completed: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+    is_all_day: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
     source_id: Mapped[str | None] = mapped_column(String(255))
     source_scope: Mapped[str | None] = mapped_column(String(255))
     notion_last_edited_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
@@ -696,6 +697,19 @@ class Assessment(TimestampMixin, Base):
     label_source: Mapped[str | None] = mapped_column(String(255))
     active: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
     archived: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+    calendar_semantic_overview: Mapped[str | None] = mapped_column(String(700))
+    calendar_semantic_description: Mapped[str | None] = mapped_column(String(1500))
+    calendar_semantic_status: Mapped[str | None] = mapped_column(String(32))
+    calendar_semantic_evidence_ids: Mapped[list[str] | None] = mapped_column(JSON)
+    calendar_semantic_description_evidence_ids: Mapped[list[str] | None] = mapped_column(JSON)
+    calendar_semantic_source_fingerprint: Mapped[str | None] = mapped_column(String(128))
+    calendar_semantic_source_last_edited_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True)
+    )
+    calendar_semantic_model_identity: Mapped[str | None] = mapped_column(String(128))
+    calendar_semantic_config_version: Mapped[str | None] = mapped_column(String(128))
+    calendar_semantic_prompt_version: Mapped[str | None] = mapped_column(String(128))
+    calendar_semantic_analyzed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
 
 
 class AcademicCourseCalendar(TimestampMixin, Base):
@@ -902,6 +916,19 @@ class CareerInterviewEvent(TimestampMixin, Base):
     content_artifact_key: Mapped[str | None] = mapped_column(String(512))
     active: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
     archived: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+    calendar_semantic_overview: Mapped[str | None] = mapped_column(String(700))
+    calendar_semantic_description: Mapped[str | None] = mapped_column(String(1500))
+    calendar_semantic_status: Mapped[str | None] = mapped_column(String(32))
+    calendar_semantic_evidence_ids: Mapped[list[str] | None] = mapped_column(JSON)
+    calendar_semantic_description_evidence_ids: Mapped[list[str] | None] = mapped_column(JSON)
+    calendar_semantic_source_fingerprint: Mapped[str | None] = mapped_column(String(128))
+    calendar_semantic_source_last_edited_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True)
+    )
+    calendar_semantic_model_identity: Mapped[str | None] = mapped_column(String(128))
+    calendar_semantic_config_version: Mapped[str | None] = mapped_column(String(128))
+    calendar_semantic_prompt_version: Mapped[str | None] = mapped_column(String(128))
+    calendar_semantic_analyzed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
 
 
 class CareerInterviewApplicationLink(TimestampMixin, Base):

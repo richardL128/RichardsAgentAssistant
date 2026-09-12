@@ -85,6 +85,7 @@ AcademicDocumentExtractionStatus = Literal[
     "failed",
     "inactive",
 ]
+CalendarSemanticStatus = Literal["valid", "not_substantive", "unavailable", "invalid"]
 AcademicClarificationWriteAction = Literal[
     "quiz",
     "assignment",
@@ -357,6 +358,23 @@ class LearningFocusMemoryInput:
     embedding_model: str | None = None
     embedding_metadata: Mapping[str, Any] | None = None
     redacted_summary: str | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class CalendarSemanticResultInput:
+    """Bounded semantic cache payload for one calendar event."""
+
+    status: CalendarSemanticStatus
+    source_fingerprint: str
+    source_last_edited_at: datetime | None
+    model_identity: str
+    config_version: str
+    prompt_version: str
+    analyzed_at: datetime
+    overview: str | None = None
+    description: str | None = None
+    evidence_ids: Sequence[str] = ()
+    description_evidence_ids: Sequence[str] = ()
 
 
 def _utc(value: datetime, field: str) -> datetime:
@@ -996,6 +1014,7 @@ class AcademicRepository:
         citation: SourceCitation,
         ambiguity_reason: str | None = None,
         completed: bool = False,
+        is_all_day: bool = False,
         trace: AssessmentSourceTrace | None = None,
     ) -> Assessment:
         _validate_fact(confidence, fact_state)
@@ -1025,6 +1044,7 @@ class AcademicRepository:
             "fact_state": fact_state,
             "ambiguity_reason": ambiguity_reason,
             "completed": completed,
+            "is_all_day": is_all_day,
             **citation.values(),
         }
         if trace is not None:
@@ -1043,6 +1063,39 @@ class AcademicRepository:
                 }
             )
         return _upsert(session, Assessment, [Assessment.notion_id == notion_id], values)
+
+    @staticmethod
+    def save_assessment_calendar_semantics(
+        session: Session,
+        *,
+        notion_id: str,
+        semantics: CalendarSemanticResultInput,
+    ) -> bool:
+        row = session.scalar(
+            select(Assessment).where(Assessment.notion_id == _bounded(notion_id)).with_for_update()
+        )
+        if row is None:
+            return False
+        source_edit = (
+            _utc(semantics.source_last_edited_at, "source_last_edited_at")
+            if semantics.source_last_edited_at is not None
+            else None
+        )
+        if (
+            source_edit is not None
+            and row.notion_last_edited_at is not None
+            and _aware_db(row.notion_last_edited_at) != source_edit
+        ):
+            return False
+        analyzed_at = _utc(semantics.analyzed_at, "analyzed_at")
+        if (
+            row.calendar_semantic_analyzed_at is not None
+            and _aware_db(row.calendar_semantic_analyzed_at) > analyzed_at
+        ):
+            return False
+        _apply_calendar_semantics(row, semantics, source_edit=source_edit, analyzed_at=analyzed_at)
+        session.flush()
+        return True
 
     @staticmethod
     def begin_proposal_operation(
@@ -4830,6 +4883,72 @@ class SQLAlchemyAcademicPlannerStore:
             horizon_days=horizon_days,
         )
 
+    def load_upcoming_calendar_items(
+        self,
+        *,
+        occurrence: date | datetime,
+        timezone: str = "America/Toronto",
+    ) -> tuple[Mapping[str, Any], ...]:
+        tz = ZoneInfo(timezone)
+        window_start, window_end = _calendar_window(occurrence, tz)
+        query_start = window_start.astimezone(UTC) - timedelta(days=1)
+        query_end = window_end.astimezone(UTC) + timedelta(days=1)
+        with Session(self.engine) as session:
+            rows = list(
+                session.execute(
+                    select(Assessment, Course)
+                    .join(Course, Assessment.course_id == Course.id)
+                    .where(
+                        Course.active.is_(True),
+                        Assessment.active.is_(True),
+                        Assessment.archived.is_(False),
+                        Assessment.due_at.is_not(None),
+                        Assessment.due_at >= query_start,
+                        Assessment.due_at <= query_end,
+                    )
+                )
+            )
+            items: list[tuple[datetime, str, str, str, Mapping[str, Any]]] = []
+            for row, course in rows:
+                due_at = _aware_db(cast(datetime, row.due_at))
+                local_start = _calendar_local_start(
+                    due_at,
+                    is_all_day=row.is_all_day,
+                    timezone=tz,
+                )
+                if not window_start <= local_start <= window_end:
+                    continue
+                item = _assessment_calendar_item(
+                    row,
+                    course,
+                    local_start=local_start,
+                    window_start=window_start,
+                    timezone=tz,
+                )
+                items.append(
+                    (
+                        local_start,
+                        "course",
+                        course.course_code.casefold(),
+                        row.title.casefold(),
+                        item,
+                    )
+                )
+            items.sort(key=lambda item: (item[0], item[1], item[2], item[3], item[4]["event_id"]))
+            return tuple(item[-1] for item in items)
+
+    def save_assessment_calendar_semantics(
+        self,
+        notion_id: str,
+        semantics: CalendarSemanticResultInput,
+    ) -> bool:
+        with Session(self.engine) as session, session.begin():
+            return AcademicRepository.save_assessment_calendar_semantics(
+                session,
+                notion_id=notion_id,
+                semantics=semantics,
+            )
+
     def save_daily_plan(self, plan: Any) -> None:
         local_day = _aware_db(plan.created_at).astimezone(_TORONTO).date()
         with Session(self.engine) as session, session.begin():
@@ -5319,6 +5438,7 @@ class SQLAlchemyAcademicPlannerStore:
                 ambiguity_reason=_field(assessment, "ambiguity_reason"),
                 citation=SourceCitation(url=_field(assessment, "source_url", "url")),
                 completed=bool(_field(assessment, "completed") or False),
+                is_all_day=bool(_field(assessment, "is_all_day") or False),
                 trace=trace,
             )
             return str(row.id)
@@ -5846,6 +5966,138 @@ def _resolve_assessment_scope(
     if row is None:
         return None
     return row.id, row.notion_id
+
+
+def _apply_calendar_semantics(
+    row: Any,
+    semantics: CalendarSemanticResultInput,
+    *,
+    source_edit: datetime | None,
+    analyzed_at: datetime,
+) -> None:
+    if semantics.status not in {"valid", "not_substantive", "unavailable", "invalid"}:
+        raise ValueError("invalid calendar semantic status")
+    overview = _bounded_optional(semantics.overview, 700)
+    description = _bounded_optional(semantics.description, 1_500)
+    evidence_ids = _bounded_semantic_ids(semantics.evidence_ids)
+    description_ids = _bounded_semantic_ids(semantics.description_evidence_ids)
+    if semantics.status in {"unavailable", "invalid"}:
+        overview = None
+        description = None
+        evidence_ids = []
+        description_ids = []
+    elif semantics.status == "not_substantive":
+        description = None
+        description_ids = []
+    row.calendar_semantic_overview = overview
+    row.calendar_semantic_description = description
+    row.calendar_semantic_status = semantics.status
+    row.calendar_semantic_evidence_ids = evidence_ids
+    row.calendar_semantic_description_evidence_ids = description_ids
+    row.calendar_semantic_source_fingerprint = _bounded(semantics.source_fingerprint, 128)
+    row.calendar_semantic_source_last_edited_at = source_edit
+    row.calendar_semantic_model_identity = _bounded(semantics.model_identity, 128)
+    row.calendar_semantic_config_version = _bounded(semantics.config_version, 128)
+    row.calendar_semantic_prompt_version = _bounded(semantics.prompt_version, 128)
+    row.calendar_semantic_analyzed_at = analyzed_at
+
+
+def _bounded_semantic_ids(values: Sequence[str]) -> list[str]:
+    return [_bounded(str(item), 255) for item in values[:12] if str(item).strip()]
+
+
+def _calendar_window(occurrence: date | datetime, timezone: ZoneInfo) -> tuple[datetime, datetime]:
+    if isinstance(occurrence, datetime):
+        local_day = _aware_db(occurrence).astimezone(timezone).date()
+    else:
+        local_day = occurrence
+    window_start = datetime.combine(local_day, datetime.min.time(), tzinfo=timezone)
+    return window_start, window_start + timedelta(days=10, hours=12)
+
+
+def _calendar_local_start(value: datetime, *, is_all_day: bool, timezone: ZoneInfo) -> datetime:
+    local = _aware_db(value).astimezone(timezone)
+    if is_all_day:
+        return datetime.combine(local.date(), datetime.min.time(), tzinfo=timezone)
+    return local
+
+
+def _assessment_calendar_item(
+    row: Assessment,
+    course: Course,
+    *,
+    local_start: datetime,
+    window_start: datetime,
+    timezone: ZoneInfo,
+) -> Mapping[str, Any]:
+    due_at = _aware_db(cast(datetime, row.due_at))
+    local_due = due_at.astimezone(timezone)
+    local_end = _aware_db(row.ends_at).astimezone(timezone) if row.ends_at is not None else None
+    semantic_status = row.calendar_semantic_status or "unavailable"
+    overview = (
+        row.calendar_semantic_overview if semantic_status in {"valid", "not_substantive"} else None
+    )
+    description = row.calendar_semantic_description if semantic_status == "valid" else None
+    return {
+        "event_id": row.notion_id,
+        "source_area": "course",
+        "source_label": course.course_code,
+        "title": row.title,
+        "display_kind": _display_kind(row.assessment_type),
+        "local_start_label": _calendar_label(local_due, is_all_day=row.is_all_day),
+        "local_end_label": (
+            _calendar_label(local_end, is_all_day=False) if local_end is not None else None
+        ),
+        "relative_date_label": _relative_day_label(local_start.date(), window_start.date()),
+        "is_all_day": row.is_all_day,
+        "completed": row.completed,
+        "semantic_status": semantic_status,
+        "semantic_overview": overview,
+        "semantic_description": description,
+        "semantic_evidence_fragment_ids": tuple(row.calendar_semantic_evidence_ids or ()),
+        "semantic_description_fragment_ids": tuple(
+            row.calendar_semantic_description_evidence_ids or ()
+        ),
+        "semantic_cache": _calendar_semantic_cache(row),
+        "source_url": row.source_url,
+        "source_last_edited_at": row.notion_last_edited_at,
+        "source_fingerprint": row.calendar_semantic_source_fingerprint,
+    }
+
+
+def _calendar_semantic_cache(row: Any) -> Mapping[str, Any]:
+    return {
+        "source_fingerprint": row.calendar_semantic_source_fingerprint,
+        "source_last_edited_at": row.calendar_semantic_source_last_edited_at,
+        "model_identity": row.calendar_semantic_model_identity,
+        "config_version": row.calendar_semantic_config_version,
+        "prompt_version": row.calendar_semantic_prompt_version,
+        "analyzed_at": row.calendar_semantic_analyzed_at,
+    }
+
+
+def _display_kind(value: str) -> str:
+    return " ".join(part.capitalize() for part in value.replace("-", "_").split("_")) or "Event"
+
+
+def _calendar_label(value: datetime, *, is_all_day: bool) -> str:
+    date_text = f"{value.strftime('%A, %B')} {value.day}, {value.year}"
+    if is_all_day:
+        return date_text
+    return f"{date_text} at {value.strftime('%H:%M %Z')}".strip()
+
+
+def _relative_day_label(target: date, anchor: date) -> str:
+    days = (target - anchor).days
+    if days == 0:
+        return "Today"
+    if days == 1:
+        return "Tomorrow"
+    if days > 1:
+        return f"In {days} days"
+    if days == -1:
+        return "Yesterday"
+    return f"{abs(days)} days ago"
 
 
 def _proposal_row_for_public_id(

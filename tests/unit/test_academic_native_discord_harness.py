@@ -350,6 +350,42 @@ async def test_configured_harness_answers_arbitrary_input_without_semantic_route
 
 
 @pytest.mark.asyncio
+async def test_blank_tool_call_text_is_skipped_while_the_tool_loop_continues() -> None:
+    events: list[str] = []
+    gateway = _Gateway(
+        [
+            AIMessage(
+                content="",
+                tool_calls=[
+                    {
+                        "id": "search-1",
+                        "name": "search_courses",
+                        "args": {"query": "ECE 202"},
+                    }
+                ],
+            ),
+            AIMessage(content="ECE 202 is Circuits."),
+        ]
+    )
+    delivery = _Delivery()
+
+    result = await _handler(
+        gateway,
+        _Store(),
+        delivery,
+        catalog=_Catalog(events),
+    )(_message("What is ECE 202?"))
+
+    assert result.status == "handled"
+    assert events == ["search_courses"]
+    assert len(gateway.inputs) == 2
+    assert delivery.responses == ["ECE 202 is Circuits."]
+    assert delivery.response_keys == [
+        "academic-discord-message:111111111111111111:final-response:v1"
+    ]
+
+
+@pytest.mark.asyncio
 async def test_progress_lifecycle_orders_runtime_model_delivery_and_completion() -> None:
     events: list[str] = []
     reporter = _RecordingProgressReporter(events)
@@ -512,6 +548,7 @@ async def test_system_message_supplies_current_owner_local_time() -> None:
     assert "America/Toronto" in system_content
     assert "2026-09-09T10:00:00-04:00" in system_content
     assert "without Z or a UTC offset" in system_content
+    assert "due_at values are already expressed in the owner's timezone" in system_content
     assert "next matching date that is not in the past" in system_content
     assert "Follow explicit response-format requests exactly" in system_content
     assert "Keep calculations, scratch work, and" in system_content
@@ -561,6 +598,73 @@ async def test_study_session_wall_time_is_converted_from_owner_timezone() -> Non
     change = delivery.confirmations[0].changes[0]
     assert change.due_at == datetime(2026, 9, 15, 22, tzinfo=UTC)
     assert change.ends_at == datetime(2026, 9, 15, 23, tzinfo=UTC)
+
+
+@pytest.mark.asyncio
+async def test_assessment_search_answers_with_owner_local_times() -> None:
+    assessments = (
+        AcademicAssessmentOption(
+            assessment_id="event-1",
+            course_id="course-1",
+            course_code="ECE 250",
+            title="Download Analysis Software and Study Notes",
+            due_at=datetime(2026, 9, 13, 3, 59, tzinfo=UTC),
+            assessment_type=AssessmentType.EVENT,
+        ),
+        AcademicAssessmentOption(
+            assessment_id="study-1",
+            course_id="course-1",
+            course_code="ECE 250",
+            title="Studying Block — insertion sort",
+            due_at=datetime(2026, 9, 15, 22, tzinfo=UTC),
+            assessment_type=AssessmentType.STUDYING_BLOCK,
+        ),
+    )
+
+    class Catalog:
+        def search_assessments(self, _query: str, _course_id: str | None = None):
+            return assessments
+
+    gateway = _Gateway(
+        [
+            AIMessage(
+                content="I'll check those calendar entries.",
+                tool_calls=[
+                    {
+                        "id": "search-1",
+                        "name": "search_assessments",
+                        "args": {"query": "download analysis notes insertion sort"},
+                    }
+                ],
+            ),
+            AIMessage(
+                content=(
+                    "Download Analysis Software and Study Notes is due Saturday, September 12. "
+                    "The insertion sort study block starts Tuesday, September 15 at 6:00 PM."
+                )
+            ),
+        ]
+    )
+    delivery = _Delivery()
+
+    result = await _handler(gateway, _Store(), delivery, catalog=Catalog())(
+        _message("When are my download-analysis event and insertion-sort study block?")
+    )
+
+    assert result.status == "handled"
+    assert delivery.responses == [
+        "I'll check those calendar entries.",
+        (
+            "Download Analysis Software and Study Notes is due Saturday, September 12. "
+            "The insertion sort study block starts Tuesday, September 15 at 6:00 PM."
+        ),
+    ]
+    model_context = "\n".join(str(message.content) for message in gateway.inputs[1])
+    assert "2026-09-12T23:59:00-04:00" in model_context
+    assert "2026-09-15T18:00:00-04:00" in model_context
+    assert model_context.count('"due_at_timezone":"America/Toronto"') == 2
+    assert "2026-09-13T03:59:00Z" not in model_context
+    assert "2026-09-15T22:00:00Z" not in model_context
 
 
 @pytest.mark.asyncio

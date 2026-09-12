@@ -215,6 +215,21 @@ async def test_discovers_jobs_tables_interviews_urls_and_excludes_jobs_from_acad
         "property",
         "page_body",
     }
+    evidence = jobs.interviews[0].evidence_fragments
+    assert {fragment.source_label for fragment in evidence}.issuperset(
+        {"Name", "Tags", "Posting", "paragraph"}
+    )
+    assert any("Prep notes" in fragment.text for fragment in evidence)
+    assert (
+        len(
+            [
+                request
+                for request in requests
+                if request.url.path == "/v1/blocks/interview-1/children"
+            ]
+        )
+        == 1
+    )
     assert [course.course_title for course in academic.courses] == ["BIO 101"]
     assert {diagnostic.course_page_id for diagnostic in academic.diagnostics} == {"bio-page"}
     assert any(request.url.path == "/v1/blocks/interview-1/children" for request in requests)

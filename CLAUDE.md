@@ -75,4 +75,5 @@ uv run alembic upgrade head
 - `compose.yaml` — application stack. `compose.claude.yaml` — sandbox only, a
   separate compose project so `docker compose up` never starts an agent.
 - `scripts/` — host-side helpers, including `claude-sandbox.sh`.
-- `docs/implementation/` — per-phase implementation notes.
+- `docs/implementation/` — current focused implementation notes; verify status
+  and runtime claims against the code and active configuration.

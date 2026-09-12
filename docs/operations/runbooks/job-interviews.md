@@ -32,6 +32,17 @@ An expired, login-only, or blocked posting must not be bypassed. Paste or attach
 the posting when asked. Existing maintained plan guidance remains available,
 but a requested research refresh does not silently substitute stale evidence.
 
+## Morning calendar coverage
+
+The combined morning briefing includes active, non-archived Interviews events
+from midnight on the intended Toronto-local day through the inclusive endpoint
+10 days and 12 hours later. It no longer renders every future interview. The
+host owns the event date, milestone label, and one grounded preparation action.
+Qwen may add a cited overview and, when event-local Notion text is substantive,
+a description. Posting research and external web content are not calendar
+description evidence. If semantic analysis fails, trusted interview metadata
+still renders with one aggregate availability condition.
+
 ## Writes and recovery
 
 Interview Date and preparation-plan writes never occur from sync or research.

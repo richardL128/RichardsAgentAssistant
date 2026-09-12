@@ -154,10 +154,26 @@ class InterviewEventSnapshot(CareerModel):
     tags: tuple[str, ...] = Field(default=(), max_length=50)
     url_candidates: tuple[UrlCandidate, ...] = Field(default=(), max_length=25)
     content_fingerprint: str = Field(min_length=1, max_length=128)
+    calendar_semantic_status: str | None = Field(default=None, max_length=32)
+    calendar_semantic_overview: str | None = Field(default=None, max_length=700)
+    calendar_semantic_description: str | None = Field(default=None, max_length=1_500)
+    calendar_semantic_evidence_ids: tuple[str, ...] = Field(default=(), max_length=12)
+    calendar_semantic_description_evidence_ids: tuple[str, ...] = Field(default=(), max_length=12)
+    calendar_semantic_source_fingerprint: str | None = Field(default=None, max_length=128)
+    calendar_semantic_source_last_edited_at: datetime | None = None
+    calendar_semantic_model_identity: str | None = Field(default=None, max_length=128)
+    calendar_semantic_config_version: str | None = Field(default=None, max_length=128)
+    calendar_semantic_prompt_version: str | None = Field(default=None, max_length=128)
+    calendar_semantic_analyzed_at: datetime | None = None
     active: bool = True
     archived: bool = False
 
-    @field_validator("date_start", "last_edited_at")
+    @field_validator(
+        "date_start",
+        "last_edited_at",
+        "calendar_semantic_source_last_edited_at",
+        "calendar_semantic_analyzed_at",
+    )
     @classmethod
     def timestamps_aware(cls, value: datetime | None) -> datetime | None:
         return _aware(value) if value is not None else None

@@ -396,6 +396,7 @@ async def test_sync_persists_valid_notion_date_end() -> None:
     assessment = store.assessments[0][0]
     assert assessment.due_at == datetime(2026, 9, 10, 23, tzinfo=UTC)
     assert assessment.ends_at == datetime(2026, 9, 10, 23, 45, tzinfo=UTC)
+    assert assessment.is_all_day is False
     assert assessment.fact_state == "confirmed"
 
 
@@ -437,6 +438,40 @@ async def test_sync_rejects_invalid_notion_date_end_without_persisting_end() -> 
     assert assessment.ends_at is None
     assert assessment.fact_state == "ambiguous"
     assert "end must be after the start" in str(assessment.ambiguity_reason)
+
+
+@pytest.mark.asyncio
+async def test_sync_preserves_date_only_assessment_granularity() -> None:
+    discovery = NotionDiscoveryResult(
+        courses_database_id="courses-db",
+        courses_source_id="courses-source",
+        courses_source_type="data_source",
+        courses=(
+            _course(
+                "course-1",
+                "ECE 250",
+                assessments=(
+                    _assessment(
+                        "event-date-only",
+                        "Quiz - Graph traversal",
+                        due=NotionDateValue(start="2026-09-20"),
+                    ),
+                ),
+            ),
+        ),
+        synced_at=NOW,
+    )
+    store = _Store()
+    syncer = AcademicNotionSync(
+        connector=cast(NotionConnector, _Connector(discovery)),
+        store=store,
+    )
+
+    result = await syncer.sync(now=NOW)
+
+    assert result.status == "succeeded"
+    assessment = store.assessments[0][0]
+    assert assessment.is_all_day is True
 
 
 @pytest.mark.asyncio

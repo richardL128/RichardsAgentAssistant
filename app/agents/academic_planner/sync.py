@@ -240,6 +240,7 @@ class _AssessmentRecord:
     ambiguity_reason: str | None
     confidence: float
     completed: bool
+    is_all_day: bool
     source_id: str
     assessments_source_id: str
     title_property_id: str
@@ -759,6 +760,7 @@ def _assessment_record(
     )
     due_at = _parse_due(assessment, timezone=timezone)
     ends_at = _parse_end(assessment, timezone=timezone)
+    is_all_day = _is_all_day_notion_date(assessment.due)
     reasons: list[str] = []
     if _classification_kind_value(classification.kind) == AssessmentKind.UNKNOWN.value:
         reasons.append(
@@ -797,6 +799,7 @@ def _assessment_record(
             ambiguity_reason=" ".join(reasons) or None,
             confidence=0.0 if ambiguous else 1.0,
             completed=(assessment.status or "").casefold() in {"completed", "done"},
+            is_all_day=is_all_day,
             source_id=assessment.assessments_source_id,
             assessments_source_id=assessment.assessments_source_id,
             title_property_id=assessment.title_property_id,
@@ -877,6 +880,11 @@ def _parse_due(assessment: NotionAssessment, *, timezone: ZoneInfo) -> datetime 
         return parsed.astimezone(UTC)
     except ValueError:
         return None
+
+
+def _is_all_day_notion_date(value: Any) -> bool:
+    start = getattr(value, "start", None)
+    return isinstance(start, str) and bool(start) and "T" not in start
 
 
 def _parse_end(assessment: NotionAssessment, *, timezone: ZoneInfo) -> datetime | None:

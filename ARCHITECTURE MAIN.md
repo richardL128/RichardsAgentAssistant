@@ -11,25 +11,29 @@ Narrowly scoped connectors → fact extraction → local Qwen reasoning
 
 The local Qwen model performs reading, reasoning, prioritization, and explanation. Deterministic tools collect facts, run tests/scanners, and perform approved writes. Credentials remain outside the model context: the orchestration layer exposes narrow tools such as “fetch today's commits” or “read an assessment page,” rather than unrestricted account access.
 
-The configured runtime has one Qwen entry point: an authorized message in the
-private academic Discord channel. A native macOS LaunchAgent owns the sole
-Discord Gateway connection, acknowledges the message, wakes the fixed Compose
-services and Ollama API, and submits an HMAC-signed reference to the loopback
-backend. Scheduled Qwen workflows for academic planning, code review, and
-finance are non-executable. Exact `confirm <proposal-id>` and `reject <proposal-id>`
-commands and clarification buttons remain model-free exceptions.
+The configured runtime permits Qwen in two bounded paths: an authorized message
+in the private academic Discord channel, and event-local semantic analysis for
+the automatic morning calendar briefing. A native macOS LaunchAgent owns the
+sole Discord Gateway connection, acknowledges interactive messages, wakes the
+fixed Compose services and Ollama API, and submits an HMAC-signed reference to
+the loopback backend. Scheduled Qwen workflows for study-plan allocation, code
+review, and finance remain non-executable. Exact `confirm <proposal-id>` and
+`reject <proposal-id>` commands and clarification buttons remain model-free
+exceptions.
 
 The API may remain cold between conversations, but the academic worker stays
 resident with PostgreSQL. That worker owns the minute-level periodic deferrer;
 keeping it resident is what makes the configured morning occurrence executable
 without loading Qwen or waiting for an inbound Discord message.
 
-The sole automatic planner schedule is the model-free combined morning
+The sole automatic planner schedule is the host-rendered combined morning
 notification. It runs from `ACADEMIC_MORNING_SCHEDULE` in `APP_TIMEZONE`, uses
 `ACADEMIC_MORNING_CATCHUP_GRACE_MINUTES` as its bounded catch-up window, and
-never loads Qwen. Each period is keyed as
-`academic-morning:YYYY-MM-DD:HHMM:v1`; the changed combined artifact uses the
-same local period via `planner-morning-delivery-v2:YYYY-MM-DD:HHMM:v1`.
+invokes Qwen only to interpret bounded text from in-window calendar events.
+Host code owns source authorization, the exact Toronto-local window, dates,
+ordering, citation checks, cache reuse, rendering, and delivery. Each period is
+keyed as `academic-morning:YYYY-MM-DD:HHMM:v1`; persisted message parts use
+`planner-morning-delivery-v2:YYYY-MM-DD:HHMM:v1:NNN`.
 
 Native source, configuration, dependencies and wake state are installed under
 `~/Library/Application Support/LifeAgent`, independent of the development
@@ -284,9 +288,12 @@ one versioned preparation plan per interview
 deterministic reminders in the existing planner-channel morning message
 ```
 
-Host code includes every current or future interview each morning and excludes
-past, inactive, or archived events. It owns `days_until`; only 14, 7, 3, and 1
-days and interview day receive bold uppercase labels. Qwen cannot change dates,
+Host code includes every active, non-archived interview in the morning
+briefing's inclusive Toronto-local window from the scheduled day's midnight
+through 10 days and 12 hours later. It owns `days_until`; only 14, 7, 3, and 1
+days and interview day receive bold uppercase labels. For each selected event,
+Qwen may produce a cited overview and decide whether event-local properties and
+page-body text contain substantive description. Qwen cannot change dates,
 milestones, IDs, or source citations. Ambiguous matches, missing postings, and
 insufficient evidence create focused, durable clarification records. Missing or
 invalid dates remain unscheduled and surface as actionable sync diagnostics.
@@ -311,9 +318,9 @@ page.
 
 Use Notion as the source of truth for assignments, tests, quizzes, events,
 rubrics, instructions, and course outlines. Convert those inputs into a
-realistic day-by-day work and study plan, send the model-free automatic morning
-to-do notification through Discord, and run an end-of-day progress check-in
-through Discord.
+realistic day-by-day work and study plan, send the host-rendered automatic
+morning calendar briefing through Discord, and run an end-of-day progress
+check-in through Discord.
 
 ```text
 Notion assessment calendar + attached PDFs/pages
@@ -327,8 +334,8 @@ Deterministic scheduler + bounded Qwen semantic conversation reasoning
 Proposed Discord response, study blocks, carry-forward queue, model-free confirmations
 ```
 
-The automatic morning path is a deterministic branch of this system, not a
-Qwen path:
+The automatic morning path keeps scheduling and delivery deterministic while
+using Qwen for bounded event semantics:
 
 ```text
 ACADEMIC_MORNING_SCHEDULE in APP_TIMEZONE
@@ -337,7 +344,11 @@ fresh complete Notion sync
                     ↓
 deterministic allocator for the intended local day
                     ↓
-one idempotent Discord to-do notification
+inclusive 10-day-12-hour course and Jobs event inventory
+                    ↓
+bounded event evidence → Qwen interpreter + critic → exact semantic cache
+                    ↓
+host-rendered, retry-safe multipart Discord briefing
 ```
 
 ### Suggested Notion structure
@@ -489,11 +500,15 @@ A low-weight quiz tomorrow covering two topics receives a short review block. A 
 The deterministic allocator remains authoritative for deadlines, planned start
 times, study durations, carry-forward, and deferred work. The automatic morning
 notification is the sole executable academic schedule. It performs a fresh
-complete Notion sync, builds the intended Toronto-local day, and sends one
-model-free Discord notification. If Notion is inaccessible, incomplete, stale,
-or misconfigured, the job reports an actionable setup/source condition instead
-of sending a false light-day message. The authorized private Discord channel is
-the sole Qwen entry point; scheduled academic model work remains non-executable.
+complete Notion sync, builds the intended Toronto-local day, inventories every
+active dated course and Jobs event through the exact inclusive 10-day-12-hour
+endpoint, and asks Qwen only for cited event-local semantics. Model failure
+removes only unverified overview/description prose; trusted calendar metadata
+still renders with one honest availability condition. The full multipart
+manifest is persisted before sending so retries resume missing parts without
+duplicating delivered content. If academic Notion data is inaccessible,
+incomplete, stale, or misconfigured, the job reports an actionable setup/source
+condition instead of sending a false light-day message.
 
 Operational health persists this schedule as `health_checks.check_name =
 'academic_morning'`. Before the configured occurrence and throughout the grace
@@ -540,10 +555,11 @@ The frontend's complete architecture and implementation guidance lives in [front
 
 1. Build the Discord-mentioned academic assistant as the only configured
    conversation-triggered study-session path.
-2. Treat historical/planned scheduled academic Qwen, code-review Qwen, and
+2. Treat historical/planned scheduled study-plan Qwen, code-review Qwen, and
    finance Qwen workflows as non-executable in the current runtime; restoring
-   them requires a future architecture change. The model-free academic morning
-   notification remains the only automatic academic schedule.
+   them requires a future architecture change. The host-controlled morning
+   briefing, including its bounded event-semantic calls, remains the only
+   automatic academic schedule.
 3. Consider any future scheduled finance briefing only after selecting and
    authorizing the exact eight-source allowlist, subscriptions/data access, and a
    new runtime design.

@@ -11,9 +11,10 @@ failures M`). A stalled worker appears as a `procrastinate_job` with status
 `QUEUE_STALLED_AFTER_SECONDS` threshold (default: 120 seconds).
 
 When the queue is backlogged, current Discord-triggered API work can stop
-progressing. The scheduled model-free academic morning notification can also be
-delayed. Scheduled finance, code-review, and academic Qwen/model paths are not
-executable in the current architecture.
+progressing. The host-controlled academic morning notification, including its
+bounded event-semantic model calls, can also be delayed. Scheduled finance,
+code-review, and Qwen study-plan generation remain non-executable in the current
+architecture.
 
 ## Diagnosis
 
@@ -104,9 +105,9 @@ docker compose up -d postgres api worker-academic-planner
 ```
 
 Do not start legacy code-review or finance model workers; the academic worker
-runs only durable Discord academic jobs, the scheduled model-free academic
-morning notification, and model-free/ingestion work. There is no configured
-scheduled model worker.
+runs durable Discord academic jobs, the scheduled morning notification, and
+ingestion work. The morning job uses the configured Qwen boundary only for
+bounded event semantics; there is no separate scheduled model worker.
 
 Do not manually delete `procrastinate_jobs` rows to clear a queue backlog.
 Deleting rows erases the job definition and retry history without creating an

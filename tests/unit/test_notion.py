@@ -647,6 +647,55 @@ async def test_retrieves_assessment_body_material_with_nesting_pagination_and_fi
 
 
 @pytest.mark.asyncio
+async def test_calendar_evidence_collects_all_text_without_description_field_rules() -> None:
+    body_text = "Review breadth-first search and runtime analysis."
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/v1/pages/assessment-1":
+            page = _assessment_page("assessment-1", "Graph traversal quiz")
+            properties = page["properties"]
+            assert isinstance(properties, dict)
+            properties["Unexpected syllabus wording"] = {
+                "id": "unexpected-prop",
+                "type": "rich_text",
+                "rich_text": [{"plain_text": "Compare BFS and DFS."}],
+            }
+            properties["Description"] = {
+                "id": "description-prop",
+                "type": "rich_text",
+                "rich_text": [{"plain_text": "Join the room five minutes early."}],
+            }
+            properties["Files"] = {"id": "files", "type": "files", "files": []}
+            return httpx.Response(200, json=page)
+        if request.url.path == "/v1/blocks/assessment-1/children":
+            return httpx.Response(
+                200,
+                json={
+                    "results": [_text_block("body-1", "callout", body_text)],
+                    "has_more": False,
+                    "next_cursor": None,
+                },
+            )
+        return httpx.Response(404, json={"message": "unexpected"})
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+        connector = NotionConnector(token="secret", courses_database_id="courses-db", client=client)
+        evidence = await connector.retrieve_calendar_event_evidence("assessment-1")
+
+    by_label = {fragment.source_label: fragment for fragment in evidence.fragments}
+    assert by_label["Unexpected syllabus wording"].text == "Compare BFS and DFS."
+    assert by_label["Description"].text == "Join the room five minutes early."
+    assert by_label["callout"].text == body_text
+    assert "Related" not in by_label
+    assert "People" not in by_label
+    assert "Files" not in by_label
+    assert [fragment.ordinal for fragment in evidence.fragments] == list(
+        range(len(evidence.fragments))
+    )
+    assert len(evidence.content_fingerprint) == 64
+
+
+@pytest.mark.asyncio
 async def test_refresh_assessment_material_file_refetches_current_signed_url() -> None:
     calls = 0
 

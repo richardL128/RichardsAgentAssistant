@@ -325,7 +325,7 @@ class NativeAcademicDiscordHandler:
             if progress is not None:
                 await _safe_progress_update(reporter, progress)
             rendered = _render_event(event)
-            if rendered is None:
+            if rendered is None or not rendered.strip():
                 return
             event_index += 1
             await self._delivery.send_response(
@@ -835,7 +835,7 @@ class _AcademicToolState:
                     title=item.course_code,
                 ),
             )
-        return [item.model_dump(mode="json") for item in results]
+        return [_assessment_result_for_model(item, self._timezone) for item in results]
 
     async def _inspect_inbound_pdf(self, arguments: Mapping[str, object]) -> object:
         args = _InspectInboundPdfArgs.model_validate(arguments)
@@ -1299,8 +1299,21 @@ def _system_message(now: datetime, timezone: ZoneInfo) -> str:
         + local_now.isoformat(timespec="seconds")
         + ". For due_at and starts_at tool arguments, send the intended local wall-clock "
         + "date and time without Z or a UTC offset; the host applies the owner's timezone. "
+        + "Assessment-search due_at values are already expressed in the owner's timezone; "
+        + "report their displayed calendar date and clock time without converting them again. "
         + "Resolve dates without a year to the next matching date that is not in the past."
     )
+
+
+def _assessment_result_for_model(
+    assessment: AcademicAssessmentOption,
+    timezone: ZoneInfo,
+) -> dict[str, object]:
+    payload = assessment.model_dump(mode="json")
+    if assessment.due_at is not None:
+        payload["due_at"] = assessment.due_at.astimezone(timezone).isoformat()
+        payload["due_at_timezone"] = timezone.key
+    return payload
 
 
 def _render_tool_error(error: str | None) -> str | None:

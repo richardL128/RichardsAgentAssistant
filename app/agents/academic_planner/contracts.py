@@ -395,7 +395,7 @@ class ScheduledMorningBlock(PlannerModel):
 
 
 class ScheduledMorningNotification(PlannerModel):
-    """Combined model-free planner message with deterministic provenance."""
+    """Logical scheduled briefing and its deterministic Discord-sized parts."""
 
     period_key: str = Field(min_length=1, max_length=512)
     intended_local_date: date
@@ -403,12 +403,20 @@ class ScheduledMorningNotification(PlannerModel):
     source_synced_at: datetime
     blocks: tuple[ScheduledMorningBlock, ...] = Field(max_length=100)
     interview_items: tuple[InterviewReminderFact, ...] = Field(default=(), max_length=100)
-    message_text: str = Field(min_length=1, max_length=2_000)
+    message_text: str = Field(min_length=1)
+    message_parts: tuple[str, ...] = Field(min_length=1)
 
     @field_validator("scheduled_at", "source_synced_at")
     @classmethod
     def timestamps_aware(cls, value: datetime) -> datetime:
         return _aware(value)
+
+    @field_validator("message_parts")
+    @classmethod
+    def message_parts_fit_discord(cls, value: tuple[str, ...]) -> tuple[str, ...]:
+        if any(len(part) > 2_000 for part in value):
+            raise ValueError("scheduled morning message part exceeds Discord's content limit")
+        return value
 
 
 class InboundMaterialProposalPreview(PlannerModel):

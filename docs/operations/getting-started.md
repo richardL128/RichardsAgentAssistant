@@ -11,18 +11,20 @@ LifeAgent is local-first: PostgreSQL and the application run in Compose, while
 Ollama runs on the host. Keep all credentials in `.env` or a secret manager;
 never commit them or paste them into logs, tickets, or chat.
 
-The sole configured Qwen path is the authorized private Discord channel. The
-native macOS Discord wake LaunchAgent remains connected while the API is cold,
+Qwen is configured for authorized private Discord conversations and bounded
+event-local semantic analysis in the automatic morning briefing. The native
+macOS Discord wake LaunchAgent remains connected while the API is cold,
 acknowledges an allowlisted owner's message, starts the fixed local services as
 needed, and submits a signed reference to the backend. PostgreSQL and the
-model-free planner worker stays resident so scheduled work does not depend on
-an inbound Discord message. Health checks, startup, messages outside that
-channel or owner allowlist, and every scheduled task must not load Qwen.
+planner worker stay resident so scheduled work does not depend on an inbound
+Discord message. Health checks, startup, and messages outside the channel or
+owner allowlist must not load Qwen.
 
 The one executable automatic planner schedule is the combined morning
-notification. It is deterministic and model-free: it refreshes Notion, builds
-the intended local day's academic plan, adds due interview reminders, and sends
-one idempotent Discord message.
+notification. Host code refreshes Notion, builds the intended local day's
+academic plan, selects course and Jobs events in the exact 10-day-12-hour local
+window, validates Qwen-produced event semantics, and sends a persisted,
+idempotent multipart Discord briefing.
 
 ## 1. Start the platform
 
@@ -84,9 +86,9 @@ need to keep.
 
 The API container runs migrations automatically. It does not own a Discord
 Gateway listener. `worker-academic-planner` owns durable planner-channel jobs,
-assessment-material ingestion, and the model-free combined morning
-notification. No scheduled model job or legacy model worker is a runtime
-option.
+assessment-material ingestion, and the combined morning notification. The
+morning path may call the configured Qwen model only for event-local semantics;
+no legacy model worker or other scheduled model workflow is a runtime option.
 
 ## 2. Connect host Ollama to Docker
 
@@ -119,9 +121,10 @@ OLLAMA_MODEL_KEEP_ALIVE_SECONDS=300
 OLLAMA_STARTUP_TIMEOUT_SECONDS=30
 ```
 
-`MODEL_TRIGGER_MODE` is closed to the authorized private Discord channel.
-Academic Qwen, code-review Qwen, and finance Qwen schedules are not configured.
-The academic morning schedule is separate and model-free.
+`MODEL_TRIGGER_MODE` keeps interactive model requests closed to the authorized
+private Discord channel. Study-plan, code-review, and finance Qwen schedules are
+not configured. The separate academic morning schedule is host-controlled and
+uses the same configured model only for bounded event semantics.
 
 Clearing `OLLAMA_MODEL_DIGEST` skips digest pinning during first setup. Pin the
 actual digest later after verifying the model, by copying the digest returned
@@ -330,10 +333,11 @@ condition remains visible in persisted health. A successful discovery clears
 the active reminder condition.
 
 Academic sync and deterministic schedule construction remain model-free. The
-automatic morning notification is executable, but it cannot call Qwen. The
-allowlisted private Discord channel is the sole Qwen trigger. Raw Notion
-envelopes, source document text, unauthorized Discord message bodies,
-embeddings, and unrelated memory do not cross the model boundary.
+automatic morning notification may call Qwen after host code selects in-window
+events and collects bounded event-local textual properties and supported page
+blocks. Raw Notion envelopes, relations, files, attachment/OCR content,
+credentials, unauthorized Discord message bodies, embeddings, and unrelated
+memory do not cross this model boundary.
 
 ### Automatic morning notification
 
@@ -343,6 +347,9 @@ Configure the morning schedule in local application time:
 APP_TIMEZONE=America/Toronto
 ACADEMIC_MORNING_SCHEDULE=08:00
 ACADEMIC_MORNING_CATCHUP_GRACE_MINUTES=30
+CALENDAR_SEMANTIC_EVENT_TIMEOUT_SECONDS=180
+CALENDAR_SEMANTIC_TOTAL_TIMEOUT_SECONDS=600
+CALENDAR_SEMANTIC_PROMPT_MAX_CHARS=16000
 ```
 
 `ACADEMIC_MORNING_SCHEDULE` is interpreted in `APP_TIMEZONE`. The default
@@ -351,13 +358,18 @@ must not send a stale morning notification after that deadline. Each scheduled
 period records one run with agent `academic_morning_notification`, schedule
 `academic-morning`, and idempotency key
 `academic-morning:YYYY-MM-DD:HHMM:v1`. The combined academic/interview Discord
-artifact uses `planner-morning-delivery-v2:YYYY-MM-DD:HHMM:v1`.
+manifest derives ordered delivery keys as
+`planner-morning-delivery-v2:YYYY-MM-DD:HHMM:v1:NNN`. Each part is at most
+2,000 characters, and the persisted manifest lets retries skip parts already
+delivered.
 
 Before sending a normal morning plan, the job completes the academic sync and
 then the Jobs/Interviews sync. A career failure is disclosed in the combined
 message but does not hide a valid academic plan; one invalid interview does not
 hide other valid interview reminders. Missing academic sharing, stale academic
-sync, or Discord delivery uncertainty remains fail-closed.
+sync, or Discord delivery uncertainty remains fail-closed. Semantic model or
+critic failure does not suppress trusted event titles and dates; the message
+omits unverified prose and includes one bounded availability condition.
 
 For setup recovery or an immediate refresh after fixing a template/share
 problem, run the same idempotent boundary manually:

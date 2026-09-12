@@ -13,10 +13,11 @@ The operations console or `/health/ready` may also show `ollama=attention` with
 a diagnostic such as `Ollama unavailable`, `configured Ollama model is not
 installed`, or `configured Ollama model digest does not match`.
 
-In the default runtime, Qwen-powered work starts only from a message sent by an
-authorized owner in the configured private Discord academic channel. A bot
-mention is optional. Startup, health checks, messages from other users or
-channels, and every schedule must not load Qwen.
+In the default runtime, Qwen-powered work starts from a message sent by an
+authorized owner in the configured private Discord academic channel or from the
+automatic morning briefing's bounded event-semantic phase. A bot mention is
+optional for interactive work. Startup, health checks, and messages from other
+users or channels must not load Qwen.
 
 ## Diagnosis
 
@@ -49,8 +50,14 @@ docker compose exec api python -c "import httpx; r=httpx.get('http://host.docker
 ```
 
 Use queue inspection only to diagnose operational backlog. Queue and health
-checks should not be treated as permission to start scheduled model workflows in
-the current runtime.
+checks should not be treated as permission to start any model workflow beyond
+the configured private-channel conversation and morning event-semantic paths.
+
+For a morning run, inspect `calendar_briefing.semantic_interpretation` and
+`calendar_briefing.semantic_validation` rows in `run_steps`. If Ollama cannot
+become ready inside the configured event/total deadlines, the briefing should
+still contain trusted event titles and dates, omit unverified semantic prose,
+and show one aggregate availability condition.
 
 ## Fix
 

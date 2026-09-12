@@ -14,6 +14,7 @@ from app.agents.job_interviews.contracts import PreparationPlanSnapshot
 from app.db.job_interviews import (
     ApplicationRowInput,
     ApplicationTableInput,
+    CalendarSemanticResultInput,
     CareerWriteProposalInput,
     InterviewEventInput,
     InterviewLinkInput,
@@ -325,3 +326,93 @@ def test_sqlalchemy_store_adapter_satisfies_sync_and_morning_protocols(engine) -
     assert upcoming[0].url_candidates[0].url == "https://jobs.example/1"
     assert store.get_current_plan("interview-1").revision == 1
     assert store.health_summary()["upcoming_interview_count"] == 1
+
+
+def test_jobs_calendar_items_are_upper_bounded_and_semantic_cache_is_optimistic(engine) -> None:
+    with Session(engine) as session, session.begin():
+        workspace = _workspace(session)
+        JobInterviewRepository.upsert_interview_event(
+            session,
+            workspace_id=workspace.id,
+            event=InterviewEventInput(
+                interview_page_id="interview-all-day",
+                title="All-day interview milestone",
+                local_date=date(2026, 9, 20),
+                notion_last_edited_at=datetime(2026, 9, 9, 12, tzinfo=UTC),
+                content_fingerprint="all-day-source",
+                is_all_day=True,
+            ),
+        )
+        JobInterviewRepository.upsert_interview_event(
+            session,
+            workspace_id=workspace.id,
+            event=InterviewEventInput(
+                interview_page_id="interview-inclusive-end",
+                title="Noon endpoint interview",
+                local_date=date(2026, 9, 20),
+                date_start=datetime(2026, 9, 20, 16, tzinfo=UTC),
+                notion_last_edited_at=datetime(2026, 9, 9, 12, tzinfo=UTC),
+                content_fingerprint="endpoint-source",
+            ),
+        )
+        JobInterviewRepository.upsert_interview_event(
+            session,
+            workspace_id=workspace.id,
+            event=InterviewEventInput(
+                interview_page_id="interview-outside",
+                title="After endpoint interview",
+                local_date=date(2026, 9, 20),
+                date_start=datetime(2026, 9, 20, 16, 1, tzinfo=UTC),
+                notion_last_edited_at=datetime(2026, 9, 9, 12, tzinfo=UTC),
+                content_fingerprint="outside-source",
+            ),
+        )
+        saved = JobInterviewRepository.save_interview_calendar_semantics(
+            session,
+            interview_page_id="interview-inclusive-end",
+            semantics=CalendarSemanticResultInput(
+                status="valid",
+                overview="A technical interview at the inclusive window endpoint.",
+                description="The event is exactly at noon Toronto time.",
+                source_fingerprint="endpoint-source",
+                source_last_edited_at=datetime(2026, 9, 9, 12, tzinfo=UTC),
+                model_identity="qwen-test",
+                config_version="calendar-test",
+                prompt_version="prompt-v1",
+                analyzed_at=datetime(2026, 9, 9, 13, tzinfo=UTC),
+                evidence_ids=("frag-1",),
+                description_evidence_ids=("frag-1",),
+            ),
+        )
+        stale = JobInterviewRepository.save_interview_calendar_semantics(
+            session,
+            interview_page_id="interview-inclusive-end",
+            semantics=CalendarSemanticResultInput(
+                status="valid",
+                overview="Stale overview",
+                description="Stale description",
+                source_fingerprint="older-evidence-source",
+                source_last_edited_at=datetime(2026, 9, 9, 11, 59, tzinfo=UTC),
+                model_identity="qwen-test",
+                config_version="calendar-test",
+                prompt_version="prompt-v1",
+                analyzed_at=datetime(2026, 9, 9, 14, tzinfo=UTC),
+                evidence_ids=("frag-old",),
+                description_evidence_ids=("frag-old",),
+            ),
+        )
+        assert saved is True
+        assert stale is False
+
+    items = SQLAlchemyJobInterviewStore(engine).load_upcoming_calendar_items(
+        occurrence=date(2026, 9, 10)
+    )
+
+    assert [item["event_id"] for item in items] == [
+        "interview-all-day",
+        "interview-inclusive-end",
+    ]
+    assert items[0]["is_all_day"] is True
+    assert items[1]["semantic_status"] == "valid"
+    assert items[1]["semantic_description"] == "The event is exactly at noon Toronto time."
+    assert items[1]["semantic_cache"]["source_fingerprint"] == "endpoint-source"

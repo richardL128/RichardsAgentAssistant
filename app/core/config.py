@@ -156,6 +156,9 @@ class Settings(BaseSettings):
     academic_confirmation_ttl_hours: Annotated[int, Field(gt=0, le=168)] = 24
     academic_morning_schedule: time = time(hour=8)
     academic_morning_catchup_grace_minutes: Annotated[int, Field(ge=1, le=180)] = 30
+    calendar_semantic_event_timeout_seconds: Annotated[float, Field(gt=0, le=600)] = 180.0
+    calendar_semantic_total_timeout_seconds: Annotated[float, Field(gt=0, le=1_500)] = 600.0
+    calendar_semantic_prompt_max_chars: Annotated[int, Field(ge=1_000, le=16_000)] = 16_000
     academic_end_of_day_schedule: time = time(hour=21)
     job_research_timeout_seconds: Annotated[float, Field(gt=0, le=60)] = 10.0
     job_research_max_redirects: Annotated[int, Field(ge=0, le=8)] = 3

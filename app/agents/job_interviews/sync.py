@@ -291,6 +291,9 @@ def _interview_record(
             tags=_tags(interview.properties),
             property_snapshot=interview.properties,
             url_candidates=_url_candidates(interview),
+            evidence_fragments=tuple(
+                fragment.model_dump(mode="json") for fragment in interview.evidence_fragments
+            ),
             active=not archived,
             archived=archived,
         ),
@@ -370,6 +373,16 @@ def _interview_fingerprint(interview: NotionInterviewEvent) -> str:
         "date": interview.date.model_dump(mode="python") if interview.date else None,
         "last_edited_at": interview.last_edited_at.isoformat(),
         "url_candidates": [item.url for item in interview.url_candidates],
+        "evidence_fragments": [
+            {
+                "fragment_id": item.fragment_id,
+                "source_kind": item.source_kind,
+                "source_label": item.source_label,
+                "text": item.text,
+                "ordinal": item.ordinal,
+            }
+            for item in interview.evidence_fragments
+        ],
     }
     body = json.dumps(payload, ensure_ascii=True, sort_keys=True, separators=(",", ":"))
     return hashlib.sha256(body.encode("utf-8")).hexdigest()

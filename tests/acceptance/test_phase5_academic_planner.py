@@ -383,19 +383,24 @@ async def test_scheduled_morning_notification_uses_fresh_sync_sql_plan_and_disco
             timezone_name="America/Toronto",
         )
 
-    expected = (
-        "Good morning, Richard. Today's plan for Thursday, September 10, 2026:\n"
-        "- 09:00 — ECE 250 Quiz 1 review (45 minutes, assessment)\n"
-        "- 09:45 — MATH 239 Assignment 2 (60 minutes, assessment)\n"
-        "Have a good day!"
-    )
     assert result["status"] == "succeeded"
     assert result["block_count"] == 2
     assert replay["status"] == "succeeded"
     assert syncer.calls == [occurrence.scheduled_at, occurrence.scheduled_at]
     assert len(requests) == 1
     body = json.loads(requests[0].content)
-    assert body["content"] == expected
+    content = body["content"]
+    assert content.startswith(
+        "Good morning, Richard. Today's plan for Thursday, September 10, 2026:"
+    )
+    assert "Today's study blocks:" in content
+    assert content.count("09:00 — ECE 250 Quiz 1 review (45 minutes, assessment)") == 1
+    assert content.count("09:45 — MATH 239 Assignment 2 (60 minutes, assessment)") == 1
+    assert "Upcoming course dates through Sunday, September 20 at 12:00 EDT:" in content
+    assert content.count("ECE 250 — Quiz — ECE 250 Quiz 1 review") == 1
+    assert content.count("MATH 239 — Assignment — MATH 239 Assignment 2") == 1
+    assert "Semantic event details were unavailable for 2 events" in content
+    assert content.endswith("Have a good day!")
     assert body["allowed_mentions"] == {"parse": []}
     assert body["enforce_nonce"] is True
     with Session(engine) as session:
@@ -412,7 +417,7 @@ async def test_scheduled_morning_notification_uses_fresh_sync_sql_plan_and_disco
     assert [row.allocated_minutes for row in stored_blocks] == [45, 60]
     assert [row.block_kind for row in stored_blocks] == ["assessment", "assessment"]
     assert len(deliveries) == 1
-    assert deliveries[0].idempotency_key == scheduled_delivery_key(period_key, occurrence)
+    assert deliveries[0].idempotency_key == f"{scheduled_delivery_key(period_key, occurrence)}:001"
     assert deliveries[0].status == "sent"
     assert deliveries[0].attempt_count == 1
     assert body["nonce"] == deliveries[0].id.hex[:25]

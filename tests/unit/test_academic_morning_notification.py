@@ -23,6 +23,13 @@ from app.agents.academic_planner.morning_notification import (
     scheduled_delivery_key,
 )
 from app.agents.academic_planner.sync import AcademicNotionSync, AcademicNotionSyncResult
+from app.agents.calendar_briefing import (
+    CalendarEventEvidenceFragment,
+    CalendarEventSemanticInterpreter,
+    CalendarEventSemanticResult,
+    CalendarEventSourceKind,
+)
+from app.agents.calendar_briefing.semantic_interpreter import CalendarEventSemanticCritique
 from app.agents.job_interviews.contracts import (
     InterviewEventSnapshot,
     InterviewReminderFact,
@@ -98,6 +105,26 @@ class CareerStore:
             ),
         )
 
+    def load_upcoming_calendar_items(self, *, occurrence: datetime, timezone: str):
+        assert occurrence == OCCURRENCE.scheduled_at
+        assert timezone == "America/Toronto"
+        return (
+            {
+                "event_id": "interview-1",
+                "source_area": "jobs",
+                "source_label": "Jobs/Interviews",
+                "title": "Shopify Technical Interview",
+                "display_kind": "Interview",
+                "local_start_label": "Thursday, September 17, 2026",
+                "relative_date_label": "In 7 days",
+                "is_all_day": True,
+                "completed": False,
+                "semantic_status": "unavailable",
+                "source_last_edited_at": OCCURRENCE.scheduled_at,
+                "semantic_cache": {},
+            },
+        )
+
     def get_current_plan(self, interview_page_id: str):
         assert interview_page_id == "interview-1"
         return PreparationPlanSnapshot(
@@ -129,6 +156,101 @@ class CareerSyncer:
         if self.fails:
             raise RuntimeError("career source unavailable")
         return SimpleNamespace(status="succeeded")
+
+
+class ReadyRuntime:
+    async def ensure_ready(self):
+        return SimpleNamespace(model="qwen-test")
+
+
+class SemanticGateway:
+    model_identity = "qwen-test"
+    config_version = "cfg-test"
+
+    def __init__(self, outputs: list[object]) -> None:
+        self.outputs = outputs
+
+    async def invoke_structured(self, *, prompt: str, response_model: type[object]):
+        del prompt, response_model
+        return SimpleNamespace(output=self.outputs.pop(0))
+
+
+class SemanticStore(Store):
+    def __init__(self, *, many: int = 1) -> None:
+        super().__init__()
+        self.many = many
+        self.semantic_saves: list[tuple[str, object]] = []
+
+    def load_upcoming_calendar_items(self, *, occurrence: datetime, timezone: str):
+        assert occurrence == OCCURRENCE.scheduled_at
+        assert timezone == "America/Toronto"
+        return tuple(
+            {
+                "event_id": f"event-{index}",
+                "source_area": "course",
+                "source_label": "ECE 250",
+                "title": f"Graph traversal event {index} " + "x" * 80,
+                "display_kind": "Quiz",
+                "local_start_label": "Friday, September 11, 2026 at 10:00 EDT",
+                "relative_date_label": "Tomorrow",
+                "is_all_day": False,
+                "completed": False,
+                "semantic_status": "unavailable",
+                "source_last_edited_at": OCCURRENCE.scheduled_at,
+                "semantic_cache": {},
+            }
+            for index in range(self.many)
+        )
+
+    def save_assessment_calendar_semantics(self, event_id: str, semantics: object) -> bool:
+        self.semantic_saves.append((event_id, semantics))
+        return True
+
+
+class EvidenceConnector:
+    async def retrieve_calendar_event_evidence(self, page_id: str):
+        fragment = CalendarEventEvidenceFragment(
+            fragment_id=f"{page_id}:property:topics",
+            event_id=page_id,
+            source_kind=CalendarEventSourceKind.PROPERTY,
+            source_label="Unexpected syllabus wording",
+            text="Prepare BFS, DFS, and runtime analysis.",
+            ordinal=0,
+        )
+        return SimpleNamespace(
+            event_id=page_id,
+            last_edited_at=OCCURRENCE.scheduled_at,
+            fragments=(fragment,),
+        )
+
+
+class MemoryManifestStore:
+    def __init__(self) -> None:
+        self.value = None
+
+    def load(self, *, period_key: str):
+        del period_key
+        return self.value
+
+    def save(self, manifest, *, period_key: str, delivered_ordinals: set[int]) -> None:
+        del period_key
+        self.value = (manifest, set(delivered_ordinals))
+
+
+class PartialFailureDelivery(Delivery):
+    def __init__(self) -> None:
+        super().__init__()
+        self.failed_once = False
+        self.delivered_keys: list[str] = []
+
+    async def send_scheduled_notification(self, content: str, *, idempotency_key: str):
+        ordinal = int(idempotency_key.rsplit(":", 1)[-1])
+        if ordinal == 2 and not self.failed_once:
+            self.failed_once = True
+            raise RuntimeError("forced part-two failure")
+        self.messages.append((content, idempotency_key))
+        self.delivered_keys.append(idempotency_key)
+        return SimpleNamespace(status="sent")
 
 
 class FailureSyncStore:
@@ -255,7 +377,7 @@ async def test_successful_empty_refresh_sends_natural_light_day_message() -> Non
     assert store.loaded_at == [OCCURRENCE.scheduled_at]
     assert len(store.saved) == 1
     assert "no scheduled study blocks today" in delivery.messages[0][0]
-    assert delivery.messages[0][1] == scheduled_delivery_key(PERIOD_KEY, OCCURRENCE)
+    assert delivery.messages[0][1] == f"{scheduled_delivery_key(PERIOD_KEY, OCCURRENCE)}:001"
 
 
 async def test_combined_morning_delivers_academic_and_interview_once_with_audit() -> None:
@@ -304,6 +426,88 @@ async def test_career_failure_keeps_academic_morning_delivery_honest() -> None:
     assert result["career_sync_status"] == "failed"
     assert "no scheduled study blocks today" in delivery.messages[0][0]
     assert "academic plan is unaffected" in delivery.messages[0][0]
+
+
+async def test_scheduled_path_renders_and_persists_critic_approved_semantics() -> None:
+    store = SemanticStore()
+    delivery = Delivery()
+    fragment_id = "event-0:property:topics"
+    candidate = CalendarEventSemanticResult(
+        event_id="event-0",
+        overview="A quiz focused on graph traversal techniques.",
+        description_present=True,
+        description="Prepare BFS, DFS, and runtime analysis.",
+        evidence_fragment_ids=(fragment_id,),
+        description_fragment_ids=(fragment_id,),
+    )
+    critique = CalendarEventSemanticCritique(
+        accepted=True,
+        overview_supported=True,
+        description_supported=True,
+        no_invented_claims=True,
+        no_instruction_following=True,
+        same_event=True,
+        cites_only_supplied_fragments=True,
+    )
+    interpreter = CalendarEventSemanticInterpreter(SemanticGateway([candidate, critique]))
+
+    result = await execute_scheduled_morning_notification(
+        store=store,
+        syncer=Syncer(
+            AcademicNotionSyncResult(status="succeeded", synced_at=OCCURRENCE.scheduled_at)
+        ),
+        delivery=delivery,
+        occurrence=OCCURRENCE,
+        period_key=PERIOD_KEY,
+        executed_at=OCCURRENCE.scheduled_at,
+        evidence_connector=EvidenceConnector(),
+        semantic_interpreter=interpreter,
+        ollama_runtime=ReadyRuntime(),
+    )
+
+    assert result["semantic_calls"] == 1
+    assert result["valid_descriptions"] == 1
+    assert "Overview: A quiz focused on graph traversal techniques." in delivery.messages[0][0]
+    assert "Description: Prepare BFS, DFS, and runtime analysis." in delivery.messages[0][0]
+    assert len(store.semantic_saves) == 1
+
+
+async def test_multipart_retry_resumes_persisted_manifest_without_duplicate_part_one() -> None:
+    store = SemanticStore(many=40)
+    syncer = Syncer(AcademicNotionSyncResult(status="succeeded", synced_at=OCCURRENCE.scheduled_at))
+    delivery = PartialFailureDelivery()
+    manifest_store = MemoryManifestStore()
+
+    with pytest.raises(RuntimeError, match="forced part-two failure"):
+        await execute_scheduled_morning_notification(
+            store=store,
+            syncer=syncer,
+            delivery=delivery,
+            occurrence=OCCURRENCE,
+            period_key=PERIOD_KEY,
+            executed_at=OCCURRENCE.scheduled_at,
+            manifest_store=manifest_store,
+        )
+
+    resumed = await execute_scheduled_morning_notification(
+        store=store,
+        syncer=syncer,
+        delivery=delivery,
+        occurrence=OCCURRENCE,
+        period_key=PERIOD_KEY,
+        executed_at=OCCURRENCE.scheduled_at,
+        manifest_store=manifest_store,
+    )
+
+    assert resumed["resumed_manifest"] is True
+    assert resumed["part_count"] >= 3
+    assert syncer.calls == [OCCURRENCE.scheduled_at]
+    part_one_key = f"{scheduled_delivery_key(PERIOD_KEY, OCCURRENCE)}:001"
+    assert delivery.delivered_keys.count(part_one_key) == 1
+    assert all(len(content) <= 2_000 for content, _key in delivery.messages)
+    combined = "\n".join(content for content, _key in delivery.messages)
+    for index in range(40):
+        assert combined.count(f"Graph traversal event {index} ") == 1
 
 
 async def test_allocator_output_is_authoritative_for_populated_notification() -> None:

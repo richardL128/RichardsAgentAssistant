@@ -2,18 +2,21 @@
 
 from __future__ import annotations
 
+import hashlib
+import json
 import re
 import uuid
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
-from datetime import UTC, date, datetime
+from datetime import UTC, date, datetime, timedelta
 from typing import Any, Literal, cast
 from zoneinfo import ZoneInfo
 
-from sqlalchemy import Engine, func, select
+from sqlalchemy import Engine, and_, func, or_, select
 from sqlalchemy.exc import IntegrityError, NoResultFound
 from sqlalchemy.orm import Session
 
+from app.agents.calendar_briefing.contracts import CalendarEventSemanticStatus
 from app.agents.job_interviews.contracts import (
     ApplicationInterpretation,
     ApplicationRowSnapshot,
@@ -50,6 +53,7 @@ CareerProposalStatus = Literal[
     "token_mismatch",
 ]
 CareerReceiptStatus = Literal["ready", "already_applied", "in_progress", "uncertain", "failed"]
+CalendarSemanticStatus = Literal["valid", "not_substantive", "unavailable", "invalid"]
 _SHA256 = re.compile(r"^[0-9a-f]{64}$")
 _RECEIPT_FIELDS = frozenset(("proposal_id", "page_id", "url", "notion_request_id", "edited_at"))
 
@@ -124,9 +128,27 @@ class InterviewEventInput:
     tags: Sequence[str] = ()
     property_snapshot: Mapping[str, Any] | None = None
     url_candidates: Sequence[Mapping[str, Any]] = ()
+    evidence_fragments: Sequence[Mapping[str, Any]] = ()
     content_artifact_key: str | None = None
     active: bool = True
     archived: bool = False
+
+
+@dataclass(frozen=True, slots=True)
+class CalendarSemanticResultInput:
+    """Bounded semantic cache payload for one calendar event."""
+
+    status: CalendarSemanticStatus
+    source_fingerprint: str
+    source_last_edited_at: datetime | None
+    model_identity: str
+    config_version: str
+    prompt_version: str
+    analyzed_at: datetime
+    overview: str | None = None
+    description: str | None = None
+    evidence_ids: Sequence[str] = ()
+    description_evidence_ids: Sequence[str] = ()
 
 
 @dataclass(frozen=True, slots=True)
@@ -581,6 +603,91 @@ class JobInterviewRepository:
             .order_by(CareerInterviewEvent.local_date, CareerInterviewEvent.date_start)
         )
         return [_interview_public(session, row) for row in rows]
+
+    @staticmethod
+    def load_upcoming_calendar_items(
+        session: Session,
+        *,
+        occurrence: date | datetime,
+        timezone: str = "America/Toronto",
+    ) -> list[dict[str, Any]]:
+        tz = ZoneInfo(timezone)
+        window_start, window_end = _calendar_window(occurrence, tz)
+        query_start = window_start.astimezone(UTC) - timedelta(days=1)
+        query_end = window_end.astimezone(UTC) + timedelta(days=1)
+        rows = list(
+            session.scalars(
+                select(CareerInterviewEvent)
+                .where(
+                    CareerInterviewEvent.active.is_(True),
+                    CareerInterviewEvent.archived.is_(False),
+                    CareerInterviewEvent.local_date.is_not(None),
+                    CareerInterviewEvent.local_date >= window_start.date(),
+                    CareerInterviewEvent.local_date <= window_end.date(),
+                    or_(
+                        CareerInterviewEvent.date_start.is_(None),
+                        and_(
+                            CareerInterviewEvent.date_start >= query_start,
+                            CareerInterviewEvent.date_start <= query_end,
+                        ),
+                    ),
+                )
+                .order_by(CareerInterviewEvent.local_date, CareerInterviewEvent.date_start)
+            )
+        )
+        items: list[tuple[datetime, str, str, str, dict[str, Any]]] = []
+        for row in rows:
+            local_start = _interview_local_start(row, timezone=tz)
+            if local_start is None or not window_start <= local_start <= window_end:
+                continue
+            item = _interview_calendar_item(
+                row,
+                local_start=local_start,
+                window_start=window_start,
+                timezone=tz,
+            )
+            items.append(
+                (
+                    local_start,
+                    "jobs",
+                    "jobs/interviews",
+                    row.title.casefold(),
+                    item,
+                )
+            )
+        items.sort(key=lambda item: (item[0], item[1], item[2], item[3], item[4]["event_id"]))
+        return [item[-1] for item in items]
+
+    @staticmethod
+    def save_interview_calendar_semantics(
+        session: Session,
+        *,
+        interview_page_id: str,
+        semantics: CalendarSemanticResultInput,
+    ) -> bool:
+        row = session.scalar(
+            select(CareerInterviewEvent)
+            .where(CareerInterviewEvent.interview_page_id == _bounded(interview_page_id))
+            .with_for_update()
+        )
+        if row is None:
+            return False
+        source_edit = (
+            _utc(semantics.source_last_edited_at, "source_last_edited_at")
+            if semantics.source_last_edited_at is not None
+            else None
+        )
+        if source_edit is not None and _aware_db(row.notion_last_edited_at) != source_edit:
+            return False
+        analyzed_at = _utc(semantics.analyzed_at, "analyzed_at")
+        if (
+            row.calendar_semantic_analyzed_at is not None
+            and _aware_db(row.calendar_semantic_analyzed_at) > analyzed_at
+        ):
+            return False
+        _apply_calendar_semantics(row, semantics, source_edit=source_edit, analyzed_at=analyzed_at)
+        session.flush()
+        return True
 
     @staticmethod
     def search_interviews(
@@ -1275,7 +1382,7 @@ class SQLAlchemyJobInterviewStore:
                             dict(item) for item in getattr(interview, "url_candidates", ())[:25]
                         ],
                         "content_fingerprint": _bounded(
-                            f"{interview.interview_page_id}:{interview.last_edited_at.isoformat()}",
+                            _legacy_interview_fingerprint(interview),
                             128,
                         ),
                         "content_artifact_key": None,
@@ -1328,6 +1435,33 @@ class SQLAlchemyJobInterviewStore:
         with Session(self.engine) as session:
             rows = JobInterviewRepository.load_upcoming_interviews(session, now=now)
             return tuple(_interview_contract(row) for row in rows)
+
+    def load_upcoming_calendar_items(
+        self,
+        *,
+        occurrence: date | datetime,
+        timezone: str = "America/Toronto",
+    ) -> tuple[Mapping[str, Any], ...]:
+        with Session(self.engine) as session:
+            return tuple(
+                JobInterviewRepository.load_upcoming_calendar_items(
+                    session,
+                    occurrence=occurrence,
+                    timezone=timezone,
+                )
+            )
+
+    def save_interview_calendar_semantics(
+        self,
+        interview_page_id: str,
+        semantics: CalendarSemanticResultInput,
+    ) -> bool:
+        with Session(self.engine) as session, session.begin():
+            return JobInterviewRepository.save_interview_calendar_semantics(
+                session,
+                interview_page_id=interview_page_id,
+                semantics=semantics,
+            )
 
     def search_interviews(self, query: str, *, now: datetime) -> tuple[InterviewEventSnapshot, ...]:
         with Session(self.engine) as session:
@@ -1557,6 +1691,137 @@ def _application_interpretation_public(row: CareerApplicationInterpretation) -> 
     }
 
 
+def _apply_calendar_semantics(
+    row: Any,
+    semantics: CalendarSemanticResultInput,
+    *,
+    source_edit: datetime | None,
+    analyzed_at: datetime,
+) -> None:
+    if semantics.status not in {"valid", "not_substantive", "unavailable", "invalid"}:
+        raise ValueError("invalid calendar semantic status")
+    overview = _bounded_optional(semantics.overview, 700)
+    description = _bounded_optional(semantics.description, 1_500)
+    evidence_ids = _bounded_semantic_ids(semantics.evidence_ids)
+    description_ids = _bounded_semantic_ids(semantics.description_evidence_ids)
+    if semantics.status in {"unavailable", "invalid"}:
+        overview = None
+        description = None
+        evidence_ids = []
+        description_ids = []
+    elif semantics.status == "not_substantive":
+        description = None
+        description_ids = []
+    row.calendar_semantic_overview = overview
+    row.calendar_semantic_description = description
+    row.calendar_semantic_status = semantics.status
+    row.calendar_semantic_evidence_ids = evidence_ids
+    row.calendar_semantic_description_evidence_ids = description_ids
+    row.calendar_semantic_source_fingerprint = _bounded(semantics.source_fingerprint, 128)
+    row.calendar_semantic_source_last_edited_at = source_edit
+    row.calendar_semantic_model_identity = _bounded(semantics.model_identity, 128)
+    row.calendar_semantic_config_version = _bounded(semantics.config_version, 128)
+    row.calendar_semantic_prompt_version = _bounded(semantics.prompt_version, 128)
+    row.calendar_semantic_analyzed_at = analyzed_at
+
+
+def _bounded_semantic_ids(values: Sequence[str]) -> list[str]:
+    return [_bounded(str(item), 255) for item in values[:12] if str(item).strip()]
+
+
+def _calendar_window(occurrence: date | datetime, timezone: ZoneInfo) -> tuple[datetime, datetime]:
+    if isinstance(occurrence, datetime):
+        local_day = _aware_db(occurrence).astimezone(timezone).date()
+    else:
+        local_day = occurrence
+    window_start = datetime.combine(local_day, datetime.min.time(), tzinfo=timezone)
+    return window_start, window_start + timedelta(days=10, hours=12)
+
+
+def _interview_local_start(
+    row: CareerInterviewEvent,
+    *,
+    timezone: ZoneInfo,
+) -> datetime | None:
+    if row.local_date is None:
+        return None
+    if row.is_all_day or row.date_start is None:
+        return datetime.combine(row.local_date, datetime.min.time(), tzinfo=timezone)
+    return _aware_db(row.date_start).astimezone(timezone)
+
+
+def _interview_calendar_item(
+    row: CareerInterviewEvent,
+    *,
+    local_start: datetime,
+    window_start: datetime,
+    timezone: ZoneInfo,
+) -> dict[str, Any]:
+    local_end = None
+    semantic_status = row.calendar_semantic_status or CalendarEventSemanticStatus.UNAVAILABLE.value
+    overview = (
+        row.calendar_semantic_overview if semantic_status in {"valid", "not_substantive"} else None
+    )
+    description = row.calendar_semantic_description if semantic_status == "valid" else None
+    return {
+        "event_id": row.interview_page_id,
+        "source_area": "jobs",
+        "source_label": "Jobs/Interviews",
+        "title": row.title,
+        "display_kind": "Interview",
+        "local_start_label": _calendar_label(local_start, is_all_day=row.is_all_day),
+        "local_end_label": (
+            _calendar_label(local_end, is_all_day=False) if local_end is not None else None
+        ),
+        "relative_date_label": _relative_day_label(local_start.date(), window_start.date()),
+        "is_all_day": row.is_all_day,
+        "completed": False,
+        "semantic_status": semantic_status,
+        "semantic_overview": overview,
+        "semantic_description": description,
+        "semantic_evidence_fragment_ids": tuple(row.calendar_semantic_evidence_ids or ()),
+        "semantic_description_fragment_ids": tuple(
+            row.calendar_semantic_description_evidence_ids or ()
+        ),
+        "semantic_cache": _calendar_semantic_cache(row),
+        "source_url": row.source_url,
+        "source_last_edited_at": row.notion_last_edited_at,
+        "source_fingerprint": row.calendar_semantic_source_fingerprint,
+        "url_candidates": row.url_candidates,
+    }
+
+
+def _calendar_semantic_cache(row: Any) -> Mapping[str, Any]:
+    return {
+        "source_fingerprint": row.calendar_semantic_source_fingerprint,
+        "source_last_edited_at": row.calendar_semantic_source_last_edited_at,
+        "model_identity": row.calendar_semantic_model_identity,
+        "config_version": row.calendar_semantic_config_version,
+        "prompt_version": row.calendar_semantic_prompt_version,
+        "analyzed_at": row.calendar_semantic_analyzed_at,
+    }
+
+
+def _calendar_label(value: datetime, *, is_all_day: bool) -> str:
+    date_text = f"{value.strftime('%A, %B')} {value.day}, {value.year}"
+    if is_all_day:
+        return date_text
+    return f"{date_text} at {value.strftime('%H:%M %Z')}".strip()
+
+
+def _relative_day_label(target: date, anchor: date) -> str:
+    days = (target - anchor).days
+    if days == 0:
+        return "Today"
+    if days == 1:
+        return "Tomorrow"
+    if days > 1:
+        return f"In {days} days"
+    if days == -1:
+        return "Yesterday"
+    return f"{abs(days)} days ago"
+
+
 def _interview_public(session: Session, row: CareerInterviewEvent) -> dict[str, Any]:
     plan = session.scalar(
         select(CareerPreparationPlan).where(CareerPreparationPlan.interview_id == row.id)
@@ -1579,6 +1844,19 @@ def _interview_public(session: Session, row: CareerInterviewEvent) -> dict[str, 
         "tags": row.tags,
         "url_candidates": row.url_candidates,
         "content_fingerprint": row.content_fingerprint,
+        "calendar_semantic_status": row.calendar_semantic_status,
+        "calendar_semantic_overview": row.calendar_semantic_overview,
+        "calendar_semantic_description": row.calendar_semantic_description,
+        "calendar_semantic_evidence_ids": row.calendar_semantic_evidence_ids,
+        "calendar_semantic_description_evidence_ids": (
+            row.calendar_semantic_description_evidence_ids
+        ),
+        "calendar_semantic_source_fingerprint": row.calendar_semantic_source_fingerprint,
+        "calendar_semantic_source_last_edited_at": row.calendar_semantic_source_last_edited_at,
+        "calendar_semantic_model_identity": row.calendar_semantic_model_identity,
+        "calendar_semantic_config_version": row.calendar_semantic_config_version,
+        "calendar_semantic_prompt_version": row.calendar_semantic_prompt_version,
+        "calendar_semantic_analyzed_at": row.calendar_semantic_analyzed_at,
         "active": row.active,
         "archived": row.archived,
         "plan_revision": plan.revision if plan else None,
@@ -1646,6 +1924,25 @@ def _cursor_scope(source_id: str) -> str:
     return f"notion:{_bounded(source_id, 255)}"
 
 
+def _legacy_interview_fingerprint(interview: Any) -> str:
+    last_edited_at = getattr(interview, "last_edited_at", None)
+    payload = {
+        "page_id": getattr(interview, "interview_page_id", None),
+        "last_edited_at": (
+            last_edited_at.isoformat() if isinstance(last_edited_at, datetime) else None
+        ),
+        "url_candidates": [dict(item) for item in getattr(interview, "url_candidates", ())[:25]],
+        "evidence_fragments": [
+            dict(item) for item in getattr(interview, "evidence_fragments", ())[:40]
+        ],
+    }
+    return hashlib.sha256(
+        json.dumps(payload, ensure_ascii=True, sort_keys=True, separators=(",", ":")).encode(
+            "utf-8"
+        )
+    ).hexdigest()
+
+
 def _diagnostic_status(code: str | None) -> str:
     if code in {"jobs_page_missing", "notion_configuration_missing"}:
         return "missing"
@@ -1676,6 +1973,41 @@ def _interview_contract(row: Mapping[str, Any]) -> InterviewEventSnapshot:
         tags=tuple(cast(Sequence[str], row.get("tags") or ())),
         url_candidates=tuple(_url_candidate_contracts(row.get("url_candidates") or ())),
         content_fingerprint=str(row["content_fingerprint"]),
+        calendar_semantic_status=cast(str | None, row.get("calendar_semantic_status")),
+        calendar_semantic_overview=cast(str | None, row.get("calendar_semantic_overview")),
+        calendar_semantic_description=cast(str | None, row.get("calendar_semantic_description")),
+        calendar_semantic_evidence_ids=tuple(
+            cast(Sequence[str], row.get("calendar_semantic_evidence_ids") or ())
+        ),
+        calendar_semantic_description_evidence_ids=tuple(
+            cast(Sequence[str], row.get("calendar_semantic_description_evidence_ids") or ())
+        ),
+        calendar_semantic_source_fingerprint=cast(
+            str | None,
+            row.get("calendar_semantic_source_fingerprint"),
+        ),
+        calendar_semantic_source_last_edited_at=(
+            _aware_db(cast(datetime, row["calendar_semantic_source_last_edited_at"]))
+            if row.get("calendar_semantic_source_last_edited_at") is not None
+            else None
+        ),
+        calendar_semantic_model_identity=cast(
+            str | None,
+            row.get("calendar_semantic_model_identity"),
+        ),
+        calendar_semantic_config_version=cast(
+            str | None,
+            row.get("calendar_semantic_config_version"),
+        ),
+        calendar_semantic_prompt_version=cast(
+            str | None,
+            row.get("calendar_semantic_prompt_version"),
+        ),
+        calendar_semantic_analyzed_at=(
+            _aware_db(cast(datetime, row["calendar_semantic_analyzed_at"]))
+            if row.get("calendar_semantic_analyzed_at") is not None
+            else None
+        ),
         active=bool(row.get("active", True)),
         archived=bool(row.get("archived", False)),
     )

@@ -41,8 +41,10 @@ scripts/lifeagent_host_runtime.sh status
 records its non-secret image ID, installs a runtime snapshot with a separate
 Python environment, preserves the existing HMAC key and outbox, and installs
 both LaunchAgents. It then keeps PostgreSQL and the academic worker resident for
-the model-free morning schedule and stops only the API, so the next authorized
-message exercises the cold API wake. Secrets are not embedded in either plist.
+the host-controlled morning schedule and stops only the API, so the next
+authorized message exercises the cold API wake. The morning worker may use
+Ollama for bounded event semantics independently of the Discord wake path.
+Secrets are not embedded in either plist.
 
 Use `install` only when the image and deployment marker are already current:
 

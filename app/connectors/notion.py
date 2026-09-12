@@ -77,6 +77,9 @@ MAX_INTERVIEW_BODY_BLOCKS = 200
 MAX_INTERVIEW_BODY_REQUESTS = 50
 MAX_INTERVIEW_BODY_DEPTH = 3
 MAX_INTERVIEW_URL_CANDIDATES = 50
+MAX_CALENDAR_EVIDENCE_FRAGMENTS = 40
+MAX_CALENDAR_EVIDENCE_FRAGMENT_CHARS = 4_000
+MAX_CALENDAR_EVIDENCE_TOTAL_CHARS = 10_000
 MAX_ASSESSMENT_MATERIAL_BLOCKS = 500
 MAX_ASSESSMENT_MATERIAL_REQUESTS = 100
 MAX_ASSESSMENT_MATERIAL_DEPTH = 4
@@ -261,6 +264,32 @@ class NotionInterviewUrlCandidate(BaseModel):
     order: int = Field(ge=0, le=MAX_INTERVIEW_URL_CANDIDATES)
 
 
+class NotionCalendarEvidenceFragment(BaseModel):
+    """One bounded, event-local textual fragment safe for semantic analysis."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    fragment_id: str = Field(min_length=1, max_length=255)
+    event_id: str = Field(pattern=_ID_PATTERN.pattern)
+    source_kind: Literal["property", "page_body_block"]
+    source_label: str = Field(min_length=1, max_length=128)
+    text: str = Field(min_length=1, max_length=MAX_CALENDAR_EVIDENCE_FRAGMENT_CHARS)
+    ordinal: int = Field(ge=0, lt=MAX_CALENDAR_EVIDENCE_FRAGMENTS)
+
+
+class NotionCalendarEventEvidence(BaseModel):
+    """Exact bounded evidence and edit version collected from one Notion event page."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    event_id: str = Field(pattern=_ID_PATTERN.pattern)
+    last_edited_at: datetime
+    fragments: tuple[NotionCalendarEvidenceFragment, ...] = Field(
+        default=(), max_length=MAX_CALENDAR_EVIDENCE_FRAGMENTS
+    )
+    content_fingerprint: str = Field(min_length=64, max_length=64)
+
+
 class NotionInterviewEvent(BaseModel):
     """Normalized interview event discovered from the Jobs Interviews database."""
 
@@ -285,6 +314,9 @@ class NotionInterviewEvent(BaseModel):
     properties: Mapping[str, Any]
     url_candidates: tuple[NotionInterviewUrlCandidate, ...] = Field(
         default=(), max_length=MAX_INTERVIEW_URL_CANDIDATES
+    )
+    evidence_fragments: tuple[NotionCalendarEvidenceFragment, ...] = Field(
+        default=(), max_length=MAX_CALENDAR_EVIDENCE_FRAGMENTS
     )
 
 
@@ -1240,6 +1272,90 @@ def _normalize_properties(properties: Mapping[str, Any]) -> dict[str, Any]:
         else:
             normalized[name] = None
     return normalized
+
+
+_CALENDAR_EXCLUDED_PROPERTY_TYPES: Final[frozenset[str]] = frozenset(
+    {
+        "button",
+        "created_by",
+        "created_time",
+        "files",
+        "last_edited_by",
+        "last_edited_time",
+        "people",
+        "relation",
+        "unique_id",
+        "verification",
+    }
+)
+
+
+def _calendar_text_value(value: Any) -> str | None:
+    """Render only bounded textual values without assigning semantic relevance."""
+
+    if isinstance(value, str):
+        normalized = " ".join(value.split())
+        return normalized[:MAX_CALENDAR_EVIDENCE_FRAGMENT_CHARS] or None
+    if isinstance(value, tuple | list):
+        items = cast(Sequence[Any], value)
+        textual = [" ".join(item.split()) for item in items if isinstance(item, str)]
+        normalized = ", ".join(item for item in textual if item)
+        return normalized[:MAX_CALENDAR_EVIDENCE_FRAGMENT_CHARS] or None
+    return None
+
+
+def _calendar_property_fragments(
+    event_id: str,
+    properties: Mapping[str, Any],
+    *,
+    order_start: int = 0,
+) -> tuple[NotionCalendarEvidenceFragment, ...]:
+    """Collect every technically eligible textual property in stable source order."""
+
+    fragments: list[NotionCalendarEvidenceFragment] = []
+    total_chars = 0
+    for property_name, raw_value in properties.items():
+        if len(fragments) + order_start >= MAX_CALENDAR_EVIDENCE_FRAGMENTS:
+            break
+        if not isinstance(raw_value, Mapping):
+            continue
+        property_map = cast(Mapping[str, Any], raw_value)
+        property_type = property_map.get("type")
+        if not isinstance(property_type, str) or property_type in _CALENDAR_EXCLUDED_PROPERTY_TYPES:
+            continue
+        text = _calendar_text_value(_normalize_value(property_map))
+        if text is None:
+            continue
+        remaining = MAX_CALENDAR_EVIDENCE_TOTAL_CHARS - total_chars
+        if remaining <= 0:
+            break
+        text = text[:remaining]
+        if not text:
+            break
+        property_id = _property_id(property_name, property_map)
+        fragments.append(
+            NotionCalendarEvidenceFragment(
+                fragment_id=_source_key(event_id, "property", property_id),
+                event_id=event_id,
+                source_kind="property",
+                source_label=_property_name(property_name, property_map)[:128],
+                text=text,
+                ordinal=order_start + len(fragments),
+            )
+        )
+        total_chars += len(text)
+    return tuple(fragments)
+
+
+def _calendar_evidence_fingerprint(
+    event_id: str, fragments: Sequence[NotionCalendarEvidenceFragment]
+) -> str:
+    payload = {
+        "event_id": event_id,
+        "fragments": [fragment.model_dump(mode="json") for fragment in fragments],
+    }
+    serialized = json.dumps(payload, ensure_ascii=True, sort_keys=True, separators=(",", ":"))
+    return hashlib.sha256(serialized.encode("utf-8")).hexdigest()
 
 
 def _find_title_property(properties: Mapping[str, Any]) -> tuple[str, Mapping[str, Any]] | None:
@@ -2282,6 +2398,124 @@ class NotionConnector:
                 ErrorCode.CONNECTOR_TRANSIENT, "Notion returned too much assessment material"
             ) from None
 
+    async def retrieve_calendar_event_evidence(
+        self,
+        page_id: str,
+        *,
+        page_size: int = 100,
+        max_depth: int = MAX_INTERVIEW_BODY_DEPTH,
+        max_blocks: int = MAX_INTERVIEW_BODY_BLOCKS,
+        max_requests: int = MAX_INTERVIEW_BODY_REQUESTS,
+    ) -> NotionCalendarEventEvidence:
+        """Collect bounded textual properties and body blocks from one event page.
+
+        The collector enforces only the technical evidence boundary. It does not
+        infer whether any field or block is an event description.
+        """
+
+        source_page_id = _validate_page_id(page_id)
+        if not 1 <= page_size <= 100:
+            raise permanent_error(ErrorCode.INPUT_INVALID, "Notion block page size is invalid")
+        if not 0 <= max_depth <= MAX_ASSESSMENT_MATERIAL_DEPTH:
+            raise permanent_error(ErrorCode.INPUT_INVALID, "Notion evidence depth is invalid")
+        if not 1 <= max_blocks <= MAX_ASSESSMENT_MATERIAL_BLOCKS:
+            raise permanent_error(ErrorCode.INPUT_INVALID, "Notion evidence block limit is invalid")
+        if not 1 <= max_requests <= MAX_ASSESSMENT_MATERIAL_REQUESTS:
+            raise permanent_error(
+                ErrorCode.INPUT_INVALID, "Notion evidence request limit is invalid"
+            )
+
+        response = await self._request(
+            "GET", f"/pages/{quote(source_page_id, safe='')}", json_body=None
+        )
+        data = self._json_object(response, "Notion page")
+        raw_page_id = data.get("id")
+        properties = data.get("properties")
+        if not isinstance(raw_page_id, str) or not isinstance(properties, Mapping):
+            raise transient_error(ErrorCode.CONNECTOR_TRANSIENT, "Notion returned invalid page")
+        try:
+            source_page_id = _validate_page_id(raw_page_id)
+            last_edited_at = _parse_edited(data.get("last_edited_time"))
+            fragments = list(
+                _calendar_property_fragments(
+                    source_page_id,
+                    cast(Mapping[str, Any], properties),
+                )
+            )
+        except (ValueError, ValidationError, LifeAgentError):
+            raise transient_error(
+                ErrorCode.CONNECTOR_TRANSIENT, "Notion returned invalid event evidence"
+            ) from None
+
+        request_count = 0
+        block_count = 0
+        total_chars = sum(len(fragment.text) for fragment in fragments)
+        stopped = False
+
+        async def walk(parent_id: str, depth: int) -> None:
+            nonlocal block_count, request_count, stopped, total_chars
+            cursor: str | None = None
+            seen_cursors: set[str] = set()
+            while not stopped:
+                if request_count >= max_requests:
+                    stopped = True
+                    return
+                batch = await self.retrieve_block_children(
+                    parent_id, start_cursor=cursor, page_size=page_size
+                )
+                request_count += 1
+                for block in batch.blocks:
+                    if (
+                        block_count >= max_blocks
+                        or len(fragments) >= MAX_CALENDAR_EVIDENCE_FRAGMENTS
+                        or total_chars >= MAX_CALENDAR_EVIDENCE_TOTAL_CHARS
+                    ):
+                        stopped = True
+                        return
+                    block_count += 1
+                    block_id = block.get("id")
+                    block_type = block.get("type")
+                    if not isinstance(block_id, str) or not isinstance(block_type, str):
+                        continue
+                    text = " ".join(_block_text(block).split())
+                    remaining = MAX_CALENDAR_EVIDENCE_TOTAL_CHARS - total_chars
+                    if text and remaining > 0:
+                        normalized_id = _validate_page_id(block_id)
+                        bounded_text = text[: min(remaining, MAX_CALENDAR_EVIDENCE_FRAGMENT_CHARS)]
+                        fragments.append(
+                            NotionCalendarEvidenceFragment(
+                                fragment_id=_source_key(source_page_id, "body", normalized_id),
+                                event_id=source_page_id,
+                                source_kind="page_body_block",
+                                source_label=block_type[:128],
+                                text=bounded_text,
+                                ordinal=len(fragments),
+                            )
+                        )
+                        total_chars += len(bounded_text)
+                    if block.get("has_children") is True and depth < max_depth:
+                        await walk(_validate_page_id(block_id), depth + 1)
+                        if stopped:
+                            return
+                if not batch.has_more:
+                    return
+                if batch.next_cursor is None or batch.next_cursor in seen_cursors:
+                    raise transient_error(
+                        ErrorCode.CONNECTOR_TRANSIENT,
+                        "Notion event evidence returned invalid pagination",
+                    )
+                cursor = batch.next_cursor
+                seen_cursors.add(cursor)
+
+        await walk(source_page_id, 0)
+        result = tuple(fragments)
+        return NotionCalendarEventEvidence(
+            event_id=source_page_id,
+            last_edited_at=last_edited_at,
+            fragments=result,
+            content_fingerprint=_calendar_evidence_fingerprint(source_page_id, result),
+        )
+
     async def refresh_assessment_material_file(
         self,
         *,
@@ -3068,6 +3302,12 @@ class NotionConnector:
         try:
             interview_page_id = _validate_page_id(page_id)
             date_value_normalized = _date_value(date_value[1].get("date"))
+            evidence_fragments = list(
+                _calendar_property_fragments(
+                    interview_page_id,
+                    cast(Mapping[str, Any], properties),
+                )
+            )
             url_candidates = list(
                 self._interview_property_url_candidates(
                     interview_page_id,
@@ -3080,6 +3320,7 @@ class NotionConnector:
                     start_order=len(url_candidates),
                     diagnostics=diagnostics,
                     page_size=page_size,
+                    evidence_fragments=evidence_fragments,
                 )
             )
             if date_value_normalized is None or date_value_normalized.start is None:
@@ -3115,6 +3356,7 @@ class NotionConnector:
                 in_trash=raw_page.get("in_trash") is True,
                 properties=_normalize_properties(cast(Mapping[str, Any], properties)),
                 url_candidates=tuple(url_candidates[:MAX_INTERVIEW_URL_CANDIDATES]),
+                evidence_fragments=tuple(evidence_fragments),
             )
         except (ValueError, ValidationError, LifeAgentError):
             diagnostics.append(
@@ -3173,6 +3415,7 @@ class NotionConnector:
         start_order: int,
         diagnostics: list[NotionDiscoveryDiagnostic],
         page_size: int,
+        evidence_fragments: list[NotionCalendarEvidenceFragment] | None = None,
     ) -> tuple[NotionInterviewUrlCandidate, ...]:
         candidates: list[NotionInterviewUrlCandidate] = []
         seen: set[tuple[str, str]] = set()
@@ -3230,6 +3473,34 @@ class NotionConnector:
                     block_id = block.get("id")
                     if not isinstance(block_id, str):
                         continue
+                    block_type = block.get("type")
+                    if evidence_fragments is not None and isinstance(block_type, str):
+                        total_chars = sum(len(item.text) for item in evidence_fragments)
+                        remaining = MAX_CALENDAR_EVIDENCE_TOTAL_CHARS - total_chars
+                        text = " ".join(_block_text(block).split())
+                        if (
+                            text
+                            and remaining > 0
+                            and len(evidence_fragments) < MAX_CALENDAR_EVIDENCE_FRAGMENTS
+                        ):
+                            normalized_id = _validate_page_id(block_id)
+                            evidence_fragments.append(
+                                NotionCalendarEvidenceFragment(
+                                    fragment_id=_source_key(
+                                        interview_page_id, "body", normalized_id
+                                    ),
+                                    event_id=interview_page_id,
+                                    source_kind="page_body_block",
+                                    source_label=block_type[:128],
+                                    text=text[
+                                        : min(
+                                            remaining,
+                                            MAX_CALENDAR_EVIDENCE_FRAGMENT_CHARS,
+                                        )
+                                    ],
+                                    ordinal=len(evidence_fragments),
+                                )
+                            )
                     for url in _block_url_values(block):
                         if len(candidates) + start_order >= MAX_INTERVIEW_URL_CANDIDATES:
                             stopped = True
@@ -4012,6 +4283,8 @@ __all__ = [
     "NotionAssessmentMaterials",
     "NotionAttachment",
     "NotionBlockBatch",
+    "NotionCalendarEventEvidence",
+    "NotionCalendarEvidenceFragment",
     "NotionConnector",
     "NotionCourse",
     "NotionDateValue",

@@ -14,6 +14,7 @@ from sqlalchemy.orm import Session
 from app.db.academic import (
     AcademicRepository,
     AssessmentSourceTrace,
+    CalendarSemanticResultInput,
     ClarificationInput,
     CourseCalendarInput,
     DocumentChunkInput,
@@ -349,6 +350,107 @@ def test_store_preserves_expanded_todo_types_for_generic_scheduling(engine) -> N
     assert {assessment.id: assessment.assessment_type for assessment in facts.assessments} == (
         expected_types
     )
+
+
+def test_upcoming_calendar_items_use_local_window_and_semantic_cache(engine) -> None:
+    course = _course(engine)
+    edited = datetime(2026, 9, 9, 12, tzinfo=UTC)
+    with Session(engine) as session, session.begin():
+        included_all_day = AcademicRepository.upsert_assessment(
+            session,
+            notion_id="notion-all-day-boundary",
+            course_id=course,
+            title="Boundary all-day quiz",
+            assessment_type="quiz",
+            due_at=datetime(2026, 9, 21, 3, 59, tzinfo=UTC),
+            grade_weight_percent=5,
+            estimated_minutes=30,
+            confidence=1,
+            fact_state="confirmed",
+            citation=SourceCitation(),
+            is_all_day=True,
+            trace=AssessmentSourceTrace(
+                source_id="assessment-source",
+                source_scope="notion:assessment-source",
+                notion_last_edited_at=edited,
+                title_property_id="title-prop",
+            ),
+        )
+        AcademicRepository.upsert_assessment(
+            session,
+            notion_id="notion-timed-outside",
+            course_id=course,
+            title="Late timed lab",
+            assessment_type="lab",
+            due_at=datetime(2026, 9, 20, 16, 1, tzinfo=UTC),
+            grade_weight_percent=None,
+            estimated_minutes=60,
+            confidence=1,
+            fact_state="confirmed",
+            citation=SourceCitation(),
+        )
+        AcademicRepository.upsert_assessment(
+            session,
+            notion_id="notion-completed-ambiguous",
+            course_id=course,
+            title="Completed ambiguous assignment",
+            assessment_type="assignment",
+            due_at=datetime(2026, 9, 11, 15, tzinfo=UTC),
+            grade_weight_percent=10,
+            estimated_minutes=90,
+            confidence=0.4,
+            fact_state="ambiguous",
+            citation=SourceCitation(),
+            completed=True,
+        )
+        saved = AcademicRepository.save_assessment_calendar_semantics(
+            session,
+            notion_id=included_all_day.notion_id,
+            semantics=CalendarSemanticResultInput(
+                status="not_substantive",
+                overview="A quiz scheduled as an all-day course date.",
+                source_fingerprint="academic-source-v1",
+                source_last_edited_at=edited,
+                model_identity="qwen-test",
+                config_version="calendar-test",
+                prompt_version="prompt-v1",
+                analyzed_at=datetime(2026, 9, 9, 13, tzinfo=UTC),
+                evidence_ids=("frag-1",),
+            ),
+        )
+        stale = AcademicRepository.save_assessment_calendar_semantics(
+            session,
+            notion_id=included_all_day.notion_id,
+            semantics=CalendarSemanticResultInput(
+                status="valid",
+                overview="Stale overview",
+                description="Stale description",
+                source_fingerprint="academic-source-v0",
+                source_last_edited_at=edited - timedelta(minutes=1),
+                model_identity="qwen-test",
+                config_version="calendar-test",
+                prompt_version="prompt-v1",
+                analyzed_at=datetime(2026, 9, 9, 14, tzinfo=UTC),
+                evidence_ids=("frag-old",),
+                description_evidence_ids=("frag-old",),
+            ),
+        )
+        assert saved is True
+        assert stale is False
+
+    items = SQLAlchemyAcademicPlannerStore(engine).load_upcoming_calendar_items(
+        occurrence=date(2026, 9, 10)
+    )
+
+    assert [item["event_id"] for item in items] == [
+        "notion-completed-ambiguous",
+        "notion-all-day-boundary",
+    ]
+    assert items[0]["completed"] is True
+    assert items[1]["is_all_day"] is True
+    assert items[1]["semantic_status"] == "not_substantive"
+    assert items[1]["semantic_overview"] == "A quiz scheduled as an all-day course date."
+    assert items[1]["semantic_cache"]["source_fingerprint"] == "academic-source-v1"
 
 
 def test_document_versions_chunks_search_and_cursor_are_idempotent(engine) -> None:

@@ -1,12 +1,21 @@
-"""Deterministic, model-free scheduled academic morning notification."""
+"""Model-reasoned, host-authoritative scheduled morning calendar briefing."""
 
 from __future__ import annotations
 
+import asyncio
+import json
 import uuid
-from collections.abc import Callable
+from collections.abc import Callable, Mapping, Sequence
+from contextlib import suppress
 from datetime import UTC, datetime, timedelta
-from typing import Any, Protocol
+from pathlib import Path
+from typing import Any, Literal, Protocol, cast
 from zoneinfo import ZoneInfo
+
+from pydantic import ValidationError
+from sqlalchemy import update
+from sqlalchemy.engine import Engine
+from sqlalchemy.orm import Session
 
 from app.agents.academic_planner.contracts import (
     DailyPlan,
@@ -16,23 +25,42 @@ from app.agents.academic_planner.contracts import (
 )
 from app.agents.academic_planner.sync import AcademicNotionSync, AcademicNotionSyncResult
 from app.agents.academic_planner.workflow import build_daily_plan
+from app.agents.calendar_briefing import (
+    CalendarBriefingDeliveryManifest,
+    CalendarEventEvidenceFragment,
+    CalendarEventSemanticInput,
+    CalendarEventSemanticInterpreter,
+    CalendarEventSemanticStatus,
+    CalendarEventSourceArea,
+    ScheduledMorningCalendarItem,
+    build_calendar_briefing_manifest,
+    fingerprint_event_evidence,
+)
+from app.agents.calendar_briefing.semantic_interpreter import CALENDAR_SEMANTIC_PROMPT_VERSION
 from app.agents.job_interviews.contracts import InterviewEventSnapshot, InterviewReminderFact
 from app.agents.job_interviews.morning import (
     build_interview_reminder_facts,
     load_reminder_inputs,
-    render_interview_reminders,
+    reminder_label,
 )
 from app.agents.job_interviews.sync import JobInterviewNotionSync
+from app.artifacts.store import ArtifactStore
 from app.core.config import Settings, get_settings
 from app.core.errors import ErrorCode, LifeAgentError, transient_error
+from app.db.academic import CalendarSemanticResultInput as AcademicCalendarSemanticResultInput
 from app.db.academic import SQLAlchemyAcademicPlannerStore
+from app.db.job_interviews import CalendarSemanticResultInput as JobCalendarSemanticResultInput
 from app.db.job_interviews import SQLAlchemyJobInterviewStore
+from app.db.models import AgentRun, StepStatus
+from app.db.repositories import RunRepository
 from app.db.session import Database
+from app.llm.gateway import LLMGateway
+from app.llm.ollama_runtime import OllamaRuntime, OllamaRuntimeError
 from app.queue.idempotency import build_idempotency_key
 from app.queue.periodic import PeriodicOccurrence, stable_period_key
 
 _SOURCE_FRESHNESS = timedelta(minutes=5)
-_DISCORD_CONTENT_LIMIT = 2_000
+_CALENDAR_WINDOW = timedelta(days=10, hours=12)
 
 
 class ScheduledMorningSyncer(Protocol):
@@ -48,6 +76,13 @@ class ScheduledMorningStore(Protocol):
 
     def save_daily_plan(self, plan: DailyPlan) -> None: ...
 
+    def load_upcoming_calendar_items(
+        self,
+        *,
+        occurrence: datetime,
+        timezone: str,
+    ) -> tuple[Mapping[str, Any], ...]: ...
+
 
 class ScheduledMorningDelivery(Protocol):
     async def send_scheduled_notification(
@@ -56,6 +91,141 @@ class ScheduledMorningDelivery(Protocol):
         *,
         idempotency_key: str,
     ) -> object: ...
+
+
+class ScheduledMorningManifestStore(Protocol):
+    def load(
+        self, *, period_key: str
+    ) -> tuple[CalendarBriefingDeliveryManifest, set[int]] | None: ...
+
+    def save(
+        self,
+        manifest: CalendarBriefingDeliveryManifest,
+        *,
+        period_key: str,
+        delivered_ordinals: set[int],
+    ) -> None: ...
+
+
+class CalendarEvidenceConnector(Protocol):
+    async def retrieve_calendar_event_evidence(self, page_id: str) -> Any: ...
+
+
+class ScheduledMorningProgress(Protocol):
+    def record(
+        self,
+        phase: str,
+        status: Literal["running", "succeeded", "failed"],
+        *,
+        attempt: int,
+        diagnostic: str,
+    ) -> None: ...
+
+
+class _DatabaseProgressRecorder:
+    """Persist bounded phase state without source text or model responses."""
+
+    def __init__(self, *, engine: Engine, run_id: uuid.UUID) -> None:
+        self._engine = engine
+        self._run_id = run_id
+
+    def record(
+        self,
+        phase: str,
+        status: Literal["running", "succeeded", "failed"],
+        *,
+        attempt: int,
+        diagnostic: str,
+    ) -> None:
+        step_status = {
+            "running": StepStatus.RUNNING,
+            "succeeded": StepStatus.SUCCEEDED,
+            "failed": StepStatus.FAILED,
+        }[status]
+        now = datetime.now(UTC)
+        with suppress(Exception), Session(self._engine) as session, session.begin():
+            step = RunRepository.create_step_attempt(
+                session,
+                run_id=self._run_id,
+                node_name=f"calendar_briefing.{phase}"[:128],
+                attempt=attempt,
+                status=step_status,
+                diagnostic=diagnostic[:2_000],
+            )
+            RunRepository.update_step(
+                session,
+                step.id,
+                step_status,
+                started_at=now if status == "running" else None,
+                ended_at=now if status != "running" else None,
+                diagnostic=diagnostic[:2_000],
+            )
+
+
+class _ArtifactManifestStore:
+    """Persist a complete rendered manifest on the durable run before any send."""
+
+    def __init__(self, *, engine: Engine, run_id: uuid.UUID, artifact_root: Path) -> None:
+        self._engine = engine
+        self._run_id = run_id
+        self._artifacts = ArtifactStore(artifact_root)
+
+    def load(self, *, period_key: str) -> tuple[CalendarBriefingDeliveryManifest, set[int]] | None:
+        with Session(self._engine) as session:
+            run = session.get(AgentRun, self._run_id)
+            artifact_key = run.artifact_key if run is not None else None
+        if not artifact_key:
+            return None
+        try:
+            raw_payload: object = json.loads(self._artifacts.get(artifact_key))
+            if not isinstance(raw_payload, dict):
+                return None
+            payload = cast(dict[str, object], raw_payload)
+            if payload.get("period_key") != period_key:
+                return None
+            manifest = CalendarBriefingDeliveryManifest.model_validate(payload.get("manifest"))
+            raw_delivered = payload.get("delivered_ordinals", [])
+            if not isinstance(raw_delivered, list):
+                return None
+            delivered_values = cast(list[object], raw_delivered)
+            delivered = {
+                int(value)
+                for value in delivered_values
+                if isinstance(value, int | str) and str(value).isdigit()
+            }
+            return manifest, delivered
+        except (OSError, TypeError, ValueError, ValidationError, json.JSONDecodeError):
+            return None
+
+    def save(
+        self,
+        manifest: CalendarBriefingDeliveryManifest,
+        *,
+        period_key: str,
+        delivered_ordinals: set[int],
+    ) -> None:
+        payload = json.dumps(
+            {
+                "period_key": period_key,
+                "manifest": manifest.model_dump(mode="json"),
+                "delivered_ordinals": sorted(delivered_ordinals),
+            },
+            ensure_ascii=True,
+            separators=(",", ":"),
+            sort_keys=True,
+        )
+        artifact = self._artifacts.put(
+            payload,
+            media_type="application/json",
+            data_class="calendar_briefing_manifest",
+            already_redacted=True,
+        )
+        with Session(self._engine) as session, session.begin():
+            session.execute(
+                update(AgentRun)
+                .where(AgentRun.id == self._run_id)
+                .values(artifact_key=artifact.key)
+            )
 
 
 def _aware(value: datetime, field: str) -> datetime:
@@ -77,6 +247,34 @@ def scheduled_delivery_key(period_key: str, occurrence: PeriodicOccurrence) -> s
 
     local_date, local_time = _period_parts(period_key, occurrence)
     return build_idempotency_key("planner-morning-delivery-v2", local_date, local_time)
+
+
+async def _deliver_manifest(
+    delivery: ScheduledMorningDelivery,
+    manifest: CalendarBriefingDeliveryManifest,
+    *,
+    manifest_store: ScheduledMorningManifestStore | None,
+    period_key: str,
+    delivered_ordinals: set[int] | None = None,
+) -> tuple[list[object], set[int]]:
+    delivered = set(delivered_ordinals or ())
+    receipts: list[object] = []
+    for part in manifest.parts:
+        if part.ordinal in delivered:
+            continue
+        receipt = await delivery.send_scheduled_notification(
+            part.content,
+            idempotency_key=part.delivery_key,
+        )
+        receipts.append(receipt)
+        delivered.add(part.ordinal)
+        if manifest_store is not None:
+            manifest_store.save(
+                manifest,
+                period_key=period_key,
+                delivered_ordinals=delivered,
+            )
+    return receipts, delivered
 
 
 def scheduled_attention_key(
@@ -102,11 +300,12 @@ def build_scheduled_morning_notification(
     occurrence: PeriodicOccurrence,
     source_synced_at: datetime,
     timezone_name: str,
+    course_calendar_items: tuple[ScheduledMorningCalendarItem, ...] = (),
+    job_calendar_items: tuple[ScheduledMorningCalendarItem, ...] = (),
     interview_reminders: tuple[InterviewReminderFact, ...] = (),
-    interviews: tuple[InterviewEventSnapshot, ...] = (),
     career_condition: str | None = None,
 ) -> ScheduledMorningNotification:
-    """Select the intended local day and render every selected block exactly once."""
+    """Render authoritative plan/calendar facts and validated model semantics."""
 
     zone = ZoneInfo(timezone_name)
     source_synced_at = _aware(source_synced_at, "source_synced_at").astimezone(UTC)
@@ -131,8 +330,8 @@ def build_scheduled_morning_notification(
         )
 
     date_label = intended_date.strftime("%A, %B %d, %Y").replace(" 0", " ")
+    lines = [f"Good morning, Richard. Today's plan for {date_label}:", "", "Today's study blocks:"]
     if selected:
-        lines = [f"Good morning, Richard. Today's plan for {date_label}:"]
         for block in selected:
             details = [f"{block.duration_minutes} minutes", block.block_kind]
             if block.carried_over:
@@ -141,25 +340,77 @@ def build_scheduled_morning_notification(
                 f"- {block.local_start.strftime('%H:%M')} — {block.title} ({', '.join(details)})"
             )
     else:
-        lines = [
-            f"Good morning, Richard. Your academic plan for {date_label} is clear—there are "
-            "no scheduled study blocks today."
-        ]
-    if interview_reminders:
-        lines.extend(("", "Upcoming interviews:"))
-        lines.append(
-            render_interview_reminders(
-                interview_reminders,
-                interviews=interviews,
-                timezone_name=timezone_name,
-            )
+        lines.append("There are no scheduled study blocks today.")
+
+    window_end = (
+        datetime.combine(
+            intended_date,
+            datetime.min.time(),
+            tzinfo=zone,
         )
-    elif career_condition:
-        lines.extend(("", f"Interviews: {career_condition}"))
-    lines.append("Have a good day!")
+        + _CALENDAR_WINDOW
+    )
+    window_label = window_end.strftime("%A, %B %d at %H:%M %Z").replace(" 0", " ")
+    lines.extend(("", f"Upcoming course dates through {window_label}:"))
+    if course_calendar_items:
+        for index, item in enumerate(course_calendar_items):
+            if index:
+                lines.append("")
+            completed = " (completed)" if item.completed else ""
+            lines.append(
+                f"- {item.relative_date_label} — {item.source_label} — "
+                f"{item.display_kind} — {item.title}{completed}"
+            )
+            due_label = item.local_start_label
+            if item.local_end_label:
+                due_label = f"{due_label} to {item.local_end_label}"
+            lines.append(f"  Due: {due_label}")
+            _append_semantics(lines, item)
+    else:
+        lines.append("- No course calendar dates in this window.")
+
+    reminder_by_id = {item.interview_page_id: item for item in interview_reminders}
+    lines.extend(("", "Upcoming job events:"))
+    if job_calendar_items:
+        for index, item in enumerate(job_calendar_items):
+            if index:
+                lines.append("")
+            reminder = reminder_by_id.get(item.event_id)
+            emphasis = reminder_label(reminder.days_until) if reminder is not None else None
+            relative = emphasis or item.relative_date_label
+            lines.append(f"- {relative} — {item.title}")
+            when_label = item.local_start_label
+            if item.local_end_label:
+                when_label = f"{when_label} to {item.local_end_label}"
+            lines.append(f"  When: {when_label}")
+            _append_semantics(lines, item)
+            if reminder is not None and reminder.grounded_next_actions:
+                lines.append(f"  Next: {reminder.grounded_next_actions[0]}")
+    else:
+        lines.append("- No Jobs/Interviews calendar events in this window.")
+
+    unavailable = sum(
+        item.semantic_status
+        in {CalendarEventSemanticStatus.UNAVAILABLE, CalendarEventSemanticStatus.INVALID}
+        for item in (*course_calendar_items, *job_calendar_items)
+    )
+    conditions: list[str] = []
+    if unavailable:
+        conditions.append(
+            f"Semantic event details were unavailable for {unavailable} "
+            f"event{'s' if unavailable != 1 else ''}; trusted calendar metadata is shown."
+        )
+    if career_condition:
+        conditions.append(career_condition)
+    if conditions:
+        lines.extend(("", "Calendar conditions:"))
+        lines.extend(f"- {condition}" for condition in conditions)
+    lines.extend(("", "Have a good day!"))
     message = "\n".join(lines)
-    if len(message) > _DISCORD_CONTENT_LIMIT:
-        raise ValueError("scheduled academic notification exceeds Discord's content limit")
+    manifest = build_calendar_briefing_manifest(
+        message,
+        delivery_key_prefix=scheduled_delivery_key(period_key, occurrence),
+    )
     return ScheduledMorningNotification(
         period_key=period_key,
         intended_local_date=intended_date,
@@ -168,7 +419,286 @@ def build_scheduled_morning_notification(
         blocks=tuple(selected),
         interview_items=interview_reminders,
         message_text=message,
+        message_parts=tuple(part.content for part in manifest.parts),
     )
+
+
+def _append_semantics(lines: list[str], item: ScheduledMorningCalendarItem) -> None:
+    if item.semantic_overview:
+        lines.append(f"  Overview: {item.semantic_overview}")
+    if item.semantic_description:
+        lines.append(f"  Description: {item.semantic_description}")
+
+
+_SCHEDULED_ITEM_FIELDS = frozenset(ScheduledMorningCalendarItem.model_fields)
+
+
+def _scheduled_item(
+    raw: Mapping[str, Any],
+    *,
+    status: CalendarEventSemanticStatus | None = None,
+    overview: str | None = None,
+    description: str | None = None,
+    evidence_ids: Sequence[str] = (),
+    description_evidence_ids: Sequence[str] = (),
+) -> ScheduledMorningCalendarItem:
+    values = {key: value for key, value in raw.items() if key in _SCHEDULED_ITEM_FIELDS}
+    if status is not None:
+        values.update(
+            {
+                "semantic_status": status,
+                "semantic_overview": overview,
+                "semantic_description": description,
+                "semantic_evidence_fragment_ids": tuple(evidence_ids),
+                "semantic_description_fragment_ids": tuple(description_evidence_ids),
+            }
+        )
+    return ScheduledMorningCalendarItem.model_validate(values)
+
+
+def _cache_is_exact(raw: Mapping[str, Any], interpreter: CalendarEventSemanticInterpreter) -> bool:
+    raw_cache: object = raw.get("semantic_cache")
+    source_edit = raw.get("source_last_edited_at")
+    if not isinstance(raw_cache, Mapping):
+        return False
+    cache = cast(Mapping[str, object], raw_cache)
+    status = raw.get("semantic_status")
+    if status not in {
+        CalendarEventSemanticStatus.VALID,
+        CalendarEventSemanticStatus.NOT_SUBSTANTIVE,
+        "valid",
+        "not_substantive",
+    }:
+        return False
+    return bool(
+        cache.get("source_fingerprint")
+        and cache.get("source_fingerprint") == raw.get("source_fingerprint")
+        and cache.get("source_last_edited_at") == source_edit
+        and cache.get("model_identity") == interpreter.model_identity
+        and cache.get("config_version") == interpreter.config_version
+        and cache.get("prompt_version") == CALENDAR_SEMANTIC_PROMPT_VERSION
+    )
+
+
+def _record_progress(
+    progress: ScheduledMorningProgress | None,
+    phase: str,
+    status: Literal["running", "succeeded", "failed"],
+    *,
+    attempt: int,
+    diagnostic: str,
+) -> None:
+    if progress is not None:
+        progress.record(phase, status, attempt=attempt, diagnostic=diagnostic)
+
+
+async def _refresh_calendar_semantics(
+    raw_items: Sequence[Mapping[str, Any]],
+    *,
+    connector: CalendarEvidenceConnector | None,
+    interpreter: CalendarEventSemanticInterpreter | None,
+    ollama_runtime: OllamaRuntime | None,
+    academic_store: Any,
+    career_store: Any,
+    event_timeout_seconds: float,
+    total_timeout_seconds: float,
+    progress: ScheduledMorningProgress | None = None,
+    attempt: int = 1,
+) -> tuple[tuple[ScheduledMorningCalendarItem, ...], dict[str, int]]:
+    counts = {
+        "semantic_cache_hits": 0,
+        "semantic_calls": 0,
+        "valid_descriptions": 0,
+        "no_description_decisions": 0,
+        "invalid_semantics": 0,
+        "unavailable_semantics": 0,
+    }
+    items: list[ScheduledMorningCalendarItem] = []
+    pending = [
+        raw for raw in raw_items if interpreter is None or not _cache_is_exact(raw, interpreter)
+    ]
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + total_timeout_seconds
+    ready = connector is not None and interpreter is not None and ollama_runtime is not None
+    if ready and pending:
+        try:
+            await asyncio.wait_for(
+                cast(OllamaRuntime, ollama_runtime).ensure_ready(),
+                timeout=min(event_timeout_seconds, max(0.001, deadline - loop.time())),
+            )
+        except (OllamaRuntimeError, TimeoutError):
+            ready = False
+
+    for raw in raw_items:
+        if interpreter is not None and _cache_is_exact(raw, interpreter):
+            item = _scheduled_item(raw)
+            items.append(item)
+            counts["semantic_cache_hits"] += 1
+            if item.semantic_status == CalendarEventSemanticStatus.VALID:
+                counts["valid_descriptions"] += 1
+            else:
+                counts["no_description_decisions"] += 1
+            continue
+        if not ready or connector is None or interpreter is None or loop.time() >= deadline:
+            items.append(_scheduled_item(raw, status=CalendarEventSemanticStatus.UNAVAILABLE))
+            counts["unavailable_semantics"] += 1
+            continue
+
+        event_id = str(raw["event_id"])
+        source_edit = raw.get("source_last_edited_at")
+        try:
+            remaining = max(0.001, deadline - loop.time())
+            async with asyncio.timeout(min(event_timeout_seconds, remaining)):
+                _record_progress(
+                    progress,
+                    "evidence_collection",
+                    "running",
+                    attempt=attempt,
+                    diagnostic="collecting_event_evidence",
+                )
+                collected = await connector.retrieve_calendar_event_evidence(event_id)
+                if (
+                    getattr(collected, "event_id", None) != event_id
+                    or getattr(collected, "last_edited_at", None) != source_edit
+                ):
+                    raise ValueError("calendar source changed after metadata synchronization")
+                fragments = tuple(
+                    CalendarEventEvidenceFragment.model_validate(
+                        fragment.model_dump(mode="json")
+                        if callable(getattr(fragment, "model_dump", None))
+                        else fragment
+                    )
+                    for fragment in getattr(collected, "fragments", ())
+                )
+                _record_progress(
+                    progress,
+                    "evidence_collection",
+                    "succeeded",
+                    attempt=attempt,
+                    diagnostic=f"event_evidence_collected:{len(fragments)}",
+                )
+                fingerprint = fingerprint_event_evidence(fragments, event_id=event_id)
+                semantic_input = CalendarEventSemanticInput(
+                    event_id=event_id,
+                    source_area=CalendarEventSourceArea(str(raw["source_area"])),
+                    source_label=str(raw["source_label"]),
+                    title=str(raw["title"]),
+                    event_kind=str(raw["display_kind"]),
+                    local_date_label=str(raw["local_start_label"]),
+                    local_time_label=(
+                        None if bool(raw.get("is_all_day")) else str(raw["local_start_label"])
+                    ),
+                    is_all_day=bool(raw.get("is_all_day")),
+                    source_fingerprint=fingerprint,
+                    source_last_edited_at=cast(datetime | None, source_edit),
+                    evidence_fragments=fragments,
+                )
+                counts["semantic_calls"] += 1
+                _record_progress(
+                    progress,
+                    "semantic_interpretation",
+                    "running",
+                    attempt=attempt,
+                    diagnostic="qwen_event_interpretation_started",
+                )
+                outcome = await interpreter.analyze(semantic_input)
+        except (LifeAgentError, TimeoutError, TypeError, ValueError, ValidationError):
+            _record_progress(
+                progress,
+                "evidence_collection",
+                "failed",
+                attempt=attempt,
+                diagnostic="event_evidence_unavailable",
+            )
+            _record_progress(
+                progress,
+                "semantic_interpretation",
+                "failed",
+                attempt=attempt,
+                diagnostic="event_semantics_unavailable",
+            )
+            items.append(_scheduled_item(raw, status=CalendarEventSemanticStatus.UNAVAILABLE))
+            counts["unavailable_semantics"] += 1
+            continue
+
+        result = outcome.result
+        _record_progress(
+            progress,
+            "semantic_interpretation",
+            "succeeded",
+            attempt=attempt,
+            diagnostic=f"event_semantics_status:{outcome.status.value}",
+        )
+        _record_progress(
+            progress,
+            "semantic_validation",
+            "succeeded" if result is not None else "failed",
+            attempt=attempt,
+            diagnostic=f"critic_validation_status:{outcome.status.value}",
+        )
+        overview = result.overview if result is not None else None
+        description = result.description if result is not None else None
+        evidence_ids = result.evidence_fragment_ids if result is not None else ()
+        description_ids = result.description_fragment_ids if result is not None else ()
+        item = _scheduled_item(
+            raw,
+            status=outcome.status,
+            overview=overview,
+            description=description,
+            evidence_ids=evidence_ids,
+            description_evidence_ids=description_ids,
+        )
+        items.append(item)
+        if outcome.status == CalendarEventSemanticStatus.VALID:
+            counts["valid_descriptions"] += 1
+        elif outcome.status == CalendarEventSemanticStatus.NOT_SUBSTANTIVE:
+            counts["no_description_decisions"] += 1
+        elif outcome.status == CalendarEventSemanticStatus.INVALID:
+            counts["invalid_semantics"] += 1
+        else:
+            counts["unavailable_semantics"] += 1
+
+        if raw.get("source_area") == "course":
+            saver = getattr(academic_store, "save_assessment_calendar_semantics", None)
+            if callable(saver):
+                with suppress(Exception):
+                    saver(
+                        event_id,
+                        AcademicCalendarSemanticResultInput(
+                            status=outcome.status.value,
+                            source_fingerprint=semantic_input.source_fingerprint,
+                            source_last_edited_at=semantic_input.source_last_edited_at,
+                            model_identity=interpreter.model_identity or "unknown",
+                            config_version=interpreter.config_version or "unknown",
+                            prompt_version=outcome.prompt_version,
+                            analyzed_at=datetime.now(UTC),
+                            overview=overview,
+                            description=description,
+                            evidence_ids=evidence_ids,
+                            description_evidence_ids=description_ids,
+                        ),
+                    )
+        else:
+            saver = getattr(career_store, "save_interview_calendar_semantics", None)
+            if callable(saver):
+                with suppress(Exception):
+                    saver(
+                        event_id,
+                        JobCalendarSemanticResultInput(
+                            status=outcome.status.value,
+                            source_fingerprint=semantic_input.source_fingerprint,
+                            source_last_edited_at=semantic_input.source_last_edited_at,
+                            model_identity=interpreter.model_identity or "unknown",
+                            config_version=interpreter.config_version or "unknown",
+                            prompt_version=outcome.prompt_version,
+                            analyzed_at=datetime.now(UTC),
+                            overview=overview,
+                            description=description,
+                            evidence_ids=evidence_ids,
+                            description_evidence_ids=description_ids,
+                        ),
+                    )
+    return tuple(items), counts
 
 
 def _attention_message(error_code: ErrorCode, occurrence: PeriodicOccurrence) -> str:
@@ -233,6 +763,24 @@ def _sync_error_code(result: AcademicNotionSyncResult) -> ErrorCode:
     return ErrorCode.SOURCE_SYNC_FAILED
 
 
+def _load_windowed_calendar_items(
+    owner: object,
+    *,
+    occurrence: datetime,
+    timezone: str,
+) -> tuple[Mapping[str, Any], ...]:
+    loader = getattr(owner, "load_upcoming_calendar_items", None)
+    if not callable(loader):
+        return ()
+    loaded: object = loader(occurrence=occurrence, timezone=timezone)
+    if not isinstance(loaded, Sequence):
+        return ()
+    loaded_items = cast(Sequence[object], loaded)
+    return tuple(
+        cast(Mapping[str, Any], item) for item in loaded_items if isinstance(item, Mapping)
+    )
+
+
 async def execute_scheduled_morning_notification(
     *,
     store: ScheduledMorningStore,
@@ -248,6 +796,13 @@ async def execute_scheduled_morning_notification(
     attempt_limit: int = 3,
     career_store: Any | None = None,
     career_syncer: ScheduledCareerSyncer | None = None,
+    evidence_connector: CalendarEvidenceConnector | None = None,
+    semantic_interpreter: CalendarEventSemanticInterpreter | None = None,
+    ollama_runtime: OllamaRuntime | None = None,
+    manifest_store: ScheduledMorningManifestStore | None = None,
+    semantic_event_timeout_seconds: float = 180.0,
+    semantic_total_timeout_seconds: float = 600.0,
+    progress: ScheduledMorningProgress | None = None,
 ) -> dict[str, object]:
     """Refresh, allocate, persist, format, and deliver one scheduled local period."""
 
@@ -261,6 +816,54 @@ async def execute_scheduled_morning_notification(
         raise ValueError("attempt values are invalid")
     if current < occurrence.scheduled_at:
         raise ValueError("scheduled notification cannot execute before its occurrence")
+    existing_manifest = manifest_store.load(period_key=period_key) if manifest_store else None
+    if existing_manifest is not None:
+        if delivery is None:
+            return {
+                "status": "failed",
+                "error_code": ErrorCode.AUTHORIZATION_INVALID.value,
+                "delivery_count": 0,
+                "part_count": len(existing_manifest[0].parts),
+            }
+        manifest, delivered_ordinals = existing_manifest
+        _record_progress(
+            progress,
+            "delivery",
+            "running",
+            attempt=attempt,
+            diagnostic="resuming_persisted_manifest",
+        )
+        try:
+            receipts, delivered = await _deliver_manifest(
+                delivery,
+                manifest,
+                manifest_store=manifest_store,
+                period_key=period_key,
+                delivered_ordinals=delivered_ordinals,
+            )
+        except Exception:
+            _record_progress(
+                progress,
+                "delivery",
+                "failed",
+                attempt=attempt,
+                diagnostic="multipart_delivery_failed",
+            )
+            raise
+        _record_progress(
+            progress,
+            "delivery",
+            "succeeded",
+            attempt=attempt,
+            diagnostic=f"manifest_parts_delivered:{len(delivered)}",
+        )
+        return {
+            "status": "succeeded",
+            "resumed_manifest": True,
+            "part_count": len(manifest.parts),
+            "delivery_count": len(receipts),
+            "delivered_part_count": len(delivered),
+        }
     if current > occurrence.scheduled_at + timedelta(minutes=catchup_grace_minutes):
         count = await _send_attention(
             delivery,
@@ -275,8 +878,32 @@ async def execute_scheduled_morning_notification(
             "block_count": 0,
         }
 
-    sync_result = await syncer.sync(now=current)
+    _record_progress(
+        progress,
+        "source_refresh",
+        "running",
+        attempt=attempt,
+        diagnostic="academic_source_refresh_started",
+    )
+    try:
+        sync_result = await syncer.sync(now=current)
+    except Exception:
+        _record_progress(
+            progress,
+            "source_refresh",
+            "failed",
+            attempt=attempt,
+            diagnostic="academic_source_refresh_failed",
+        )
+        raise
     if sync_result.status != "succeeded":
+        _record_progress(
+            progress,
+            "source_refresh",
+            "failed",
+            attempt=attempt,
+            diagnostic=f"academic_source_status:{sync_result.status}",
+        )
         error_code = _sync_error_code(sync_result)
         if sync_result.retryable and attempt < attempt_limit:
             raise transient_error(error_code, "academic source refresh is temporarily unavailable")
@@ -297,6 +924,13 @@ async def execute_scheduled_morning_notification(
     if synced_at is None or abs(current - _aware(synced_at, "synced_at").astimezone(UTC)) > (
         _SOURCE_FRESHNESS
     ):
+        _record_progress(
+            progress,
+            "source_refresh",
+            "failed",
+            attempt=attempt,
+            diagnostic="academic_source_freshness_unproven",
+        )
         count = await _send_attention(
             delivery,
             period_key=period_key,
@@ -310,12 +944,25 @@ async def execute_scheduled_morning_notification(
             "delivery_count": count,
             "block_count": 0,
         }
+    _record_progress(
+        progress,
+        "source_refresh",
+        "succeeded",
+        attempt=attempt,
+        diagnostic="academic_source_refresh_succeeded",
+    )
 
     facts = store.load_planner_facts(now=occurrence.scheduled_at, horizon_days=horizon_days)
     plan = build_daily_plan(facts, now=occurrence.scheduled_at)
     store.save_daily_plan(plan)
+    raw_academic_items = _load_windowed_calendar_items(
+        store,
+        occurrence=occurrence.scheduled_at,
+        timezone=timezone_name,
+    )
     interview_reminders: tuple[InterviewReminderFact, ...] = ()
     interview_events: tuple[InterviewEventSnapshot, ...] = ()
+    raw_job_items: tuple[Mapping[str, Any], ...] = ()
     career_condition: str | None = None
     career_sync_status = "unconfigured"
     if career_store is not None:
@@ -326,11 +973,19 @@ async def execute_scheduled_morning_notification(
             else:
                 career_sync_status = "cached"
             if career_sync_status in {"succeeded", "partial", "cached"}:
+                raw_job_items = _load_windowed_calendar_items(
+                    career_store,
+                    occurrence=occurrence.scheduled_at,
+                    timezone=timezone_name,
+                )
                 loaded_interviews, loaded_plans = load_reminder_inputs(
                     career_store,
                     now=occurrence.scheduled_at,
                 )
-                interview_events = tuple(loaded_interviews)
+                in_window_ids = {str(item["event_id"]) for item in raw_job_items}
+                interview_events = tuple(
+                    item for item in loaded_interviews if item.interview_page_id in in_window_ids
+                )
                 interview_reminders = build_interview_reminder_facts(
                     interview_events,
                     now=occurrence.scheduled_at,
@@ -350,33 +1005,31 @@ async def execute_scheduled_morning_notification(
             career_condition = (
                 "I couldn't refresh interview reminders; the academic plan is unaffected."
             )
-    try:
-        notification = build_scheduled_morning_notification(
-            plan,
-            period_key=period_key,
-            occurrence=occurrence,
-            source_synced_at=synced_at,
-            timezone_name=timezone_name,
-            interview_reminders=interview_reminders,
-            interviews=interview_events,
-            career_condition=career_condition,
-        )
-    except ValueError as exc:
-        if "content limit" not in str(exc):
-            raise
-        count = await _send_attention(
-            delivery,
-            period_key=period_key,
-            occurrence=occurrence,
-            error_code=ErrorCode.DELIVERY_CONTENT_TOO_LONG,
-        )
-        return {
-            "status": "attention",
-            "error_code": ErrorCode.DELIVERY_CONTENT_TOO_LONG.value,
-            "sync_status": sync_result.status,
-            "delivery_count": count,
-            "block_count": 0,
-        }
+    calendar_items, semantic_counts = await _refresh_calendar_semantics(
+        (*raw_academic_items, *raw_job_items),
+        connector=evidence_connector,
+        interpreter=semantic_interpreter,
+        ollama_runtime=ollama_runtime,
+        academic_store=store,
+        career_store=career_store,
+        event_timeout_seconds=semantic_event_timeout_seconds,
+        total_timeout_seconds=semantic_total_timeout_seconds,
+        progress=progress,
+        attempt=attempt,
+    )
+    academic_items = tuple(item for item in calendar_items if item.source_area.value == "course")
+    job_items = tuple(item for item in calendar_items if item.source_area.value == "jobs")
+    notification = build_scheduled_morning_notification(
+        plan,
+        period_key=period_key,
+        occurrence=occurrence,
+        source_synced_at=synced_at,
+        timezone_name=timezone_name,
+        course_calendar_items=academic_items,
+        job_calendar_items=job_items,
+        interview_reminders=interview_reminders,
+        career_condition=career_condition,
+    )
     if delivery is None:
         return {
             "status": "failed",
@@ -387,9 +1040,65 @@ async def execute_scheduled_morning_notification(
             "interview_count": len(notification.interview_items),
             "plan_id": str(plan.plan_id),
         }
-    receipt = await delivery.send_scheduled_notification(
-        notification.message_text,
-        idempotency_key=scheduled_delivery_key(period_key, occurrence),
+    _record_progress(
+        progress,
+        "manifest_creation",
+        "running",
+        attempt=attempt,
+        diagnostic="rendering_delivery_manifest",
+    )
+    try:
+        manifest = build_calendar_briefing_manifest(
+            notification.message_text,
+            delivery_key_prefix=scheduled_delivery_key(period_key, occurrence),
+        )
+        if manifest_store is not None:
+            manifest_store.save(manifest, period_key=period_key, delivered_ordinals=set())
+    except Exception:
+        _record_progress(
+            progress,
+            "manifest_creation",
+            "failed",
+            attempt=attempt,
+            diagnostic="delivery_manifest_failed",
+        )
+        raise
+    _record_progress(
+        progress,
+        "manifest_creation",
+        "succeeded",
+        attempt=attempt,
+        diagnostic=f"persisted_manifest_parts:{len(manifest.parts)}",
+    )
+    _record_progress(
+        progress,
+        "delivery",
+        "running",
+        attempt=attempt,
+        diagnostic="multipart_delivery_started",
+    )
+    try:
+        receipts, delivered_ordinals = await _deliver_manifest(
+            delivery,
+            manifest,
+            manifest_store=manifest_store,
+            period_key=period_key,
+        )
+    except Exception:
+        _record_progress(
+            progress,
+            "delivery",
+            "failed",
+            attempt=attempt,
+            diagnostic="multipart_delivery_failed",
+        )
+        raise
+    _record_progress(
+        progress,
+        "delivery",
+        "succeeded",
+        attempt=attempt,
+        diagnostic=f"manifest_parts_delivered:{len(delivered_ordinals)}",
     )
     reminder_audit_status = "not_applicable"
     if notification.interview_items and career_store is not None:
@@ -397,7 +1106,7 @@ async def execute_scheduled_morning_notification(
         if callable(recorder):
             reminder_audit_status = "recorded"
             try:
-                raw_delivery_id = getattr(receipt, "id", None)
+                raw_delivery_id = getattr(receipts[-1], "id", None) if receipts else None
                 delivery_id = raw_delivery_id if isinstance(raw_delivery_id, uuid.UUID) else None
                 for item in notification.interview_items:
                     recorder(
@@ -413,14 +1122,19 @@ async def execute_scheduled_morning_notification(
         "plan_id": str(plan.plan_id),
         "block_count": len(notification.blocks),
         "interview_count": len(notification.interview_items),
+        "academic_event_count": len(academic_items),
+        "job_event_count": len(job_items),
         "career_sync_status": career_sync_status,
         "deferred_count": len(plan.deferred_assessment_ids),
         "deferred_practice_count": len(plan.deferred_practice_focus_ids),
         "ambiguous_count": len(plan.ambiguous_questions),
         "sync_status": sync_result.status,
-        "delivery_count": 1,
-        "delivery_status": str(getattr(receipt, "status", "sent")),
+        "part_count": len(manifest.parts),
+        "delivery_count": len(receipts),
+        "delivered_part_count": len(delivered_ordinals),
+        "delivery_status": str(getattr(receipts[-1], "status", "sent")),
         "reminder_audit_status": reminder_audit_status,
+        **semantic_counts,
     }
 
 
@@ -435,6 +1149,11 @@ class _Runtime:
         career_store: SQLAlchemyJobInterviewStore,
         career_syncer: JobInterviewNotionSync,
         delivery: ScheduledMorningDelivery | None,
+        evidence_connector: CalendarEvidenceConnector | None,
+        semantic_interpreter: CalendarEventSemanticInterpreter,
+        ollama_runtime: OllamaRuntime,
+        manifest_store: ScheduledMorningManifestStore,
+        progress: ScheduledMorningProgress,
     ) -> None:
         self.database = database
         self.settings = settings
@@ -443,6 +1162,11 @@ class _Runtime:
         self.career_store = career_store
         self.career_syncer = career_syncer
         self.delivery = delivery
+        self.evidence_connector = evidence_connector
+        self.semantic_interpreter = semantic_interpreter
+        self.ollama_runtime = ollama_runtime
+        self.manifest_store = manifest_store
+        self.progress = progress
 
 
 RuntimeFactory = Callable[[uuid.UUID], _Runtime]
@@ -486,6 +1210,18 @@ def _load_runtime(run_id: uuid.UUID) -> _Runtime:
         timezone=settings.app_timezone,
         setup_condition_code=setup_condition,
     )
+    gateway = LLMGateway(settings)
+    semantic_interpreter = CalendarEventSemanticInterpreter(
+        gateway,
+        max_prompt_chars=settings.calendar_semantic_prompt_max_chars,
+    )
+    ollama_runtime = OllamaRuntime(settings)
+    manifest_store = _ArtifactManifestStore(
+        engine=database.engine,
+        run_id=run_id,
+        artifact_root=settings.artifact_root,
+    )
+    progress = _DatabaseProgressRecorder(engine=database.engine, run_id=run_id)
     delivery = None
     if settings.discord_bot_token is not None and settings.discord_academic_channel_id is not None:
         from app.connectors.discord import (
@@ -512,6 +1248,11 @@ def _load_runtime(run_id: uuid.UUID) -> _Runtime:
         career_store=career_store,
         career_syncer=career_syncer,
         delivery=delivery,
+        evidence_connector=connector,
+        semantic_interpreter=semantic_interpreter,
+        ollama_runtime=ollama_runtime,
+        manifest_store=manifest_store,
+        progress=progress,
     )
 
 
@@ -551,6 +1292,17 @@ async def run_scheduled_morning_notification(
             attempt_limit=attempt_limit,
             career_store=runtime.career_store,
             career_syncer=runtime.career_syncer,
+            evidence_connector=runtime.evidence_connector,
+            semantic_interpreter=runtime.semantic_interpreter,
+            ollama_runtime=runtime.ollama_runtime,
+            manifest_store=runtime.manifest_store,
+            semantic_event_timeout_seconds=(
+                runtime.settings.calendar_semantic_event_timeout_seconds
+            ),
+            semantic_total_timeout_seconds=(
+                runtime.settings.calendar_semantic_total_timeout_seconds
+            ),
+            progress=runtime.progress,
         )
     finally:
         runtime.database.dispose()
