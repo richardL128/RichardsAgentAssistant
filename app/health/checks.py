@@ -280,6 +280,12 @@ def check_academic_notion_status(
     material_pending = int(snapshot.get("material_pending_count", 0))
     material_failed = int(snapshot.get("material_failed_count", 0))
     material_partial = int(snapshot.get("material_partial_count", 0))
+    inbound_awaiting_target = int(snapshot.get("inbound_material_awaiting_target_count", 0))
+    inbound_proposal_pending = int(snapshot.get("inbound_material_proposal_pending_count", 0))
+    inbound_uncertain = int(snapshot.get("inbound_material_uncertain_count", 0))
+    inbound_seeding = int(snapshot.get("inbound_material_seeding_count", 0))
+    orphan_uploads = int(snapshot.get("inbound_material_orphan_upload_warning_count", 0))
+    indexing_delayed = int(snapshot.get("inbound_material_indexing_delayed_count", 0))
     setup_codes = snapshot.get("setup_condition_codes", [])
     setup_summary = ",".join(str(code) for code in setup_codes) if setup_codes else "none"
     state = (
@@ -292,6 +298,10 @@ def check_academic_notion_status(
             or material_pending
             or material_failed
             or material_partial
+            or inbound_uncertain
+            or inbound_seeding
+            or orphan_uploads
+            or indexing_delayed
         )
         else HealthState.HEALTHY
     )
@@ -310,6 +320,12 @@ def check_academic_notion_status(
             f"materials pending {material_pending}; "
             f"materials failed {material_failed}; "
             f"materials partial {material_partial}; "
+            f"PDFs awaiting target {inbound_awaiting_target}; "
+            f"PDF proposals pending {inbound_proposal_pending}; "
+            f"PDF seeding {inbound_seeding}; "
+            f"PDF seeding uncertain {inbound_uncertain}; "
+            f"orphaned upload warnings {orphan_uploads}; "
+            f"PDF indexing delayed {indexing_delayed}; "
             f"last sync {snapshot.get('last_sync_at') or 'never'}; "
             f"migration {snapshot.get('migration', 'unknown')}"
         ),

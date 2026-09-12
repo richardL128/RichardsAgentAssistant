@@ -41,6 +41,22 @@ class UserCreatableAssessmentType(StrEnum):
     STUDYING_BLOCK = "studying_block"
 
 
+class ValidatedMaterialPlanningSignals(PlannerModel):
+    """Critic-validated, evidence-backed inputs allowed to influence priority."""
+
+    effort_lower_minutes: int = Field(gt=0, le=10_080)
+    effort_upper_minutes: int = Field(gt=0, le=10_080)
+    scope_score: float = Field(ge=0, le=1)
+    dependency_risk_score: float = Field(ge=0, le=1)
+    evidence_chunk_ids: tuple[str, ...] = Field(min_length=1, max_length=20)
+    profile_version: str = Field(min_length=1, max_length=128)
+    critic_validated: Literal[True] = True
+
+    def model_post_init(self, __context: object) -> None:
+        if self.effort_upper_minutes < self.effort_lower_minutes:
+            raise ValueError("material effort upper bound must not be below its lower bound")
+
+
 class Assessment(PlannerModel):
     id: str = Field(min_length=1, max_length=255)
     course: str = Field(min_length=1, max_length=255)
@@ -55,6 +71,7 @@ class Assessment(PlannerModel):
     completed: bool = False
     ambiguous: bool = False
     citations: tuple[str, ...] = ()
+    material_signals: ValidatedMaterialPlanningSignals | None = None
 
     @field_validator("due_at")
     @classmethod
@@ -394,6 +411,14 @@ class ScheduledMorningNotification(PlannerModel):
         return _aware(value)
 
 
+class InboundMaterialProposalPreview(PlannerModel):
+    """Bounded PDF metadata safe to show in an exact-confirmation preview."""
+
+    inbound_material_id: UUID
+    filename: str = Field(min_length=1, max_length=255)
+    byte_size: int = Field(gt=0, le=20_971_520)
+
+
 class ProposedChange(PlannerModel):
     field: Literal[
         "completed",
@@ -402,6 +427,7 @@ class ProposedChange(PlannerModel):
         "new_deadline",
         "new_event",
         "create_assessment",
+        "attach_assessment_material",
         "update_assessment",
         "archive_assessment",
     ]
@@ -415,6 +441,11 @@ class ProposedChange(PlannerModel):
     assessment_type: AssessmentType | None = None
     expected_last_edited_at: datetime | None = None
     expected_title: str | None = Field(default=None, min_length=1, max_length=500)
+    inbound_material_ids: tuple[UUID, ...] | None = Field(default=None, max_length=5)
+    inbound_material_previews: tuple[InboundMaterialProposalPreview, ...] | None = Field(
+        default=None, max_length=5
+    )
+    supersedes_proposal_id: UUID | None = None
 
     @field_validator("due_at", "ends_at", "expected_last_edited_at")
     @classmethod
@@ -485,6 +516,8 @@ class CreateAssessmentCall(PlannerModel):
     title: str = Field(min_length=1, max_length=500)
     due_at: datetime
     assessment_type: UserCreatableAssessmentType
+    inbound_material_ids: tuple[UUID, ...] = Field(default=(), max_length=5)
+    supersedes_proposal_id: UUID | None = None
 
     @field_validator("due_at")
     @classmethod
@@ -492,11 +525,20 @@ class CreateAssessmentCall(PlannerModel):
         return _aware(value)
 
 
+class AttachAssessmentMaterialCall(PlannerModel):
+    """Propose attaching captured owner-scoped PDFs to one searched assessment."""
+
+    tool: Literal["attach_material_to_assessment"]
+    assessment_id: str = Field(min_length=1, max_length=255)
+    inbound_material_ids: tuple[UUID, ...] = Field(min_length=1, max_length=5)
+
+
 class CreateStudySessionCall(PlannerModel):
     """Create one confirmed studying block with a host-derived end timestamp."""
 
     tool: Literal["create_study_session"]
     course_id: str = Field(min_length=1, max_length=255)
+    assessment_id: str | None = Field(default=None, min_length=1, max_length=255)
     topic: str = Field(min_length=1, max_length=300)
     starts_at: datetime
     duration_minutes: int = Field(ge=5, le=240)
@@ -1001,6 +1043,7 @@ __all__ = [
     "AssessmentMaterialSource",
     "AssessmentMaterialSourceKind",
     "AssessmentType",
+    "AttachAssessmentMaterialCall",
     "AvailabilityWindow",
     "CheckinExtraction",
     "CheckinProposal",
@@ -1013,6 +1056,7 @@ __all__ = [
     "DiscoursePartialFacts",
     "FixedCommitment",
     "GroundedAssessmentInsight",
+    "InboundMaterialProposalPreview",
     "IncompleteBlock",
     "LearningFocusStatus",
     "MemoryManagementOutcome",
@@ -1040,5 +1084,6 @@ __all__ = [
     "StudyBlock",
     "UpdateAssessmentCall",
     "UserCreatableAssessmentType",
+    "ValidatedMaterialPlanningSignals",
     "WorkBreakdown",
 ]

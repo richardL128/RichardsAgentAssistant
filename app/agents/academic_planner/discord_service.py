@@ -5,11 +5,13 @@ from __future__ import annotations
 from dataclasses import dataclass
 
 from app.agents.academic_planner.discord_harness import NativeAcademicDiscordHandler
+from app.agents.academic_planner.material_intake import AcademicMaterialIntakeService
 from app.agents.academic_planner.notion_mutations import DiscoveredAcademicNotionWriter
 from app.agents.academic_planner.sync import AcademicNotionSync
 from app.agents.job_interviews.agent_loop import CareerAgentToolState
 from app.agents.job_interviews.notion_mutations import DiscoveredCareerNotionWriter
 from app.agents.job_interviews.sync import JobInterviewNotionSync
+from app.artifacts.store import ArtifactStore
 from app.connectors.discord import (
     DiscordAcademicPlannerAdapter,
     DiscordAcademicResponseDelivery,
@@ -22,6 +24,7 @@ from app.db.job_interviews import SQLAlchemyJobInterviewStore
 from app.db.session import Database
 from app.llm.gateway import LLMGateway
 from app.llm.ollama_runtime import OllamaRuntime
+from app.queue import tasks as queue_tasks
 
 
 @dataclass(slots=True)
@@ -63,6 +66,16 @@ def create_academic_discord_service(
         confirmation_ttl_hours=app_settings.academic_confirmation_ttl_hours,
         default_practice_minutes=app_settings.academic_memory_default_practice_minutes,
     )
+    artifact_store = ArtifactStore(
+        app_settings.artifact_root,
+        default_retention_days=app_settings.artifact_retention_days,
+    )
+    material_intake = AcademicMaterialIntakeService(
+        store=store,
+        artifact_store=artifact_store,
+        max_bytes=app_settings.discord_academic_pdf_max_bytes,
+        max_pages=app_settings.academic_material_pdf_max_pages,
+    )
     adapter = DiscordAcademicPlannerAdapter(
         token=token,
         allowed_channel_ids={channel_id},
@@ -81,6 +94,10 @@ def create_academic_discord_service(
         and app_settings.notion_courses_database_id is not None
     ):
         notion_setup_condition = "notion_configuration_invalid"
+
+    async def enqueue_material(page_id: str, fingerprint: str) -> object:
+        return await queue_tasks.defer_academic_material_ingestion(page_id, fingerprint)
+
     catalog_syncer = AcademicNotionSync(
         connector=notion_connector,
         store=store,
@@ -89,7 +106,7 @@ def create_academic_discord_service(
         timezone=app_settings.app_timezone,
         clarification_ttl_hours=app_settings.academic_confirmation_ttl_hours,
         setup_condition_code=notion_setup_condition,
-        material_enqueuer=None,
+        material_enqueuer=enqueue_material,
     )
     career_store = SQLAlchemyJobInterviewStore(database.engine)
     career_syncer = JobInterviewNotionSync(
@@ -102,6 +119,8 @@ def create_academic_discord_service(
         DiscoveredAcademicNotionWriter(
             connector=notion_connector,
             target_store=store,
+            artifact_loader=artifact_store,
+            post_seed_syncer=catalog_syncer,
         )
         if notion_connector is not None
         else None
@@ -148,6 +167,7 @@ def create_academic_discord_service(
         ),
         career_engine=database.engine,
         career_writer_provider=lambda: career_writer,
+        material_intake=material_intake,
     )
     return AcademicDiscordService(handler=handler, database=database)
 

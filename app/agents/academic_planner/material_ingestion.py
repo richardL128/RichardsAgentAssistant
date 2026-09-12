@@ -45,6 +45,10 @@ class MaterialEmbeddingGateway(Protocol):
     async def embed_academic_text(self, text: str) -> Any: ...
 
 
+class MaterialPlanningProfileGenerator(Protocol):
+    async def refresh_profile(self, assessment_id: str) -> Any: ...
+
+
 @dataclass(frozen=True, slots=True)
 class MaterialIngestionResult:
     assessment_page_id: str
@@ -55,6 +59,8 @@ class MaterialIngestionResult:
     failed_count: int
     inactive_count: int
     diagnostic_codes: tuple[str, ...] = ()
+    profile_status: str | None = None
+    profile_error_code: str | None = None
 
     def as_dict(self) -> dict[str, object]:
         return {
@@ -66,6 +72,8 @@ class MaterialIngestionResult:
             "failed_count": self.failed_count,
             "inactive_count": self.inactive_count,
             "diagnostic_codes": list(self.diagnostic_codes),
+            "profile_status": self.profile_status,
+            "profile_error_code": self.profile_error_code,
         }
 
 
@@ -86,6 +94,7 @@ class AssessmentMaterialIngestionService:
         pdf_max_pages: int = 15,
         ocr_timeout_seconds: float = 30.0,
         ocr_min_page_chars: int = 24,
+        profile_generator: MaterialPlanningProfileGenerator | None = None,
     ) -> None:
         self._engine = engine
         self._connector = connector
@@ -98,6 +107,7 @@ class AssessmentMaterialIngestionService:
         self._pdf_max_pages = pdf_max_pages
         self._ocr_timeout_seconds = ocr_timeout_seconds
         self._ocr_min_page_chars = ocr_min_page_chars
+        self._profile_generator = profile_generator
 
     async def ingest_assessment(
         self,
@@ -244,6 +254,15 @@ class AssessmentMaterialIngestionService:
             if failed == 0
             else ("partial" if activated or unchanged or has_last_good else "failed")
         )
+        profile_status: str | None = None
+        profile_error_code: str | None = None
+        if status == "succeeded" and self._profile_generator is not None:
+            try:
+                profile_result = await self._profile_generator.refresh_profile(assessment.notion_id)
+                profile_status = str(getattr(profile_result, "status", "completed"))[:64]
+            except Exception:
+                profile_error_code = "material_profile_generation_failed"
+                diagnostics.append(profile_error_code)
         return MaterialIngestionResult(
             assessment_page_id=assessment_page_id,
             status=status,
@@ -253,6 +272,8 @@ class AssessmentMaterialIngestionService:
             failed_count=failed,
             inactive_count=inactive,
             diagnostic_codes=tuple(sorted(set(diagnostics)))[:100],
+            profile_status=profile_status,
+            profile_error_code=profile_error_code,
         )
 
     def _assessment(self, page_id: str) -> Assessment:
@@ -529,15 +550,37 @@ async def run_assessment_material_ingestion(
         character not in "0123456789abcdef" for character in source_fingerprint
     ):
         raise ValueError("assessment material fingerprint must be SHA-256 hex")
+    from app.agents.academic_planner.material_planning import (
+        AssessmentMaterialPlanningProfileService,
+        MaterialPlanningModelIdentity,
+    )
     from app.connectors.notion import NotionConnector
     from app.core.config import get_settings
+    from app.db.academic import SQLAlchemyAcademicPlannerStore
     from app.db.session import Database
     from app.llm.embeddings import AcademicEmbeddingGateway
+    from app.llm.gateway import LLMGateway
 
     settings = get_settings()
     if settings.notion_token is None or settings.notion_courses_database_id is None:
         raise RuntimeError("Notion assessment material ingestion is not configured")
     database = Database(settings)
+    embedding_gateway = AcademicEmbeddingGateway(settings)
+    model_gateway = LLMGateway(settings)
+    planner_store = SQLAlchemyAcademicPlannerStore(
+        database.engine,
+        embedding_gateway=embedding_gateway,
+        confirmation_ttl_hours=settings.academic_confirmation_ttl_hours,
+        default_practice_minutes=settings.academic_memory_default_practice_minutes,
+    )
+    profile_generator = AssessmentMaterialPlanningProfileService(
+        model=model_gateway,
+        repository=planner_store,
+        model_identity=MaterialPlanningModelIdentity(
+            generator_model=model_gateway.model_identity,
+            critic_model=model_gateway.model_identity,
+        ),
+    )
     connector = NotionConnector(
         token=settings.notion_token,
         courses_database_id=settings.notion_courses_database_id,
@@ -550,7 +593,7 @@ async def run_assessment_material_ingestion(
             settings.artifact_root,
             default_retention_days=settings.artifact_retention_days,
         ),
-        embedding_gateway=AcademicEmbeddingGateway(settings),
+        embedding_gateway=embedding_gateway,
         max_bytes=settings.notion_attachment_max_bytes,
         max_depth=settings.notion_material_max_block_depth,
         max_blocks=settings.notion_material_max_blocks,
@@ -558,6 +601,7 @@ async def run_assessment_material_ingestion(
         pdf_max_pages=settings.academic_material_pdf_max_pages,
         ocr_timeout_seconds=settings.academic_material_ocr_timeout_seconds,
         ocr_min_page_chars=settings.academic_material_ocr_min_page_chars,
+        profile_generator=profile_generator,
     )
     try:
         result = await service.ingest_assessment(

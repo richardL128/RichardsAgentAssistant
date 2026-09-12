@@ -1675,6 +1675,67 @@ class AcademicDocumentChunk(TimestampMixin, Base):
     embedding_dimensions: Mapped[int | None] = mapped_column()
 
 
+class AcademicAssessmentMaterialProfile(TimestampMixin, Base):
+    """Validated planning signals derived from active assessment material chunks."""
+
+    __tablename__ = "academic_assessment_material_profiles"
+    __table_args__ = (
+        UniqueConstraint("profile_version", name="uq_academic_material_profiles_version"),
+        CheckConstraint(
+            "state IN ('validated','active','rejected','inactive')",
+            name="state_valid",
+        ),
+        CheckConstraint("effort_lower_minutes > 0", name="effort_lower_positive"),
+        CheckConstraint("effort_upper_minutes >= effort_lower_minutes", name="effort_range_valid"),
+        CheckConstraint("scope_score >= 0 AND scope_score <= 1", name="scope_score_valid"),
+        CheckConstraint(
+            "dependency_risk_score >= 0 AND dependency_risk_score <= 1",
+            name="dependency_risk_score_valid",
+        ),
+        CheckConstraint(
+            "explicit_grade_weight_percent IS NULL OR "
+            "(explicit_grade_weight_percent >= 0 AND explicit_grade_weight_percent <= 100)",
+            name="explicit_grade_weight_valid",
+        ),
+        Index(
+            "uq_academic_material_profiles_active_assessment",
+            "assessment_id",
+            unique=True,
+            postgresql_where=text("state = 'active'"),
+            sqlite_where=text("state = 'active'"),
+        ),
+        Index("ix_academic_material_profiles_assessment_state", "assessment_id", "state"),
+        Index("ix_academic_material_profiles_created", "created_at"),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(primary_key=True, default=uuid.uuid4)
+    assessment_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey("assessments.id", ondelete="CASCADE"), nullable=False
+    )
+    profile_id: Mapped[str] = mapped_column(String(128), nullable=False)
+    profile_version: Mapped[str] = mapped_column(String(128), nullable=False)
+    state: Mapped[str] = mapped_column(String(32), nullable=False, default="validated")
+    deliverables_summary: Mapped[str] = mapped_column(String(1_000), nullable=False)
+    success_criteria_summary: Mapped[str] = mapped_column(String(1_000), nullable=False)
+    study_topics_summary: Mapped[str] = mapped_column(String(1_000), nullable=False)
+    explicit_grade_weight_percent: Mapped[float | None] = mapped_column(Float)
+    effort_lower_minutes: Mapped[int] = mapped_column(nullable=False)
+    effort_upper_minutes: Mapped[int] = mapped_column(nullable=False)
+    scope_score: Mapped[float] = mapped_column(Float, nullable=False)
+    dependency_risk_score: Mapped[float] = mapped_column(Float, nullable=False)
+    evidence_chunk_ids: Mapped[list[str]] = mapped_column(JSON, nullable=False, default=list)
+    document_versions: Mapped[list[dict[str, Any]]] = mapped_column(
+        JSON, nullable=False, default=list
+    )
+    model_identity: Mapped[dict[str, Any]] = mapped_column(JSON, nullable=False, default=dict)
+    critique: Mapped[dict[str, Any]] = mapped_column(JSON, nullable=False, default=dict)
+    rejection_reason: Mapped[str | None] = mapped_column(String(500))
+    generated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=text("CURRENT_TIMESTAMP")
+    )
+    activated_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+
+
 class AcademicSyncCursor(TimestampMixin, Base):
     """Durable Notion delta cursor, keyed by integration/database scope."""
 
@@ -1724,10 +1785,12 @@ class AcademicProposedChange(TimestampMixin, Base):
     __table_args__ = (
         UniqueConstraint("idempotency_key", name="uq_academic_proposals_idempotency"),
         CheckConstraint(
-            "state IN ('pending','confirmed','applying','rejected','applied','expired')",
+            "state IN "
+            "('pending','confirmed','applying','rejected','applied','expired','superseded')",
             name="state_valid",
         ),
         Index("ix_academic_proposals_state", "state", "created_at"),
+        Index("ix_academic_proposals_owner_channel", "owner_discord_user_id", "discord_channel_id"),
     )
 
     id: Mapped[uuid.UUID] = mapped_column(primary_key=True, default=uuid.uuid4)
@@ -1738,6 +1801,8 @@ class AcademicProposedChange(TimestampMixin, Base):
     operation: Mapped[str] = mapped_column(String(128), nullable=False)
     target_type: Mapped[str] = mapped_column(String(128), nullable=False)
     target_id: Mapped[str] = mapped_column(String(255), nullable=False)
+    owner_discord_user_id: Mapped[str | None] = mapped_column(String(32))
+    discord_channel_id: Mapped[str | None] = mapped_column(String(32))
     payload: Mapped[dict[str, Any]] = mapped_column(JSON, nullable=False, default=dict)
     redacted_preview: Mapped[str] = mapped_column(String(4_000), nullable=False)
     confirmation_token: Mapped[str] = mapped_column(String(255), nullable=False)
@@ -1745,6 +1810,76 @@ class AcademicProposedChange(TimestampMixin, Base):
     state: Mapped[str] = mapped_column(String(32), nullable=False, default="pending")
     expires_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     applied_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    superseded_by_id: Mapped[uuid.UUID | None] = mapped_column(
+        ForeignKey("academic_proposed_changes.id", ondelete="SET NULL")
+    )
+    superseded_reason: Mapped[str | None] = mapped_column(String(128))
+    superseded_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+
+
+class AcademicInboundMaterial(TimestampMixin, Base):
+    """Captured Discord PDF awaiting a confirmation-gated Notion seed."""
+
+    __tablename__ = "academic_inbound_materials"
+    __table_args__ = (
+        UniqueConstraint(
+            "discord_message_id",
+            "discord_attachment_id",
+            name="uq_academic_inbound_materials_discord_attachment",
+        ),
+        CheckConstraint("length(discord_message_id) > 0", name="discord_message_id_nonempty"),
+        CheckConstraint("length(discord_attachment_id) > 0", name="discord_attachment_id_nonempty"),
+        CheckConstraint("length(owner_discord_user_id) > 0", name="owner_discord_user_id_nonempty"),
+        CheckConstraint("length(discord_channel_id) > 0", name="discord_channel_id_nonempty"),
+        CheckConstraint("length(filename) > 0", name="filename_nonempty"),
+        CheckConstraint(
+            "declared_byte_size IS NULL OR declared_byte_size > 0",
+            name="declared_size_positive",
+        ),
+        CheckConstraint("observed_byte_size > 0", name="observed_size_positive"),
+        CheckConstraint("length(content_hash) = 64", name="content_hash_length"),
+        CheckConstraint("length(raw_artifact_key) = 64", name="raw_artifact_key_length"),
+        CheckConstraint(
+            "state IN "
+            "('captured','awaiting_target','proposal_pending','seeding','seeded','failed',"
+            "'uncertain','expired')",
+            name="state_valid",
+        ),
+        Index(
+            "ix_academic_inbound_materials_owner_pending",
+            "owner_discord_user_id",
+            "discord_channel_id",
+            "state",
+            "created_at",
+        ),
+        Index("ix_academic_inbound_materials_assessment", "assessment_id", "state"),
+        Index("ix_academic_inbound_materials_proposal", "proposal_id", "state"),
+        Index("ix_academic_inbound_materials_hash", "content_hash"),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(primary_key=True, default=uuid.uuid4)
+    discord_message_id: Mapped[str] = mapped_column(String(32), nullable=False)
+    discord_attachment_id: Mapped[str] = mapped_column(String(32), nullable=False)
+    owner_discord_user_id: Mapped[str] = mapped_column(String(32), nullable=False)
+    discord_channel_id: Mapped[str] = mapped_column(String(32), nullable=False)
+    filename: Mapped[str] = mapped_column(String(255), nullable=False)
+    media_type: Mapped[str | None] = mapped_column(String(128))
+    declared_byte_size: Mapped[int | None] = mapped_column(BigInteger)
+    observed_byte_size: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    content_hash: Mapped[str] = mapped_column(String(64), nullable=False)
+    raw_artifact_key: Mapped[str] = mapped_column(String(64), nullable=False)
+    state: Mapped[str] = mapped_column(String(32), nullable=False, default="captured")
+    assessment_id: Mapped[uuid.UUID | None] = mapped_column(
+        ForeignKey("assessments.id", ondelete="SET NULL")
+    )
+    proposal_id: Mapped[uuid.UUID | None] = mapped_column(
+        ForeignKey("academic_proposed_changes.id", ondelete="SET NULL")
+    )
+    notion_page_id: Mapped[str | None] = mapped_column(String(255))
+    notion_block_id: Mapped[str | None] = mapped_column(String(255))
+    notion_upload_id: Mapped[str | None] = mapped_column(String(255))
+    error_code: Mapped[str | None] = mapped_column(String(128))
+    expires_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
 
 
 class AcademicProposalOperationJournal(TimestampMixin, Base):
@@ -1787,6 +1922,7 @@ ProposalOperationJournal = AcademicProposalOperationJournal
 
 
 __all__ = [
+    "AcademicAssessmentMaterialProfile",
     "AcademicCheckIn",
     "AcademicClarification",
     "AcademicCourseCalendar",
@@ -1794,6 +1930,7 @@ __all__ = [
     "AcademicDiscourseTurn",
     "AcademicDocument",
     "AcademicDocumentChunk",
+    "AcademicInboundMaterial",
     "AcademicLearningFocus",
     "AcademicLearningFocusEvent",
     "AcademicProposalOperationJournal",

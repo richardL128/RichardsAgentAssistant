@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import hashlib
+import json
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from types import SimpleNamespace
@@ -14,9 +16,15 @@ from sqlalchemy.orm import Session
 from sqlalchemy.pool import StaticPool
 
 from app.api.discord_handoff import router
-from app.connectors.discord import DiscordFetchedAuthor, DiscordFetchedMessage
+from app.artifacts.store import ArtifactStore
+from app.connectors.discord import (
+    DiscordFetchedAttachment,
+    DiscordFetchedAuthor,
+    DiscordFetchedMessage,
+    DiscordPdfAttachmentDownload,
+)
 from app.core.config import Settings
-from app.db.models import Base, DiscordWakeInbound
+from app.db.models import AcademicInboundMaterial, Base, DiscordWakeInbound
 from app.host.handoff import (
     DiscordHostHandoffEvent,
     DiscordHostInteractionHandoffEvent,
@@ -147,6 +155,86 @@ def test_signed_message_handoff_refetches_persists_and_queues_once(
         assert stored.discord_event_id == MESSAGE_ID
         assert stored.ack_message_id == ACK_ID
         assert stored.enqueued_at is not None
+
+
+def test_pdf_only_handoff_captures_private_artifact_and_reference_manifest(
+    handoff_app, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    app, settings, engine, queued = handoff_app
+    pdf = b"%PDF-1.4\n% bounded test\n"
+    signed_url = (
+        "https://cdn.discordapp.com/attachments/222222222222222222/"
+        "777777777777777777/rubric.pdf?ex=secret"
+    )
+
+    async def fetch(_adapter, *, channel_id: str, message_id: str):
+        if message_id == ACK_ID:
+            return DiscordFetchedMessage(
+                id=ACK_ID,
+                channel_id=CHANNEL_ID,
+                author=DiscordFetchedAuthor(id=BOT_ID, bot=True),
+                timestamp=EVENT_TIME,
+                content=SecretStr("wake acknowledgement"),
+            )
+        return DiscordFetchedMessage(
+            id=MESSAGE_ID,
+            channel_id=CHANNEL_ID,
+            author=DiscordFetchedAuthor(id=USER_ID),
+            timestamp=EVENT_TIME,
+            content=SecretStr(""),
+            attachments=(
+                DiscordFetchedAttachment(
+                    id="777777777777777777",
+                    filename="rubric.pdf",
+                    content_type="application/pdf",
+                    size=len(pdf),
+                    url=SecretStr(signed_url),
+                ),
+            ),
+        )
+
+    async def download(_adapter, attachment, **_kwargs):
+        return DiscordPdfAttachmentDownload(
+            attachment_id=attachment.id,
+            filename=attachment.filename,
+            content_type=attachment.content_type,
+            declared_size=attachment.size,
+            observed_size=len(pdf),
+            sha256_hex=hashlib.sha256(pdf).hexdigest(),
+            content=pdf,
+        )
+
+    monkeypatch.setattr(
+        "app.api.discord_handoff.DiscordAcademicPlannerAdapter.fetch_message", fetch
+    )
+    monkeypatch.setattr(
+        "app.api.discord_handoff.DiscordAcademicPlannerAdapter.download_pdf_attachment",
+        download,
+    )
+    body, headers = _signed_request(_message_event(), settings.discord_host_handoff_secret)
+
+    with TestClient(app) as client:
+        response = client.post("/internal/discord/academic/handoff", content=body, headers=headers)
+
+    assert response.status_code == 202, response.text
+    assert len(queued) == 1
+    with Session(engine) as session:
+        material = session.scalar(select(AcademicInboundMaterial))
+        wake = session.scalar(select(DiscordWakeInbound))
+        assert material is not None
+        assert wake is not None
+        assert material.filename == "rubric.pdf"
+        assert material.content_hash == hashlib.sha256(pdf).hexdigest()
+        assert material.raw_artifact_key != wake.content_artifact_key
+        manifest = json.loads(
+            ArtifactStore(settings.artifact_root).get(wake.content_artifact_key).decode()
+        )
+        assert manifest == {
+            "version": "discord-academic-inbound-v2",
+            "message_text": "",
+            "inbound_material_ids": [str(material.id)],
+        }
+        assert signed_url not in str(manifest)
 
 
 def test_handoff_rejects_bad_signature_stale_and_oversized_body(handoff_app) -> None:

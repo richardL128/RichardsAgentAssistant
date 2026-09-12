@@ -39,10 +39,26 @@ def priority_score(
     current = _aware(now, "now")
     remaining_days = max((assessment.due_at - current).total_seconds() / 86_400, 0.0)
     deadline_pressure = max(0.0, 100.0 - remaining_days * 12.0)
+    effective_effort = assessment.estimated_minutes
+    effective_scope = assessment.scope_size
+    material_risk = 0.0
+    if assessment.material_signals is not None:
+        signals = assessment.material_signals
+        evidence_effort = (signals.effort_lower_minutes + signals.effort_upper_minutes) / 2
+        # Rubric evidence can refine effort, but cannot make a typed estimate vanish or explode.
+        effective_effort = int(
+            min(
+                assessment.estimated_minutes * 2,
+                max(assessment.estimated_minutes * 0.5, evidence_effort),
+            )
+        )
+        effective_scope = max(effective_scope, min(100.0, signals.scope_score * 100.0))
+        # Material-only dependency/risk contributes at most twenty score points.
+        material_risk = signals.dependency_risk_score * 20.0
     effort_pressure = 0.0
     if available_minutes is not None and available_minutes > 0:
-        effort_pressure = min(100.0, assessment.estimated_minutes / available_minutes * 100.0)
-    risk = assessment.confidence_gap * 30.0 + assessment.scope_size * 0.2
+        effort_pressure = min(100.0, effective_effort / available_minutes * 100.0)
+    risk = assessment.confidence_gap * 30.0 + effective_scope * 0.2 + material_risk
     return round(
         deadline_pressure
         + assessment.weight_percent
@@ -197,7 +213,14 @@ def allocate_plan_with_deferred(
                         rationale=(
                             "Carried incomplete work forward before its deadline."
                             if carried
-                            else "Scheduled by deadline, effort, weight, risk and course priority."
+                            else (
+                                "Scheduled by deadline, effort, weight, risk and course priority; "
+                                "critic-validated material evidence refined bounded "
+                                "effort/scope/risk."
+                                if assessment.material_signals is not None
+                                else "Scheduled by deadline, effort, weight, risk and course "
+                                "priority."
+                            )
                         ),
                     )
                 )

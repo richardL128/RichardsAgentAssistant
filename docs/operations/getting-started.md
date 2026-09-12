@@ -402,9 +402,22 @@ DISCORD_ACADEMIC_AUTHORIZED_USER_IDS=[123456789012345678]
 DISCORD_ACADEMIC_MESSAGE_CONTENT_ENABLED=true
 DISCORD_APPLICATION_ID=...
 MODEL_TRIGGER_MODE=authorized_discord_channel
+DISCORD_ACADEMIC_PDF_MAX_ATTACHMENTS=5
+DISCORD_ACADEMIC_PDF_MAX_BYTES=20971520
+DISCORD_ACADEMIC_PDF_DOWNLOAD_TIMEOUT_SECONDS=15
+DISCORD_ACADEMIC_PDF_INTAKE_TTL_HOURS=48
 DISCORD_FINANCE_CHANNEL_ID=...
 DISCORD_CODE_REVIEW_CHANNEL_ID=...
 ```
+
+PDF intake is deliberately bounded: one message may carry one to five PDF
+attachments, each no larger than 20 MiB. Lower limits may be configured; the
+20 MiB ceiling cannot be raised through configuration. Downloads reject
+redirects and non-Discord media hosts, verify the declared and observed length,
+require a PDF signature, and never forward the bot token to the media host.
+Inspection and canonical ingestion retain the existing 15-page extraction/OCR
+cap; longer documents are reported with partial coverage instead of implying
+that every page was indexed.
 
 Only the listed Discord users can authorize a request. The Gateway is an
 outbound WebSocket connection and does not expose a public port. Button
@@ -462,6 +475,7 @@ confirm <canonical-proposal-uuid>
 reject <canonical-proposal-uuid>
 <@bot> create an assignment in ECE 202 due Friday, and delete the old lab in ECE 250
 <@bot> I need to study for ECE 250, specifically race conditions and insertion sort.
+<attach syllabus.pdf> Add this material to the right assessment and seed my calendar.
 ```
 
 Free-form requests run through the local Qwen agent loop after
@@ -474,6 +488,32 @@ delete as Notion archive and refuses stale or ambiguous targets. With
 `DISCORD_APPLICATION_ID` is still used to validate the bot identity and strip
 mention syntax, but it does not classify the request. Exact confirmation and
 rejection replies remain model-free.
+
+An attachment-only authorized message is valid. After the immediate wake
+acknowledgement, LifeAgent re-fetches the Discord message, stores verified PDFs
+privately, and lets the harness inspect them and search synchronized assessment
+targets. It may propose attaching files to one existing assessment or creating
+a new assessment and attaching them. The proposal preview shows the target,
+filename, size, and exact confirmation command; it never exposes internal
+artifact or intake identifiers. No Notion upload occurs until that command is
+received.
+
+If the target is ambiguous, the PDFs remain in `awaiting_target` state. The
+owner's next message in the same private channel receives a bounded list of
+recent unresolved intake IDs, so the harness can inspect and bind the retained
+files without accepting another owner's or channel's material.
+
+The editable progress message moves through honest PDF-specific states such as
+capture, inspection, catalog matching, awaiting confirmation, Notion upload,
+and seeded with indexing queued/complete/delayed. A partial or uncertain Notion
+outcome ends with an actionable failure state; it never remains indefinitely
+working or claims indexing completed without a receipt.
+
+Sending a second authorized message for the same intake replaces the pending
+proposal atomically. The old confirmation token then fails safely. Confirmed
+files use Notion's direct upload API, are attached to the assessment page, and
+are followed by canonical sync. Local indexing may finish later; Discord reports
+that as delayed instead of re-uploading the file.
 
 Each accepted model attempt adopts the idempotent wake acknowledgement and edits
 it with host-owned runtime, turn, generic tool-activity, and reply-preparation
@@ -541,6 +581,12 @@ GitHub model-queue webhook. New academic proposals originate only in the native
 Discord harness. Treat proposal IDs and confirmation events as sensitive
 workflow data. Do not enable broad message collection or grant unnecessary
 privileged intents.
+
+Private intake artifacts outlive their proposal TTL by a safety margin and are
+deleted only after the configured retention boundary. Readiness diagnostics
+surface bounded counts for intake awaiting a target, pending proposals, active
+seeding, uncertain writes, orphan uploads, and delayed indexing; they never
+include URLs, PDF bytes, or extracted text.
 
 Confirmed Notion writes remain unavailable until a host integration supplies a
 reviewed `AcademicNotionWriter` containing the exact discovered page targets and

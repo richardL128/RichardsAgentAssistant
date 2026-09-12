@@ -376,6 +376,36 @@ write. Its Discord preview is rendered by host code in Toronto local time and
 shows every course, canonical `Studying Block — <topic>` title, start, end, and
 duration before the exact `confirm <proposal-id>` command can apply it.
 
+Authorized PDF attachments use the same conversation and confirmation boundary.
+The Gateway captures only bounded attachment metadata before the acknowledgement;
+the handoff then re-fetches the authenticated Discord message and downloads at
+most five PDFs from Discord's official media hosts into the private,
+content-addressed artifact store. Relational rows and queued manifests contain
+only opaque identifiers and bounded metadata—never attachment URLs, bytes, or
+extracted text. The harness can inspect a PDF, search the synchronized assessment
+catalog, and propose either a new assessment or attachment to one existing
+assessment. The deterministic preview names the target and files, but no Notion
+upload occurs before the exact confirmation command.
+
+```text
+authorized Discord PDF attachment
+                    ↓
+bounded capture + private artifact
+                    ↓
+Qwen inspection and assessment matching
+                    ↓
+owner-visible proposal + exact confirmation
+                    ↓
+direct Notion file upload + assessment page/block attachment
+                    ↓
+canonical Notion re-sync + local indexing/profile refresh
+```
+
+A second authorized message with the same captured material atomically
+supersedes the earlier pending proposal. Only the newest confirmation token can
+apply. Upload uncertainty or partial failure is terminal for automatic replay;
+the old architecture is not retained as a fallback write path.
+
 No external calendar is involved: not Google Calendar, Apple Calendar, Microsoft
 Calendar, or a separate Notion Calendar API. LifeAgent also does not publish
 planner-generated PostgreSQL `StudyBlock` allocations to Notion automatically.
@@ -394,7 +424,10 @@ assessment facts.
 4. Chunk and embed material locally, with every read hard-scoped to its assessment.
 5. Let the semantic material agent select free-form, useful insights for today's
    scheduled block and require exact evidence chunk IDs plus a separate critic.
-6. Keep persisted dates, bounds, and commitment invariants deterministic after
+6. Build a bounded, versioned material profile from cited evidence; a separate
+   critic must accept it before activation, and the previous accepted profile
+   remains active if refresh fails.
+7. Keep persisted dates, bounds, and commitment invariants deterministic after
    Qwen has semantically interpreted free-form conversation. Ambiguous weights
    or other typed facts never become hard constraints without reconciliation.
 
@@ -421,6 +454,10 @@ deadline pressure
 ```
 
 Time estimates improve from actual time logged against previous assignment types and courses.
+Material-derived effort signals may scale a typed estimate only from `0.5x` to
+`2x`. Scope and dependency-risk adjustments are each capped at 20 priority
+points. They never change a deadline, fixed commitment, grade weight, or course
+priority.
 
 ### Test and quiz prioritization
 

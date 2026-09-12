@@ -63,8 +63,10 @@ _INTERVIEWS_DATABASE_TITLE: Final[str] = "interviews"
 _HTTPS_URL_PATTERN: Final[re.Pattern[str]] = re.compile(r"https://[^\s<>()\"']+")
 MAX_NOTION_RESPONSE_BYTES = 5 * 1024 * 1024
 MAX_ATTACHMENT_BYTES = 25 * 1024 * 1024
+MAX_NOTION_DIRECT_UPLOAD_BYTES = 20 * 1024 * 1024
 MAX_DISCOVERY_CURSOR_PAGES = 100
 MAX_DISCOVERY_RESULTS = 500
+MAX_UPLOADED_PDF_BLOCKS = 5
 MAX_JOB_CHILD_BLOCKS = 200
 MAX_JOB_APPLICATION_TABLES = 10
 MAX_JOB_APPLICATION_ROWS = 500
@@ -462,6 +464,29 @@ class NotionPageTarget(BaseModel):
     database: DatabaseName
 
 
+class NotionUploadedPdf(BaseModel):
+    """A sent Notion file-upload object ready to attach as a PDF block."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    file_upload_id: str = Field(pattern=_ID_PATTERN.pattern)
+    filename: str = Field(min_length=1, max_length=255)
+    content_type: Literal["application/pdf"] = "application/pdf"
+
+
+class NotionFileUploadReceipt(BaseModel):
+    """Bounded receipt for a Notion direct file-upload phase."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    file_upload_id: str = Field(pattern=_ID_PATTERN.pattern)
+    filename: str = Field(min_length=1, max_length=255)
+    content_type: Literal["application/pdf"] = "application/pdf"
+    content_length: int | None = Field(default=None, ge=0, le=MAX_NOTION_DIRECT_UPLOAD_BYTES)
+    status: str | None = Field(default=None, max_length=80)
+    expiry_time: datetime | None = None
+
+
 class NotionWriteReceipt(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True)
 
@@ -469,6 +494,8 @@ class NotionWriteReceipt(BaseModel):
     page_id: str
     url: str | None = None
     property_id: str | None = None
+    file_upload_ids: tuple[str, ...] = Field(default=(), max_length=MAX_UPLOADED_PDF_BLOCKS)
+    block_ids: tuple[str, ...] = Field(default=(), max_length=MAX_UPLOADED_PDF_BLOCKS)
 
 
 class NotionWriteConflict(LifeAgentError):  # noqa: N818
@@ -512,6 +539,30 @@ def _validate_id(value: str, label: str) -> str:
 def _validate_page_id(value: str) -> str:
     _validate_id(value.replace("-", ""), "page ID")
     return value
+
+
+def _validate_pdf_upload_filename(value: str) -> str:
+    filename = value.strip()
+    if (
+        not filename
+        or filename != value
+        or len(filename) > 255
+        or filename in {".", ".."}
+        or "/" in filename
+        or "\\" in filename
+        or any(ord(character) < 32 for character in filename)
+        or not filename.casefold().endswith(".pdf")
+    ):
+        raise permanent_error(ErrorCode.INPUT_INVALID, "Notion PDF filename is invalid")
+    return filename
+
+
+def _validate_pdf_upload_bytes(content: bytes) -> bytes:
+    if not content or len(content) > MAX_NOTION_DIRECT_UPLOAD_BYTES:
+        raise permanent_error(ErrorCode.INPUT_INVALID, "Notion PDF upload size is invalid")
+    if not content.startswith(b"%PDF-"):
+        raise permanent_error(ErrorCode.INPUT_INVALID, "Notion PDF upload content is invalid")
+    return content
 
 
 def _text_chunks(value: str, size: int) -> tuple[str, ...]:
@@ -979,6 +1030,45 @@ def _date_property_value(
             )
         date_value["end"] = end_at.isoformat().replace("+00:00", "Z")
     return {"date": date_value}
+
+
+def _uploaded_pdf_block_payload(uploaded_pdf: NotionUploadedPdf) -> dict[str, Any]:
+    upload_id = _validate_id(uploaded_pdf.file_upload_id, "file upload ID")
+    _validate_pdf_upload_filename(uploaded_pdf.filename)
+    if uploaded_pdf.content_type != "application/pdf":
+        raise permanent_error(ErrorCode.INPUT_INVALID, "Notion PDF upload content type is invalid")
+    return {
+        "object": "block",
+        "type": "pdf",
+        "pdf": {
+            "type": "file_upload",
+            "file_upload": {"id": upload_id},
+        },
+    }
+
+
+def _uploaded_pdf_block_payloads(
+    uploaded_pdfs: Sequence[NotionUploadedPdf],
+) -> list[dict[str, Any]]:
+    if not uploaded_pdfs:
+        return []
+    if len(uploaded_pdfs) > MAX_UPLOADED_PDF_BLOCKS:
+        raise permanent_error(ErrorCode.INPUT_INVALID, "Too many Notion PDF blocks requested")
+    upload_ids: set[str] = set()
+    children: list[dict[str, Any]] = []
+    for uploaded_pdf in uploaded_pdfs:
+        if uploaded_pdf.file_upload_id in upload_ids:
+            raise permanent_error(ErrorCode.INPUT_INVALID, "Duplicate Notion PDF upload requested")
+        upload_ids.add(uploaded_pdf.file_upload_id)
+        children.append(_uploaded_pdf_block_payload(uploaded_pdf))
+    return children
+
+
+def _uploaded_pdf_ids(uploaded_pdfs: Sequence[NotionUploadedPdf]) -> tuple[str, ...]:
+    return tuple(
+        _validate_id(uploaded_pdf.file_upload_id, "file upload ID")
+        for uploaded_pdf in uploaded_pdfs
+    )
 
 
 def _property_id(name: str, value: Mapping[str, Any]) -> str:
@@ -1537,6 +1627,7 @@ class NotionConnector:
         title: str,
         due: datetime | str,
         ends_at: datetime | str | None = None,
+        uploaded_pdfs: Sequence[NotionUploadedPdf] = (),
     ) -> NotionWriteReceipt:
         """Create one assessment page under a discovered Notion data source."""
 
@@ -1544,16 +1635,20 @@ class NotionConnector:
         source_id = _validate_id(data_source_id, "data source ID")
         title_id = _validate_property_reference(title_property_id, "title property")
         date_id = _validate_property_reference(date_property_id, "date property")
+        children = _uploaded_pdf_block_payloads(uploaded_pdfs)
+        json_body: dict[str, Any] = {
+            "parent": {"type": "data_source_id", "data_source_id": source_id},
+            "properties": {
+                title_id: {"title": _title_segments(_validate_title_text(title))},
+                date_id: _date_property_value(due, ends_at=ends_at),
+            },
+        }
+        if children:
+            json_body["children"] = children
         response = await self._request(
             "POST",
             "/pages",
-            json_body={
-                "parent": {"type": "data_source_id", "data_source_id": source_id},
-                "properties": {
-                    title_id: {"title": _title_segments(_validate_title_text(title))},
-                    date_id: _date_property_value(due, ends_at=ends_at),
-                },
-            },
+            json_body=json_body,
         )
         data = self._json_object(response, "Notion page create")
         page_id_value = data.get("id")
@@ -1565,6 +1660,46 @@ class NotionConnector:
             proposal_id=receipt_id,
             page_id=_validate_page_id(page_id_value),
             url=data.get("url") if isinstance(data.get("url"), str) else None,
+            file_upload_ids=_uploaded_pdf_ids(uploaded_pdfs),
+        )
+
+    async def create_pdf_file_upload(self, *, filename: str) -> NotionFileUploadReceipt:
+        """Create one Notion direct File Upload object for a bounded PDF."""
+
+        safe_filename = _validate_pdf_upload_filename(filename)
+        response = await self._request(
+            "POST",
+            "/file_uploads",
+            json_body={
+                "filename": safe_filename,
+                "content_type": "application/pdf",
+            },
+        )
+        data = self._json_object(response, "Notion file upload create")
+        return self._file_upload_receipt(data, fallback_filename=safe_filename)
+
+    async def send_pdf_file_upload(
+        self,
+        *,
+        file_upload_id: str,
+        filename: str,
+        content: bytes,
+    ) -> NotionFileUploadReceipt:
+        """Send PDF bytes to an existing Notion direct File Upload object."""
+
+        upload_id = _validate_id(file_upload_id, "file upload ID")
+        safe_filename = _validate_pdf_upload_filename(filename)
+        pdf = _validate_pdf_upload_bytes(content)
+        response = await self._multipart_request(
+            "POST",
+            f"/file_uploads/{quote(upload_id, safe='')}/send",
+            files={"file": (safe_filename, pdf, "application/pdf")},
+        )
+        data = self._json_object(response, "Notion file upload send")
+        return self._file_upload_receipt(
+            data,
+            fallback_filename=safe_filename,
+            fallback_content_length=len(pdf),
         )
 
     async def retrieve_interview_write_precondition(
@@ -1796,6 +1931,44 @@ class NotionConnector:
             proposal_id=receipt_id,
             page_id=_validate_page_id(patched_id),
             url=data.get("url") if isinstance(data.get("url"), str) else None,
+        )
+
+    async def append_uploaded_pdf_blocks(
+        self,
+        *,
+        proposal_id: str,
+        page_id: str,
+        title_property_id: str,
+        expected_title: str,
+        expected_last_edited_at: datetime,
+        uploaded_pdfs: Sequence[NotionUploadedPdf],
+    ) -> NotionWriteReceipt:
+        """Append sent Notion upload IDs as PDF blocks after the page precondition holds."""
+
+        receipt_id = _validate_proposal_id(proposal_id)
+        title_id = _validate_property_reference(title_property_id, "title property")
+        children = _uploaded_pdf_block_payloads(uploaded_pdfs)
+        if not children:
+            raise permanent_error(ErrorCode.INPUT_INVALID, "Notion PDF blocks are required")
+        current = await self._guarded_assessment_precondition(
+            page_id=page_id,
+            title_property_id=title_id,
+            expected_title=expected_title,
+            expected_last_edited_at=expected_last_edited_at,
+        )
+        response = await self._request(
+            "PATCH",
+            f"/blocks/{quote(current.page_id, safe='')}/children",
+            json_body={"children": children},
+        )
+        data = self._json_object(response, "Notion PDF block append")
+        block_ids = self._block_ids_from_append_response(data)
+        return NotionWriteReceipt(
+            proposal_id=receipt_id,
+            page_id=current.page_id,
+            url=current.source_url,
+            file_upload_ids=_uploaded_pdf_ids(uploaded_pdfs),
+            block_ids=block_ids,
         )
 
     async def guarded_archive_assessment_page(
@@ -3615,6 +3788,42 @@ class NotionConnector:
         finally:
             if owns_client:
                 await client.aclose()
+        self._raise_for_response(response)
+        return response
+
+    async def _multipart_request(
+        self,
+        method: Literal["POST"],
+        path: str,
+        *,
+        files: Mapping[str, tuple[str, bytes, str]],
+    ) -> httpx.Response:
+        owns_client = self._client is None
+        client = self._client or httpx.AsyncClient(timeout=httpx.Timeout(self._timeout_seconds))
+        headers = {
+            "Authorization": f"Bearer {_secret(self._token)}",
+            "Notion-Version": NOTION_API_VERSION,
+        }
+        try:
+            response = await client.request(
+                method,
+                f"{NOTION_API_BASE_URL}{path}",
+                headers=headers,
+                files=files,
+                timeout=self._timeout_seconds,
+            )
+        except httpx.TransportError:
+            raise transient_error(
+                ErrorCode.CONNECTOR_TRANSIENT, "Notion transport is unavailable"
+            ) from None
+        finally:
+            if owns_client:
+                await client.aclose()
+        self._raise_for_response(response)
+        return response
+
+    @staticmethod
+    def _raise_for_response(response: httpx.Response) -> None:
         if len(response.content) > MAX_NOTION_RESPONSE_BYTES:
             raise permanent_error(ErrorCode.INPUT_INVALID, "Notion response exceeds the size limit")
         if response.status_code in {401, 403}:
@@ -3625,7 +3834,84 @@ class NotionConnector:
             )
         if response.status_code >= 400:
             raise permanent_error(ErrorCode.INPUT_INVALID, "Notion rejected the request")
-        return response
+
+    @staticmethod
+    def _file_upload_receipt(
+        data: Mapping[str, Any],
+        *,
+        fallback_filename: str,
+        fallback_content_length: int | None = None,
+    ) -> NotionFileUploadReceipt:
+        raw_id = data.get("id")
+        if not isinstance(raw_id, str):
+            raise transient_error(
+                ErrorCode.CONNECTOR_TRANSIENT, "Notion returned invalid file upload receipt"
+            )
+        raw_filename = data.get("filename")
+        filename = (
+            raw_filename if isinstance(raw_filename, str) and raw_filename else fallback_filename
+        )
+        raw_content_type = data.get("content_type")
+        content_type = (
+            raw_content_type
+            if isinstance(raw_content_type, str) and raw_content_type
+            else "application/pdf"
+        )
+        if content_type != "application/pdf":
+            raise transient_error(
+                ErrorCode.CONNECTOR_TRANSIENT, "Notion returned invalid file upload content type"
+            )
+        raw_content_length = data.get("content_length")
+        content_length = (
+            raw_content_length
+            if isinstance(raw_content_length, int) and not isinstance(raw_content_length, bool)
+            else fallback_content_length
+        )
+        status = data.get("status")
+        expiry = data.get("expiry_time")
+        try:
+            return NotionFileUploadReceipt(
+                file_upload_id=_validate_id(raw_id, "file upload ID"),
+                filename=_validate_pdf_upload_filename(filename),
+                content_type="application/pdf",
+                content_length=content_length,
+                status=status if isinstance(status, str) else None,
+                expiry_time=_parse_edited(expiry) if isinstance(expiry, str) else None,
+            )
+        except (ValueError, ValidationError, LifeAgentError):
+            raise transient_error(
+                ErrorCode.CONNECTOR_TRANSIENT, "Notion returned invalid file upload receipt"
+            ) from None
+
+    @staticmethod
+    def _block_ids_from_append_response(data: Mapping[str, Any]) -> tuple[str, ...]:
+        results = data.get("results")
+        if not isinstance(results, list):
+            raise transient_error(
+                ErrorCode.CONNECTOR_TRANSIENT, "Notion returned invalid PDF block receipt"
+            )
+        block_ids: list[str] = []
+        for item in cast(list[Any], results):
+            if not isinstance(item, Mapping):
+                raise transient_error(
+                    ErrorCode.CONNECTOR_TRANSIENT, "Notion returned invalid PDF block receipt"
+                )
+            block_id = cast(Mapping[str, Any], item).get("id")
+            if not isinstance(block_id, str):
+                raise transient_error(
+                    ErrorCode.CONNECTOR_TRANSIENT, "Notion returned invalid PDF block receipt"
+                )
+            try:
+                block_ids.append(_validate_page_id(block_id))
+            except LifeAgentError:
+                raise transient_error(
+                    ErrorCode.CONNECTOR_TRANSIENT, "Notion returned invalid PDF block receipt"
+                ) from None
+        if len(block_ids) > MAX_UPLOADED_PDF_BLOCKS:
+            raise transient_error(
+                ErrorCode.CONNECTOR_TRANSIENT, "Notion returned too many PDF block receipts"
+            )
+        return tuple(block_ids)
 
     @staticmethod
     def _json_object(response: httpx.Response, diagnostic: str) -> dict[str, Any]:
@@ -3715,6 +4001,7 @@ class AcademicNotionWriter:
 
 __all__ = [
     "MAX_ATTACHMENT_BYTES",
+    "MAX_NOTION_DIRECT_UPLOAD_BYTES",
     "NOTION_API_BASE_URL",
     "NOTION_API_VERSION",
     "AcademicNotionWriter",
@@ -3730,6 +4017,7 @@ __all__ = [
     "NotionDateValue",
     "NotionDiscoveryDiagnostic",
     "NotionDiscoveryResult",
+    "NotionFileUploadReceipt",
     "NotionInterviewEvent",
     "NotionInterviewUrlCandidate",
     "NotionJobApplicationTable",
@@ -3743,6 +4031,7 @@ __all__ = [
     "NotionPageBatch",
     "NotionPageTarget",
     "NotionTitlePrecondition",
+    "NotionUploadedPdf",
     "NotionWriteConflict",
     "NotionWriteReceipt",
     "PlannerProposedChange",

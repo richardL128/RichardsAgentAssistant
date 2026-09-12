@@ -1,12 +1,15 @@
 from __future__ import annotations
 
+from collections.abc import Iterator
 from datetime import UTC, datetime
 from pathlib import Path
 from types import SimpleNamespace
+from typing import Any, cast
 
 import fitz
 import pytest
 from sqlalchemy import create_engine, func, select
+from sqlalchemy.engine import Engine
 from sqlalchemy.orm import Session
 
 from app.agents.academic_planner.material_ingestion import (
@@ -26,10 +29,10 @@ NOW = datetime(2026, 9, 9, 12, tzinfo=UTC)
 
 
 def _pdf(text: str) -> bytes:
-    document = fitz.open()
-    page = document.new_page()
+    document: Any = fitz.open()
+    page: Any = document.new_page()
     page.insert_text((72, 72), text)
-    content = document.tobytes()
+    content = cast(bytes, document.tobytes())
     document.close()
     return content
 
@@ -37,7 +40,7 @@ def _pdf(text: str) -> bytes:
 class _EmbeddingGateway:
     model_identity = "fake-embedding:v1"
 
-    async def embed_academic_text(self, text: str):
+    async def embed_academic_text(self, text: str) -> SimpleNamespace:
         seed = float((sum(text.encode()) % 7) + 1)
         return SimpleNamespace(
             status="valid",
@@ -46,22 +49,35 @@ class _EmbeddingGateway:
         )
 
 
+class _ProfileGenerator:
+    def __init__(self) -> None:
+        self.calls: list[str] = []
+
+    async def refresh_profile(self, assessment_id: str) -> SimpleNamespace:
+        self.calls.append(assessment_id)
+        return SimpleNamespace(status="activated")
+
+
 class _Connector:
     def __init__(self, snapshot: NotionAssessmentMaterials, content: bytes | None = None) -> None:
         self.snapshot = snapshot
         self.content = content
         self.download_error: Exception | None = None
 
-    async def retrieve_assessment_materials(self, page_id: str, **kwargs):
+    async def retrieve_assessment_materials(
+        self, page_id: str, **kwargs: object
+    ) -> NotionAssessmentMaterials:
         assert page_id == self.snapshot.assessment_page_id
         assert kwargs["max_depth"] == 8
         return self.snapshot
 
-    async def refresh_assessment_material_file(self, *, assessment_page_id: str, source_key: str):
+    async def refresh_assessment_material_file(
+        self, *, assessment_page_id: str, source_key: str
+    ) -> NotionMaterialFile:
         assert assessment_page_id == self.snapshot.assessment_page_id
         return next(item for item in self.snapshot.files if item.source_key == source_key)
 
-    async def download_attachment(self, attachment, *, max_bytes: int) -> bytes:
+    async def download_attachment(self, attachment: NotionMaterialFile, *, max_bytes: int) -> bytes:
         assert max_bytes > 0
         if self.download_error is not None:
             raise self.download_error
@@ -70,8 +86,8 @@ class _Connector:
 
 
 @pytest.fixture
-def material_runtime(tmp_path: Path):
-    engine = create_engine(f"sqlite+pysqlite:///{tmp_path / 'materials.db'}")
+def material_runtime(tmp_path: Path) -> Iterator[tuple[Engine, ArtifactStore]]:
+    engine: Engine = create_engine(f"sqlite+pysqlite:///{tmp_path / 'materials.db'}")
     Base.metadata.create_all(engine)
     with Session(engine) as session, session.begin():
         course = AcademicRepository.upsert_course(
@@ -101,7 +117,9 @@ def material_runtime(tmp_path: Path):
 
 
 @pytest.mark.asyncio
-async def test_body_ingestion_is_private_cited_embedded_and_replay_safe(material_runtime) -> None:
+async def test_body_ingestion_is_private_cited_embedded_and_replay_safe(
+    material_runtime: tuple[Engine, ArtifactStore],
+) -> None:
     engine, artifacts = material_runtime
     snapshot = NotionAssessmentMaterials(
         assessment_page_id="assessment-page",
@@ -150,7 +168,7 @@ async def test_body_ingestion_is_private_cited_embedded_and_replay_safe(material
 
 @pytest.mark.asyncio
 async def test_changed_pdf_failure_preserves_last_good_and_removed_source_deactivates(
-    material_runtime,
+    material_runtime: tuple[Engine, ArtifactStore],
 ) -> None:
     engine, artifacts = material_runtime
     file = NotionMaterialFile(
@@ -226,3 +244,70 @@ def test_queue_fingerprint_uses_only_stable_metadata() -> None:
     assert first == assessment_material_fingerprint("assessment-page", NOW)
     assert first != assessment_material_fingerprint("assessment-page", NOW.replace(hour=13))
     assert len(first) == 64
+
+
+@pytest.mark.asyncio
+async def test_profile_generator_runs_only_after_successful_canonical_ingestion(
+    material_runtime: tuple[Engine, ArtifactStore],
+) -> None:
+    engine, artifacts = material_runtime
+    generator = _ProfileGenerator()
+    snapshot = NotionAssessmentMaterials(
+        assessment_page_id="assessment-page",
+        last_edited_at=NOW,
+        text_blocks=(
+            NotionMaterialTextBlock(
+                source_page_id="assessment-page",
+                source_block_id="paragraph-1",
+                source_key="assessment-page:body:paragraph-1",
+                order=0,
+                block_type="paragraph",
+                text="Rubric requires clear derivations and a simulation appendix.",
+            ),
+        ),
+    )
+    service = AssessmentMaterialIngestionService(
+        engine=engine,
+        connector=_Connector(snapshot),  # type: ignore[arg-type]
+        artifact_store=artifacts,
+        embedding_gateway=_EmbeddingGateway(),
+        max_bytes=1024 * 1024,
+        profile_generator=generator,
+    )
+
+    succeeded = await service.ingest_assessment("assessment-page")
+    assert succeeded.status == "succeeded"
+    assert succeeded.profile_status == "activated"
+    assert generator.calls == ["assessment-page"]
+
+    file = NotionMaterialFile(
+        source_kind="notion_block_file",
+        source_page_id="assessment-page",
+        source_block_id="expired-file",
+        source_key="assessment-page:block:expired-file",
+        order=0,
+        name="expired.pdf",
+        url="https://prod-files-secure.s3.us-west-2.amazonaws.com/file.pdf?X-Amz-Signature=x",
+        mime_type="application/pdf",
+    )
+    connector = _Connector(
+        NotionAssessmentMaterials(
+            assessment_page_id="assessment-page",
+            last_edited_at=NOW.replace(hour=13),
+            files=(file,),
+        )
+    )
+    connector.download_error = RuntimeError("expired attachment")
+    failing_service = AssessmentMaterialIngestionService(
+        engine=engine,
+        connector=connector,  # type: ignore[arg-type]
+        artifact_store=artifacts,
+        embedding_gateway=_EmbeddingGateway(),
+        max_bytes=1024 * 1024,
+        profile_generator=generator,
+    )
+    partial = await failing_service.ingest_assessment("assessment-page")
+
+    assert partial.status == "failed"
+    assert partial.profile_status is None
+    assert generator.calls == ["assessment-page"]

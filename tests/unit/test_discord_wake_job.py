@@ -1,12 +1,15 @@
+import json
 from datetime import UTC, datetime
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
+from uuid import UUID
 
 import pytest
 from sqlalchemy import create_engine
 from sqlalchemy.orm import Session
 
 from app.agents.academic_planner import discord_wake_job
+from app.artifacts.store import ArtifactStore
 from app.core.config import Settings
 from app.db.discord_wake import DiscordWakeInboundInput, DiscordWakeRepository
 from app.db.models import Base, DiscordWakeInbound
@@ -95,3 +98,51 @@ async def test_message_worker_preserves_content_without_synthetic_mention(monkey
     assert len(captured) == 1
     assert captured[0].content.get_secret_value() == raw_content
     assert captured[0].mentioned_user_ids == ()
+
+
+@pytest.mark.asyncio
+async def test_message_worker_reconstructs_attachment_only_manifest(monkeypatch, tmp_path) -> None:
+    engine = create_engine("sqlite+pysqlite:///:memory:")
+    settings = Settings(_env_file=None, artifact_root=tmp_path / "artifacts")
+    material_id = UUID("e50b8b53-8d14-49f8-b7aa-c2f2235b50b7")
+    artifact = ArtifactStore(settings.artifact_root).put(
+        json.dumps(
+            {
+                "version": "discord-academic-inbound-v2",
+                "message_text": "",
+                "inbound_material_ids": [str(material_id)],
+            }
+        ),
+        media_type="application/json",
+        data_class="discord_inbound_manifest",
+        already_redacted=True,
+    )
+    monkeypatch.setattr(discord_wake_job, "Database", lambda _: SimpleNamespace(engine=engine))
+    job = discord_wake_job.DiscordWakeJob(settings)
+    captured = []
+
+    async def handler(message):
+        captured.append(message)
+        return SimpleNamespace(status="handled")
+
+    service = SimpleNamespace(handler=handler, close=lambda: None)
+    monkeypatch.setattr(discord_wake_job, "create_academic_discord_service", lambda _: service)
+    row = SimpleNamespace(
+        event_kind="message",
+        action="academic_checkin",
+        interaction_action=None,
+        clarification_id=None,
+        discord_channel_id="222222222222222222",
+        discord_user_id="333333333333333333",
+        discord_message_id="111111111111111111",
+        ack_message_id="444444444444444444",
+        content_artifact_key=artifact.key,
+        received_at=datetime(2026, 9, 9, tzinfo=UTC),
+    )
+
+    status = await job._run_message(discord_wake_job._WakeSnapshot(row))
+
+    assert status == "handled"
+    assert captured[0].content.get_secret_value() == ""
+    assert captured[0].attachments == ()
+    assert captured[0].inbound_material_ids == (material_id,)

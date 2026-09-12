@@ -15,7 +15,13 @@ from websockets.exceptions import WebSocketException
 from app.agents.academic_planner import discord_checkin
 from app.agents.academic_planner.contracts import AcademicRequestRouteDecision
 from app.agents.academic_planner.discord_checkin import AcademicDiscordCheckinHandler
+from app.connectors.discord import (
+    DiscordAcademicPlannerAdapter,
+    DiscordFetchedAttachment,
+    DiscordFetchedMessage,
+)
 from app.connectors.discord_gateway import (
+    DiscordAcademicMessageAttachment,
     DiscordAcademicMessageCreate,
     DiscordClarificationCallbackResult,
     DiscordClarificationInteraction,
@@ -25,6 +31,7 @@ from app.connectors.discord_gateway import (
     DiscordMessageCallbackResult,
     normalize_academic_message,
 )
+from app.core.errors import ErrorCode, LifeAgentError
 from app.llm.ollama_runtime import OllamaRuntimeReady
 
 CHANNEL = "987654321012345678"
@@ -36,6 +43,8 @@ ASSISTANT = "444445555566666"
 TOKEN = "never-print-this-discord-token"
 PRIVATE_CONTENT = "completed assessment-secret"
 MESSAGE_CONTENT_INTENTS = 33_280
+PDF_URL = "https://cdn.discordapp.com/attachments/1/2/rubric.pdf?ex=abc&is=def&hm=123"
+PDF_BYTES = b"%PDF-1.7\nbounded test bytes\n"
 
 
 class _GatewayHttp:
@@ -137,8 +146,8 @@ class _FailOnceMessageHandler(_MessageHandler):
 
 class _ContentGuard(dict[str, object]):
     def get(self, key: str, default: object = None) -> object:
-        if key == "content":
-            raise AssertionError("unauthorized Discord content was accessed")
+        if key in {"content", "attachments"}:
+            raise AssertionError("unauthorized Discord content or attachments were accessed")
         return super().get(key, default)
 
 
@@ -168,6 +177,7 @@ def _message_payload(
     content: str = PRIVATE_CONTENT,
     bot: bool = False,
     mentioned_user_ids: tuple[str, ...] = (),
+    attachments: list[Mapping[str, object]] | None = None,
 ) -> dict[str, object]:
     return {
         "op": 0,
@@ -180,7 +190,25 @@ def _message_payload(
             "timestamp": "2026-09-03T21:00:00.000000+00:00",
             "content": content,
             "mentions": [{"id": item} for item in mentioned_user_ids],
+            "attachments": attachments or [],
         },
+    }
+
+
+def _attachment_payload(
+    *,
+    attachment_id: str = "777778888899999",
+    filename: str = "rubric.pdf",
+    content_type: object = "application/pdf",
+    size: object = len(PDF_BYTES),
+    url: object = PDF_URL,
+) -> dict[str, object]:
+    return {
+        "id": attachment_id,
+        "filename": filename,
+        "content_type": content_type,
+        "size": size,
+        "url": url,
     }
 
 
@@ -341,6 +369,109 @@ async def test_authorized_message_create_is_scheduled_once_and_redacted() -> Non
 
 
 @pytest.mark.asyncio
+async def test_attachment_only_pdf_message_is_scheduled_with_redacted_metadata() -> None:
+    handler = _MessageHandler()
+    listener = _listener(message_handler=handler)
+    payload = _message_payload(content="", attachments=[_attachment_payload()])
+
+    assert await listener.handle_gateway_payload(payload) == "handled"
+    await asyncio.wait_for(handler.started.wait(), timeout=1)
+
+    message = handler.messages[0]
+    assert message.content.get_secret_value() == ""
+    assert message.attachments == (
+        DiscordAcademicMessageAttachment(
+            id="777778888899999",
+            filename="rubric.pdf",
+            content_type="application/pdf",
+            size=len(PDF_BYTES),
+            url=SecretStr(PDF_URL),
+        ),
+    )
+    assert message.inbound_material_ids == ()
+    assert PDF_URL not in repr(message)
+    assert PDF_URL not in str(message)
+
+    handler.release.set()
+    await listener.drain_message_tasks()
+
+
+def test_normalized_message_keeps_only_first_five_candidate_pdf_attachments() -> None:
+    raw = _message_payload(
+        content="",
+        attachments=[
+            _attachment_payload(
+                attachment_id=str(777778888899990 + index),
+                filename=f"rubric-{index}.pdf",
+            )
+            for index in range(6)
+        ],
+    )["d"]
+    assert isinstance(raw, dict)
+
+    message = normalize_academic_message(
+        raw,
+        allowed_channel_ids={CHANNEL},
+        authorized_user_ids={USER},
+    )
+
+    assert message is not None
+    assert [attachment.filename for attachment in message.attachments] == [
+        "rubric-0.pdf",
+        "rubric-1.pdf",
+        "rubric-2.pdf",
+        "rubric-3.pdf",
+        "rubric-4.pdf",
+    ]
+
+
+@pytest.mark.parametrize(
+    "attachment",
+    [
+        _attachment_payload(filename="rubric.txt"),
+        _attachment_payload(filename="../rubric.pdf"),
+        _attachment_payload(content_type="image/png"),
+        _attachment_payload(size=0),
+        _attachment_payload(size=20 * 1024 * 1024 + 1),
+        _attachment_payload(url="https://example.com/attachments/1/2/rubric.pdf"),
+        _attachment_payload(url="https://cdn.discordapp.com/not-attachments/rubric.pdf"),
+        _attachment_payload(url=None),
+    ],
+)
+def test_empty_message_requires_at_least_one_valid_pdf_attachment(
+    attachment: Mapping[str, object],
+) -> None:
+    raw = _message_payload(content="", attachments=[attachment])["d"]
+    assert isinstance(raw, dict)
+
+    assert (
+        normalize_academic_message(
+            raw,
+            allowed_channel_ids={CHANNEL},
+            authorized_user_ids={USER},
+        )
+        is None
+    )
+
+
+def test_text_message_ignores_malformed_attachment_metadata() -> None:
+    raw = _message_payload(
+        content="please help with this",
+        attachments=[_attachment_payload(filename="../rubric.pdf")],
+    )["d"]
+    assert isinstance(raw, dict)
+
+    message = normalize_academic_message(
+        raw,
+        allowed_channel_ids={CHANNEL},
+        authorized_user_ids={USER},
+    )
+
+    assert message is not None
+    assert message.attachments == ()
+
+
+@pytest.mark.asyncio
 async def test_duplicate_mentioned_event_runs_readiness_and_qwen_once(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -490,6 +621,149 @@ def test_normalized_message_requires_bounded_content_and_timestamp() -> None:
         )
         is None
     )
+
+
+def test_refetched_message_contract_accepts_attachment_only_and_redacts_signed_url() -> None:
+    message = DiscordFetchedMessage.model_validate(
+        {
+            "id": MESSAGE,
+            "channel_id": CHANNEL,
+            "author": {"id": USER},
+            "timestamp": "2026-09-03T21:00:00.000000+00:00",
+            "content": "",
+            "attachments": [_attachment_payload()],
+        }
+    )
+
+    assert message.attachments == (
+        DiscordFetchedAttachment(
+            id="777778888899999",
+            filename="rubric.pdf",
+            content_type="application/pdf",
+            size=len(PDF_BYTES),
+            url=SecretStr(PDF_URL),
+        ),
+    )
+    assert PDF_URL not in repr(message)
+    assert PDF_URL not in str(message)
+
+
+def test_refetched_message_rejects_empty_body_without_candidate_pdf() -> None:
+    with pytest.raises(ValueError, match="content or a candidate PDF"):
+        DiscordFetchedMessage.model_validate(
+            {
+                "id": MESSAGE,
+                "channel_id": CHANNEL,
+                "author": {"id": USER},
+                "timestamp": "2026-09-03T21:00:00.000000+00:00",
+                "content": "",
+                "attachments": [_attachment_payload(filename="rubric.txt")],
+            }
+        )
+
+
+@pytest.mark.asyncio
+async def test_fetch_message_exposes_bounded_refetched_attachment_metadata() -> None:
+    async def handler(request: httpx.Request) -> httpx.Response:
+        assert request.url.path.endswith(f"/channels/{CHANNEL}/messages/{MESSAGE}")
+        assert request.headers["authorization"] == f"Bot {TOKEN}"
+        return httpx.Response(
+            200,
+            json={
+                "id": MESSAGE,
+                "channel_id": CHANNEL,
+                "author": {"id": USER},
+                "timestamp": "2026-09-03T21:00:00.000000+00:00",
+                "content": "",
+                "attachments": [_attachment_payload()],
+            },
+        )
+
+    async with httpx.AsyncClient(
+        base_url="https://discord.com/api/v10",
+        transport=httpx.MockTransport(handler),
+    ) as client:
+        adapter = DiscordAcademicPlannerAdapter(
+            token=SecretStr(TOKEN),
+            allowed_channel_ids={CHANNEL},
+            client=client,
+        )
+
+        message = await adapter.fetch_message(channel_id=CHANNEL, message_id=MESSAGE)
+
+    assert message.attachments[0].filename == "rubric.pdf"
+    assert message.attachments[0].url.get_secret_value() == PDF_URL
+
+
+@pytest.mark.asyncio
+async def test_download_pdf_attachment_uses_cdn_without_bot_auth_and_verifies_bytes() -> None:
+    async def handler(request: httpx.Request) -> httpx.Response:
+        assert str(request.url) == PDF_URL
+        assert "authorization" not in request.headers
+        return httpx.Response(200, content=PDF_BYTES)
+
+    attachment = DiscordFetchedAttachment(
+        id="777778888899999",
+        filename="rubric.pdf",
+        content_type="application/pdf",
+        size=len(PDF_BYTES),
+        url=SecretStr(PDF_URL),
+    )
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+        adapter = DiscordAcademicPlannerAdapter(
+            token=SecretStr(TOKEN),
+            allowed_channel_ids={CHANNEL},
+            client=client,
+        )
+
+        download = await adapter.download_pdf_attachment(attachment)
+
+    assert download.attachment_id == attachment.id
+    assert download.filename == "rubric.pdf"
+    assert download.declared_size == len(PDF_BYTES)
+    assert download.observed_size == len(PDF_BYTES)
+    assert download.content == PDF_BYTES
+    assert download.sha256_hex
+    assert PDF_BYTES.decode() not in repr(download)
+
+
+@pytest.mark.asyncio
+async def test_download_pdf_attachment_rejects_redirects_size_mismatch_and_spoofed_bytes() -> None:
+    cases: list[tuple[httpx.Response, str]] = [
+        (
+            httpx.Response(
+                302,
+                headers={"Location": "https://cdn.discordapp.com/attachments/1/2/other.pdf"},
+            ),
+            "redirect",
+        ),
+        (httpx.Response(200, content=PDF_BYTES + b"extra"), "size"),
+        (httpx.Response(200, content=b"not a pdf".ljust(len(PDF_BYTES), b"x")), "PDF"),
+    ]
+    for response, expected in cases:
+
+        async def handler(_request: httpx.Request, response: httpx.Response = response):
+            return response
+
+        attachment = DiscordFetchedAttachment(
+            id="777778888899999",
+            filename="rubric.pdf",
+            content_type="application/pdf",
+            size=len(PDF_BYTES),
+            url=SecretStr(PDF_URL),
+        )
+        async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+            adapter = DiscordAcademicPlannerAdapter(
+                token=SecretStr(TOKEN),
+                allowed_channel_ids={CHANNEL},
+                client=client,
+            )
+
+            with pytest.raises(LifeAgentError) as raised:
+                await adapter.download_pdf_attachment(attachment)
+
+        assert raised.value.record.code is ErrorCode.INPUT_INVALID
+        assert expected in raised.value.record.diagnostic
 
 
 @pytest.mark.asyncio

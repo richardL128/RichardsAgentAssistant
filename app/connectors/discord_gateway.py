@@ -10,10 +10,11 @@ from collections.abc import Awaitable, Callable, Mapping
 from contextlib import suppress
 from datetime import UTC, datetime
 from typing import Any, Literal, Protocol, cast
+from urllib.parse import urlsplit
 from uuid import UUID
 
 import httpx
-from pydantic import BaseModel, ConfigDict, Field, SecretStr, field_validator
+from pydantic import BaseModel, ConfigDict, Field, SecretStr, field_validator, model_validator
 from websockets.exceptions import WebSocketException
 
 DiscordClarificationAction = Literal[
@@ -48,6 +49,12 @@ _DISCORD_INTENT_GUILD_MESSAGES = 1 << 9
 _DISCORD_INTENT_MESSAGE_CONTENT = 1 << 15
 _DISCORD_MESSAGE_CONTENT_INTENTS = _DISCORD_INTENT_GUILD_MESSAGES | _DISCORD_INTENT_MESSAGE_CONTENT
 _DISCORD_MESSAGE_CONTENT_LIMIT = 2_000
+_DISCORD_ATTACHMENT_LIMIT = 5
+_DISCORD_ATTACHMENT_FILENAME_LIMIT = 255
+_DISCORD_ATTACHMENT_CONTENT_TYPE_LIMIT = 127
+_DISCORD_ATTACHMENT_URL_LIMIT = 2_048
+_DISCORD_PDF_ATTACHMENT_MAX_BYTES = 20 * 1024 * 1024
+_DISCORD_ATTACHMENT_CDN_HOSTS = frozenset({"cdn.discordapp.com", "media.discordapp.net"})
 _DISCORD_INTENT_CLOSE_CODES = {4013, 4014}
 
 
@@ -71,6 +78,47 @@ class DiscordClarificationCallbackResult(BaseModel):
     status: DiscordInteractionStatus
 
 
+class DiscordAcademicMessageAttachment(BaseModel):
+    """Safe Discord PDF attachment metadata captured at the Gateway boundary."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    id: str = Field(pattern=r"^[0-9]{5,24}$")
+    filename: str = Field(min_length=1, max_length=_DISCORD_ATTACHMENT_FILENAME_LIMIT)
+    content_type: str | None = Field(
+        default=None,
+        max_length=_DISCORD_ATTACHMENT_CONTENT_TYPE_LIMIT,
+    )
+    size: int = Field(gt=0, le=_DISCORD_PDF_ATTACHMENT_MAX_BYTES)
+    url: SecretStr = Field(repr=False)
+
+    @field_validator("filename")
+    @classmethod
+    def filename_is_safe_pdf(cls, value: str) -> str:
+        if value != value.strip():
+            raise ValueError("Discord attachment filename must be bounded and safe")
+        if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._ ()\[\]-]{0,254}", value):
+            raise ValueError("Discord attachment filename must be bounded and safe")
+        if not value.lower().endswith(".pdf"):
+            raise ValueError("Discord attachment must be a PDF")
+        return value
+
+    @field_validator("content_type")
+    @classmethod
+    def content_type_is_pdf_when_present(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        if value.lower() != "application/pdf":
+            raise ValueError("Discord attachment content type must be application/pdf")
+        return value
+
+    @field_validator("url")
+    @classmethod
+    def url_is_safe_discord_cdn(cls, value: SecretStr) -> SecretStr:
+        _validate_discord_attachment_url(value.get_secret_value())
+        return value
+
+
 class DiscordAcademicMessageCreate(BaseModel):
     """Sanitized authorized Discord message facts for academic check-in handling."""
 
@@ -81,7 +129,12 @@ class DiscordAcademicMessageCreate(BaseModel):
     author_id: str = Field(pattern=r"^[0-9]{5,24}$")
     timestamp: datetime
     content: SecretStr = Field(repr=False)
+    attachments: tuple[DiscordAcademicMessageAttachment, ...] = Field(
+        default=(),
+        max_length=_DISCORD_ATTACHMENT_LIMIT,
+    )
     mentioned_user_ids: tuple[str, ...] = Field(default=(), max_length=20)
+    inbound_material_ids: tuple[UUID, ...] = Field(default=(), max_length=_DISCORD_ATTACHMENT_LIMIT)
     progress_message_id: str | None = Field(default=None, pattern=r"^[0-9]{5,24}$")
 
     @field_validator("timestamp")
@@ -95,9 +148,19 @@ class DiscordAcademicMessageCreate(BaseModel):
     @classmethod
     def content_is_bounded(cls, value: SecretStr) -> SecretStr:
         content = value.get_secret_value()
-        if not content or len(content) > _DISCORD_MESSAGE_CONTENT_LIMIT:
-            raise ValueError("Discord message content must be present and bounded")
+        if len(content) > _DISCORD_MESSAGE_CONTENT_LIMIT:
+            raise ValueError("Discord message content must be bounded")
         return value
+
+    @model_validator(mode="after")
+    def content_or_pdf_attachment_is_present(self) -> DiscordAcademicMessageCreate:
+        if (
+            not self.content.get_secret_value().strip()
+            and not self.attachments
+            and not self.inbound_material_ids
+        ):
+            raise ValueError("Discord message content or a candidate PDF attachment is required")
+        return self
 
     def has_verified_mention(self, application_id: str) -> bool:
         """Require both Discord mention metadata and canonical mention text."""
@@ -698,8 +761,9 @@ def normalize_academic_message(
     content = _str_value(data.get("content"))
     if timestamp is None or content is None:
         return None
-    if not content or len(content) > _DISCORD_MESSAGE_CONTENT_LIMIT:
+    if len(content) > _DISCORD_MESSAGE_CONTENT_LIMIT:
         return None
+    attachments = _candidate_pdf_attachments(data.get("attachments"))
     raw_mentions = data.get("mentions")
     mentioned_user_ids: list[str] = []
     if isinstance(raw_mentions, list):
@@ -708,14 +772,43 @@ def normalize_academic_message(
             mention_id = _str_value(mention.get("id")) if mention is not None else None
             if mention_id is not None and _DISCORD_ID_PATTERN.fullmatch(mention_id) is not None:
                 mentioned_user_ids.append(mention_id)
-    return DiscordAcademicMessageCreate(
-        message_id=message_id,
-        channel_id=channel_id,
-        author_id=author_id,
-        timestamp=timestamp,
-        content=SecretStr(content),
-        mentioned_user_ids=tuple(mentioned_user_ids),
-    )
+    try:
+        return DiscordAcademicMessageCreate(
+            message_id=message_id,
+            channel_id=channel_id,
+            author_id=author_id,
+            timestamp=timestamp,
+            content=SecretStr(content),
+            attachments=attachments,
+            mentioned_user_ids=tuple(mentioned_user_ids),
+        )
+    except ValueError:
+        return None
+
+
+def _candidate_pdf_attachments(value: object) -> tuple[DiscordAcademicMessageAttachment, ...]:
+    if not isinstance(value, list):
+        return ()
+    candidates: list[DiscordAcademicMessageAttachment] = []
+    for item in cast(list[Any], value)[:_DISCORD_ATTACHMENT_LIMIT]:
+        attachment = _mapping_value(item)
+        if attachment is None:
+            continue
+        filename = _str_value(attachment.get("filename"))
+        if filename is None or not filename.lower().endswith(".pdf"):
+            continue
+        payload = {
+            "id": attachment.get("id"),
+            "filename": filename,
+            "content_type": attachment.get("content_type"),
+            "size": attachment.get("size"),
+            "url": attachment.get("url"),
+        }
+        try:
+            candidates.append(DiscordAcademicMessageAttachment.model_validate(payload))
+        except ValueError:
+            continue
+    return tuple(candidates)
 
 
 async def _default_websocket_connect(url: str) -> DiscordGatewayWebSocket:
@@ -820,7 +913,22 @@ def _parse_discord_timestamp(value: str | None) -> datetime | None:
     return parsed.astimezone(UTC)
 
 
+def _validate_discord_attachment_url(value: str) -> None:
+    if not value or len(value) > _DISCORD_ATTACHMENT_URL_LIMIT:
+        raise ValueError("Discord attachment URL must be bounded")
+    parsed = urlsplit(value)
+    host = parsed.hostname.lower() if parsed.hostname is not None else None
+    if (
+        parsed.scheme != "https"
+        or host not in _DISCORD_ATTACHMENT_CDN_HOSTS
+        or not parsed.path.startswith("/attachments/")
+        or parsed.fragment
+    ):
+        raise ValueError("Discord attachment URL must use an official CDN host")
+
+
 __all__ = [
+    "DiscordAcademicMessageAttachment",
     "DiscordAcademicMessageCreate",
     "DiscordClarificationAction",
     "DiscordClarificationCallbackResult",

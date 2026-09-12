@@ -10,11 +10,13 @@ import pytest
 
 from app.agents.academic_planner.contracts import ProposedChange
 from app.connectors.notion import (
+    MAX_NOTION_DIRECT_UPLOAD_BYTES,
     AcademicNotionWriter,
     ConfirmedPropertyChange,
     NotionAttachment,
     NotionConnector,
     NotionPageTarget,
+    NotionUploadedPdf,
     NotionWriteConflict,
 )
 from app.core.errors import LifeAgentError
@@ -903,3 +905,239 @@ async def test_academic_writer_maps_exact_confirmation_to_allowlisted_patch() ->
     body = requests[0].content.decode()
     assert "assessments-status" in body
     assert "Completed" in body
+
+
+@pytest.mark.asyncio
+async def test_direct_pdf_file_upload_create_and_send_use_notion_contract() -> None:
+    requests: list[httpx.Request] = []
+    pdf = b"%PDF-1.7\nrubric bytes"
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        if request.url.path == "/v1/file_uploads":
+            assert json.loads(request.content) == {
+                "filename": "rubric.pdf",
+                "content_type": "application/pdf",
+            }
+            return httpx.Response(
+                200,
+                json={
+                    "id": "upload-1",
+                    "filename": "rubric.pdf",
+                    "content_type": "application/pdf",
+                    "status": "pending",
+                    "expiry_time": "2026-09-03T13:00:00.000Z",
+                },
+            )
+        if request.url.path == "/v1/file_uploads/upload-1/send":
+            content_type = request.headers["content-type"]
+            assert content_type.startswith("multipart/form-data; boundary=")
+            assert b'filename="rubric.pdf"' in request.content
+            assert b"application/pdf" in request.content
+            assert pdf in request.content
+            return httpx.Response(
+                200,
+                json={
+                    "id": "upload-1",
+                    "filename": "rubric.pdf",
+                    "content_type": "application/pdf",
+                    "content_length": len(pdf),
+                    "status": "uploaded",
+                },
+            )
+        return httpx.Response(404, json={"message": "unexpected"})
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+        connector = NotionConnector(token="secret", courses_database_id="courses-db", client=client)
+        created = await connector.create_pdf_file_upload(filename="rubric.pdf")
+        sent = await connector.send_pdf_file_upload(
+            file_upload_id=created.file_upload_id,
+            filename=created.filename,
+            content=pdf,
+        )
+
+    assert created.file_upload_id == "upload-1"
+    assert created.status == "pending"
+    assert created.expiry_time == datetime(2026, 9, 3, 13, 0, tzinfo=UTC)
+    assert sent.content_length == len(pdf)
+    assert sent.status == "uploaded"
+    assert [request.method for request in requests] == ["POST", "POST"]
+    assert requests[0].headers["Authorization"] == "Bearer secret"
+    assert requests[0].headers["Notion-Version"] == "2025-09-03"
+    assert requests[0].headers["Content-Type"] == "application/json"
+    assert requests[1].headers["Authorization"] == "Bearer secret"
+    assert requests[1].headers["Notion-Version"] == "2025-09-03"
+
+
+@pytest.mark.asyncio
+async def test_create_assessment_page_can_include_uploaded_pdf_children() -> None:
+    requests: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        return httpx.Response(
+            200,
+            json={"id": "assessment-page-1", "url": "https://www.notion.so/assessment-page-1"},
+        )
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+        connector = NotionConnector(token="secret", courses_database_id="courses-db", client=client)
+        receipt = await connector.create_assessment_page(
+            proposal_id="proposal-1",
+            data_source_id="assessments-source-1",
+            title_property_id="title-prop",
+            date_property_id="date-prop",
+            title="Assignment 2",
+            due="2026-10-08",
+            uploaded_pdfs=(NotionUploadedPdf(file_upload_id="upload-1", filename="a2-rubric.pdf"),),
+        )
+
+    assert receipt.file_upload_ids == ("upload-1",)
+    body = json.loads(requests[0].content)
+    assert body["children"] == [
+        {
+            "object": "block",
+            "type": "pdf",
+            "pdf": {
+                "type": "file_upload",
+                "file_upload": {"id": "upload-1"},
+            },
+        }
+    ]
+
+
+@pytest.mark.asyncio
+async def test_append_uploaded_pdf_blocks_is_guarded_and_returns_block_receipts() -> None:
+    requests: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        if request.method == "GET":
+            return httpx.Response(
+                200,
+                json={
+                    "id": "assessment-1",
+                    "last_edited_time": EDITED,
+                    "url": "https://www.notion.so/assessment-1",
+                    "archived": False,
+                    "in_trash": False,
+                    "properties": {"Name": _title_property("Assignment 2")},
+                },
+            )
+        return httpx.Response(200, json={"results": [{"id": "pdf-block-1"}]})
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+        connector = NotionConnector(token="secret", courses_database_id="courses-db", client=client)
+        receipt = await connector.append_uploaded_pdf_blocks(
+            proposal_id="proposal-2",
+            page_id="assessment-1",
+            title_property_id="title-prop",
+            expected_title="Assignment 2",
+            expected_last_edited_at=EDITED_AT,
+            uploaded_pdfs=(NotionUploadedPdf(file_upload_id="upload-1", filename="a2-rubric.pdf"),),
+        )
+
+    assert receipt.page_id == "assessment-1"
+    assert receipt.url == "https://www.notion.so/assessment-1"
+    assert receipt.file_upload_ids == ("upload-1",)
+    assert receipt.block_ids == ("pdf-block-1",)
+    assert [request.method for request in requests] == ["GET", "PATCH"]
+    assert requests[1].url.path == "/v1/blocks/assessment-1/children"
+    assert json.loads(requests[1].content) == {
+        "children": [
+            {
+                "object": "block",
+                "type": "pdf",
+                "pdf": {
+                    "type": "file_upload",
+                    "file_upload": {"id": "upload-1"},
+                },
+            }
+        ]
+    }
+
+
+@pytest.mark.asyncio
+async def test_pdf_upload_validation_rejects_malformed_inputs_without_request() -> None:
+    requests: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        return httpx.Response(200, json={"id": "upload-1"})
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+        connector = NotionConnector(token="secret", courses_database_id="courses-db", client=client)
+        with pytest.raises(LifeAgentError, match="input_invalid"):
+            await connector.create_pdf_file_upload(filename="../rubric.pdf")
+        with pytest.raises(LifeAgentError, match="input_invalid"):
+            await connector.create_pdf_file_upload(filename="rubric.txt")
+        with pytest.raises(LifeAgentError, match="input_invalid"):
+            await connector.send_pdf_file_upload(
+                file_upload_id="upload-1",
+                filename="rubric.pdf",
+                content=b"not a pdf",
+            )
+        with pytest.raises(LifeAgentError, match="input_invalid"):
+            await connector.send_pdf_file_upload(
+                file_upload_id="upload-1",
+                filename="rubric.pdf",
+                content=b"%PDF-" + b"x" * (MAX_NOTION_DIRECT_UPLOAD_BYTES - 4),
+            )
+        with pytest.raises(LifeAgentError, match="input_invalid"):
+            await connector.append_uploaded_pdf_blocks(
+                proposal_id="proposal-1",
+                page_id="assessment-1",
+                title_property_id="title-prop",
+                expected_title="Assignment",
+                expected_last_edited_at=EDITED_AT,
+                uploaded_pdfs=(
+                    NotionUploadedPdf(file_upload_id="upload-1", filename="rubric.pdf"),
+                    NotionUploadedPdf(file_upload_id="upload-1", filename="rubric-copy.pdf"),
+                ),
+            )
+
+    assert requests == []
+
+
+@pytest.mark.asyncio
+async def test_send_pdf_file_upload_uses_safe_error_policy_for_rate_limits() -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        assert request.url.path == "/v1/file_uploads/upload-1/send"
+        return httpx.Response(429, json={"message": "RAW_VENDOR_BODY_SHOULD_NOT_LEAK"})
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+        connector = NotionConnector(token="secret", courses_database_id="courses-db", client=client)
+        with pytest.raises(LifeAgentError) as raised:
+            await connector.send_pdf_file_upload(
+                file_upload_id="upload-1",
+                filename="rubric.pdf",
+                content=b"%PDF-1.7\nrubric",
+            )
+
+    assert raised.value.record.code.value == "connector_transient"
+    assert raised.value.record.diagnostic == "Notion is temporarily unavailable"
+    assert "RAW_VENDOR_BODY_SHOULD_NOT_LEAK" not in raised.value.record.diagnostic
+
+
+@pytest.mark.asyncio
+async def test_direct_pdf_upload_rejects_malformed_vendor_receipt_without_url_leak() -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        assert request.url.path == "/v1/file_uploads"
+        return httpx.Response(
+            200,
+            json={
+                "id": "upload-1",
+                "filename": "rubric.pdf",
+                "content_type": "text/plain",
+                "url": "https://signed.example.invalid/SHOULD_NOT_LEAK",
+            },
+        )
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+        connector = NotionConnector(token="secret", courses_database_id="courses-db", client=client)
+        with pytest.raises(LifeAgentError) as raised:
+            await connector.create_pdf_file_upload(filename="rubric.pdf")
+
+    assert raised.value.record.code.value == "connector_transient"
+    assert raised.value.record.diagnostic == "Notion returned invalid file upload content type"
+    assert "SHOULD_NOT_LEAK" not in raised.value.record.diagnostic

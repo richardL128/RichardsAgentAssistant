@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 from datetime import UTC
 from typing import cast
 from uuid import UUID
@@ -89,7 +90,12 @@ class DiscordWakeJob:
             or row.discord_user_id is None
         ):
             raise ValueError("Discord message handoff is incomplete")
-        raw_content = self._load_content(row.content_artifact_key)
+        loaded_content = self._load_content(row.content_artifact_key)
+        if isinstance(loaded_content, tuple):
+            raw_content, inbound_material_ids = loaded_content
+        else:
+            # Preserve compatibility with legacy/custom loaders that return text.
+            raw_content, inbound_material_ids = loaded_content, ()
         service = create_academic_discord_service(self._settings)
         try:
             result = await service.handler(
@@ -99,6 +105,7 @@ class DiscordWakeJob:
                     author_id=row.discord_user_id,
                     timestamp=row.received_at,
                     content=SecretStr(raw_content),
+                    inbound_material_ids=inbound_material_ids,
                     progress_message_id=row.ack_message_id,
                 )
             )
@@ -133,15 +140,42 @@ class DiscordWakeJob:
         )
         return str(result.get("status", "failed"))
 
-    def _load_content(self, artifact_key: str) -> str:
+    def _load_content(self, artifact_key: str) -> str | tuple[str, tuple[UUID, ...]]:
         store = ArtifactStore(
             self._settings.artifact_root,
             default_retention_days=self._settings.artifact_retention_days,
         )
-        content = store.get(artifact_key).decode("utf-8")
-        if not content or len(content) > 2_000:
+        raw = store.get(artifact_key).decode("utf-8")
+        try:
+            value: object = json.loads(raw)
+        except json.JSONDecodeError:
+            value = None
+        if (
+            isinstance(value, dict)
+            and cast(dict[str, object], value).get("version") == "discord-academic-inbound-v2"
+        ):
+            payload = cast(dict[str, object], value)
+            content = payload.get("message_text")
+            material_values = payload.get("inbound_material_ids", [])
+            if not isinstance(content, str) or len(content) > 2_000:
+                raise ValueError("Discord inbound manifest text is invalid")
+            if not isinstance(material_values, list):
+                raise ValueError("Discord inbound manifest material references are invalid")
+            material_list = cast(list[object], material_values)
+            if len(material_list) > 5:
+                raise ValueError("Discord inbound manifest material references are invalid")
+            try:
+                material_ids = tuple(UUID(str(item)) for item in material_list)
+            except ValueError:
+                raise ValueError(
+                    "Discord inbound manifest material references are invalid"
+                ) from None
+            if not content.strip() and not material_ids:
+                raise ValueError("Discord inbound manifest is empty")
+            return content, material_ids
+        if not raw or len(raw) > 2_000:
             raise ValueError("Discord inbound content artifact is invalid")
-        return content
+        return raw, ()
 
 
 class _WakeSnapshot:

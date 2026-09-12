@@ -21,6 +21,7 @@ from sqlalchemy.exc import IntegrityError, NoResultFound
 from sqlalchemy.orm import Session
 
 from app.db.models import (
+    AcademicAssessmentMaterialProfile,
     AcademicCheckIn,
     AcademicClarification,
     AcademicCourseCalendar,
@@ -28,6 +29,7 @@ from app.db.models import (
     AcademicDiscourseTurn,
     AcademicDocument,
     AcademicDocumentChunk,
+    AcademicInboundMaterial,
     AcademicLearningFocus,
     AcademicLearningFocusEvent,
     AcademicProposalOperationJournal,
@@ -57,6 +59,17 @@ ProposalRejectionStatus = Literal[
 ProposalOperationStatus = Literal["ready", "already_applied", "in_progress", "uncertain", "failed"]
 LearningFocusReminderStatus = Literal["remind", "snoozed_and_remind", "delete"]
 LearningFocusMutationStatus = Literal["applied", "not_found", "stale"]
+AcademicInboundMaterialCreateStatus = Literal["created", "replayed"]
+AcademicInboundMaterialState = Literal[
+    "captured",
+    "awaiting_target",
+    "proposal_pending",
+    "seeding",
+    "seeded",
+    "failed",
+    "uncertain",
+    "expired",
+]
 AcademicDocumentSourceKind = Literal[
     "notion_page_body",
     "notion_property_file",
@@ -124,6 +137,34 @@ _ACADEMIC_DOCUMENT_STATUSES = frozenset(
     )
 )
 _ACADEMIC_DOCUMENT_USABLE_STATUSES = frozenset(("extracted", "partial"))
+_ACADEMIC_INBOUND_MATERIAL_STATES = frozenset(
+    (
+        "captured",
+        "awaiting_target",
+        "proposal_pending",
+        "seeding",
+        "seeded",
+        "failed",
+        "uncertain",
+        "expired",
+    )
+)
+_ACADEMIC_INBOUND_MATERIAL_PENDING_STATES = frozenset(
+    ("captured", "awaiting_target", "proposal_pending", "uncertain")
+)
+_ACADEMIC_INBOUND_MATERIAL_TERMINAL_STATES = frozenset(("seeded", "failed", "expired"))
+_ACADEMIC_INBOUND_MATERIAL_STATE_RANK = {
+    "captured": 0,
+    "awaiting_target": 1,
+    "uncertain": 2,
+    "proposal_pending": 3,
+    "seeding": 4,
+    "seeded": 5,
+    "failed": 5,
+    "expired": 5,
+}
+_DISCORD_ID = re.compile(r"^[0-9]{1,32}$")
+_SAFE_PDF_FILENAME = re.compile(r"^[^/\\:\x00-\x1f\x7f]{1,255}$")
 _SIGNED_NOTION_URL_MARKERS = (
     "prod-files-secure.s3.",
     "prod-files-secure.notion-static.com",
@@ -255,6 +296,59 @@ class InboundCheckinPersistResult:
 
 
 @dataclass(frozen=True, slots=True)
+class AcademicInboundMaterialInput:
+    """Validated Discord PDF metadata ready for durable owner-scoped capture."""
+
+    discord_message_id: str
+    discord_attachment_id: str
+    owner_discord_user_id: str
+    discord_channel_id: str
+    filename: str
+    media_type: str | None
+    declared_byte_size: int | None
+    observed_byte_size: int
+    content_hash: str
+    raw_artifact_key: str
+    captured_at: datetime
+    expires_at: datetime
+
+
+@dataclass(frozen=True, slots=True)
+class AcademicInboundMaterialPersistResult:
+    """Create-or-replay result for one Discord attachment identity."""
+
+    status: AcademicInboundMaterialCreateStatus
+    row: AcademicInboundMaterial
+
+
+@dataclass(frozen=True, slots=True)
+class AcademicInboundMaterialSnapshot:
+    """Owner-authorized intake metadata without raw Discord URLs or PDF text."""
+
+    id: uuid.UUID
+    discord_message_id: str
+    discord_attachment_id: str
+    owner_discord_user_id: str
+    discord_channel_id: str
+    filename: str
+    media_type: str | None
+    declared_byte_size: int | None
+    observed_byte_size: int
+    content_hash: str
+    raw_artifact_key: str
+    state: str
+    assessment_id: uuid.UUID | None
+    proposal_id: uuid.UUID | None
+    notion_page_id: str | None
+    notion_block_id: str | None
+    notion_upload_id: str | None
+    error_code: str | None
+    expires_at: datetime | None
+    created_at: datetime
+    updated_at: datetime
+
+
+@dataclass(frozen=True, slots=True)
 class LearningFocusMemoryInput:
     """Raw reflection text plus optional embedding payload for one focus turn."""
 
@@ -301,6 +395,501 @@ def _upsert(
             raise
         return existing
     return instance
+
+
+class AcademicInboundMaterialRepository:
+    """Durable owner-scoped intake state for Discord PDF material."""
+
+    @staticmethod
+    def create_or_replay(
+        session: Session,
+        material: AcademicInboundMaterialInput,
+    ) -> AcademicInboundMaterialPersistResult:
+        values = _inbound_material_values(material)
+        row = AcademicInboundMaterial(**values)
+        try:
+            with session.begin_nested():
+                session.add(row)
+                session.flush()
+            return AcademicInboundMaterialPersistResult(status="created", row=row)
+        except IntegrityError:
+            existing = session.scalar(
+                select(AcademicInboundMaterial)
+                .where(
+                    AcademicInboundMaterial.discord_message_id == values["discord_message_id"],
+                    AcademicInboundMaterial.discord_attachment_id
+                    == values["discord_attachment_id"],
+                )
+                .with_for_update()
+            )
+            if existing is None:
+                raise
+            _validate_inbound_material_replay(existing, values)
+            return AcademicInboundMaterialPersistResult(status="replayed", row=existing)
+
+    @staticmethod
+    def get_owned(
+        session: Session,
+        material_id: uuid.UUID,
+        *,
+        owner_discord_user_id: str,
+        discord_channel_id: str,
+        now: datetime | None = None,
+        include_expired: bool = False,
+    ) -> AcademicInboundMaterial | None:
+        row = session.scalar(
+            select(AcademicInboundMaterial)
+            .where(
+                AcademicInboundMaterial.id == material_id,
+                AcademicInboundMaterial.owner_discord_user_id
+                == _discord_id(owner_discord_user_id, "owner_discord_user_id"),
+                AcademicInboundMaterial.discord_channel_id
+                == _discord_id(discord_channel_id, "discord_channel_id"),
+            )
+            .with_for_update()
+        )
+        if row is None:
+            return None
+        AcademicInboundMaterialRepository.expire_if_needed(session, row, now=now)
+        if not include_expired and row.state == "expired":
+            return None
+        return row
+
+    @staticmethod
+    def get_owned_snapshot(
+        session: Session,
+        material_id: uuid.UUID,
+        *,
+        owner_discord_user_id: str,
+        discord_channel_id: str,
+        now: datetime | None = None,
+        include_expired: bool = False,
+    ) -> AcademicInboundMaterialSnapshot | None:
+        row = AcademicInboundMaterialRepository.get_owned(
+            session,
+            material_id,
+            owner_discord_user_id=owner_discord_user_id,
+            discord_channel_id=discord_channel_id,
+            now=now,
+            include_expired=include_expired,
+        )
+        return _inbound_material_snapshot(row) if row is not None else None
+
+    @staticmethod
+    def find_recent_pending(
+        session: Session,
+        *,
+        owner_discord_user_id: str,
+        discord_channel_id: str,
+        now: datetime | None = None,
+        limit: int = 10,
+        states: Iterable[str] | None = None,
+    ) -> list[AcademicInboundMaterial]:
+        bounded_limit = max(1, min(limit, 50))
+        current = _utc(now or datetime.now(UTC), "now")
+        selected_states = frozenset(states or _ACADEMIC_INBOUND_MATERIAL_PENDING_STATES)
+        if not selected_states <= _ACADEMIC_INBOUND_MATERIAL_STATES:
+            raise ValueError("invalid inbound material state filter")
+        return list(
+            session.scalars(
+                select(AcademicInboundMaterial)
+                .where(
+                    AcademicInboundMaterial.owner_discord_user_id
+                    == _discord_id(owner_discord_user_id, "owner_discord_user_id"),
+                    AcademicInboundMaterial.discord_channel_id
+                    == _discord_id(discord_channel_id, "discord_channel_id"),
+                    AcademicInboundMaterial.state.in_(selected_states),
+                    or_(
+                        AcademicInboundMaterial.expires_at.is_(None),
+                        AcademicInboundMaterial.expires_at > current,
+                    ),
+                )
+                .order_by(AcademicInboundMaterial.created_at.desc(), AcademicInboundMaterial.id)
+                .limit(bounded_limit)
+            )
+        )
+
+    @staticmethod
+    def find_duplicate_available(
+        session: Session,
+        *,
+        owner_discord_user_id: str,
+        discord_channel_id: str,
+        content_hash: str,
+        observed_byte_size: int,
+        now: datetime | None = None,
+        exclude_material_id: uuid.UUID | None = None,
+        limit: int = 10,
+    ) -> list[AcademicInboundMaterial]:
+        if not _SHA256.fullmatch(content_hash):
+            raise ValueError("content hash must be SHA-256 hex")
+        if observed_byte_size <= 0:
+            raise ValueError("observed byte size must be positive")
+        current = _utc(now or datetime.now(UTC), "now")
+        conditions = [
+            AcademicInboundMaterial.owner_discord_user_id
+            == _discord_id(owner_discord_user_id, "owner_discord_user_id"),
+            AcademicInboundMaterial.discord_channel_id
+            == _discord_id(discord_channel_id, "discord_channel_id"),
+            AcademicInboundMaterial.content_hash == content_hash,
+            AcademicInboundMaterial.observed_byte_size == observed_byte_size,
+            AcademicInboundMaterial.state.in_(
+                _ACADEMIC_INBOUND_MATERIAL_PENDING_STATES | {"seeded"}
+            ),
+            or_(
+                AcademicInboundMaterial.expires_at.is_(None),
+                AcademicInboundMaterial.expires_at > current,
+                AcademicInboundMaterial.state == "seeded",
+            ),
+        ]
+        if exclude_material_id is not None:
+            conditions.append(AcademicInboundMaterial.id != exclude_material_id)
+        return list(
+            session.scalars(
+                select(AcademicInboundMaterial)
+                .where(*conditions)
+                .order_by(AcademicInboundMaterial.created_at.desc(), AcademicInboundMaterial.id)
+                .limit(max(1, min(limit, 50)))
+            )
+        )
+
+    @staticmethod
+    def validate_for_proposal(
+        session: Session,
+        material_ids: Sequence[uuid.UUID],
+        *,
+        owner_discord_user_id: str,
+        discord_channel_id: str,
+        now: datetime | None = None,
+        proposal_id: uuid.UUID | None = None,
+    ) -> tuple[uuid.UUID, ...]:
+        if not material_ids:
+            return ()
+        if len(material_ids) > 5:
+            raise ValueError("at most five inbound materials can be attached to one proposal")
+        unique_ids = tuple(dict.fromkeys(material_ids))
+        if len(unique_ids) != len(material_ids):
+            raise ValueError("duplicate inbound material IDs are not allowed")
+        for material_id in unique_ids:
+            row = AcademicInboundMaterialRepository.get_owned(
+                session,
+                material_id,
+                owner_discord_user_id=owner_discord_user_id,
+                discord_channel_id=discord_channel_id,
+                now=now,
+            )
+            if row is None:
+                raise NoResultFound(f"academic inbound material {material_id} was not found")
+            if row.state not in {"captured", "awaiting_target", "proposal_pending"}:
+                raise ValueError("inbound material is not available for a proposal")
+            if row.proposal_id is not None and row.proposal_id != proposal_id:
+                linked = session.get(AcademicProposedChange, row.proposal_id)
+                if linked is None or linked.state in {"pending", "confirmed", "applying"}:
+                    raise ValueError("inbound material is bound to a competing live proposal")
+        return unique_ids
+
+    @staticmethod
+    def bind_to_proposal(
+        session: Session,
+        material_id: uuid.UUID,
+        *,
+        owner_discord_user_id: str,
+        discord_channel_id: str,
+        proposal_id: uuid.UUID,
+        assessment_id: uuid.UUID | str | None = None,
+        now: datetime | None = None,
+    ) -> AcademicInboundMaterial:
+        row = AcademicInboundMaterialRepository.get_owned(
+            session,
+            material_id,
+            owner_discord_user_id=owner_discord_user_id,
+            discord_channel_id=discord_channel_id,
+            now=now,
+        )
+        if row is None:
+            raise NoResultFound(f"academic inbound material {material_id} was not found")
+        if row.state not in {"captured", "awaiting_target", "proposal_pending"}:
+            raise ValueError("inbound material is not available for proposal binding")
+        if row.proposal_id is not None and row.proposal_id != proposal_id:
+            raise ValueError("inbound material is already bound to another live proposal")
+        bound_assessment_id = _parse_uuid(assessment_id) if assessment_id is not None else None
+        if assessment_id is not None and bound_assessment_id is None:
+            raise ValueError("assessment_id must be a UUID")
+        if bound_assessment_id is not None and row.assessment_id not in (
+            None,
+            bound_assessment_id,
+        ):
+            raise ValueError("inbound material is already bound to another assessment")
+        proposal = session.get(AcademicProposedChange, proposal_id)
+        if proposal is None:
+            raise NoResultFound(f"academic proposal {proposal_id} was not found")
+        if proposal.state != "pending":
+            raise ValueError("proposal must be pending before material binding")
+        row.proposal_id = proposal_id
+        if bound_assessment_id is not None:
+            row.assessment_id = bound_assessment_id
+        _advance_inbound_material_state(row, "proposal_pending")
+        session.flush()
+        return row
+
+    @staticmethod
+    def bind_to_assessment(
+        session: Session,
+        material_id: uuid.UUID,
+        *,
+        owner_discord_user_id: str,
+        discord_channel_id: str,
+        assessment_id: uuid.UUID,
+        now: datetime | None = None,
+    ) -> AcademicInboundMaterial:
+        row = AcademicInboundMaterialRepository.get_owned(
+            session,
+            material_id,
+            owner_discord_user_id=owner_discord_user_id,
+            discord_channel_id=discord_channel_id,
+            now=now,
+        )
+        if row is None:
+            raise NoResultFound(f"academic inbound material {material_id} was not found")
+        if row.assessment_id is not None and row.assessment_id != assessment_id:
+            raise ValueError("inbound material is already bound to another assessment")
+        row.assessment_id = assessment_id
+        _advance_inbound_material_state(row, "awaiting_target")
+        session.flush()
+        return row
+
+    @staticmethod
+    def advance_state(
+        session: Session,
+        material_id: uuid.UUID,
+        *,
+        owner_discord_user_id: str,
+        discord_channel_id: str,
+        state: AcademicInboundMaterialState,
+        error_code: str | None = None,
+        now: datetime | None = None,
+    ) -> AcademicInboundMaterial:
+        row = AcademicInboundMaterialRepository.get_owned(
+            session,
+            material_id,
+            owner_discord_user_id=owner_discord_user_id,
+            discord_channel_id=discord_channel_id,
+            now=now,
+            include_expired=True,
+        )
+        if row is None:
+            raise NoResultFound(f"academic inbound material {material_id} was not found")
+        _advance_inbound_material_state(row, state)
+        if error_code is not None or state != "failed":
+            row.error_code = _bounded_optional(error_code, 128)
+        session.flush()
+        return row
+
+    @staticmethod
+    def mark_seeded(
+        session: Session,
+        material_id: uuid.UUID,
+        *,
+        owner_discord_user_id: str,
+        discord_channel_id: str,
+        notion_page_id: str,
+        notion_block_id: str | None,
+        notion_upload_id: str | None,
+        proposal_id: uuid.UUID | None = None,
+        assessment_id: uuid.UUID | None = None,
+    ) -> AcademicInboundMaterial:
+        row = AcademicInboundMaterialRepository.get_owned(
+            session,
+            material_id,
+            owner_discord_user_id=owner_discord_user_id,
+            discord_channel_id=discord_channel_id,
+            include_expired=True,
+        )
+        if row is None:
+            raise NoResultFound(f"academic inbound material {material_id} was not found")
+        if proposal_id is not None and row.proposal_id not in (None, proposal_id):
+            raise ValueError("seeded receipt proposal does not match bound material")
+        if assessment_id is not None and row.assessment_id not in (None, assessment_id):
+            raise ValueError("seeded receipt assessment does not match bound material")
+        row.proposal_id = proposal_id or row.proposal_id
+        row.assessment_id = assessment_id or row.assessment_id
+        row.notion_page_id = _bounded(notion_page_id, 255)
+        row.notion_block_id = _bounded_optional(notion_block_id, 255)
+        row.notion_upload_id = _bounded_optional(notion_upload_id, 255)
+        row.error_code = None
+        _advance_inbound_material_state(row, "seeded")
+        session.flush()
+        return row
+
+    @staticmethod
+    def expire_if_needed(
+        session: Session,
+        row: AcademicInboundMaterial,
+        *,
+        now: datetime | None = None,
+    ) -> bool:
+        if row.state in _ACADEMIC_INBOUND_MATERIAL_TERMINAL_STATES:
+            return False
+        if row.expires_at is None:
+            return False
+        if _aware_db(row.expires_at) > _utc(now or datetime.now(UTC), "now"):
+            return False
+        row.state = "expired"
+        row.error_code = "intake_expired"
+        session.flush()
+        return True
+
+    @staticmethod
+    def find_pending_create_proposals(
+        session: Session,
+        *,
+        owner_discord_user_id: str,
+        discord_channel_id: str,
+        now: datetime | None = None,
+        limit: int = 10,
+    ) -> list[AcademicProposedChange]:
+        current = _utc(now or datetime.now(UTC), "now")
+        rows = session.execute(
+            select(AcademicProposedChange, AcademicCheckIn)
+            .join(AcademicCheckIn, AcademicCheckIn.id == AcademicProposedChange.checkin_id)
+            .where(
+                AcademicProposedChange.state == "pending",
+                or_(
+                    AcademicProposedChange.expires_at.is_(None),
+                    AcademicProposedChange.expires_at > current,
+                ),
+            )
+            .order_by(AcademicProposedChange.created_at.desc(), AcademicProposedChange.id)
+            .limit(max(1, min(limit * 4, 100)))
+        )
+        scoped: list[AcademicProposedChange] = []
+        for proposal, checkin in rows:
+            if not _proposal_matches_owner_channel(
+                proposal,
+                checkin,
+                owner_discord_user_id=owner_discord_user_id,
+                discord_channel_id=discord_channel_id,
+            ):
+                continue
+            if not _proposal_is_creation_only(proposal):
+                continue
+            scoped.append(proposal)
+            if len(scoped) >= max(1, min(limit, 50)):
+                break
+        return scoped
+
+    @staticmethod
+    def find_single_pending_create_proposal(
+        session: Session,
+        *,
+        owner_discord_user_id: str,
+        discord_channel_id: str,
+        now: datetime | None = None,
+    ) -> tuple[Literal["found", "not_found", "ambiguous"], AcademicProposedChange | None]:
+        rows = AcademicInboundMaterialRepository.find_pending_create_proposals(
+            session,
+            owner_discord_user_id=owner_discord_user_id,
+            discord_channel_id=discord_channel_id,
+            now=now,
+            limit=2,
+        )
+        if len(rows) == 1:
+            return "found", rows[0]
+        if not rows:
+            return "not_found", None
+        return "ambiguous", None
+
+    @staticmethod
+    def supersede_pending_create_with_materials(
+        session: Session,
+        *,
+        old_proposal_id: uuid.UUID,
+        new_proposal_id: uuid.UUID,
+        material_ids: Sequence[uuid.UUID],
+        owner_discord_user_id: str,
+        discord_channel_id: str,
+        superseded_reason: str = "replacement_with_inbound_material",
+        now: datetime | None = None,
+    ) -> AcademicProposedChange:
+        AcademicInboundMaterialRepository.validate_for_proposal(
+            session,
+            material_ids,
+            owner_discord_user_id=owner_discord_user_id,
+            discord_channel_id=discord_channel_id,
+            now=now,
+            proposal_id=new_proposal_id,
+        )
+        old = AcademicInboundMaterialRepository.mark_proposal_superseded(
+            session,
+            old_proposal_id=old_proposal_id,
+            new_proposal_id=new_proposal_id,
+            owner_discord_user_id=owner_discord_user_id,
+            discord_channel_id=discord_channel_id,
+            superseded_reason=superseded_reason,
+            now=now,
+        )
+        for material_id in material_ids:
+            AcademicInboundMaterialRepository.bind_to_proposal(
+                session,
+                material_id,
+                owner_discord_user_id=owner_discord_user_id,
+                discord_channel_id=discord_channel_id,
+                proposal_id=new_proposal_id,
+                now=now,
+            )
+        return old
+
+    @staticmethod
+    def mark_proposal_superseded(
+        session: Session,
+        *,
+        old_proposal_id: uuid.UUID,
+        new_proposal_id: uuid.UUID,
+        owner_discord_user_id: str,
+        discord_channel_id: str,
+        superseded_reason: str = "replacement_with_inbound_material",
+        actor: str = "academic_planner",
+        now: datetime | None = None,
+    ) -> AcademicProposedChange:
+        old = session.scalar(
+            select(AcademicProposedChange)
+            .where(AcademicProposedChange.id == old_proposal_id)
+            .with_for_update()
+        )
+        if old is None:
+            raise NoResultFound(f"academic proposal {old_proposal_id} was not found")
+        new = session.get(AcademicProposedChange, new_proposal_id)
+        if new is None:
+            raise NoResultFound(f"academic proposal {new_proposal_id} was not found")
+        checkin = session.get(AcademicCheckIn, old.checkin_id)
+        if checkin is None or not _proposal_matches_owner_channel(
+            old,
+            checkin,
+            owner_discord_user_id=owner_discord_user_id,
+            discord_channel_id=discord_channel_id,
+        ):
+            raise ValueError("proposal is not scoped to the owner/channel")
+        current = _utc(now or datetime.now(UTC), "now")
+        if old.expires_at is not None and _aware_db(old.expires_at) <= current:
+            old.state = "expired"
+            session.flush()
+            return old
+        if old.state != "pending":
+            raise ValueError("only pending proposals can be superseded")
+        old.state = "superseded"
+        old.superseded_by_id = new_proposal_id
+        old.superseded_reason = _bounded(superseded_reason, 128)
+        old.superseded_at = current
+        AuditRepository.append(
+            session,
+            actor=_bounded(actor, 128),
+            action="academic_proposal.superseded",
+            target_type="academic_proposal",
+            target_id=str(old_proposal_id),
+            result="superseded",
+        )
+        session.flush()
+        return old
 
 
 class AcademicRepository:
@@ -838,6 +1427,58 @@ class AcademicRepository:
                 .group_by(AcademicDocument.extraction_status)
             )
         }
+        inbound_state_counts = {
+            state: int(count)
+            for state, count in session.execute(
+                select(AcademicInboundMaterial.state, func.count()).group_by(
+                    AcademicInboundMaterial.state
+                )
+            )
+        }
+        orphan_upload_warnings = session.scalar(
+            select(func.count())
+            .select_from(AcademicInboundMaterial)
+            .where(
+                AcademicInboundMaterial.notion_upload_id.is_not(None),
+                AcademicInboundMaterial.notion_block_id.is_(None),
+                AcademicInboundMaterial.state.in_(["seeding", "uncertain", "failed"]),
+            )
+        )
+        seeded_intakes = list(
+            session.scalars(
+                select(AcademicInboundMaterial).where(
+                    AcademicInboundMaterial.state == "seeded",
+                    AcademicInboundMaterial.notion_page_id.is_not(None),
+                )
+            )
+        )
+        indexing_delayed = 0
+        for intake in seeded_intakes:
+            source_matches = [
+                AcademicDocument.notion_id == intake.notion_page_id,
+                AcademicDocument.source_page_id == intake.notion_page_id,
+            ]
+            if intake.notion_block_id is not None:
+                source_matches.append(AcademicDocument.source_block_id == intake.notion_block_id)
+            has_active_document = session.scalar(
+                select(func.count())
+                .select_from(AcademicDocument)
+                .where(
+                    or_(*source_matches),
+                    AcademicDocument.active.is_(True),
+                    AcademicDocument.extraction_status.in_(_ACADEMIC_DOCUMENT_USABLE_STATUSES),
+                )
+            )
+            if not has_active_document:
+                indexing_delayed += 1
+        profile_state_counts = {
+            state: int(count)
+            for state, count in session.execute(
+                select(AcademicAssessmentMaterialProfile.state, func.count()).group_by(
+                    AcademicAssessmentMaterialProfile.state
+                )
+            )
+        }
         return {
             "course_count": session.scalar(select(func.count()).select_from(Course)) or 0,
             "calendar_count": len(calendars),
@@ -853,8 +1494,20 @@ class AcademicRepository:
             + material_status_counts.get("unsupported", 0)
             + material_status_counts.get("ocr_required", 0),
             "material_partial_count": material_status_counts.get("partial", 0),
+            "inbound_material_awaiting_target_count": inbound_state_counts.get(
+                "awaiting_target", 0
+            ),
+            "inbound_material_proposal_pending_count": inbound_state_counts.get(
+                "proposal_pending", 0
+            ),
+            "inbound_material_uncertain_count": inbound_state_counts.get("uncertain", 0),
+            "inbound_material_seeding_count": inbound_state_counts.get("seeding", 0),
+            "inbound_material_orphan_upload_warning_count": orphan_upload_warnings or 0,
+            "inbound_material_indexing_delayed_count": indexing_delayed,
+            "material_profile_active_count": profile_state_counts.get("active", 0),
+            "material_profile_rejected_count": profile_state_counts.get("rejected", 0),
             "last_sync_at": _aware_db(last_sync).isoformat() if last_sync is not None else None,
-            "migration": "0014_academic_materials",
+            "migration": "0022_academic_material_profiles",
         }
 
     @staticmethod
@@ -1247,6 +1900,145 @@ class AcademicRepository:
             statement = statement.where(AcademicDocument.active.is_(True))
         rows_by_id = {row.id: row for row in session.scalars(statement)}
         return [rows_by_id[chunk_id] for chunk_id in ids if chunk_id in rows_by_id]
+
+    @staticmethod
+    def list_material_planning_chunks(
+        session: Session,
+        *,
+        assessment_id: uuid.UUID,
+        public_assessment_id: str,
+        limit: int,
+    ) -> list[Mapping[str, Any]]:
+        if limit < 1 or limit > 100:
+            raise ValueError("material planning chunk limit must be between 1 and 100")
+        rows = session.execute(
+            select(AcademicDocumentChunk, AcademicDocument)
+            .join(AcademicDocument, AcademicDocument.id == AcademicDocumentChunk.document_id)
+            .where(
+                AcademicDocument.assessment_id == assessment_id,
+                AcademicDocument.active.is_(True),
+                AcademicDocument.extraction_status.in_(_ACADEMIC_DOCUMENT_USABLE_STATUSES),
+                AcademicDocument.access_classification == "private",
+            )
+            .order_by(AcademicDocument.retrieved_at.desc(), AcademicDocumentChunk.ordinal)
+            .limit(limit)
+        )
+        return [
+            _material_planning_chunk_mapping(chunk, document, public_assessment_id)
+            for chunk, document in rows
+        ]
+
+    @staticmethod
+    def read_material_planning_chunks(
+        session: Session,
+        chunk_ids: Sequence[str],
+    ) -> list[Mapping[str, Any]]:
+        ids = tuple(dict.fromkeys(uuid.UUID(str(chunk_id)) for chunk_id in chunk_ids))
+        if not ids:
+            return []
+        if len(ids) > 100:
+            raise ValueError("too many material planning chunk ids requested")
+        rows = session.execute(
+            select(AcademicDocumentChunk, AcademicDocument, Assessment)
+            .join(AcademicDocument, AcademicDocument.id == AcademicDocumentChunk.document_id)
+            .join(Assessment, Assessment.id == AcademicDocument.assessment_id)
+            .where(
+                AcademicDocumentChunk.id.in_(ids),
+                AcademicDocument.access_classification == "private",
+            )
+        )
+        by_id = {
+            chunk.id: _material_planning_chunk_mapping(chunk, document, assessment.notion_id)
+            for chunk, document, assessment in rows
+        }
+        return [by_id[chunk_id] for chunk_id in ids if chunk_id in by_id]
+
+    @staticmethod
+    def get_active_material_planning_profile(
+        session: Session,
+        *,
+        assessment_id: uuid.UUID,
+    ) -> AcademicAssessmentMaterialProfile | None:
+        return session.scalar(
+            select(AcademicAssessmentMaterialProfile).where(
+                AcademicAssessmentMaterialProfile.assessment_id == assessment_id,
+                AcademicAssessmentMaterialProfile.state == "active",
+            )
+        )
+
+    @staticmethod
+    def save_material_planning_profile(
+        session: Session,
+        *,
+        profile: Any,
+    ) -> AcademicAssessmentMaterialProfile:
+        assessment_scope = _resolve_assessment_scope(session, profile.assessment_id)
+        if assessment_scope is None:
+            raise NoResultFound(f"academic assessment {profile.assessment_id} was not found")
+        assessment_id, public_assessment_id = assessment_scope
+        if profile.state == "active":
+            _validate_material_planning_profile_evidence(
+                session,
+                profile,
+                assessment_id=assessment_id,
+                public_assessment_id=public_assessment_id,
+            )
+        values = _material_planning_profile_values(profile, assessment_id=assessment_id)
+        existing = session.scalar(
+            select(AcademicAssessmentMaterialProfile).where(
+                AcademicAssessmentMaterialProfile.profile_version == profile.profile_version
+            )
+        )
+        if existing is not None:
+            preserved_state = (
+                "active"
+                if existing.state == "active" and profile.state == "active"
+                else values["state"]
+            )
+            for key, value in values.items():
+                if key == "state":
+                    setattr(existing, key, preserved_state)
+                else:
+                    setattr(existing, key, value)
+            session.flush()
+            return existing
+        row = AcademicAssessmentMaterialProfile(**values)
+        session.add(row)
+        session.flush()
+        return row
+
+    @staticmethod
+    def activate_material_planning_profile(
+        session: Session,
+        *,
+        profile: Any,
+    ) -> AcademicAssessmentMaterialProfile:
+        if profile.state != "active":
+            raise ValueError("only accepted profiles can be activated")
+        assessment_scope = _resolve_assessment_scope(session, profile.assessment_id)
+        if assessment_scope is None:
+            raise NoResultFound(f"academic assessment {profile.assessment_id} was not found")
+        assessment_id, public_assessment_id = assessment_scope
+        _validate_material_planning_profile_evidence(
+            session,
+            profile,
+            assessment_id=assessment_id,
+            public_assessment_id=public_assessment_id,
+        )
+        row = AcademicRepository.save_material_planning_profile(session, profile=profile)
+        session.execute(
+            update(AcademicAssessmentMaterialProfile)
+            .where(
+                AcademicAssessmentMaterialProfile.assessment_id == assessment_id,
+                AcademicAssessmentMaterialProfile.state == "active",
+                AcademicAssessmentMaterialProfile.id != row.id,
+            )
+            .values(state="inactive")
+        )
+        row.state = "active"
+        row.activated_at = datetime.now(UTC)
+        session.flush()
+        return row
 
     @staticmethod
     def search_semantic_document_chunks(
@@ -2313,6 +3105,8 @@ class AcademicRepository:
         redacted_preview: str,
         confirmation_token: str,
         expires_at: datetime | None = None,
+        owner_discord_user_id: str | None = None,
+        discord_channel_id: str | None = None,
     ) -> AcademicProposedChange:
         if not confirmation_token.strip():
             raise ValueError("confirmation token must not be empty")
@@ -2322,6 +3116,16 @@ class AcademicRepository:
             "operation": operation,
             "target_type": target_type,
             "target_id": target_id,
+            "owner_discord_user_id": (
+                _discord_id(owner_discord_user_id, "owner_discord_user_id")
+                if owner_discord_user_id is not None
+                else None
+            ),
+            "discord_channel_id": (
+                _discord_id(discord_channel_id, "discord_channel_id")
+                if discord_channel_id is not None
+                else None
+            ),
             "payload": dict(payload),
             "redacted_preview": redacted_preview,
             "confirmation_token": confirmation_token,
@@ -2566,6 +3370,148 @@ def _document_extraction_status(value: str) -> str:
     return normalized
 
 
+def _material_planning_chunk_mapping(
+    chunk: AcademicDocumentChunk,
+    document: AcademicDocument,
+    public_assessment_id: str,
+) -> Mapping[str, Any]:
+    return {
+        "chunk_id": str(chunk.id),
+        "assessment_id": public_assessment_id,
+        "document_id": str(document.id),
+        "document_version": document.document_version,
+        "content_hash": document.content_hash,
+        "active": (
+            document.active and document.extraction_status in _ACADEMIC_DOCUMENT_USABLE_STATUSES
+        ),
+        "content": chunk.content,
+        "source_page": chunk.source_page,
+        "source_block": chunk.source_block,
+        "heading": chunk.heading,
+    }
+
+
+def _material_planning_profile_values(
+    profile: Any,
+    *,
+    assessment_id: uuid.UUID,
+) -> dict[str, Any]:
+    state = "validated" if profile.state == "active" else "rejected"
+    return {
+        "assessment_id": assessment_id,
+        "profile_id": _bounded(profile.profile_id, 128),
+        "profile_version": _bounded(profile.profile_version, 128),
+        "state": state,
+        "deliverables_summary": _bounded(profile.deliverables_summary, 1_000),
+        "success_criteria_summary": _bounded(profile.success_criteria_summary, 1_000),
+        "study_topics_summary": _bounded(profile.study_topics_summary, 1_000),
+        "explicit_grade_weight_percent": profile.explicit_grade_weight_percent,
+        "effort_lower_minutes": profile.effort_lower_minutes,
+        "effort_upper_minutes": profile.effort_upper_minutes,
+        "scope_score": profile.scope_score,
+        "dependency_risk_score": profile.dependency_risk_score,
+        "evidence_chunk_ids": list(profile.evidence_chunk_ids),
+        "document_versions": [
+            item.model_dump(mode="json") if hasattr(item, "model_dump") else dict(item)
+            for item in profile.document_versions
+        ],
+        "model_identity": profile.model_identity.model_dump(mode="json"),
+        "critique": profile.critique.model_dump(mode="json"),
+        "rejection_reason": _bounded_optional(profile.rejection_reason, 500),
+        "generated_at": datetime.now(UTC),
+        "activated_at": None,
+    }
+
+
+def _validate_material_planning_profile_evidence(
+    session: Session,
+    profile: Any,
+    *,
+    assessment_id: uuid.UUID,
+    public_assessment_id: str,
+) -> None:
+    mappings = AcademicRepository.read_material_planning_chunks(
+        session,
+        profile.evidence_chunk_ids,
+    )
+    by_id = {str(item["chunk_id"]): item for item in mappings}
+    if set(by_id) != set(profile.evidence_chunk_ids):
+        raise ValueError("material planning profile cites missing chunks")
+    expected_versions = {
+        (str(item.document_id), str(item.document_version), str(item.content_hash))
+        for item in profile.document_versions
+    }
+    observed_versions: set[tuple[str, str, str]] = set()
+    for chunk_id in profile.evidence_chunk_ids:
+        item = by_id[chunk_id]
+        if item["assessment_id"] != public_assessment_id:
+            raise ValueError("material planning profile cites another assessment")
+        if not item["active"]:
+            raise ValueError("material planning profile cites inactive material")
+        observed_versions.add(
+            (
+                str(item["document_id"]),
+                str(item["document_version"]),
+                str(item["content_hash"]),
+            )
+        )
+    if expected_versions != observed_versions:
+        raise ValueError("material planning profile document versions are stale")
+    row = session.get(Assessment, assessment_id)
+    if row is None or row.notion_id != public_assessment_id:
+        raise ValueError("material planning profile assessment scope is stale")
+
+
+def _material_planning_profile_from_row(
+    row: AcademicAssessmentMaterialProfile,
+    *,
+    public_assessment_id: str,
+) -> Any:
+    from app.agents.academic_planner.material_planning import (
+        AssessmentMaterialPlanningProfile,
+        MaterialPlanningDocumentVersion,
+        MaterialPlanningModelIdentity,
+        MaterialPlanningProfileCritique,
+    )
+
+    return AssessmentMaterialPlanningProfile(
+        profile_id=row.profile_id,
+        profile_version=row.profile_version,
+        assessment_id=public_assessment_id,
+        state="active" if row.state == "active" else "rejected",
+        deliverables_summary=row.deliverables_summary,
+        success_criteria_summary=row.success_criteria_summary,
+        study_topics_summary=row.study_topics_summary,
+        effort_lower_minutes=row.effort_lower_minutes,
+        effort_upper_minutes=row.effort_upper_minutes,
+        scope_score=row.scope_score,
+        dependency_risk_score=row.dependency_risk_score,
+        explicit_grade_weight_percent=row.explicit_grade_weight_percent,
+        evidence_chunk_ids=tuple(row.evidence_chunk_ids),
+        document_versions=tuple(
+            MaterialPlanningDocumentVersion.model_validate(item) for item in row.document_versions
+        ),
+        model_identity=MaterialPlanningModelIdentity.model_validate(row.model_identity),
+        critique=MaterialPlanningProfileCritique.model_validate(row.critique),
+        rejection_reason=row.rejection_reason,
+    )
+
+
+def _material_planning_signals(row: AcademicAssessmentMaterialProfile | None) -> Any | None:
+    if row is None or row.state != "active":
+        return None
+    from app.agents.academic_planner.contracts import ValidatedMaterialPlanningSignals
+
+    return ValidatedMaterialPlanningSignals(
+        effort_lower_minutes=row.effort_lower_minutes,
+        effort_upper_minutes=row.effort_upper_minutes,
+        scope_score=row.scope_score,
+        dependency_risk_score=row.dependency_risk_score,
+        evidence_chunk_ids=tuple(row.evidence_chunk_ids),
+        profile_version=row.profile_version,
+    )
+
+
 def _durable_source_url(value: str | None) -> str | None:
     """Drop temporary signed Notion attachment URLs before relational persistence."""
 
@@ -2660,6 +3606,182 @@ def _proposal_operation_snapshot(row: AcademicProposalOperationJournal) -> dict[
         "receipt": dict(row.receipt or {}),
         "error_code": row.error_code,
     }
+
+
+def _inbound_material_values(material: AcademicInboundMaterialInput) -> dict[str, Any]:
+    filename = _safe_pdf_filename(material.filename)
+    media_type = material.media_type.strip().lower() if material.media_type else None
+    if media_type is not None and media_type != "application/pdf":
+        raise ValueError("inbound material media type must be application/pdf when present")
+    if material.declared_byte_size is not None and material.declared_byte_size <= 0:
+        raise ValueError("declared byte size must be positive")
+    if material.observed_byte_size <= 0:
+        raise ValueError("observed byte size must be positive")
+    if (
+        material.declared_byte_size is not None
+        and material.declared_byte_size != material.observed_byte_size
+    ):
+        raise ValueError("declared and observed byte size must match")
+    if not _SHA256.fullmatch(material.content_hash):
+        raise ValueError("content hash must be SHA-256 hex")
+    if not _SHA256.fullmatch(material.raw_artifact_key):
+        raise ValueError("raw artifact key must be SHA-256 hex")
+    return {
+        "discord_message_id": _discord_id(material.discord_message_id, "discord_message_id"),
+        "discord_attachment_id": _discord_id(
+            material.discord_attachment_id, "discord_attachment_id"
+        ),
+        "owner_discord_user_id": _discord_id(
+            material.owner_discord_user_id, "owner_discord_user_id"
+        ),
+        "discord_channel_id": _discord_id(material.discord_channel_id, "discord_channel_id"),
+        "filename": filename,
+        "media_type": media_type,
+        "declared_byte_size": material.declared_byte_size,
+        "observed_byte_size": material.observed_byte_size,
+        "content_hash": material.content_hash,
+        "raw_artifact_key": material.raw_artifact_key,
+        "state": "captured",
+        "expires_at": _utc(material.expires_at, "expires_at"),
+        "created_at": _utc(material.captured_at, "captured_at"),
+        "updated_at": _utc(material.captured_at, "captured_at"),
+    }
+
+
+def _validate_inbound_material_replay(
+    row: AcademicInboundMaterial,
+    values: Mapping[str, Any],
+) -> None:
+    immutable_fields = (
+        "owner_discord_user_id",
+        "discord_channel_id",
+        "filename",
+        "media_type",
+        "declared_byte_size",
+        "observed_byte_size",
+        "content_hash",
+        "raw_artifact_key",
+    )
+    for field in immutable_fields:
+        if getattr(row, field) != values[field]:
+            raise ValueError("discord attachment replay conflicts with persisted intake metadata")
+
+
+def _advance_inbound_material_state(
+    row: AcademicInboundMaterial,
+    state: AcademicInboundMaterialState | str,
+) -> None:
+    if state not in _ACADEMIC_INBOUND_MATERIAL_STATES:
+        raise ValueError("invalid inbound material state")
+    if row.state == state:
+        return
+    if row.state in _ACADEMIC_INBOUND_MATERIAL_TERMINAL_STATES:
+        raise ValueError("terminal inbound material state cannot advance")
+    if row.state == "seeding" and state == "uncertain":
+        row.state = state
+        return
+    current_rank = _ACADEMIC_INBOUND_MATERIAL_STATE_RANK[row.state]
+    next_rank = _ACADEMIC_INBOUND_MATERIAL_STATE_RANK[state]
+    if next_rank < current_rank:
+        raise ValueError("inbound material state cannot move backwards")
+    row.state = state
+
+
+def _inbound_material_snapshot(row: AcademicInboundMaterial) -> AcademicInboundMaterialSnapshot:
+    return AcademicInboundMaterialSnapshot(
+        id=row.id,
+        discord_message_id=row.discord_message_id,
+        discord_attachment_id=row.discord_attachment_id,
+        owner_discord_user_id=row.owner_discord_user_id,
+        discord_channel_id=row.discord_channel_id,
+        filename=row.filename,
+        media_type=row.media_type,
+        declared_byte_size=row.declared_byte_size,
+        observed_byte_size=row.observed_byte_size,
+        content_hash=row.content_hash,
+        raw_artifact_key=row.raw_artifact_key,
+        state=row.state,
+        assessment_id=row.assessment_id,
+        proposal_id=row.proposal_id,
+        notion_page_id=row.notion_page_id,
+        notion_block_id=row.notion_block_id,
+        notion_upload_id=row.notion_upload_id,
+        error_code=row.error_code,
+        expires_at=_aware_db(row.expires_at) if row.expires_at is not None else None,
+        created_at=_aware_db(row.created_at),
+        updated_at=_aware_db(row.updated_at),
+    )
+
+
+def _proposal_matches_owner_channel(
+    proposal: AcademicProposedChange,
+    checkin: AcademicCheckIn,
+    *,
+    owner_discord_user_id: str,
+    discord_channel_id: str,
+) -> bool:
+    expected_owner = _discord_id(owner_discord_user_id, "owner_discord_user_id")
+    expected_channel = _discord_id(discord_channel_id, "discord_channel_id")
+    payload = proposal.payload or {}
+    proposal_owner = proposal.owner_discord_user_id or _payload_string(
+        payload,
+        "owner_discord_user_id",
+        "discord_user_id",
+    )
+    proposal_channel = proposal.discord_channel_id or _payload_string(
+        payload,
+        "discord_channel_id",
+        "channel_id",
+    )
+    if proposal_channel is None and checkin.channel.startswith("discord:"):
+        proposal_channel = checkin.channel.removeprefix("discord:")
+    return proposal_owner == expected_owner and proposal_channel == expected_channel
+
+
+def _proposal_is_creation_only(proposal: AcademicProposedChange) -> bool:
+    payload = proposal.payload or {}
+    changes_raw = payload.get("changes")
+    if isinstance(changes_raw, list):
+        changes = cast(list[object], changes_raw)
+        return len(changes) == 1 and _payload_string(changes[0], "field") == "create_assessment"
+    return proposal.operation in {"create_assessment", "notion_create_assessment"}
+
+
+def _payload_string(payload: Any, *keys: str) -> str | None:
+    if not isinstance(payload, Mapping):
+        return None
+    mapping = cast(Mapping[str, Any], payload)
+    for key in keys:
+        value = mapping.get(key)
+        if isinstance(value, str) and value.strip():
+            return value.strip()
+    return None
+
+
+def _inbound_material_ids_from_changes(
+    changes: Sequence[Any],
+    explicit_ids: Sequence[uuid.UUID],
+) -> tuple[uuid.UUID, ...]:
+    ids: list[uuid.UUID] = list(explicit_ids)
+    for change in changes:
+        raw_ids = _field(change, "inbound_material_ids")
+        if raw_ids is None:
+            continue
+        if not isinstance(raw_ids, Sequence) or isinstance(raw_ids, (str, bytes)):
+            raise ValueError("inbound material IDs must be a sequence")
+        ids.extend(uuid.UUID(str(value)) for value in cast(Sequence[object], raw_ids))
+    return tuple(dict.fromkeys(ids))
+
+
+def _superseded_public_proposal_id_from_changes(changes: Sequence[Any]) -> uuid.UUID | None:
+    superseded_ids = {
+        uuid.UUID(str(value))
+        for change in changes
+        if (value := _field(change, "supersedes_proposal_id")) is not None
+    }
+    if len(superseded_ids) > 1:
+        raise ValueError("only one superseded proposal can be replaced at a time")
+    return next(iter(superseded_ids), None)
 
 
 def _learning_focus_option(session: Session, focus: AcademicLearningFocus) -> Any:
@@ -3400,6 +4522,56 @@ class SQLAlchemyAcademicPlannerStore:
                 )
             return results
 
+    def list_material_chunks(
+        self,
+        assessment_id: str,
+        *,
+        limit: int,
+    ) -> Sequence[Mapping[str, Any]]:
+        with Session(self.engine) as session:
+            scope = _resolve_assessment_scope(session, assessment_id)
+            if scope is None:
+                return []
+            internal_assessment_id, public_assessment_id = scope
+            return AcademicRepository.list_material_planning_chunks(
+                session,
+                assessment_id=internal_assessment_id,
+                public_assessment_id=public_assessment_id,
+                limit=limit,
+            )
+
+    def read_material_chunks(
+        self,
+        chunk_ids: Sequence[str],
+    ) -> Sequence[Mapping[str, Any]]:
+        with Session(self.engine) as session:
+            return AcademicRepository.read_material_planning_chunks(session, chunk_ids)
+
+    def get_active_profile(self, assessment_id: str) -> Any | None:
+        with Session(self.engine) as session:
+            scope = _resolve_assessment_scope(session, assessment_id)
+            if scope is None:
+                return None
+            internal_assessment_id, public_assessment_id = scope
+            row = AcademicRepository.get_active_material_planning_profile(
+                session,
+                assessment_id=internal_assessment_id,
+            )
+            if row is None:
+                return None
+            return _material_planning_profile_from_row(
+                row,
+                public_assessment_id=public_assessment_id,
+            )
+
+    def save_profile(self, profile: Any) -> None:
+        with Session(self.engine) as session, session.begin():
+            AcademicRepository.save_material_planning_profile(session, profile=profile)
+
+    def activate_profile(self, profile: Any) -> None:
+        with Session(self.engine) as session, session.begin():
+            AcademicRepository.activate_material_planning_profile(session, profile=profile)
+
     async def search_semantic_assessment_materials(
         self,
         assessment_id: uuid.UUID | str,
@@ -3503,6 +4675,17 @@ class SQLAlchemyAcademicPlannerStore:
                     .order_by(Assessment.due_at, Assessment.notion_id)
                 )
             )
+            active_profiles = {
+                row.assessment_id: row
+                for row in session.scalars(
+                    select(AcademicAssessmentMaterialProfile).where(
+                        AcademicAssessmentMaterialProfile.assessment_id.in_(
+                            {assessment.id for assessment in assessment_rows}
+                        ),
+                        AcademicAssessmentMaterialProfile.state == "active",
+                    )
+                )
+            }
             assessments: list[Any] = []
             ambiguous: list[Any] = []
             for row in assessment_rows:
@@ -3537,6 +4720,7 @@ class SQLAlchemyAcademicPlannerStore:
                         completed=row.completed,
                         ambiguous=row.fact_state != "confirmed",
                         citations=(citation,),
+                        material_signals=_material_planning_signals(active_profiles.get(row.id)),
                     )
                 )
             commitments = [
@@ -3778,6 +4962,8 @@ class SQLAlchemyAcademicPlannerStore:
         external_event_id: str,
         channel: str,
         received_at: datetime,
+        owner_discord_user_id: str | None = None,
+        inbound_material_ids: Sequence[uuid.UUID] = (),
     ) -> InboundCheckinPersistResult:
         """Persist one authorized Discord message as a deduplicated check-in.
 
@@ -3790,6 +4976,39 @@ class SQLAlchemyAcademicPlannerStore:
         event_key = f"discord-message:{event_id}"
         with Session(self.engine) as session, session.begin():
             changes = tuple(proposal.changes)
+            material_ids = _inbound_material_ids_from_changes(changes, inbound_material_ids)
+            supersedes_public_id = _superseded_public_proposal_id_from_changes(changes)
+            proposal_owner = (
+                _discord_id(owner_discord_user_id, "owner_discord_user_id")
+                if owner_discord_user_id is not None
+                else None
+            )
+            proposal_channel = None
+            if proposal_owner is not None or material_ids:
+                proposal_channel = _discord_id(channel, "discord_channel_id")
+            if material_ids and proposal_owner is None:
+                raise ValueError("owner_discord_user_id is required for inbound material binding")
+            superseded_row_id: uuid.UUID | None = None
+            if supersedes_public_id is not None:
+                if not material_ids:
+                    raise ValueError("superseded create replacement requires inbound materials")
+                if proposal_owner is None or proposal_channel is None:
+                    raise ValueError("owner/channel scope is required for proposal supersession")
+                status, pending_create = (
+                    AcademicInboundMaterialRepository.find_single_pending_create_proposal(
+                        session,
+                        owner_discord_user_id=proposal_owner,
+                        discord_channel_id=proposal_channel,
+                    )
+                )
+                requested_old = _proposal_row_for_public_id(session, supersedes_public_id)
+                if status != "found" or pending_create is None or requested_old is None:
+                    raise ValueError("no single compatible pending create proposal to supersede")
+                if pending_create.id != requested_old.id:
+                    raise ValueError(
+                        "superseded proposal is not the single compatible pending create"
+                    )
+                superseded_row_id = pending_create.id
             plan_id = _resolve_study_plan_id(session, proposal.source_plan_id)
             checkin_status: Literal["questioned", "proposal_pending"] = (
                 "proposal_pending" if changes else "questioned"
@@ -3856,7 +5075,41 @@ class SQLAlchemyAcademicPlannerStore:
                     confirmation_token=proposal.confirmation_event,
                     expires_at=getattr(proposal, "expires_at", None)
                     or now + timedelta(hours=self.confirmation_ttl_hours),
+                    owner_discord_user_id=proposal_owner,
+                    discord_channel_id=proposal_channel,
                 )
+                if material_ids:
+                    material_owner = proposal_owner
+                    material_channel = proposal_channel
+                    if material_owner is None or material_channel is None:
+                        raise ValueError(
+                            "owner/channel scope is required for inbound material binding"
+                        )
+                    if superseded_row_id is not None:
+                        AcademicInboundMaterialRepository.supersede_pending_create_with_materials(
+                            session,
+                            old_proposal_id=superseded_row_id,
+                            new_proposal_id=proposal_row.id,
+                            material_ids=material_ids,
+                            owner_discord_user_id=material_owner,
+                            discord_channel_id=material_channel,
+                        )
+                    else:
+                        AcademicInboundMaterialRepository.validate_for_proposal(
+                            session,
+                            material_ids,
+                            owner_discord_user_id=material_owner,
+                            discord_channel_id=material_channel,
+                            proposal_id=proposal_row.id,
+                        )
+                        for material_id in material_ids:
+                            AcademicInboundMaterialRepository.bind_to_proposal(
+                                session,
+                                material_id,
+                                owner_discord_user_id=material_owner,
+                                discord_channel_id=material_channel,
+                                proposal_id=proposal_row.id,
+                            )
             return InboundCheckinPersistResult(
                 status="created",
                 checkin_id=checkin.id,
@@ -4124,6 +5377,282 @@ class SQLAlchemyAcademicPlannerStore:
             )
             return _proposal_operation_snapshot(row)
 
+    def create_or_replay_inbound_material(
+        self, material: AcademicInboundMaterialInput
+    ) -> tuple[AcademicInboundMaterialCreateStatus, AcademicInboundMaterialSnapshot]:
+        with Session(self.engine) as session, session.begin():
+            result = AcademicInboundMaterialRepository.create_or_replay(session, material)
+            return result.status, _inbound_material_snapshot(result.row)
+
+    def validate_for_proposal(
+        self,
+        ids: Sequence[uuid.UUID],
+        owner_discord_user_id: str,
+        discord_channel_id: str,
+        now: datetime | None = None,
+    ) -> tuple[uuid.UUID, ...]:
+        with Session(self.engine) as session, session.begin():
+            return AcademicInboundMaterialRepository.validate_for_proposal(
+                session,
+                ids,
+                owner_discord_user_id=owner_discord_user_id,
+                discord_channel_id=discord_channel_id,
+                now=now,
+            )
+
+    def get_inbound_material(
+        self,
+        material_id: uuid.UUID,
+        *,
+        owner_discord_user_id: str | None = None,
+        discord_channel_id: str | None = None,
+    ) -> AcademicInboundMaterialSnapshot | None:
+        with Session(self.engine) as session:
+            if owner_discord_user_id is not None and discord_channel_id is not None:
+                return AcademicInboundMaterialRepository.get_owned_snapshot(
+                    session,
+                    material_id,
+                    owner_discord_user_id=owner_discord_user_id,
+                    discord_channel_id=discord_channel_id,
+                    include_expired=True,
+                )
+            row = session.get(AcademicInboundMaterial, material_id)
+            return _inbound_material_snapshot(row) if row is not None else None
+
+    def load_inbound_material_snapshot(
+        self,
+        *,
+        material_id: uuid.UUID,
+        proposal_id: uuid.UUID,
+    ) -> AcademicInboundMaterialSnapshot | None:
+        with Session(self.engine) as session:
+            proposal_row = _proposal_row_for_public_id(session, proposal_id)
+            if proposal_row is None:
+                return None
+            row = session.get(AcademicInboundMaterial, material_id)
+            if row is None or row.proposal_id != proposal_row.id:
+                return None
+            return _inbound_material_snapshot(row)
+
+    def mark_inbound_material_proposal_pending(
+        self,
+        material_id: uuid.UUID,
+        *,
+        owner_discord_user_id: str,
+        discord_channel_id: str,
+        proposal_id: uuid.UUID,
+        assessment_id: uuid.UUID | None = None,
+        now: datetime | None = None,
+    ) -> AcademicInboundMaterialSnapshot:
+        with Session(self.engine) as session, session.begin():
+            proposal_row = _proposal_row_for_id(session, proposal_id)
+            if proposal_row is None:
+                raise NoResultFound(f"academic proposal {proposal_id} was not found")
+            resolved_assessment_id = _resolve_material_assessment_id(session, assessment_id)
+            row = AcademicInboundMaterialRepository.bind_to_proposal(
+                session,
+                material_id,
+                owner_discord_user_id=owner_discord_user_id,
+                discord_channel_id=discord_channel_id,
+                proposal_id=proposal_row.id,
+                assessment_id=resolved_assessment_id,
+                now=now,
+            )
+            return _inbound_material_snapshot(row)
+
+    def mark_inbound_material_seeding(
+        self,
+        material_id: uuid.UUID,
+        *,
+        owner_discord_user_id: str | None = None,
+        discord_channel_id: str | None = None,
+        proposal_id: uuid.UUID | None = None,
+        assessment_id: uuid.UUID | str | None = None,
+        notion_upload_id: str | None = None,
+        now: datetime | None = None,
+    ) -> AcademicInboundMaterialSnapshot:
+        with Session(self.engine) as session, session.begin():
+            if proposal_id is not None:
+                row = _proposal_bound_material(session, material_id, proposal_id)
+                resolved_assessment_id = _resolve_material_assessment_id(session, assessment_id)
+                if resolved_assessment_id is not None:
+                    row.assessment_id = resolved_assessment_id
+                row.notion_upload_id = _bounded_optional(notion_upload_id, 255)
+                _advance_inbound_material_state(row, "seeding")
+                session.flush()
+            else:
+                if owner_discord_user_id is None or discord_channel_id is None:
+                    raise ValueError("owner/channel or proposal_id is required")
+                row = AcademicInboundMaterialRepository.advance_state(
+                    session,
+                    material_id,
+                    owner_discord_user_id=owner_discord_user_id,
+                    discord_channel_id=discord_channel_id,
+                    state="seeding",
+                    now=now,
+                )
+                row.notion_upload_id = _bounded_optional(notion_upload_id, 255)
+            return _inbound_material_snapshot(row)
+
+    def mark_inbound_material_seeded(
+        self,
+        material_id: uuid.UUID,
+        *,
+        owner_discord_user_id: str | None = None,
+        discord_channel_id: str | None = None,
+        notion_page_id: str,
+        notion_block_id: str | None = None,
+        notion_upload_id: str | None = None,
+        proposal_id: uuid.UUID | None = None,
+        assessment_id: uuid.UUID | str | None = None,
+    ) -> AcademicInboundMaterialSnapshot:
+        with Session(self.engine) as session, session.begin():
+            proposal_row_id = None
+            if proposal_id is not None:
+                proposal_row = _proposal_row_for_id(session, proposal_id)
+                if proposal_row is None:
+                    raise NoResultFound(f"academic proposal {proposal_id} was not found")
+                proposal_row_id = proposal_row.id
+            resolved_assessment_id = _resolve_material_assessment_id(session, assessment_id)
+            if proposal_row_id is not None and (
+                owner_discord_user_id is None or discord_channel_id is None
+            ):
+                row = _proposal_bound_material(session, material_id, proposal_row_id)
+                if resolved_assessment_id is not None and row.assessment_id not in (
+                    None,
+                    resolved_assessment_id,
+                ):
+                    raise ValueError("seeded receipt assessment does not match bound material")
+                row.assessment_id = resolved_assessment_id or row.assessment_id
+                row.notion_page_id = _bounded(notion_page_id, 255)
+                row.notion_block_id = _bounded_optional(notion_block_id, 255)
+                row.notion_upload_id = _bounded_optional(notion_upload_id, 255)
+                row.error_code = None
+                _advance_inbound_material_state(row, "seeded")
+                session.flush()
+            else:
+                if owner_discord_user_id is None or discord_channel_id is None:
+                    raise ValueError("owner/channel or proposal_id is required")
+                row = AcademicInboundMaterialRepository.mark_seeded(
+                    session,
+                    material_id,
+                    owner_discord_user_id=owner_discord_user_id,
+                    discord_channel_id=discord_channel_id,
+                    notion_page_id=notion_page_id,
+                    notion_block_id=notion_block_id,
+                    notion_upload_id=notion_upload_id,
+                    proposal_id=proposal_row_id,
+                    assessment_id=resolved_assessment_id,
+                )
+            return _inbound_material_snapshot(row)
+
+    def mark_inbound_material_uncertain(
+        self,
+        material_id: uuid.UUID,
+        *,
+        owner_discord_user_id: str | None = None,
+        discord_channel_id: str | None = None,
+        proposal_id: uuid.UUID | None = None,
+        assessment_id: uuid.UUID | str | None = None,
+        error_code: str,
+        now: datetime | None = None,
+    ) -> AcademicInboundMaterialSnapshot:
+        with Session(self.engine) as session, session.begin():
+            if proposal_id is not None:
+                row = _proposal_bound_material(session, material_id, proposal_id)
+                resolved_assessment_id = _resolve_material_assessment_id(session, assessment_id)
+                if resolved_assessment_id is not None:
+                    row.assessment_id = resolved_assessment_id
+                _advance_inbound_material_state(row, "uncertain")
+                row.error_code = _bounded_optional(error_code, 128)
+                session.flush()
+            else:
+                if owner_discord_user_id is None or discord_channel_id is None:
+                    raise ValueError("owner/channel or proposal_id is required")
+                row = AcademicInboundMaterialRepository.advance_state(
+                    session,
+                    material_id,
+                    owner_discord_user_id=owner_discord_user_id,
+                    discord_channel_id=discord_channel_id,
+                    state="uncertain",
+                    error_code=error_code,
+                    now=now,
+                )
+            return _inbound_material_snapshot(row)
+
+    def mark_inbound_material_failed(
+        self,
+        material_id: uuid.UUID,
+        *,
+        owner_discord_user_id: str | None = None,
+        discord_channel_id: str | None = None,
+        proposal_id: uuid.UUID | None = None,
+        assessment_id: uuid.UUID | str | None = None,
+        error_code: str,
+        now: datetime | None = None,
+    ) -> AcademicInboundMaterialSnapshot:
+        with Session(self.engine) as session, session.begin():
+            if proposal_id is not None:
+                row = _proposal_bound_material(session, material_id, proposal_id)
+                resolved_assessment_id = _resolve_material_assessment_id(session, assessment_id)
+                if resolved_assessment_id is not None:
+                    row.assessment_id = resolved_assessment_id
+                _advance_inbound_material_state(row, "failed")
+                row.error_code = _bounded_optional(error_code, 128)
+                session.flush()
+            else:
+                if owner_discord_user_id is None or discord_channel_id is None:
+                    raise ValueError("owner/channel or proposal_id is required")
+                row = AcademicInboundMaterialRepository.advance_state(
+                    session,
+                    material_id,
+                    owner_discord_user_id=owner_discord_user_id,
+                    discord_channel_id=discord_channel_id,
+                    state="failed",
+                    error_code=error_code,
+                    now=now,
+                )
+            return _inbound_material_snapshot(row)
+
+    def find_single_pending_create_proposal(
+        self,
+        *,
+        owner_discord_user_id: str,
+        discord_channel_id: str,
+        now: datetime | None = None,
+    ) -> tuple[Literal["found", "not_found", "ambiguous"], uuid.UUID | None]:
+        with Session(self.engine) as session:
+            status, row = AcademicInboundMaterialRepository.find_single_pending_create_proposal(
+                session,
+                owner_discord_user_id=owner_discord_user_id,
+                discord_channel_id=discord_channel_id,
+                now=now,
+            )
+            return status, row.id if row is not None else None
+
+    def supersede_pending_create_with_materials(
+        self,
+        *,
+        old_proposal_id: uuid.UUID,
+        new_proposal_id: uuid.UUID,
+        material_ids: Sequence[uuid.UUID],
+        owner_discord_user_id: str,
+        discord_channel_id: str,
+        superseded_reason: str = "replacement_with_inbound_material",
+        now: datetime | None = None,
+    ) -> None:
+        with Session(self.engine) as session, session.begin():
+            AcademicInboundMaterialRepository.supersede_pending_create_with_materials(
+                session,
+                old_proposal_id=old_proposal_id,
+                new_proposal_id=new_proposal_id,
+                material_ids=material_ids,
+                owner_discord_user_id=owner_discord_user_id,
+                discord_channel_id=discord_channel_id,
+                superseded_reason=superseded_reason,
+                now=now,
+            )
+
     def reconcile_assessment_source(
         self,
         source_id: str,
@@ -4319,6 +5848,65 @@ def _resolve_assessment_scope(
     return row.id, row.notion_id
 
 
+def _proposal_row_for_public_id(
+    session: Session,
+    proposal_id: uuid.UUID,
+) -> AcademicProposedChange | None:
+    return session.scalar(
+        select(AcademicProposedChange).where(
+            AcademicProposedChange.idempotency_key == f"academic-proposal:{proposal_id}"
+        )
+    )
+
+
+def _proposal_row_for_id(
+    session: Session,
+    proposal_id: uuid.UUID,
+) -> AcademicProposedChange | None:
+    return _proposal_row_for_public_id(session, proposal_id) or session.get(
+        AcademicProposedChange,
+        proposal_id,
+    )
+
+
+def _proposal_bound_material(
+    session: Session,
+    material_id: uuid.UUID,
+    proposal_id: uuid.UUID,
+) -> AcademicInboundMaterial:
+    proposal_row = _proposal_row_for_id(session, proposal_id)
+    if proposal_row is None:
+        raise NoResultFound(f"academic proposal {proposal_id} was not found")
+    row = session.scalar(
+        select(AcademicInboundMaterial)
+        .where(
+            AcademicInboundMaterial.id == material_id,
+            AcademicInboundMaterial.proposal_id == proposal_row.id,
+        )
+        .with_for_update()
+    )
+    if row is None:
+        raise NoResultFound(f"academic inbound material {material_id} was not found")
+    return row
+
+
+def _resolve_material_assessment_id(
+    session: Session,
+    assessment_id: uuid.UUID | str | None,
+) -> uuid.UUID | None:
+    if assessment_id is None:
+        return None
+    if isinstance(assessment_id, uuid.UUID):
+        return assessment_id
+    scope = _resolve_assessment_scope(session, assessment_id)
+    if scope is not None:
+        return scope[0]
+    parsed = _parse_uuid(assessment_id)
+    if parsed is not None:
+        return parsed
+    raise NoResultFound(f"academic assessment {assessment_id} was not found")
+
+
 def _aware_db(value: datetime) -> datetime:
     """Normalize SQLite's naive timestamp reads as UTC for planner contracts."""
 
@@ -4459,6 +6047,22 @@ def _bounded_optional(value: str | None, limit: int = BOUNDED_TEXT_CHARS) -> str
         return None
     stripped = value.strip()
     return stripped[:limit] or None
+
+
+def _discord_id(value: str, field: str) -> str:
+    normalized = value.strip()
+    if not _DISCORD_ID.fullmatch(normalized):
+        raise ValueError(f"{field} must be a Discord snowflake")
+    return normalized
+
+
+def _safe_pdf_filename(value: str) -> str:
+    normalized = value.strip()
+    if not _SAFE_PDF_FILENAME.fullmatch(normalized):
+        raise ValueError("inbound PDF filename is not safe")
+    if not normalized.lower().endswith(".pdf"):
+        raise ValueError("inbound PDF filename must end with .pdf")
+    return normalized
 
 
 def _uuid_optional(value: Any) -> uuid.UUID | None:

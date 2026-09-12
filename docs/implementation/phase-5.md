@@ -26,7 +26,13 @@ The plan's acceptance tests require that:
 4. ambiguous facts become questions and are excluded from automatic hard
    constraints; and
 5. natural-language check-ins create proposals, make no Notion writes until the
-   exact confirmation event is supplied, and are replay-safe after application.
+   exact confirmation event is supplied, and are replay-safe after application;
+6. authorized Discord PDF-only and PDF-plus-text messages persist private
+   artifacts, propose a new or existing assessment target, upload only after
+   exact confirmation, and cannot be replayed into duplicate Notion uploads; and
+7. accepted material profiles use cited evidence, survive failed refreshes via
+   last-good activation, and affect allocation only through bounded advisory
+   effort, scope, and dependency-risk signals.
 
 ## Implemented
 
@@ -85,6 +91,19 @@ The plan's acceptance tests require that:
   originate only in the native Discord harness. Exact confirmation, rejection,
   and manual sync remain mounted, and confirmation returns a fail-closed `503`
   until a scoped live writer is explicitly injected.
+- Added the Discord PDF material-seeding path: strict Gateway/refetch attachment
+  validation, redirect-free bounded downloads from official Discord media hosts,
+  content-addressed private storage, identifier-only wake manifests, durable
+  owner/channel-scoped intake state, bounded next-message resumption after an
+  ambiguous target, and atomic proposal supersession.
+- Added direct Notion file-upload sessions and assessment-page/file-block writes.
+  Confirmation validates retained artifacts immediately before upload, journals
+  every operation, refuses uncertain replay, then re-syncs canonical Notion state
+  and queues local indexing.
+- Added durable material profiles with generator/critic identity, evidence
+  citations, versioning, last-good activation, and bounded allocator influence.
+  Migrations `0021` and `0022` make intake/proposal/upload state and profiles
+  relational and auditable.
 
 ## Acceptance evidence
 
@@ -118,10 +137,17 @@ The plan's acceptance tests require that:
   injected Discord delivery adapter, source setup/failure/stale handling, and
   health classification for missing runs, failed runs, missing delivery, failed
   delivery, uncertain delivery, and on-time success.
+- `tests/integration/test_discord_pdf_calendar_seeding.py` exercises both
+  existing-target and new-assessment PDF flows through real persistence and the
+  private artifact store. It proves zero upload calls before confirmation, the
+  exact upload/create/append ordering, canonical seeded state, and replay safety.
+- PostgreSQL migration validation upgrades to the current head, downgrades to
+  `0020`, and upgrades again; the Phase 5 persistence integration suite covers
+  the new intake and profile tables against PostgreSQL.
 
 ## Deferred external verification
 
-- Live Notion database sync, live attachment download, and live Notion page
+- Live Notion database sync, live Discord attachment download, and live Notion page
   updates require Richard's scoped Notion integration token, database IDs, and
   property mappings. Automated tests use `httpx.MockTransport` and verify the
   exact outbound method, URL path, allowlisted property ID, and payload shape.

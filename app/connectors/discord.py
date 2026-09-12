@@ -3,17 +3,19 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import math
 import re
 from collections.abc import Awaitable, Callable, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import UTC, date, datetime
 from typing import TYPE_CHECKING, Any, Literal, cast
+from urllib.parse import urlsplit
 from uuid import UUID
 from zoneinfo import ZoneInfo
 
 import httpx
-from pydantic import BaseModel, ConfigDict, Field, SecretStr, field_validator
+from pydantic import BaseModel, ConfigDict, Field, SecretStr, field_validator, model_validator
 from sqlalchemy import Engine
 from sqlalchemy.orm import Session
 
@@ -38,6 +40,13 @@ if TYPE_CHECKING:
 
 _DISCORD_CONTENT_LIMIT = 2_000
 _DISCORD_NONCE_LIMIT = 25
+_DISCORD_ATTACHMENT_LIMIT = 5
+_DISCORD_ATTACHMENT_FILENAME_LIMIT = 255
+_DISCORD_ATTACHMENT_CONTENT_TYPE_LIMIT = 127
+_DISCORD_ATTACHMENT_URL_LIMIT = 2_048
+_DISCORD_PDF_ATTACHMENT_MAX_BYTES = 20 * 1024 * 1024
+_DISCORD_ATTACHMENT_CDN_HOSTS = frozenset({"cdn.discordapp.com", "media.discordapp.net"})
+_DISCORD_ATTACHMENT_DOWNLOAD_TIMEOUT_SECONDS = 10.0
 _DISCORD_SEND_RATE_LIMIT_MAX_ATTEMPTS = 3
 _DISCORD_SEND_RATE_LIMIT_MAX_TOTAL_SLEEP_SECONDS = 5.0
 _DISCORD_ID_PATTERN = re.compile(r"^[0-9]{5,24}$")
@@ -59,6 +68,16 @@ DiscordAcademicProgressPhase = Literal[
     "proposal_validation",
     "reply_preparation",
     "proposal_ready",
+    "attachment_capture",
+    "attachment_inspection",
+    "catalog_matching",
+    "awaiting_confirmation",
+    "notion_upload",
+    "material_seeded",
+    "indexing_queued",
+    "indexing_complete",
+    "indexing_delayed",
+    "partial_failure",
     "completed",
     "clarification_needed",
     "failed",
@@ -72,7 +91,16 @@ DiscordAcademicToolActivity = Literal[
     "proposal_validation",
 ]
 _TERMINAL_PROGRESS_PHASES = frozenset(
-    {"proposal_ready", "completed", "clarification_needed", "failed"}
+    {
+        "proposal_ready",
+        "awaiting_confirmation",
+        "indexing_complete",
+        "indexing_delayed",
+        "partial_failure",
+        "completed",
+        "clarification_needed",
+        "failed",
+    }
 )
 _ACADEMIC_PROGRESS_PHASES = frozenset(
     {
@@ -88,6 +116,16 @@ _ACADEMIC_PROGRESS_PHASES = frozenset(
         "proposal_validation",
         "reply_preparation",
         "proposal_ready",
+        "attachment_capture",
+        "attachment_inspection",
+        "catalog_matching",
+        "awaiting_confirmation",
+        "notion_upload",
+        "material_seeded",
+        "indexing_queued",
+        "indexing_complete",
+        "indexing_delayed",
+        "partial_failure",
         "completed",
         "clarification_needed",
         "failed",
@@ -106,6 +144,45 @@ def _bounded_discord_content(content: str) -> str:
         return content
     marker = "\n[truncated]"
     return f"{content[: _DISCORD_CONTENT_LIMIT - len(marker)]}{marker}"
+
+
+def _validate_discord_attachment_url(value: str) -> None:
+    if not value or len(value) > _DISCORD_ATTACHMENT_URL_LIMIT:
+        raise ValueError("Discord attachment URL must be bounded")
+    parsed = urlsplit(value)
+    host = parsed.hostname.lower() if parsed.hostname is not None else None
+    if (
+        parsed.scheme != "https"
+        or host not in _DISCORD_ATTACHMENT_CDN_HOSTS
+        or not parsed.path.startswith("/attachments/")
+        or parsed.fragment
+    ):
+        raise ValueError("Discord attachment URL must use an official CDN host")
+
+
+def _candidate_pdf_attachments(value: object) -> tuple[DiscordFetchedAttachment, ...]:
+    if not isinstance(value, list):
+        return ()
+    candidates: list[DiscordFetchedAttachment] = []
+    for item in cast(list[Any], value)[:_DISCORD_ATTACHMENT_LIMIT]:
+        if not isinstance(item, Mapping):
+            continue
+        attachment = cast(Mapping[str, object], item)
+        filename = attachment.get("filename")
+        if not isinstance(filename, str) or not filename.lower().endswith(".pdf"):
+            continue
+        payload = {
+            "id": attachment.get("id"),
+            "filename": filename,
+            "content_type": attachment.get("content_type"),
+            "size": attachment.get("size"),
+            "url": attachment.get("url"),
+        }
+        try:
+            candidates.append(DiscordFetchedAttachment.model_validate(payload))
+        except ValueError:
+            continue
+    return tuple(candidates)
 
 
 def _discord_retry_after_seconds(response: httpx.Response) -> float | None:
@@ -169,6 +246,64 @@ class DiscordFetchedAuthor(BaseModel):
     bot: bool = False
 
 
+class DiscordFetchedAttachment(BaseModel):
+    """Safe refetched Discord PDF attachment metadata; signed URL is redacted."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    id: str = Field(pattern=r"^[0-9]{5,24}$")
+    filename: str = Field(min_length=1, max_length=_DISCORD_ATTACHMENT_FILENAME_LIMIT)
+    content_type: str | None = Field(
+        default=None,
+        max_length=_DISCORD_ATTACHMENT_CONTENT_TYPE_LIMIT,
+    )
+    size: int = Field(gt=0, le=_DISCORD_PDF_ATTACHMENT_MAX_BYTES)
+    url: SecretStr = Field(repr=False)
+
+    @field_validator("filename")
+    @classmethod
+    def filename_is_safe_pdf(cls, value: str) -> str:
+        if value != value.strip():
+            raise ValueError("Discord attachment filename must be bounded and safe")
+        if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._ ()\[\]-]{0,254}", value):
+            raise ValueError("Discord attachment filename must be bounded and safe")
+        if not value.lower().endswith(".pdf"):
+            raise ValueError("Discord attachment must be a PDF")
+        return value
+
+    @field_validator("content_type")
+    @classmethod
+    def content_type_is_pdf_when_present(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        if value.lower() != "application/pdf":
+            raise ValueError("Discord attachment content type must be application/pdf")
+        return value
+
+    @field_validator("url")
+    @classmethod
+    def url_is_safe_discord_cdn(cls, value: SecretStr) -> SecretStr:
+        _validate_discord_attachment_url(value.get_secret_value())
+        return value
+
+
+class DiscordPdfAttachmentDownload(BaseModel):
+    """Bounded downloaded PDF bytes plus non-secret verification facts."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    attachment_id: str = Field(pattern=r"^[0-9]{5,24}$")
+    filename: str = Field(min_length=1, max_length=_DISCORD_ATTACHMENT_FILENAME_LIMIT)
+    content_type: str | None = Field(
+        default=None,
+        max_length=_DISCORD_ATTACHMENT_CONTENT_TYPE_LIMIT,
+    )
+    declared_size: int = Field(gt=0, le=_DISCORD_PDF_ATTACHMENT_MAX_BYTES)
+    observed_size: int = Field(gt=0, le=_DISCORD_PDF_ATTACHMENT_MAX_BYTES)
+    sha256_hex: str = Field(pattern=r"^[0-9a-f]{64}$")
+    content: bytes = Field(repr=False)
+
+
 class DiscordFetchedMessage(BaseModel):
     """Private refetched message; content stays secret in representations."""
 
@@ -180,6 +315,10 @@ class DiscordFetchedMessage(BaseModel):
     timestamp: datetime
     content: SecretStr = Field(repr=False)
     mentions: tuple[DiscordFetchedAuthor, ...] = Field(default=(), max_length=20)
+    attachments: tuple[DiscordFetchedAttachment, ...] = Field(
+        default=(),
+        max_length=_DISCORD_ATTACHMENT_LIMIT,
+    )
 
     @field_validator("timestamp")
     @classmethod
@@ -191,9 +330,27 @@ class DiscordFetchedMessage(BaseModel):
     @field_validator("content")
     @classmethod
     def content_is_bounded(cls, value: SecretStr) -> SecretStr:
-        if not value.get_secret_value() or len(value.get_secret_value()) > _DISCORD_CONTENT_LIMIT:
-            raise ValueError("Discord message content must be present and bounded")
+        if len(value.get_secret_value()) > _DISCORD_CONTENT_LIMIT:
+            raise ValueError("Discord message content must be bounded")
         return value
+
+    @field_validator("attachments", mode="before")
+    @classmethod
+    def attachments_are_candidate_pdfs(
+        cls,
+        value: object,
+    ) -> tuple[DiscordFetchedAttachment, ...]:
+        if isinstance(value, tuple):
+            items = cast(tuple[object, ...], value)
+            if all(isinstance(item, DiscordFetchedAttachment) for item in items):
+                return cast(tuple[DiscordFetchedAttachment, ...], items)
+        return _candidate_pdf_attachments(cast(object, value))
+
+    @model_validator(mode="after")
+    def content_or_pdf_attachment_is_present(self) -> DiscordFetchedMessage:
+        if not self.content.get_secret_value().strip() and not self.attachments:
+            raise ValueError("Discord message content or a candidate PDF attachment is required")
+        return self
 
 
 class DiscordAcademicProgressEvent(BaseModel):
@@ -735,6 +892,99 @@ class DiscordAcademicPlannerAdapter:
         finally:
             if owns_client:
                 await client.aclose()
+
+    async def download_pdf_attachment(
+        self,
+        attachment: DiscordFetchedAttachment,
+        *,
+        max_bytes: int = _DISCORD_PDF_ATTACHMENT_MAX_BYTES,
+        timeout_seconds: float = _DISCORD_ATTACHMENT_DOWNLOAD_TIMEOUT_SECONDS,
+    ) -> DiscordPdfAttachmentDownload:
+        """Download one refetched Discord PDF attachment within strict bounds."""
+
+        if max_bytes <= 0 or max_bytes > _DISCORD_PDF_ATTACHMENT_MAX_BYTES:
+            raise ValueError("Discord attachment size limit is invalid")
+        if timeout_seconds <= 0:
+            raise ValueError("Discord attachment timeout is invalid")
+        if attachment.size > max_bytes:
+            raise permanent_error(
+                ErrorCode.INPUT_INVALID,
+                "Discord attachment exceeds the size limit",
+            )
+        url = attachment.url.get_secret_value()
+        _validate_discord_attachment_url(url)
+        owns_client = self._client is None
+        client = self._client or httpx.AsyncClient(timeout=httpx.Timeout(timeout_seconds))
+        chunks: list[bytes] = []
+        observed_size = 0
+        try:
+            async with client.stream(
+                "GET",
+                url,
+                headers={},
+                follow_redirects=False,
+                timeout=httpx.Timeout(timeout_seconds),
+            ) as response:
+                _validate_discord_attachment_url(str(response.url))
+                if response.is_redirect:
+                    raise permanent_error(
+                        ErrorCode.INPUT_INVALID,
+                        "Discord attachment redirects are not allowed",
+                    )
+                try:
+                    response.raise_for_status()
+                except httpx.HTTPStatusError as exc:
+                    if exc.response.status_code in {401, 403}:
+                        raise authorization_error(
+                            "Discord attachment authorization is invalid"
+                        ) from None
+                    if exc.response.status_code == 429 or exc.response.status_code >= 500:
+                        raise transient_error(
+                            ErrorCode.CONNECTOR_TRANSIENT,
+                            "Discord attachment is temporarily unavailable",
+                        ) from None
+                    raise permanent_error(
+                        ErrorCode.INPUT_INVALID,
+                        "Discord attachment is unavailable",
+                    ) from None
+                async for chunk in response.aiter_bytes():
+                    if not chunk:
+                        continue
+                    observed_size += len(chunk)
+                    if observed_size > max_bytes:
+                        raise permanent_error(
+                            ErrorCode.INPUT_INVALID,
+                            "Discord attachment exceeds the size limit",
+                        )
+                    chunks.append(chunk)
+        except httpx.TransportError:
+            raise transient_error(
+                ErrorCode.CONNECTOR_TRANSIENT,
+                "Discord attachment transport is unavailable",
+            ) from None
+        finally:
+            if owns_client:
+                await client.aclose()
+        content = b"".join(chunks)
+        if observed_size != attachment.size:
+            raise permanent_error(
+                ErrorCode.INPUT_INVALID,
+                "Discord attachment size did not match its message metadata",
+            )
+        if not content.startswith(b"%PDF-"):
+            raise permanent_error(
+                ErrorCode.INPUT_INVALID,
+                "Discord attachment is not a PDF",
+            )
+        return DiscordPdfAttachmentDownload(
+            attachment_id=attachment.id,
+            filename=attachment.filename,
+            content_type=attachment.content_type,
+            declared_size=attachment.size,
+            observed_size=observed_size,
+            sha256_hex=hashlib.sha256(content).hexdigest(),
+            content=content,
+        )
 
     async def validate_wake_acknowledgement(
         self,
@@ -1774,6 +2024,26 @@ def _progress_stage_text(event: DiscordAcademicProgressEvent) -> str:
         return "Preparing your reply."
     if event.phase == "proposal_ready":
         return "Proposal ready."
+    if event.phase == "attachment_capture":
+        return "Capturing the PDF attachment safely."
+    if event.phase == "attachment_inspection":
+        return "Inspecting the PDF attachment."
+    if event.phase == "catalog_matching":
+        return "Matching the PDF to your current academic catalog."
+    if event.phase == "awaiting_confirmation":
+        return "Waiting for your confirmation before making any Notion change."
+    if event.phase == "notion_upload":
+        return "Uploading the confirmed PDF to Notion."
+    if event.phase == "material_seeded":
+        return "PDF seeded in Notion."
+    if event.phase == "indexing_queued":
+        return "PDF seeded in Notion; indexing has been queued."
+    if event.phase == "indexing_complete":
+        return "PDF seeded in Notion and indexing is complete."
+    if event.phase == "indexing_delayed":
+        return "PDF seeded in Notion; indexing is delayed and can recover on the next sync."
+    if event.phase == "partial_failure":
+        return "Some PDF seeding work stopped safely; completed Notion changes were preserved."
     if event.phase == "completed":
         return "Completed."
     if event.phase == "clarification_needed":
@@ -1877,6 +2147,20 @@ def _academic_proposal_preview(proposal: Any) -> str:
                 continue
             due = change.due_at.isoformat() if change.due_at is not None else "an unset date"
             lines.append(f"- Create {kind} `{change.title}` in {course}, due {due}.")
+            lines.extend(
+                f"  - Seed PDF `{material.filename}` ({_academic_file_size(material.byte_size)})."
+                for material in (getattr(change, "inbound_material_previews", ()) or ())
+            )
+            continue
+        if change.field == "attach_assessment_material":
+            course = change.course_code or "the selected course"
+            lines.append(
+                f"- Attach PDF material to existing `{change.expected_title}` in {course}."
+            )
+            lines.extend(
+                f"  - `{material.filename}` ({_academic_file_size(material.byte_size)})."
+                for material in (getattr(change, "inbound_material_previews", ()) or ())
+            )
             continue
         if change.field == "update_assessment":
             updates: list[str] = []
@@ -1907,6 +2191,12 @@ def _academic_proposal_preview(proposal: Any) -> str:
         )
     )
     return _bounded_discord_content("\n".join(lines))
+
+
+def _academic_file_size(byte_size: int) -> str:
+    if byte_size >= 1_048_576:
+        return f"{byte_size / 1_048_576:.1f} MB"
+    return f"{max(1, math.ceil(byte_size / 1_024))} KB"
 
 
 def _academic_date_range(starts_at: datetime, ends_at: datetime) -> str:
@@ -2627,8 +2917,12 @@ __all__ = [
     "DiscordDailyReviewAdapter",
     "DiscordDeliveryReceipt",
     "DiscordFailureAlertAdapter",
+    "DiscordFetchedAttachment",
+    "DiscordFetchedAuthor",
+    "DiscordFetchedMessage",
     "DiscordFinanceBriefingAdapter",
     "DiscordFinanceBriefingDelivery",
+    "DiscordPdfAttachmentDownload",
     "DiscordReviewSummaryAdapter",
     "FailureAlert",
     "FinanceDiscordBriefingMessage",

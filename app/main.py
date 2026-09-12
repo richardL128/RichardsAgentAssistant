@@ -16,6 +16,10 @@ from starlette.responses import Response
 
 from app import __version__
 from app.agents.academic_planner.material_ingestion import AssessmentMaterialIngestionService
+from app.agents.academic_planner.material_planning import (
+    AssessmentMaterialPlanningProfileService,
+    MaterialPlanningModelIdentity,
+)
 from app.agents.academic_planner.notion_mutations import DiscoveredAcademicNotionWriter
 from app.agents.academic_planner.sync import AcademicNotionSync
 from app.agents.job_interviews.notion_mutations import DiscoveredCareerNotionWriter
@@ -73,6 +77,20 @@ class SecurityHeadersMiddleware(BaseHTTPMiddleware):
         return response
 
 
+class _LazyArtifactLoader:
+    """Avoid touching the artifact filesystem until a confirmed write needs bytes."""
+
+    def __init__(self, root: Path, *, retention_days: int) -> None:
+        self._root = root
+        self._retention_days = retention_days
+
+    def get(self, key: str) -> bytes:
+        return ArtifactStore(
+            self._root,
+            default_retention_days=self._retention_days,
+        ).get(key)
+
+
 def format_toronto_time(value: datetime | None) -> str:
     """Render an exact Toronto timestamp for server-rendered console pages."""
 
@@ -104,6 +122,14 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         confirmation_ttl_hours=app_settings.academic_confirmation_ttl_hours,
         embedding_gateway=embedding_gateway,
         default_practice_minutes=app_settings.academic_memory_default_practice_minutes,
+    )
+    material_profile_generator = AssessmentMaterialPlanningProfileService(
+        model=gateway,
+        repository=academic_store,
+        model_identity=MaterialPlanningModelIdentity(
+            generator_model=gateway.model_identity,
+            critic_model=gateway.model_identity,
+        ),
     )
     academic_channel = app_settings.discord_academic_channel_id
     academic_discord = None
@@ -146,6 +172,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             pdf_max_pages=app_settings.academic_material_pdf_max_pages,
             ocr_timeout_seconds=app_settings.academic_material_ocr_timeout_seconds,
             ocr_min_page_chars=app_settings.academic_material_ocr_min_page_chars,
+            profile_generator=material_profile_generator,
         )
 
     async def enqueue_academic_material(page_id: str, fingerprint: str) -> object:
@@ -211,6 +238,11 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         DiscoveredAcademicNotionWriter(
             connector=notion_connector,
             target_store=academic_store,
+            artifact_loader=_LazyArtifactLoader(
+                app_settings.artifact_root,
+                retention_days=app_settings.artifact_retention_days,
+            ),
+            post_seed_syncer=academic_syncer,
         )
         if notion_connector is not None
         else None

@@ -241,6 +241,13 @@ failures require the configured local embedding model to appear in Ollama's
 `/api/tags`. Last-good active chunks remain available while a newer version is
 pending or failed.
 
+A confirmed PDF seed can finish its Notion upload while its canonical sync or
+local indexing job is delayed. Recover by resuming the identifier-only sync and
+indexing job; never re-upload the PDF merely to repair local indexing. Material
+profile refreshes also preserve the last accepted profile when generation,
+criticism, or indexing fails, so a queue retry must build a new candidate rather
+than deactivate the last-good profile.
+
 ## Expected health and Discord behavior
 
 Once the API runtime resumes queue processing, the queue depth should decrease
@@ -262,6 +269,11 @@ component with its diagnostic message.
 
 The alert does not include job arguments, model outputs, or run details; it
 provides only the queue depth and failure count.
+
+Academic health also reports bounded counts for PDF intake awaiting a target,
+pending proposals, active seeding, uncertain writes, orphan uploads, and delayed
+indexing. Use those counts to select the intake or operation-journal runbook;
+do not expose stored material while diagnosing queue health.
 
 ## Verify
 

@@ -3,8 +3,10 @@
 from __future__ import annotations
 
 import json
-from datetime import UTC, datetime
+import math
+from datetime import UTC, datetime, timedelta
 from typing import cast
+from uuid import UUID
 
 from fastapi import APIRouter, HTTPException, Request
 from fastapi.responses import JSONResponse
@@ -12,10 +14,19 @@ from pydantic import SecretStr, ValidationError
 from sqlalchemy.orm import Session
 
 from app.agents.academic_planner.commands import parse_academic_command
-from app.artifacts.store import ArtifactStore
-from app.connectors.discord import DiscordAcademicPlannerAdapter, DiscordFetchedMessage
-from app.connectors.discord_gateway import DiscordAcademicMessageCreate
+from app.artifacts.store import ArtifactMetadata, ArtifactStore
+from app.connectors.discord import (
+    DiscordAcademicPlannerAdapter,
+    DiscordFetchedAttachment,
+    DiscordFetchedMessage,
+    DiscordPdfAttachmentDownload,
+)
+from app.connectors.discord_gateway import (
+    DiscordAcademicMessageAttachment,
+    DiscordAcademicMessageCreate,
+)
 from app.core.errors import LifeAgentError
+from app.db.academic import AcademicInboundMaterialInput, AcademicInboundMaterialRepository
 from app.db.discord_wake import (
     DiscordWakeAction,
     DiscordWakeInboundInput,
@@ -73,16 +84,20 @@ async def accept_discord_handoff(request: Request) -> JSONResponse:
         raise HTTPException(status_code=422, detail="Wake acknowledgement is required")
     await _validate_acknowledgement(request, event)
 
+    inbound_material_ids = await _capture_pdf_attachments(request, message)
+    manifest = {
+        "version": "discord-academic-inbound-v2",
+        "message_text": message.content.get_secret_value(),
+        "inbound_material_ids": [str(item) for item in inbound_material_ids],
+    }
     artifact = ArtifactStore(
         settings.artifact_root,
         default_retention_days=settings.artifact_retention_days,
     ).put(
-        message.content.get_secret_value(),
-        media_type="text/plain",
-        data_class="discord_inbound_message",
-        secrets=(settings.discord_bot_token.get_secret_value(),)
-        if settings.discord_bot_token is not None
-        else (),
+        json.dumps(manifest, sort_keys=True, separators=(",", ":")),
+        media_type="application/json",
+        data_class="discord_inbound_manifest",
+        already_redacted=True,
     )
     action = "academic_checkin"
     if command is not None:
@@ -261,8 +276,101 @@ def _to_academic_message(message: DiscordFetchedMessage) -> DiscordAcademicMessa
         author_id=message.author.id,
         timestamp=message.timestamp,
         content=SecretStr(message.content.get_secret_value()),
+        attachments=tuple(
+            DiscordAcademicMessageAttachment(
+                id=attachment.id,
+                filename=attachment.filename,
+                content_type=attachment.content_type,
+                size=attachment.size,
+                url=attachment.url,
+            )
+            for attachment in message.attachments
+        ),
         mentioned_user_ids=tuple(mention.id for mention in message.mentions),
     )
+
+
+async def _capture_pdf_attachments(
+    request: Request,
+    message: DiscordAcademicMessageCreate,
+) -> tuple[UUID, ...]:
+    """Capture refetched PDFs privately and persist only safe durable metadata."""
+
+    if not message.attachments:
+        return ()
+    settings = request.app.state.settings
+    token = settings.discord_bot_token
+    if token is None:
+        raise HTTPException(status_code=503, detail="Discord backend is not configured")
+    adapter = DiscordAcademicPlannerAdapter(
+        token=token,
+        allowed_channel_ids={message.channel_id},
+        base_url=settings.discord_api_url,
+    )
+    retention_days = max(
+        settings.artifact_retention_days,
+        math.ceil(settings.discord_academic_pdf_intake_ttl_hours / 24) + 1,
+    )
+    artifact_store = ArtifactStore(
+        settings.artifact_root,
+        default_retention_days=settings.artifact_retention_days,
+        retention_days_by_class={"discord_academic_pdf_private": retention_days},
+    )
+    captured: list[tuple[DiscordPdfAttachmentDownload, ArtifactMetadata]] = []
+    try:
+        for attachment in message.attachments[: settings.discord_academic_pdf_max_attachments]:
+            downloaded = await adapter.download_pdf_attachment(
+                DiscordFetchedAttachment(
+                    id=attachment.id,
+                    filename=attachment.filename,
+                    content_type=attachment.content_type,
+                    size=attachment.size,
+                    url=attachment.url,
+                ),
+                max_bytes=settings.discord_academic_pdf_max_bytes,
+                timeout_seconds=settings.discord_academic_pdf_download_timeout_seconds,
+            )
+            artifact = artifact_store.put(
+                downloaded.content,
+                media_type="application/pdf",
+                data_class="discord_academic_pdf_private",
+                already_redacted=True,
+            )
+            captured.append((downloaded, artifact))
+    except LifeAgentError as exc:
+        status_code = 503 if exc.record.retryable else 422
+        raise HTTPException(status_code=status_code, detail="Discord PDF capture failed") from None
+    except (OSError, ValueError):
+        raise HTTPException(status_code=422, detail="Discord PDF capture failed") from None
+
+    expires_at = datetime.now(UTC) + timedelta(hours=settings.discord_academic_pdf_intake_ttl_hours)
+    material_ids: list[UUID] = []
+    try:
+        with Session(request.app.state.database.engine) as session, session.begin():
+            for downloaded, artifact in captured:
+                result = AcademicInboundMaterialRepository.create_or_replay(
+                    session,
+                    AcademicInboundMaterialInput(
+                        discord_message_id=message.message_id,
+                        discord_attachment_id=downloaded.attachment_id,
+                        owner_discord_user_id=message.author_id,
+                        discord_channel_id=message.channel_id,
+                        filename=downloaded.filename,
+                        media_type=downloaded.content_type or "application/pdf",
+                        declared_byte_size=downloaded.declared_size,
+                        observed_byte_size=downloaded.observed_size,
+                        content_hash=downloaded.sha256_hex,
+                        raw_artifact_key=artifact.key,
+                        captured_at=datetime.now(UTC),
+                        expires_at=expires_at,
+                    ),
+                )
+                material_ids.append(result.row.id)
+    except (ValueError, OSError):
+        raise HTTPException(
+            status_code=422, detail="Discord PDF intake could not be stored"
+        ) from None
+    return tuple(material_ids)
 
 
 __all__ = ["accept_discord_handoff", "router"]

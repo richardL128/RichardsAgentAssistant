@@ -138,6 +138,14 @@ embedding failures retain the previous active document version. Fix the local
 dependency, then let Procrastinate retry—do not copy a signed URL into a job or
 database row.
 
+Discord PDF intake has its own owner/channel-scoped states. `awaiting_target`
+means the material is retained but no unambiguous assessment target was chosen;
+`proposal_pending` means the newest proposal is waiting for its exact
+confirmation. A replacement proposal marks the older one `superseded`, so its
+token must not be confirmed. A proposal in `uncertain` may reflect an external
+Notion write whose response was lost; do not retry or reconstruct it
+automatically. Inspect the operation journal and Notion assessment page first.
+
 ## Fix
 
 **To resolve an ambiguity:**

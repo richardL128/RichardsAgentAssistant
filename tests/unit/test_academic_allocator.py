@@ -15,6 +15,7 @@ from app.agents.academic_planner.contracts import (
     IncompleteBlock,
     PlannerFacts,
     PracticeNeed,
+    ValidatedMaterialPlanningSignals,
 )
 
 
@@ -211,3 +212,30 @@ def test_expanded_todo_types_schedule_as_generic_assessment_blocks() -> None:
     studying_todo_block = next(block for block in blocks if block.assessment_id == "study-session")
     assert studying_todo_block.block_kind == "assessment"
     assert studying_todo_block.title == "Review chapter 4"
+
+
+def test_validated_material_signals_have_bounded_priority_impact_only() -> None:
+    now = datetime(2025, 3, 9, 15, tzinfo=UTC)
+    base = _assessment("base")
+    grounded = base.model_copy(
+        update={
+            "id": "grounded",
+            "material_signals": ValidatedMaterialPlanningSignals(
+                effort_lower_minutes=1_000,
+                effort_upper_minutes=2_000,
+                scope_score=1,
+                dependency_risk_score=1,
+                evidence_chunk_ids=("chunk-1",),
+                profile_version="sha256:abc",
+            ),
+        }
+    )
+
+    base_score = priority_score(base, now=now, available_minutes=240)
+    grounded_score = priority_score(grounded, now=now, available_minutes=240)
+
+    assert grounded.due_at == base.due_at
+    assert grounded.weight_percent == base.weight_percent
+    assert grounded_score > base_score
+    # Effort is capped at 2x typed effort, scope at 20, and dependency risk at 20 points.
+    assert grounded_score - base_score <= 90

@@ -116,6 +116,10 @@ class Settings(BaseSettings):
     discord_handoff_max_clock_skew_seconds: Annotated[int, Field(gt=0, le=300)] = 60
     discord_handoff_request_timeout_seconds: Annotated[float, Field(gt=0, le=30)] = 10.0
     discord_handoff_retry_attempts: Annotated[int, Field(gt=0, le=5)] = 3
+    discord_academic_pdf_max_attachments: Annotated[int, Field(gt=0, le=5)] = 5
+    discord_academic_pdf_max_bytes: Annotated[int, Field(gt=0, le=20_971_520)] = 20_971_520
+    discord_academic_pdf_download_timeout_seconds: Annotated[float, Field(gt=0, le=60)] = 15.0
+    discord_academic_pdf_intake_ttl_hours: Annotated[int, Field(gt=0, le=168)] = 48
     github_webhook_max_body_bytes: Annotated[int, Field(gt=0, le=10_485_760)] = 1_048_576
     git_clone_timeout_seconds: Annotated[float, Field(gt=0, le=600)] = 60.0
     code_command_timeout_seconds: Annotated[float, Field(gt=0, le=1800)] = 120.0
@@ -403,6 +407,12 @@ class Settings(BaseSettings):
                 self.discord_handoff_request_timeout_seconds
             ),
             "discord_handoff_retry_attempts": self.discord_handoff_retry_attempts,
+            "discord_academic_pdf_max_attachments": self.discord_academic_pdf_max_attachments,
+            "discord_academic_pdf_max_bytes": self.discord_academic_pdf_max_bytes,
+            "discord_academic_pdf_download_timeout_seconds": (
+                self.discord_academic_pdf_download_timeout_seconds
+            ),
+            "discord_academic_pdf_intake_ttl_hours": (self.discord_academic_pdf_intake_ttl_hours),
             "ops_console_auth_configured": (
                 self.ops_console_username is not None and self.ops_console_password is not None
             ),

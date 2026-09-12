@@ -7,6 +7,7 @@ import pytest
 from pydantic import SecretStr
 
 from app.connectors.discord_gateway import (
+    DiscordAcademicMessageAttachment,
     DiscordAcademicMessageCreate,
     DiscordClarificationInteraction,
 )
@@ -228,6 +229,48 @@ async def test_authorized_unmentioned_prose_is_acknowledged_and_handed_to_harnes
     assert events[-1] == "handoff"
     assert handoff.events_submitted[0].acknowledgement_message_id == "445555555555555555"
     assert outbox.get("555555555555555555").request_kind == "mention"
+
+
+@pytest.mark.asyncio
+async def test_attachment_only_pdf_is_acknowledged_before_wake_and_reference_handoff(
+    tmp_path: Path,
+) -> None:
+    settings = _settings(tmp_path)
+    events: list[str] = []
+    discord = FakeDiscord()
+    handoff = FakeHandoff(events)
+    coordinator = HostWakeCoordinator(
+        settings=settings,
+        outbox=WakeOutbox(settings.outbox_path),
+        discord=discord,
+        docker=FakeService("docker", events),
+        compose=FakeService("compose", events),
+        ollama=FakeService("ollama", events),
+        deployment=FakeService("deploy", events),
+        backend_live=FakeService("api", events),
+        handoff=handoff,
+    )
+    message = DiscordAcademicMessageCreate(
+        message_id="666666666666666666",
+        channel_id="222222222222222222",
+        author_id="333333333333333333",
+        timestamp=datetime(2026, 9, 9, tzinfo=UTC),
+        content=SecretStr(""),
+        attachments=(
+            DiscordAcademicMessageAttachment(
+                id="777777777777777777",
+                filename="rubric.pdf",
+                content_type="application/pdf",
+                size=1_024,
+                url=SecretStr("https://cdn.discordapp.com/attachments/1/2/rubric.pdf?ex=abc"),
+            ),
+        ),
+    )
+
+    assert await coordinator.process_message(message) == "handled"
+    assert discord.events[0] == "ack"
+    assert events[-1] == "handoff"
+    assert handoff.events_submitted[0].message_id == message.message_id
 
 
 @pytest.mark.asyncio
