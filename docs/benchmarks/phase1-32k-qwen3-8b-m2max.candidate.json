@@ -1,0 +1,1703 @@
+{
+  "acceptance_checks": {
+    "cold_fixture_passed": false,
+    "concurrent_results_not_mixed": true,
+    "context_length_matches": true,
+    "embedding_residency_probe_passed": true,
+    "model_allocation_within_limit": true,
+    "model_identity_stable": true,
+    "model_intervals_non_overlapping": true,
+    "single_active_model_call": true,
+    "two_tasks_completed": true,
+    "warm_fixtures_passed": false,
+    "warm_p95_within_timeout": true
+  },
+  "acceptance_thresholds": {
+    "minimum_steady_host_free_percent": 10.0,
+    "model_allocation_limit_bytes": 30064771072,
+    "steady_swapout_limit_bytes": 1073741824,
+    "warm_p95_limit_ms": 300000
+  },
+  "advisory_checks": {
+    "steady_host_headroom_observed": true,
+    "steady_swapout_within_limit": false
+  },
+  "benchmark_version": "phase1-live-v1",
+  "cold": {
+    "benchmark_version": "phase1-live-v1",
+    "config_versions": [
+      "aa315616574d47e4dd8f717eb1b4b8b16a84057380e76f453575627209b0af14"
+    ],
+    "evaluations": [
+      {
+        "assertion_failures": [],
+        "assertions_passed": false,
+        "domain": "code_review",
+        "error_code": "model_error",
+        "error_diagnostic": "Model request failed.",
+        "expected_status": "valid",
+        "fixture_id": "code-finding-triage-v1",
+        "latency_ms": 5001.107375021093,
+        "passed": false,
+        "status": "failed",
+        "telemetry": [
+          {
+            "attempt": 1,
+            "config_version": "aa315616574d47e4dd8f717eb1b4b8b16a84057380e76f453575627209b0af14",
+            "error_code": "model_error",
+            "estimated_input_tokens": 433,
+            "estimated_output_tokens": 0,
+            "finished_at": "2026-09-19T20:18:39.972461Z",
+            "input_characters": 1730,
+            "latency_ms": 5001.107375021093,
+            "model_finished_at": "2026-09-19T20:18:39.972418Z",
+            "model_identity": "qwen3:8b@500a1f067a9f782620b40bee6f7b0c89e17ae61f686b92c24933e4ca4b2b8b41",
+            "model_latency_ms": 5001.042457995936,
+            "model_started_at": "2026-09-19T20:18:34.971327Z",
+            "output_characters": 0,
+            "output_valid": false,
+            "queue_wait_ms": 0.00458303838968277,
+            "reported_input_tokens": null,
+            "reported_output_tokens": null,
+            "request_id": "ac32974d-1f0d-45b2-befc-cdb0a8d447fc",
+            "started_at": "2026-09-19T20:18:34.971316Z"
+          }
+        ],
+        "valid": false
+      }
+    ],
+    "metrics": {
+      "p50_latency_ms": 5001.107375021093,
+      "p95_latency_ms": 5001.107375021093,
+      "pass_rate": 0.0,
+      "passed_evaluations": 0,
+      "total_evaluations": 1,
+      "valid_evaluations": 0,
+      "validity_rate": 0.0
+    },
+    "model_identities": [
+      "qwen3:8b@500a1f067a9f782620b40bee6f7b0c89e17ae61f686b92c24933e4ca4b2b8b41"
+    ]
+  },
+  "cold_start_memory": {
+    "after": {
+      "free_percent": 23.0,
+      "page_size_bytes": 16384,
+      "swapouts": 89102615,
+      "total_bytes": 34359738368
+    },
+    "before": {
+      "free_percent": 35.0,
+      "page_size_bytes": 16384,
+      "swapouts": 88438151,
+      "total_bytes": 34359738368
+    },
+    "minimum_host_free_percent": 10.0,
+    "observed_context_lengths": [
+      32768
+    ],
+    "observed_reasoning_context_lengths": [
+      32768
+    ],
+    "peak_combined_model_size_bytes": 9858239692,
+    "peak_combined_model_vram_bytes": 9858239692,
+    "peak_model_size_bytes": 9858239692,
+    "peak_model_vram_bytes": 9858239692,
+    "sample_count": 10,
+    "sample_errors": 0,
+    "swapout_delta_bytes": 10886578176,
+    "swapout_delta_pages": 664464
+  },
+  "concurrency": {
+    "gateway_metrics": {
+      "active": 0,
+      "limit": 1,
+      "peak": 1
+    },
+    "model_intervals_non_overlapping": true,
+    "outputs_match_markers": true,
+    "request_ids": [
+      "c492a82b-2a3f-4684-a0c7-cb763c7ad042",
+      "73009975-3d1a-428b-b885-6b9483a00136"
+    ],
+    "statuses": [
+      "valid",
+      "valid"
+    ]
+  },
+  "embedding_probe": {
+    "expected_dimensions": 1024,
+    "finished_at": "2026-09-19T20:21:23.045421+00:00",
+    "model": "qwen3-embedding:4b",
+    "observed_dimensions": 1024,
+    "started_at": "2026-09-19T20:21:20.649732+00:00",
+    "status": "valid"
+  },
+  "gate_passed": false,
+  "generated_at": "2026-09-19T20:21:33.101480+00:00",
+  "memory": {
+    "after": {
+      "free_percent": 23.0,
+      "page_size_bytes": 16384,
+      "swapouts": 89257875,
+      "total_bytes": 34359738368
+    },
+    "before": {
+      "free_percent": 23.0,
+      "page_size_bytes": 16384,
+      "swapouts": 89102615,
+      "total_bytes": 34359738368
+    },
+    "minimum_host_free_percent": 21.0,
+    "observed_context_lengths": [
+      32768
+    ],
+    "observed_reasoning_context_lengths": [
+      32768
+    ],
+    "peak_combined_model_size_bytes": 9858239692,
+    "peak_combined_model_vram_bytes": 9858239692,
+    "peak_model_size_bytes": 9858239692,
+    "peak_model_vram_bytes": 9858239692,
+    "sample_count": 165,
+    "sample_errors": 0,
+    "swapout_delta_bytes": 2543779840,
+    "swapout_delta_pages": 155260
+  },
+  "ollama": {
+    "digest": "500a1f067a9f782620b40bee6f7b0c89e17ae61f686b92c24933e4ca4b2b8b41",
+    "identity_stable_at_finish": true,
+    "model": "qwen3:8b",
+    "tag_record": {
+      "capabilities": [
+        "completion",
+        "tools",
+        "thinking"
+      ],
+      "details": {
+        "context_length": 40960,
+        "embedding_length": 4096,
+        "families": [
+          "qwen3"
+        ],
+        "family": "qwen3",
+        "format": "gguf",
+        "parameter_size": "8.2B",
+        "parent_model": "",
+        "quantization_level": "Q4_K_M"
+      },
+      "digest": "500a1f067a9f782620b40bee6f7b0c89e17ae61f686b92c24933e4ca4b2b8b41",
+      "model": "qwen3:8b",
+      "modified_at": "2026-09-19T16:18:05.618068529-04:00",
+      "name": "qwen3:8b",
+      "size": 5225388164
+    },
+    "version": "0.33.3"
+  },
+  "platform": {
+    "machine": "arm64",
+    "python": "3.12.14",
+    "release": "25.6.0",
+    "system": "Darwin"
+  },
+  "provenance": {
+    "fixture_manifest_sha256": "f67703adbd9fba4f4ef362d0850d2b53ee41e51897cae5d1f753035af0ba6396",
+    "uv_lock_sha256": "99c79b5c79aa6c484938f1050b09da2aa9d2d453d3b05e09eae1f644070ec01f"
+  },
+  "settings": {
+    "config_version": "aa315616574d47e4dd8f717eb1b4b8b16a84057380e76f453575627209b0af14",
+    "context_reserve_tokens": 4096,
+    "embedding_dimensions": 1024,
+    "embedding_model": "qwen3-embedding:4b",
+    "max_concurrency": 1,
+    "max_input_tokens": 26624,
+    "max_output_tokens": 2048,
+    "num_batch": 32,
+    "num_ctx": 32768,
+    "reasoning": false,
+    "repair_attempts": 1,
+    "seed": 1729,
+    "temperature": 0,
+    "timeout_seconds": 300.0
+  },
+  "warm": {
+    "benchmark_version": "phase1-live-v1",
+    "config_versions": [
+      "aa315616574d47e4dd8f717eb1b4b8b16a84057380e76f453575627209b0af14"
+    ],
+    "evaluations": [
+      {
+        "assertion_failures": [],
+        "assertions_passed": false,
+        "domain": "code_review",
+        "error_code": "model_error",
+        "error_diagnostic": "Model request failed.",
+        "expected_status": "valid",
+        "fixture_id": "code-finding-triage-v1",
+        "latency_ms": 17.64804101549089,
+        "passed": false,
+        "status": "failed",
+        "telemetry": [
+          {
+            "attempt": 1,
+            "config_version": "aa315616574d47e4dd8f717eb1b4b8b16a84057380e76f453575627209b0af14",
+            "error_code": "model_error",
+            "estimated_input_tokens": 433,
+            "estimated_output_tokens": 0,
+            "finished_at": "2026-09-19T20:18:45.024866Z",
+            "input_characters": 1730,
+            "latency_ms": 17.64804101549089,
+            "model_finished_at": "2026-09-19T20:18:45.024857Z",
+            "model_identity": "qwen3:8b@500a1f067a9f782620b40bee6f7b0c89e17ae61f686b92c24933e4ca4b2b8b41",
+            "model_latency_ms": 17.634499934501946,
+            "model_started_at": "2026-09-19T20:18:45.007224Z",
+            "output_characters": 0,
+            "output_valid": false,
+            "queue_wait_ms": 0.004208064638078213,
+            "reported_input_tokens": null,
+            "reported_output_tokens": null,
+            "request_id": "7b070ede-434b-4334-8885-51ebe5786a14",
+            "started_at": "2026-09-19T20:18:45.007216Z"
+          }
+        ],
+        "valid": false
+      },
+      {
+        "assertion_failures": [
+          "thesis_impact"
+        ],
+        "assertions_passed": false,
+        "domain": "finance",
+        "error_code": "evaluation_assertion_failed",
+        "error_diagnostic": null,
+        "expected_status": "valid",
+        "fixture_id": "finance-fact-inference-v1",
+        "latency_ms": 8563.006166019477,
+        "passed": false,
+        "status": "valid",
+        "telemetry": [
+          {
+            "attempt": 1,
+            "config_version": "aa315616574d47e4dd8f717eb1b4b8b16a84057380e76f453575627209b0af14",
+            "error_code": null,
+            "estimated_input_tokens": 654,
+            "estimated_output_tokens": 211,
+            "finished_at": "2026-09-19T20:18:53.591054Z",
+            "input_characters": 2613,
+            "latency_ms": 8563.006166019477,
+            "model_finished_at": "2026-09-19T20:18:53.590585Z",
+            "model_identity": "qwen3:8b@500a1f067a9f782620b40bee6f7b0c89e17ae61f686b92c24933e4ca4b2b8b41",
+            "model_latency_ms": 8562.538207974285,
+            "model_started_at": "2026-09-19T20:18:45.027957Z",
+            "output_characters": 842,
+            "output_valid": true,
+            "queue_wait_ms": 0.0024579931050539017,
+            "reported_input_tokens": 634,
+            "reported_output_tokens": 213,
+            "request_id": "757fbc58-610a-4df7-b2fa-4d27376f2423",
+            "started_at": "2026-09-19T20:18:45.027953Z"
+          }
+        ],
+        "valid": true
+      },
+      {
+        "assertion_failures": [],
+        "assertions_passed": true,
+        "domain": "academic",
+        "error_code": null,
+        "error_diagnostic": null,
+        "expected_status": "valid",
+        "fixture_id": "academic-ambiguous-extraction-v1",
+        "latency_ms": 7424.213833990507,
+        "passed": true,
+        "status": "valid",
+        "telemetry": [
+          {
+            "attempt": 1,
+            "config_version": "aa315616574d47e4dd8f717eb1b4b8b16a84057380e76f453575627209b0af14",
+            "error_code": null,
+            "estimated_input_tokens": 637,
+            "estimated_output_tokens": 128,
+            "finished_at": "2026-09-19T20:19:01.020312Z",
+            "input_characters": 2547,
+            "latency_ms": 7424.213833990507,
+            "model_finished_at": "2026-09-19T20:19:01.020216Z",
+            "model_identity": "qwen3:8b@500a1f067a9f782620b40bee6f7b0c89e17ae61f686b92c24933e4ca4b2b8b41",
+            "model_latency_ms": 7424.1075000027195,
+            "model_started_at": "2026-09-19T20:18:53.596032Z",
+            "output_characters": 512,
+            "output_valid": true,
+            "queue_wait_ms": 0.009416951797902584,
+            "reported_input_tokens": 628,
+            "reported_output_tokens": 161,
+            "request_id": "231d2948-ff27-49ca-80b8-0f7291aec88e",
+            "started_at": "2026-09-19T20:18:53.596021Z"
+          }
+        ],
+        "valid": true
+      },
+      {
+        "assertion_failures": [],
+        "assertions_passed": true,
+        "domain": "structured_output",
+        "error_code": null,
+        "error_diagnostic": null,
+        "expected_status": "valid",
+        "fixture_id": "valid-json-v1",
+        "latency_ms": 1219.2700420273468,
+        "passed": true,
+        "status": "valid",
+        "telemetry": [
+          {
+            "attempt": 1,
+            "config_version": "aa315616574d47e4dd8f717eb1b4b8b16a84057380e76f453575627209b0af14",
+            "error_code": null,
+            "estimated_input_tokens": 168,
+            "estimated_output_tokens": 17,
+            "finished_at": "2026-09-19T20:19:02.247225Z",
+            "input_characters": 670,
+            "latency_ms": 1219.2700420273468,
+            "model_finished_at": "2026-09-19T20:19:02.247184Z",
+            "model_identity": "qwen3:8b@500a1f067a9f782620b40bee6f7b0c89e17ae61f686b92c24933e4ca4b2b8b41",
+            "model_latency_ms": 1219.2236250266433,
+            "model_started_at": "2026-09-19T20:19:01.027952Z",
+            "output_characters": 66,
+            "output_valid": true,
+            "queue_wait_ms": 0.009416951797902584,
+            "reported_input_tokens": 156,
+            "reported_output_tokens": 24,
+            "request_id": "54e4e5d4-2516-48bf-bb4e-6c09203518b0",
+            "started_at": "2026-09-19T20:19:01.027940Z"
+          }
+        ],
+        "valid": true
+      },
+      {
+        "assertion_failures": [],
+        "assertions_passed": false,
+        "domain": "code_review",
+        "error_code": "model_error",
+        "error_diagnostic": "Model request failed.",
+        "expected_status": "valid",
+        "fixture_id": "code-finding-triage-v1",
+        "latency_ms": 18.03045906126499,
+        "passed": false,
+        "status": "failed",
+        "telemetry": [
+          {
+            "attempt": 1,
+            "config_version": "aa315616574d47e4dd8f717eb1b4b8b16a84057380e76f453575627209b0af14",
+            "error_code": "model_error",
+            "estimated_input_tokens": 433,
+            "estimated_output_tokens": 0,
+            "finished_at": "2026-09-19T20:19:02.268478Z",
+            "input_characters": 1730,
+            "latency_ms": 18.03045906126499,
+            "model_finished_at": "2026-09-19T20:19:02.268469Z",
+            "model_identity": "qwen3:8b@500a1f067a9f782620b40bee6f7b0c89e17ae61f686b92c24933e4ca4b2b8b41",
+            "model_latency_ms": 18.016875023022294,
+            "model_started_at": "2026-09-19T20:19:02.250455Z",
+            "output_characters": 0,
+            "output_valid": false,
+            "queue_wait_ms": 0.00500003807246685,
+            "reported_input_tokens": null,
+            "reported_output_tokens": null,
+            "request_id": "28736883-6feb-4599-ab2d-ded1135488a7",
+            "started_at": "2026-09-19T20:19:02.250448Z"
+          }
+        ],
+        "valid": false
+      },
+      {
+        "assertion_failures": [
+          "thesis_impact"
+        ],
+        "assertions_passed": false,
+        "domain": "finance",
+        "error_code": "evaluation_assertion_failed",
+        "error_diagnostic": null,
+        "expected_status": "valid",
+        "fixture_id": "finance-fact-inference-v1",
+        "latency_ms": 7571.733999997377,
+        "passed": false,
+        "status": "valid",
+        "telemetry": [
+          {
+            "attempt": 1,
+            "config_version": "aa315616574d47e4dd8f717eb1b4b8b16a84057380e76f453575627209b0af14",
+            "error_code": null,
+            "estimated_input_tokens": 654,
+            "estimated_output_tokens": 211,
+            "finished_at": "2026-09-19T20:19:09.844402Z",
+            "input_characters": 2613,
+            "latency_ms": 7571.733999997377,
+            "model_finished_at": "2026-09-19T20:19:09.844364Z",
+            "model_identity": "qwen3:8b@500a1f067a9f782620b40bee6f7b0c89e17ae61f686b92c24933e4ca4b2b8b41",
+            "model_latency_ms": 7571.6891249176115,
+            "model_started_at": "2026-09-19T20:19:02.272593Z",
+            "output_characters": 842,
+            "output_valid": true,
+            "queue_wait_ms": 0.006458023563027382,
+            "reported_input_tokens": 634,
+            "reported_output_tokens": 213,
+            "request_id": "44da68de-28f0-4fe5-a31a-aa7cf596bc73",
+            "started_at": "2026-09-19T20:19:02.272584Z"
+          }
+        ],
+        "valid": true
+      },
+      {
+        "assertion_failures": [],
+        "assertions_passed": true,
+        "domain": "academic",
+        "error_code": null,
+        "error_diagnostic": null,
+        "expected_status": "valid",
+        "fixture_id": "academic-ambiguous-extraction-v1",
+        "latency_ms": 5752.419749973342,
+        "passed": true,
+        "status": "valid",
+        "telemetry": [
+          {
+            "attempt": 1,
+            "config_version": "aa315616574d47e4dd8f717eb1b4b8b16a84057380e76f453575627209b0af14",
+            "error_code": null,
+            "estimated_input_tokens": 637,
+            "estimated_output_tokens": 128,
+            "finished_at": "2026-09-19T20:19:15.601777Z",
+            "input_characters": 2547,
+            "latency_ms": 5752.419749973342,
+            "model_finished_at": "2026-09-19T20:19:15.601729Z",
+            "model_identity": "qwen3:8b@500a1f067a9f782620b40bee6f7b0c89e17ae61f686b92c24933e4ca4b2b8b41",
+            "model_latency_ms": 5752.365499967709,
+            "model_started_at": "2026-09-19T20:19:09.849303Z",
+            "output_characters": 512,
+            "output_valid": true,
+            "queue_wait_ms": 0.006082933396100998,
+            "reported_input_tokens": 628,
+            "reported_output_tokens": 161,
+            "request_id": "159f95e5-b2ea-4bd6-a0b6-2c55ad65261f",
+            "started_at": "2026-09-19T20:19:09.849294Z"
+          }
+        ],
+        "valid": true
+      },
+      {
+        "assertion_failures": [],
+        "assertions_passed": true,
+        "domain": "structured_output",
+        "error_code": null,
+        "error_diagnostic": null,
+        "expected_status": "valid",
+        "fixture_id": "valid-json-v1",
+        "latency_ms": 832.0481249829754,
+        "passed": true,
+        "status": "valid",
+        "telemetry": [
+          {
+            "attempt": 1,
+            "config_version": "aa315616574d47e4dd8f717eb1b4b8b16a84057380e76f453575627209b0af14",
+            "error_code": null,
+            "estimated_input_tokens": 168,
+            "estimated_output_tokens": 17,
+            "finished_at": "2026-09-19T20:19:16.436917Z",
+            "input_characters": 670,
+            "latency_ms": 832.0481249829754,
+            "model_finished_at": "2026-09-19T20:19:16.436857Z",
+            "model_identity": "qwen3:8b@500a1f067a9f782620b40bee6f7b0c89e17ae61f686b92c24933e4ca4b2b8b41",
+            "model_latency_ms": 831.9830830441788,
+            "model_started_at": "2026-09-19T20:19:15.604871Z",
+            "output_characters": 66,
+            "output_valid": true,
+            "queue_wait_ms": 0.004749977961182594,
+            "reported_input_tokens": 156,
+            "reported_output_tokens": 24,
+            "request_id": "9aeff2af-44f0-468d-be05-1f178191eb2f",
+            "started_at": "2026-09-19T20:19:15.604865Z"
+          }
+        ],
+        "valid": true
+      },
+      {
+        "assertion_failures": [],
+        "assertions_passed": false,
+        "domain": "code_review",
+        "error_code": "model_error",
+        "error_diagnostic": "Model request failed.",
+        "expected_status": "valid",
+        "fixture_id": "code-finding-triage-v1",
+        "latency_ms": 21.647125016897917,
+        "passed": false,
+        "status": "failed",
+        "telemetry": [
+          {
+            "attempt": 1,
+            "config_version": "aa315616574d47e4dd8f717eb1b4b8b16a84057380e76f453575627209b0af14",
+            "error_code": "model_error",
+            "estimated_input_tokens": 433,
+            "estimated_output_tokens": 0,
+            "finished_at": "2026-09-19T20:19:16.462685Z",
+            "input_characters": 1730,
+            "latency_ms": 21.647125016897917,
+            "model_finished_at": "2026-09-19T20:19:16.462674Z",
+            "model_identity": "qwen3:8b@500a1f067a9f782620b40bee6f7b0c89e17ae61f686b92c24933e4ca4b2b8b41",
+            "model_latency_ms": 21.630458999425173,
+            "model_started_at": "2026-09-19T20:19:16.441047Z",
+            "output_characters": 0,
+            "output_valid": false,
+            "queue_wait_ms": 0.005041016265749931,
+            "reported_input_tokens": null,
+            "reported_output_tokens": null,
+            "request_id": "6db2eb24-c8db-4661-a503-3cbe6f085ab1",
+            "started_at": "2026-09-19T20:19:16.441041Z"
+          }
+        ],
+        "valid": false
+      },
+      {
+        "assertion_failures": [
+          "thesis_impact"
+        ],
+        "assertions_passed": false,
+        "domain": "finance",
+        "error_code": "evaluation_assertion_failed",
+        "error_diagnostic": null,
+        "expected_status": "valid",
+        "fixture_id": "finance-fact-inference-v1",
+        "latency_ms": 7664.9769159266725,
+        "passed": false,
+        "status": "valid",
+        "telemetry": [
+          {
+            "attempt": 1,
+            "config_version": "aa315616574d47e4dd8f717eb1b4b8b16a84057380e76f453575627209b0af14",
+            "error_code": null,
+            "estimated_input_tokens": 654,
+            "estimated_output_tokens": 211,
+            "finished_at": "2026-09-19T20:19:24.134990Z",
+            "input_characters": 2613,
+            "latency_ms": 7664.9769159266725,
+            "model_finished_at": "2026-09-19T20:19:24.134955Z",
+            "model_identity": "qwen3:8b@500a1f067a9f782620b40bee6f7b0c89e17ae61f686b92c24933e4ca4b2b8b41",
+            "model_latency_ms": 7664.933750056662,
+            "model_started_at": "2026-09-19T20:19:16.469937Z",
+            "output_characters": 842,
+            "output_valid": true,
+            "queue_wait_ms": 0.0071249669417738914,
+            "reported_input_tokens": 634,
+            "reported_output_tokens": 213,
+            "request_id": "f948c806-2a29-4999-bf8d-9f97ed8a4250",
+            "started_at": "2026-09-19T20:19:16.469927Z"
+          }
+        ],
+        "valid": true
+      },
+      {
+        "assertion_failures": [],
+        "assertions_passed": true,
+        "domain": "academic",
+        "error_code": null,
+        "error_diagnostic": null,
+        "expected_status": "valid",
+        "fixture_id": "academic-ambiguous-extraction-v1",
+        "latency_ms": 5880.140834022313,
+        "passed": true,
+        "status": "valid",
+        "telemetry": [
+          {
+            "attempt": 1,
+            "config_version": "aa315616574d47e4dd8f717eb1b4b8b16a84057380e76f453575627209b0af14",
+            "error_code": null,
+            "estimated_input_tokens": 637,
+            "estimated_output_tokens": 128,
+            "finished_at": "2026-09-19T20:19:30.021248Z",
+            "input_characters": 2547,
+            "latency_ms": 5880.140834022313,
+            "model_finished_at": "2026-09-19T20:19:30.021165Z",
+            "model_identity": "qwen3:8b@500a1f067a9f782620b40bee6f7b0c89e17ae61f686b92c24933e4ca4b2b8b41",
+            "model_latency_ms": 5880.04425005056,
+            "model_started_at": "2026-09-19T20:19:24.141059Z",
+            "output_characters": 512,
+            "output_valid": true,
+            "queue_wait_ms": 0.005500041879713535,
+            "reported_input_tokens": 628,
+            "reported_output_tokens": 161,
+            "request_id": "f7f11b01-7308-4ee3-ae77-3390b1cac63e",
+            "started_at": "2026-09-19T20:19:24.141051Z"
+          }
+        ],
+        "valid": true
+      },
+      {
+        "assertion_failures": [],
+        "assertions_passed": true,
+        "domain": "structured_output",
+        "error_code": null,
+        "error_diagnostic": null,
+        "expected_status": "valid",
+        "fixture_id": "valid-json-v1",
+        "latency_ms": 867.7248329622671,
+        "passed": true,
+        "status": "valid",
+        "telemetry": [
+          {
+            "attempt": 1,
+            "config_version": "aa315616574d47e4dd8f717eb1b4b8b16a84057380e76f453575627209b0af14",
+            "error_code": null,
+            "estimated_input_tokens": 168,
+            "estimated_output_tokens": 17,
+            "finished_at": "2026-09-19T20:19:30.895087Z",
+            "input_characters": 670,
+            "latency_ms": 867.7248329622671,
+            "model_finished_at": "2026-09-19T20:19:30.895001Z",
+            "model_identity": "qwen3:8b@500a1f067a9f782620b40bee6f7b0c89e17ae61f686b92c24933e4ca4b2b8b41",
+            "model_latency_ms": 867.6262079970911,
+            "model_started_at": "2026-09-19T20:19:30.027372Z",
+            "output_characters": 66,
+            "output_valid": true,
+            "queue_wait_ms": 0.008416944183409214,
+            "reported_input_tokens": 156,
+            "reported_output_tokens": 24,
+            "request_id": "90ddbd2c-703c-4228-80ed-783275839594",
+            "started_at": "2026-09-19T20:19:30.027360Z"
+          }
+        ],
+        "valid": true
+      },
+      {
+        "assertion_failures": [],
+        "assertions_passed": false,
+        "domain": "code_review",
+        "error_code": "model_error",
+        "error_diagnostic": "Model request failed.",
+        "expected_status": "valid",
+        "fixture_id": "code-finding-triage-v1",
+        "latency_ms": 23.005999973975122,
+        "passed": false,
+        "status": "failed",
+        "telemetry": [
+          {
+            "attempt": 1,
+            "config_version": "aa315616574d47e4dd8f717eb1b4b8b16a84057380e76f453575627209b0af14",
+            "error_code": "model_error",
+            "estimated_input_tokens": 433,
+            "estimated_output_tokens": 0,
+            "finished_at": "2026-09-19T20:19:30.924886Z",
+            "input_characters": 1730,
+            "latency_ms": 23.005999973975122,
+            "model_finished_at": "2026-09-19T20:19:30.924861Z",
+            "model_identity": "qwen3:8b@500a1f067a9f782620b40bee6f7b0c89e17ae61f686b92c24933e4ca4b2b8b41",
+            "model_latency_ms": 22.982791997492313,
+            "model_started_at": "2026-09-19T20:19:30.901894Z",
+            "output_characters": 0,
+            "output_valid": false,
+            "queue_wait_ms": 0.00937492586672306,
+            "reported_input_tokens": null,
+            "reported_output_tokens": null,
+            "request_id": "b42e8778-a6fc-4233-a8de-54aa1addbf89",
+            "started_at": "2026-09-19T20:19:30.901880Z"
+          }
+        ],
+        "valid": false
+      },
+      {
+        "assertion_failures": [
+          "thesis_impact"
+        ],
+        "assertions_passed": false,
+        "domain": "finance",
+        "error_code": "evaluation_assertion_failed",
+        "error_diagnostic": null,
+        "expected_status": "valid",
+        "fixture_id": "finance-fact-inference-v1",
+        "latency_ms": 7791.380124981515,
+        "passed": false,
+        "status": "valid",
+        "telemetry": [
+          {
+            "attempt": 1,
+            "config_version": "aa315616574d47e4dd8f717eb1b4b8b16a84057380e76f453575627209b0af14",
+            "error_code": null,
+            "estimated_input_tokens": 654,
+            "estimated_output_tokens": 211,
+            "finished_at": "2026-09-19T20:19:38.724694Z",
+            "input_characters": 2613,
+            "latency_ms": 7791.380124981515,
+            "model_finished_at": "2026-09-19T20:19:38.724616Z",
+            "model_identity": "qwen3:8b@500a1f067a9f782620b40bee6f7b0c89e17ae61f686b92c24933e4ca4b2b8b41",
+            "model_latency_ms": 7791.290875058621,
+            "model_started_at": "2026-09-19T20:19:30.933245Z",
+            "output_characters": 842,
+            "output_valid": true,
+            "queue_wait_ms": 0.009499955922365189,
+            "reported_input_tokens": 634,
+            "reported_output_tokens": 213,
+            "request_id": "9ab74139-0440-46d5-a62c-1ede04e5d5f1",
+            "started_at": "2026-09-19T20:19:30.933231Z"
+          }
+        ],
+        "valid": true
+      },
+      {
+        "assertion_failures": [],
+        "assertions_passed": true,
+        "domain": "academic",
+        "error_code": null,
+        "error_diagnostic": null,
+        "expected_status": "valid",
+        "fixture_id": "academic-ambiguous-extraction-v1",
+        "latency_ms": 6045.11737509165,
+        "passed": true,
+        "status": "valid",
+        "telemetry": [
+          {
+            "attempt": 1,
+            "config_version": "aa315616574d47e4dd8f717eb1b4b8b16a84057380e76f453575627209b0af14",
+            "error_code": null,
+            "estimated_input_tokens": 637,
+            "estimated_output_tokens": 128,
+            "finished_at": "2026-09-19T20:19:44.822273Z",
+            "input_characters": 2547,
+            "latency_ms": 6045.11737509165,
+            "model_finished_at": "2026-09-19T20:19:44.822186Z",
+            "model_identity": "qwen3:8b@500a1f067a9f782620b40bee6f7b0c89e17ae61f686b92c24933e4ca4b2b8b41",
+            "model_latency_ms": 6045.025624916889,
+            "model_started_at": "2026-09-19T20:19:38.777096Z",
+            "output_characters": 512,
+            "output_valid": true,
+            "queue_wait_ms": 0.005833106115460396,
+            "reported_input_tokens": 628,
+            "reported_output_tokens": 161,
+            "request_id": "3f62978b-8c34-48e7-a01f-6195446343bb",
+            "started_at": "2026-09-19T20:19:38.777086Z"
+          }
+        ],
+        "valid": true
+      },
+      {
+        "assertion_failures": [],
+        "assertions_passed": true,
+        "domain": "structured_output",
+        "error_code": null,
+        "error_diagnostic": null,
+        "expected_status": "valid",
+        "fixture_id": "valid-json-v1",
+        "latency_ms": 976.5195419313386,
+        "passed": true,
+        "status": "valid",
+        "telemetry": [
+          {
+            "attempt": 1,
+            "config_version": "aa315616574d47e4dd8f717eb1b4b8b16a84057380e76f453575627209b0af14",
+            "error_code": null,
+            "estimated_input_tokens": 168,
+            "estimated_output_tokens": 17,
+            "finished_at": "2026-09-19T20:19:45.803360Z",
+            "input_characters": 670,
+            "latency_ms": 976.5195419313386,
+            "model_finished_at": "2026-09-19T20:19:45.803315Z",
+            "model_identity": "qwen3:8b@500a1f067a9f782620b40bee6f7b0c89e17ae61f686b92c24933e4ca4b2b8b41",
+            "model_latency_ms": 976.4600830385461,
+            "model_started_at": "2026-09-19T20:19:44.826846Z",
+            "output_characters": 66,
+            "output_valid": true,
+            "queue_wait_ms": 0.009416951797902584,
+            "reported_input_tokens": 156,
+            "reported_output_tokens": 24,
+            "request_id": "1873787d-e43b-41b6-b3b9-e5f18dbca0e3",
+            "started_at": "2026-09-19T20:19:44.826833Z"
+          }
+        ],
+        "valid": true
+      },
+      {
+        "assertion_failures": [],
+        "assertions_passed": false,
+        "domain": "code_review",
+        "error_code": "model_error",
+        "error_diagnostic": "Model request failed.",
+        "expected_status": "valid",
+        "fixture_id": "code-finding-triage-v1",
+        "latency_ms": 11.92175003234297,
+        "passed": false,
+        "status": "failed",
+        "telemetry": [
+          {
+            "attempt": 1,
+            "config_version": "aa315616574d47e4dd8f717eb1b4b8b16a84057380e76f453575627209b0af14",
+            "error_code": "model_error",
+            "estimated_input_tokens": 433,
+            "estimated_output_tokens": 0,
+            "finished_at": "2026-09-19T20:19:45.816853Z",
+            "input_characters": 1730,
+            "latency_ms": 11.92175003234297,
+            "model_finished_at": "2026-09-19T20:19:45.816839Z",
+            "model_identity": "qwen3:8b@500a1f067a9f782620b40bee6f7b0c89e17ae61f686b92c24933e4ca4b2b8b41",
+            "model_latency_ms": 11.90283300820738,
+            "model_started_at": "2026-09-19T20:19:45.804942Z",
+            "output_characters": 0,
+            "output_valid": false,
+            "queue_wait_ms": 0.008750008419156075,
+            "reported_input_tokens": null,
+            "reported_output_tokens": null,
+            "request_id": "38b88d5c-c03c-4769-9ac2-068727a6c6b0",
+            "started_at": "2026-09-19T20:19:45.804931Z"
+          }
+        ],
+        "valid": false
+      },
+      {
+        "assertion_failures": [
+          "thesis_impact"
+        ],
+        "assertions_passed": false,
+        "domain": "finance",
+        "error_code": "evaluation_assertion_failed",
+        "error_diagnostic": null,
+        "expected_status": "valid",
+        "fixture_id": "finance-fact-inference-v1",
+        "latency_ms": 8627.726167091168,
+        "passed": false,
+        "status": "valid",
+        "telemetry": [
+          {
+            "attempt": 1,
+            "config_version": "aa315616574d47e4dd8f717eb1b4b8b16a84057380e76f453575627209b0af14",
+            "error_code": null,
+            "estimated_input_tokens": 654,
+            "estimated_output_tokens": 211,
+            "finished_at": "2026-09-19T20:19:54.448648Z",
+            "input_characters": 2613,
+            "latency_ms": 8627.726167091168,
+            "model_finished_at": "2026-09-19T20:19:54.448592Z",
+            "model_identity": "qwen3:8b@500a1f067a9f782620b40bee6f7b0c89e17ae61f686b92c24933e4ca4b2b8b41",
+            "model_latency_ms": 8627.665167092346,
+            "model_started_at": "2026-09-19T20:19:45.820836Z",
+            "output_characters": 842,
+            "output_valid": true,
+            "queue_wait_ms": 0.005875015631318092,
+            "reported_input_tokens": 634,
+            "reported_output_tokens": 213,
+            "request_id": "983981f0-4f53-43cb-9e83-635ff2ea28e9",
+            "started_at": "2026-09-19T20:19:45.820827Z"
+          }
+        ],
+        "valid": true
+      },
+      {
+        "assertion_failures": [],
+        "assertions_passed": true,
+        "domain": "academic",
+        "error_code": null,
+        "error_diagnostic": null,
+        "expected_status": "valid",
+        "fixture_id": "academic-ambiguous-extraction-v1",
+        "latency_ms": 6437.961417017505,
+        "passed": true,
+        "status": "valid",
+        "telemetry": [
+          {
+            "attempt": 1,
+            "config_version": "aa315616574d47e4dd8f717eb1b4b8b16a84057380e76f453575627209b0af14",
+            "error_code": null,
+            "estimated_input_tokens": 637,
+            "estimated_output_tokens": 128,
+            "finished_at": "2026-09-19T20:20:00.894485Z",
+            "input_characters": 2547,
+            "latency_ms": 6437.961417017505,
+            "model_finished_at": "2026-09-19T20:20:00.894389Z",
+            "model_identity": "qwen3:8b@500a1f067a9f782620b40bee6f7b0c89e17ae61f686b92c24933e4ca4b2b8b41",
+            "model_latency_ms": 6437.853500014171,
+            "model_started_at": "2026-09-19T20:19:54.456467Z",
+            "output_characters": 512,
+            "output_valid": true,
+            "queue_wait_ms": 0.00800006091594696,
+            "reported_input_tokens": 628,
+            "reported_output_tokens": 161,
+            "request_id": "3a4ead69-ac1e-4a8e-9ba5-f61cb6621524",
+            "started_at": "2026-09-19T20:19:54.456455Z"
+          }
+        ],
+        "valid": true
+      },
+      {
+        "assertion_failures": [],
+        "assertions_passed": true,
+        "domain": "structured_output",
+        "error_code": null,
+        "error_diagnostic": null,
+        "expected_status": "valid",
+        "fixture_id": "valid-json-v1",
+        "latency_ms": 934.5384170301259,
+        "passed": true,
+        "status": "valid",
+        "telemetry": [
+          {
+            "attempt": 1,
+            "config_version": "aa315616574d47e4dd8f717eb1b4b8b16a84057380e76f453575627209b0af14",
+            "error_code": null,
+            "estimated_input_tokens": 168,
+            "estimated_output_tokens": 17,
+            "finished_at": "2026-09-19T20:20:01.834015Z",
+            "input_characters": 670,
+            "latency_ms": 934.5384170301259,
+            "model_finished_at": "2026-09-19T20:20:01.833959Z",
+            "model_identity": "qwen3:8b@500a1f067a9f782620b40bee6f7b0c89e17ae61f686b92c24933e4ca4b2b8b41",
+            "model_latency_ms": 934.477208997123,
+            "model_started_at": "2026-09-19T20:20:00.899479Z",
+            "output_characters": 66,
+            "output_valid": true,
+            "queue_wait_ms": 0.006249989382922649,
+            "reported_input_tokens": 156,
+            "reported_output_tokens": 24,
+            "request_id": "c02df90b-6d87-4760-b299-e323d34cbc35",
+            "started_at": "2026-09-19T20:20:00.899466Z"
+          }
+        ],
+        "valid": true
+      },
+      {
+        "assertion_failures": [],
+        "assertions_passed": false,
+        "domain": "code_review",
+        "error_code": "model_error",
+        "error_diagnostic": "Model request failed.",
+        "expected_status": "valid",
+        "fixture_id": "code-finding-triage-v1",
+        "latency_ms": 20.81108291167766,
+        "passed": false,
+        "status": "failed",
+        "telemetry": [
+          {
+            "attempt": 1,
+            "config_version": "aa315616574d47e4dd8f717eb1b4b8b16a84057380e76f453575627209b0af14",
+            "error_code": "model_error",
+            "estimated_input_tokens": 433,
+            "estimated_output_tokens": 0,
+            "finished_at": "2026-09-19T20:20:01.857339Z",
+            "input_characters": 1730,
+            "latency_ms": 20.81108291167766,
+            "model_finished_at": "2026-09-19T20:20:01.857299Z",
+            "model_identity": "qwen3:8b@500a1f067a9f782620b40bee6f7b0c89e17ae61f686b92c24933e4ca4b2b8b41",
+            "model_latency_ms": 20.783709012903273,
+            "model_started_at": "2026-09-19T20:20:01.836539Z",
+            "output_characters": 0,
+            "output_valid": false,
+            "queue_wait_ms": 0.0075409188866615295,
+            "reported_input_tokens": null,
+            "reported_output_tokens": null,
+            "request_id": "b3d4dbe1-bca4-443c-8e93-7bdeb0dc05d5",
+            "started_at": "2026-09-19T20:20:01.836528Z"
+          }
+        ],
+        "valid": false
+      },
+      {
+        "assertion_failures": [
+          "thesis_impact"
+        ],
+        "assertions_passed": false,
+        "domain": "finance",
+        "error_code": "evaluation_assertion_failed",
+        "error_diagnostic": null,
+        "expected_status": "valid",
+        "fixture_id": "finance-fact-inference-v1",
+        "latency_ms": 8507.927333936095,
+        "passed": false,
+        "status": "valid",
+        "telemetry": [
+          {
+            "attempt": 1,
+            "config_version": "aa315616574d47e4dd8f717eb1b4b8b16a84057380e76f453575627209b0af14",
+            "error_code": null,
+            "estimated_input_tokens": 654,
+            "estimated_output_tokens": 211,
+            "finished_at": "2026-09-19T20:20:10.370405Z",
+            "input_characters": 2613,
+            "latency_ms": 8507.927333936095,
+            "model_finished_at": "2026-09-19T20:20:10.370331Z",
+            "model_identity": "qwen3:8b@500a1f067a9f782620b40bee6f7b0c89e17ae61f686b92c24933e4ca4b2b8b41",
+            "model_latency_ms": 8507.842166000046,
+            "model_started_at": "2026-09-19T20:20:01.862397Z",
+            "output_characters": 842,
+            "output_valid": true,
+            "queue_wait_ms": 0.0073339324444532394,
+            "reported_input_tokens": 634,
+            "reported_output_tokens": 213,
+            "request_id": "1e71206b-c84f-4538-863b-7caf088f4de8",
+            "started_at": "2026-09-19T20:20:01.862387Z"
+          }
+        ],
+        "valid": true
+      },
+      {
+        "assertion_failures": [],
+        "assertions_passed": true,
+        "domain": "academic",
+        "error_code": null,
+        "error_diagnostic": null,
+        "expected_status": "valid",
+        "fixture_id": "academic-ambiguous-extraction-v1",
+        "latency_ms": 6532.002415973693,
+        "passed": true,
+        "status": "valid",
+        "telemetry": [
+          {
+            "attempt": 1,
+            "config_version": "aa315616574d47e4dd8f717eb1b4b8b16a84057380e76f453575627209b0af14",
+            "error_code": null,
+            "estimated_input_tokens": 637,
+            "estimated_output_tokens": 128,
+            "finished_at": "2026-09-19T20:20:16.910047Z",
+            "input_characters": 2547,
+            "latency_ms": 6532.002415973693,
+            "model_finished_at": "2026-09-19T20:20:16.909970Z",
+            "model_identity": "qwen3:8b@500a1f067a9f782620b40bee6f7b0c89e17ae61f686b92c24933e4ca4b2b8b41",
+            "model_latency_ms": 6531.915083993226,
+            "model_started_at": "2026-09-19T20:20:10.377986Z",
+            "output_characters": 512,
+            "output_valid": true,
+            "queue_wait_ms": 0.0070409150794148445,
+            "reported_input_tokens": 628,
+            "reported_output_tokens": 161,
+            "request_id": "9b072c22-159f-43fa-94af-5276e78c1396",
+            "started_at": "2026-09-19T20:20:10.377976Z"
+          }
+        ],
+        "valid": true
+      },
+      {
+        "assertion_failures": [],
+        "assertions_passed": true,
+        "domain": "structured_output",
+        "error_code": null,
+        "error_diagnostic": null,
+        "expected_status": "valid",
+        "fixture_id": "valid-json-v1",
+        "latency_ms": 886.4993329625577,
+        "passed": true,
+        "status": "valid",
+        "telemetry": [
+          {
+            "attempt": 1,
+            "config_version": "aa315616574d47e4dd8f717eb1b4b8b16a84057380e76f453575627209b0af14",
+            "error_code": null,
+            "estimated_input_tokens": 168,
+            "estimated_output_tokens": 17,
+            "finished_at": "2026-09-19T20:20:17.801699Z",
+            "input_characters": 670,
+            "latency_ms": 886.4993329625577,
+            "model_finished_at": "2026-09-19T20:20:17.801586Z",
+            "model_identity": "qwen3:8b@500a1f067a9f782620b40bee6f7b0c89e17ae61f686b92c24933e4ca4b2b8b41",
+            "model_latency_ms": 886.3826660672203,
+            "model_started_at": "2026-09-19T20:20:16.915204Z",
+            "output_characters": 66,
+            "output_valid": true,
+            "queue_wait_ms": 0.0068749068304896355,
+            "reported_input_tokens": 156,
+            "reported_output_tokens": 24,
+            "request_id": "62422527-e8a8-4a19-aafc-394987b90645",
+            "started_at": "2026-09-19T20:20:16.915195Z"
+          }
+        ],
+        "valid": true
+      },
+      {
+        "assertion_failures": [],
+        "assertions_passed": false,
+        "domain": "code_review",
+        "error_code": "model_error",
+        "error_diagnostic": "Model request failed.",
+        "expected_status": "valid",
+        "fixture_id": "code-finding-triage-v1",
+        "latency_ms": 19.763999967835844,
+        "passed": false,
+        "status": "failed",
+        "telemetry": [
+          {
+            "attempt": 1,
+            "config_version": "aa315616574d47e4dd8f717eb1b4b8b16a84057380e76f453575627209b0af14",
+            "error_code": "model_error",
+            "estimated_input_tokens": 433,
+            "estimated_output_tokens": 0,
+            "finished_at": "2026-09-19T20:20:17.824593Z",
+            "input_characters": 1730,
+            "latency_ms": 19.763999967835844,
+            "model_finished_at": "2026-09-19T20:20:17.824569Z",
+            "model_identity": "qwen3:8b@500a1f067a9f782620b40bee6f7b0c89e17ae61f686b92c24933e4ca4b2b8b41",
+            "model_latency_ms": 19.73254093900323,
+            "model_started_at": "2026-09-19T20:20:17.804841Z",
+            "output_characters": 0,
+            "output_valid": false,
+            "queue_wait_ms": 0.006917049176990986,
+            "reported_input_tokens": null,
+            "reported_output_tokens": null,
+            "request_id": "5983a26a-d715-4ecb-9865-131d5b60d4d3",
+            "started_at": "2026-09-19T20:20:17.804831Z"
+          }
+        ],
+        "valid": false
+      },
+      {
+        "assertion_failures": [
+          "thesis_impact"
+        ],
+        "assertions_passed": false,
+        "domain": "finance",
+        "error_code": "evaluation_assertion_failed",
+        "error_diagnostic": null,
+        "expected_status": "valid",
+        "fixture_id": "finance-fact-inference-v1",
+        "latency_ms": 8430.511667043902,
+        "passed": false,
+        "status": "valid",
+        "telemetry": [
+          {
+            "attempt": 1,
+            "config_version": "aa315616574d47e4dd8f717eb1b4b8b16a84057380e76f453575627209b0af14",
+            "error_code": null,
+            "estimated_input_tokens": 654,
+            "estimated_output_tokens": 211,
+            "finished_at": "2026-09-19T20:20:26.261612Z",
+            "input_characters": 2613,
+            "latency_ms": 8430.511667043902,
+            "model_finished_at": "2026-09-19T20:20:26.261533Z",
+            "model_identity": "qwen3:8b@500a1f067a9f782620b40bee6f7b0c89e17ae61f686b92c24933e4ca4b2b8b41",
+            "model_latency_ms": 8430.42145902291,
+            "model_started_at": "2026-09-19T20:20:17.831022Z",
+            "output_characters": 842,
+            "output_valid": true,
+            "queue_wait_ms": 0.006208079867064953,
+            "reported_input_tokens": 634,
+            "reported_output_tokens": 213,
+            "request_id": "fb44b750-959e-4091-b6ad-de2f5c9cab23",
+            "started_at": "2026-09-19T20:20:17.831012Z"
+          }
+        ],
+        "valid": true
+      },
+      {
+        "assertion_failures": [],
+        "assertions_passed": true,
+        "domain": "academic",
+        "error_code": null,
+        "error_diagnostic": null,
+        "expected_status": "valid",
+        "fixture_id": "academic-ambiguous-extraction-v1",
+        "latency_ms": 6544.489957974292,
+        "passed": true,
+        "status": "valid",
+        "telemetry": [
+          {
+            "attempt": 1,
+            "config_version": "aa315616574d47e4dd8f717eb1b4b8b16a84057380e76f453575627209b0af14",
+            "error_code": null,
+            "estimated_input_tokens": 637,
+            "estimated_output_tokens": 128,
+            "finished_at": "2026-09-19T20:20:32.815477Z",
+            "input_characters": 2547,
+            "latency_ms": 6544.489957974292,
+            "model_finished_at": "2026-09-19T20:20:32.815432Z",
+            "model_identity": "qwen3:8b@500a1f067a9f782620b40bee6f7b0c89e17ae61f686b92c24933e4ca4b2b8b41",
+            "model_latency_ms": 6544.436249998398,
+            "model_started_at": "2026-09-19T20:20:26.270925Z",
+            "output_characters": 512,
+            "output_valid": true,
+            "queue_wait_ms": 0.0077909789979457855,
+            "reported_input_tokens": 628,
+            "reported_output_tokens": 161,
+            "request_id": "7aa8ad7c-bbb7-4dac-b874-980221aa7bf9",
+            "started_at": "2026-09-19T20:20:26.270914Z"
+          }
+        ],
+        "valid": true
+      },
+      {
+        "assertion_failures": [],
+        "assertions_passed": true,
+        "domain": "structured_output",
+        "error_code": null,
+        "error_diagnostic": null,
+        "expected_status": "valid",
+        "fixture_id": "valid-json-v1",
+        "latency_ms": 940.8198340097442,
+        "passed": true,
+        "status": "valid",
+        "telemetry": [
+          {
+            "attempt": 1,
+            "config_version": "aa315616574d47e4dd8f717eb1b4b8b16a84057380e76f453575627209b0af14",
+            "error_code": null,
+            "estimated_input_tokens": 168,
+            "estimated_output_tokens": 17,
+            "finished_at": "2026-09-19T20:20:33.759080Z",
+            "input_characters": 670,
+            "latency_ms": 940.8198340097442,
+            "model_finished_at": "2026-09-19T20:20:33.759039Z",
+            "model_identity": "qwen3:8b@500a1f067a9f782620b40bee6f7b0c89e17ae61f686b92c24933e4ca4b2b8b41",
+            "model_latency_ms": 940.7720000017434,
+            "model_started_at": "2026-09-19T20:20:32.818263Z",
+            "output_characters": 66,
+            "output_valid": true,
+            "queue_wait_ms": 0.0040839659050107,
+            "reported_input_tokens": 156,
+            "reported_output_tokens": 24,
+            "request_id": "c20efdcd-b2e3-4f40-a52d-c3c1615bc9dd",
+            "started_at": "2026-09-19T20:20:32.818257Z"
+          }
+        ],
+        "valid": true
+      },
+      {
+        "assertion_failures": [],
+        "assertions_passed": false,
+        "domain": "code_review",
+        "error_code": "model_error",
+        "error_diagnostic": "Model request failed.",
+        "expected_status": "valid",
+        "fixture_id": "code-finding-triage-v1",
+        "latency_ms": 14.651500037871301,
+        "passed": false,
+        "status": "failed",
+        "telemetry": [
+          {
+            "attempt": 1,
+            "config_version": "aa315616574d47e4dd8f717eb1b4b8b16a84057380e76f453575627209b0af14",
+            "error_code": "model_error",
+            "estimated_input_tokens": 433,
+            "estimated_output_tokens": 0,
+            "finished_at": "2026-09-19T20:20:33.776253Z",
+            "input_characters": 1730,
+            "latency_ms": 14.651500037871301,
+            "model_finished_at": "2026-09-19T20:20:33.776234Z",
+            "model_identity": "qwen3:8b@500a1f067a9f782620b40bee6f7b0c89e17ae61f686b92c24933e4ca4b2b8b41",
+            "model_latency_ms": 14.623750001192093,
+            "model_started_at": "2026-09-19T20:20:33.761614Z",
+            "output_characters": 0,
+            "output_valid": false,
+            "queue_wait_ms": 0.008834060281515121,
+            "reported_input_tokens": null,
+            "reported_output_tokens": null,
+            "request_id": "f92fee72-7cd4-4f4c-a2bf-17c6c95690bb",
+            "started_at": "2026-09-19T20:20:33.761603Z"
+          }
+        ],
+        "valid": false
+      },
+      {
+        "assertion_failures": [
+          "thesis_impact"
+        ],
+        "assertions_passed": false,
+        "domain": "finance",
+        "error_code": "evaluation_assertion_failed",
+        "error_diagnostic": null,
+        "expected_status": "valid",
+        "fixture_id": "finance-fact-inference-v1",
+        "latency_ms": 8286.449749954045,
+        "passed": false,
+        "status": "valid",
+        "telemetry": [
+          {
+            "attempt": 1,
+            "config_version": "aa315616574d47e4dd8f717eb1b4b8b16a84057380e76f453575627209b0af14",
+            "error_code": null,
+            "estimated_input_tokens": 654,
+            "estimated_output_tokens": 211,
+            "finished_at": "2026-09-19T20:20:42.070190Z",
+            "input_characters": 2613,
+            "latency_ms": 8286.449749954045,
+            "model_finished_at": "2026-09-19T20:20:42.070151Z",
+            "model_identity": "qwen3:8b@500a1f067a9f782620b40bee6f7b0c89e17ae61f686b92c24933e4ca4b2b8b41",
+            "model_latency_ms": 8286.39058303088,
+            "model_started_at": "2026-09-19T20:20:33.783670Z",
+            "output_characters": 842,
+            "output_valid": true,
+            "queue_wait_ms": 0.0072499969974160194,
+            "reported_input_tokens": 634,
+            "reported_output_tokens": 213,
+            "request_id": "b57d2e78-7b82-4ed3-b92d-e9e6d069abb7",
+            "started_at": "2026-09-19T20:20:33.783660Z"
+          }
+        ],
+        "valid": true
+      },
+      {
+        "assertion_failures": [],
+        "assertions_passed": true,
+        "domain": "academic",
+        "error_code": null,
+        "error_diagnostic": null,
+        "expected_status": "valid",
+        "fixture_id": "academic-ambiguous-extraction-v1",
+        "latency_ms": 6360.541624948382,
+        "passed": true,
+        "status": "valid",
+        "telemetry": [
+          {
+            "attempt": 1,
+            "config_version": "aa315616574d47e4dd8f717eb1b4b8b16a84057380e76f453575627209b0af14",
+            "error_code": null,
+            "estimated_input_tokens": 637,
+            "estimated_output_tokens": 128,
+            "finished_at": "2026-09-19T20:20:48.437439Z",
+            "input_characters": 2547,
+            "latency_ms": 6360.541624948382,
+            "model_finished_at": "2026-09-19T20:20:48.437400Z",
+            "model_identity": "qwen3:8b@500a1f067a9f782620b40bee6f7b0c89e17ae61f686b92c24933e4ca4b2b8b41",
+            "model_latency_ms": 6360.493291984312,
+            "model_started_at": "2026-09-19T20:20:42.076838Z",
+            "output_characters": 512,
+            "output_valid": true,
+            "queue_wait_ms": 0.008041970431804657,
+            "reported_input_tokens": 628,
+            "reported_output_tokens": 161,
+            "request_id": "c79d7e41-21c4-4e23-922c-99fa35455451",
+            "started_at": "2026-09-19T20:20:42.076827Z"
+          }
+        ],
+        "valid": true
+      },
+      {
+        "assertion_failures": [],
+        "assertions_passed": true,
+        "domain": "structured_output",
+        "error_code": null,
+        "error_diagnostic": null,
+        "expected_status": "valid",
+        "fixture_id": "valid-json-v1",
+        "latency_ms": 913.2938330294564,
+        "passed": true,
+        "status": "valid",
+        "telemetry": [
+          {
+            "attempt": 1,
+            "config_version": "aa315616574d47e4dd8f717eb1b4b8b16a84057380e76f453575627209b0af14",
+            "error_code": null,
+            "estimated_input_tokens": 168,
+            "estimated_output_tokens": 17,
+            "finished_at": "2026-09-19T20:20:49.353571Z",
+            "input_characters": 670,
+            "latency_ms": 913.2938330294564,
+            "model_finished_at": "2026-09-19T20:20:49.353529Z",
+            "model_identity": "qwen3:8b@500a1f067a9f782620b40bee6f7b0c89e17ae61f686b92c24933e4ca4b2b8b41",
+            "model_latency_ms": 913.2451670011505,
+            "model_started_at": "2026-09-19T20:20:48.440277Z",
+            "output_characters": 66,
+            "output_valid": true,
+            "queue_wait_ms": 0.004415982402861118,
+            "reported_input_tokens": 156,
+            "reported_output_tokens": 24,
+            "request_id": "9397897d-dd1c-4c2e-98ce-bf6f4db8878d",
+            "started_at": "2026-09-19T20:20:48.440271Z"
+          }
+        ],
+        "valid": true
+      },
+      {
+        "assertion_failures": [],
+        "assertions_passed": false,
+        "domain": "code_review",
+        "error_code": "model_error",
+        "error_diagnostic": "Model request failed.",
+        "expected_status": "valid",
+        "fixture_id": "code-finding-triage-v1",
+        "latency_ms": 11.907333042472601,
+        "passed": false,
+        "status": "failed",
+        "telemetry": [
+          {
+            "attempt": 1,
+            "config_version": "aa315616574d47e4dd8f717eb1b4b8b16a84057380e76f453575627209b0af14",
+            "error_code": "model_error",
+            "estimated_input_tokens": 433,
+            "estimated_output_tokens": 0,
+            "finished_at": "2026-09-19T20:20:49.367045Z",
+            "input_characters": 1730,
+            "latency_ms": 11.907333042472601,
+            "model_finished_at": "2026-09-19T20:20:49.367033Z",
+            "model_identity": "qwen3:8b@500a1f067a9f782620b40bee6f7b0c89e17ae61f686b92c24933e4ca4b2b8b41",
+            "model_latency_ms": 11.893915943801403,
+            "model_started_at": "2026-09-19T20:20:49.355144Z",
+            "output_characters": 0,
+            "output_valid": false,
+            "queue_wait_ms": 0.004667090252041817,
+            "reported_input_tokens": null,
+            "reported_output_tokens": null,
+            "request_id": "8412bd2b-0199-4fe9-b43b-3378bd9641ba",
+            "started_at": "2026-09-19T20:20:49.355138Z"
+          }
+        ],
+        "valid": false
+      },
+      {
+        "assertion_failures": [
+          "thesis_impact"
+        ],
+        "assertions_passed": false,
+        "domain": "finance",
+        "error_code": "evaluation_assertion_failed",
+        "error_diagnostic": null,
+        "expected_status": "valid",
+        "fixture_id": "finance-fact-inference-v1",
+        "latency_ms": 8505.552834016271,
+        "passed": false,
+        "status": "valid",
+        "telemetry": [
+          {
+            "attempt": 1,
+            "config_version": "aa315616574d47e4dd8f717eb1b4b8b16a84057380e76f453575627209b0af14",
+            "error_code": null,
+            "estimated_input_tokens": 654,
+            "estimated_output_tokens": 211,
+            "finished_at": "2026-09-19T20:20:57.876221Z",
+            "input_characters": 2613,
+            "latency_ms": 8505.552834016271,
+            "model_finished_at": "2026-09-19T20:20:57.876168Z",
+            "model_identity": "qwen3:8b@500a1f067a9f782620b40bee6f7b0c89e17ae61f686b92c24933e4ca4b2b8b41",
+            "model_latency_ms": 8505.497583071701,
+            "model_started_at": "2026-09-19T20:20:49.370582Z",
+            "output_characters": 842,
+            "output_valid": true,
+            "queue_wait_ms": 0.004417030140757561,
+            "reported_input_tokens": 634,
+            "reported_output_tokens": 213,
+            "request_id": "5def3867-7819-4f03-8bc1-8b1972b030a5",
+            "started_at": "2026-09-19T20:20:49.370575Z"
+          }
+        ],
+        "valid": true
+      },
+      {
+        "assertion_failures": [],
+        "assertions_passed": true,
+        "domain": "academic",
+        "error_code": null,
+        "error_diagnostic": null,
+        "expected_status": "valid",
+        "fixture_id": "academic-ambiguous-extraction-v1",
+        "latency_ms": 6517.318541998975,
+        "passed": true,
+        "status": "valid",
+        "telemetry": [
+          {
+            "attempt": 1,
+            "config_version": "aa315616574d47e4dd8f717eb1b4b8b16a84057380e76f453575627209b0af14",
+            "error_code": null,
+            "estimated_input_tokens": 637,
+            "estimated_output_tokens": 128,
+            "finished_at": "2026-09-19T20:21:04.400215Z",
+            "input_characters": 2547,
+            "latency_ms": 6517.318541998975,
+            "model_finished_at": "2026-09-19T20:21:04.400143Z",
+            "model_identity": "qwen3:8b@500a1f067a9f782620b40bee6f7b0c89e17ae61f686b92c24933e4ca4b2b8b41",
+            "model_latency_ms": 6517.2399170696735,
+            "model_started_at": "2026-09-19T20:20:57.882836Z",
+            "output_characters": 512,
+            "output_valid": true,
+            "queue_wait_ms": 0.006582937203347683,
+            "reported_input_tokens": 628,
+            "reported_output_tokens": 161,
+            "request_id": "7d43161b-62fe-4a37-a452-7a523f6fa1e3",
+            "started_at": "2026-09-19T20:20:57.882826Z"
+          }
+        ],
+        "valid": true
+      },
+      {
+        "assertion_failures": [],
+        "assertions_passed": true,
+        "domain": "structured_output",
+        "error_code": null,
+        "error_diagnostic": null,
+        "expected_status": "valid",
+        "fixture_id": "valid-json-v1",
+        "latency_ms": 946.3197080185637,
+        "passed": true,
+        "status": "valid",
+        "telemetry": [
+          {
+            "attempt": 1,
+            "config_version": "aa315616574d47e4dd8f717eb1b4b8b16a84057380e76f453575627209b0af14",
+            "error_code": null,
+            "estimated_input_tokens": 168,
+            "estimated_output_tokens": 17,
+            "finished_at": "2026-09-19T20:21:05.352010Z",
+            "input_characters": 670,
+            "latency_ms": 946.3197080185637,
+            "model_finished_at": "2026-09-19T20:21:05.351958Z",
+            "model_identity": "qwen3:8b@500a1f067a9f782620b40bee6f7b0c89e17ae61f686b92c24933e4ca4b2b8b41",
+            "model_latency_ms": 946.2586250156164,
+            "model_started_at": "2026-09-19T20:21:04.405694Z",
+            "output_characters": 66,
+            "output_valid": true,
+            "queue_wait_ms": 0.0077500008046627045,
+            "reported_input_tokens": 156,
+            "reported_output_tokens": 24,
+            "request_id": "21114159-6162-4aab-ba2c-b015f89d242f",
+            "started_at": "2026-09-19T20:21:04.405683Z"
+          }
+        ],
+        "valid": true
+      },
+      {
+        "assertion_failures": [],
+        "assertions_passed": false,
+        "domain": "code_review",
+        "error_code": "model_error",
+        "error_diagnostic": "Model request failed.",
+        "expected_status": "valid",
+        "fixture_id": "code-finding-triage-v1",
+        "latency_ms": 22.088958998210728,
+        "passed": false,
+        "status": "failed",
+        "telemetry": [
+          {
+            "attempt": 1,
+            "config_version": "aa315616574d47e4dd8f717eb1b4b8b16a84057380e76f453575627209b0af14",
+            "error_code": "model_error",
+            "estimated_input_tokens": 433,
+            "estimated_output_tokens": 0,
+            "finished_at": "2026-09-19T20:21:05.376095Z",
+            "input_characters": 1730,
+            "latency_ms": 22.088958998210728,
+            "model_finished_at": "2026-09-19T20:21:05.376077Z",
+            "model_identity": "qwen3:8b@500a1f067a9f782620b40bee6f7b0c89e17ae61f686b92c24933e4ca4b2b8b41",
+            "model_latency_ms": 22.065334022045135,
+            "model_started_at": "2026-09-19T20:21:05.354015Z",
+            "output_characters": 0,
+            "output_valid": false,
+            "queue_wait_ms": 0.005875015631318092,
+            "reported_input_tokens": null,
+            "reported_output_tokens": null,
+            "request_id": "f7b4232d-7d12-4059-9e3c-1e2318aa2b4b",
+            "started_at": "2026-09-19T20:21:05.353997Z"
+          }
+        ],
+        "valid": false
+      },
+      {
+        "assertion_failures": [
+          "thesis_impact"
+        ],
+        "assertions_passed": false,
+        "domain": "finance",
+        "error_code": "evaluation_assertion_failed",
+        "error_diagnostic": null,
+        "expected_status": "valid",
+        "fixture_id": "finance-fact-inference-v1",
+        "latency_ms": 8140.546957962215,
+        "passed": false,
+        "status": "valid",
+        "telemetry": [
+          {
+            "attempt": 1,
+            "config_version": "aa315616574d47e4dd8f717eb1b4b8b16a84057380e76f453575627209b0af14",
+            "error_code": null,
+            "estimated_input_tokens": 654,
+            "estimated_output_tokens": 211,
+            "finished_at": "2026-09-19T20:21:13.521625Z",
+            "input_characters": 2613,
+            "latency_ms": 8140.546957962215,
+            "model_finished_at": "2026-09-19T20:21:13.521448Z",
+            "model_identity": "qwen3:8b@500a1f067a9f782620b40bee6f7b0c89e17ae61f686b92c24933e4ca4b2b8b41",
+            "model_latency_ms": 8140.2836659690365,
+            "model_started_at": "2026-09-19T20:21:05.381076Z",
+            "output_characters": 842,
+            "output_valid": true,
+            "queue_wait_ms": 0.006292015314102173,
+            "reported_input_tokens": 634,
+            "reported_output_tokens": 213,
+            "request_id": "a1adf162-7a51-4338-81b9-2e52d22189cf",
+            "started_at": "2026-09-19T20:21:05.381067Z"
+          }
+        ],
+        "valid": true
+      },
+      {
+        "assertion_failures": [],
+        "assertions_passed": true,
+        "domain": "academic",
+        "error_code": null,
+        "error_diagnostic": null,
+        "expected_status": "valid",
+        "fixture_id": "academic-ambiguous-extraction-v1",
+        "latency_ms": 6181.385290925391,
+        "passed": true,
+        "status": "valid",
+        "telemetry": [
+          {
+            "attempt": 1,
+            "config_version": "aa315616574d47e4dd8f717eb1b4b8b16a84057380e76f453575627209b0af14",
+            "error_code": null,
+            "estimated_input_tokens": 637,
+            "estimated_output_tokens": 128,
+            "finished_at": "2026-09-19T20:21:19.708483Z",
+            "input_characters": 2547,
+            "latency_ms": 6181.385290925391,
+            "model_finished_at": "2026-09-19T20:21:19.708385Z",
+            "model_identity": "qwen3:8b@500a1f067a9f782620b40bee6f7b0c89e17ae61f686b92c24933e4ca4b2b8b41",
+            "model_latency_ms": 6181.279334006831,
+            "model_started_at": "2026-09-19T20:21:13.527051Z",
+            "output_characters": 512,
+            "output_valid": true,
+            "queue_wait_ms": 0.005541020072996616,
+            "reported_input_tokens": 628,
+            "reported_output_tokens": 161,
+            "request_id": "de9c5cef-367e-42ee-ae96-35d974e9cfd9",
+            "started_at": "2026-09-19T20:21:13.527043Z"
+          }
+        ],
+        "valid": true
+      },
+      {
+        "assertion_failures": [],
+        "assertions_passed": true,
+        "domain": "structured_output",
+        "error_code": null,
+        "error_diagnostic": null,
+        "expected_status": "valid",
+        "fixture_id": "valid-json-v1",
+        "latency_ms": 926.1497079860419,
+        "passed": true,
+        "status": "valid",
+        "telemetry": [
+          {
+            "attempt": 1,
+            "config_version": "aa315616574d47e4dd8f717eb1b4b8b16a84057380e76f453575627209b0af14",
+            "error_code": null,
+            "estimated_input_tokens": 168,
+            "estimated_output_tokens": 17,
+            "finished_at": "2026-09-19T20:21:20.640827Z",
+            "input_characters": 670,
+            "latency_ms": 926.1497079860419,
+            "model_finished_at": "2026-09-19T20:21:20.640805Z",
+            "model_identity": "qwen3:8b@500a1f067a9f782620b40bee6f7b0c89e17ae61f686b92c24933e4ca4b2b8b41",
+            "model_latency_ms": 926.1198749300092,
+            "model_started_at": "2026-09-19T20:21:19.714678Z",
+            "output_characters": 66,
+            "output_valid": true,
+            "queue_wait_ms": 0.008958042599260807,
+            "reported_input_tokens": 156,
+            "reported_output_tokens": 24,
+            "request_id": "d707dce5-1bad-4b6f-8f93-4e5be828ff9a",
+            "started_at": "2026-09-19T20:21:19.714667Z"
+          }
+        ],
+        "valid": true
+      }
+    ],
+    "metrics": {
+      "p50_latency_ms": 1219.2700420273468,
+      "p95_latency_ms": 8507.927333936095,
+      "pass_rate": 0.5,
+      "passed_evaluations": 20,
+      "total_evaluations": 40,
+      "valid_evaluations": 30,
+      "validity_rate": 0.75
+    },
+    "model_identities": [
+      "qwen3:8b@500a1f067a9f782620b40bee6f7b0c89e17ae61f686b92c24933e4ca4b2b8b41"
+    ]
+  }
+}

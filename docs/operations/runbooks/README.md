@@ -6,12 +6,13 @@ root and that the current stack uses the service names in `compose.yaml`:
 `postgres`, `api`, and `worker-academic-planner`.
 
 The current configured runtime includes two native macOS LaunchAgents plus the
-Compose API, PostgreSQL, and academic worker. Qwen-powered work is triggered
-only by messages from authorized owners in the configured private Discord
-channel. The automatic academic morning
-notification is scheduled and executable, but it is model-free. Scheduled
-academic Qwen, code-review Qwen, and finance Qwen workflows are not executable
-runtime paths.
+Compose API, PostgreSQL, and academic worker. Qwen-powered conversation work is
+triggered only by messages from authorized owners in the configured private
+Discord channel. The automatic academic morning notification is scheduled and
+executable; its only model boundary is bounded event-local semantic
+interpretation for selected calendar rows. Scheduled academic conversation
+Qwen, code-review Qwen, and finance Qwen workflows are not executable runtime
+paths.
 
 For first-time setup, see [Getting started](../getting-started.md).
 

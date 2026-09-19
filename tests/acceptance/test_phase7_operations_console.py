@@ -127,7 +127,6 @@ def _settings(tmp_path: Path) -> Settings:
         notion_token=SecretStr(SECRET_MARKERS[2]),
         notion_courses_database_id="courses",
         notion_assessments_database_id="assessments",
-        notion_study_blocks_database_id="study-blocks",
         finance_source_allowlist_version="finance-sources-test",
     )
 

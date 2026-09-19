@@ -163,7 +163,7 @@ async def test_confirmed_pdf_seed_crosses_real_persistence_and_notion_boundaries
             content_hash=hashlib.sha256(PDF).hexdigest(),
             raw_artifact_key=artifact.key,
             captured_at=NOW,
-            expires_at=NOW + timedelta(days=2),
+            expires_at=NOW + timedelta(days=30),
         )
     )
     preview = InboundMaterialProposalPreview(

@@ -29,6 +29,8 @@ def test_host_settings_are_standalone_and_restrict_local_handoff(tmp_path: Path)
     assert settings.compose_file == tmp_path / "compose.yaml"
     assert settings.backend_handoff_url.startswith("http://127.0.0.1:")
     assert settings.discord_academic_authorized_user_ids == frozenset({"333333333333333333"})
+    assert settings.embedding_model == "qwen3-embedding:4b"
+    assert settings.embedding_dimensions == 1024
 
 
 def test_host_settings_reject_noncanonical_compose_file(tmp_path: Path) -> None:
@@ -59,6 +61,8 @@ def test_host_settings_from_env_requires_handoff_secret(tmp_path: Path) -> None:
         "DISCORD_ACADEMIC_AUTHORIZED_USER_IDS": "[333333333333333333]",
         "DISCORD_ACADEMIC_MESSAGE_CONTENT_ENABLED": "true",
         "DISCORD_HOST_HANDOFF_SECRET": "handoff-secret",
+        "EMBEDDING_MODEL": "qwen3-embedding:4b",
+        "EMBEDDING_DIMENSIONS": "1024",
         "LIFEAGENT_DOCKER": "/usr/local/bin/docker",
         "LIFEAGENT_LAUNCHCTL": "/bin/launchctl",
         "LIFEAGENT_OLLAMA": "/usr/local/bin/ollama",
@@ -67,6 +71,8 @@ def test_host_settings_from_env_requires_handoff_secret(tmp_path: Path) -> None:
     loaded = HostWakeSettings.from_env(env, repository_root=tmp_path)
 
     assert loaded.host_handoff_secret.get_secret_value() == "handoff-secret"
+    assert loaded.embedding_model == "qwen3-embedding:4b"
+    assert loaded.embedding_dimensions == 1024
 
 
 def test_host_settings_from_env_requires_discord_handoff_secret(tmp_path: Path) -> None:

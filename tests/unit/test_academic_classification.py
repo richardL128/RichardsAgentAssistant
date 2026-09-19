@@ -19,8 +19,6 @@ from app.agents.academic_planner.classification import (
         ("assigment 2", AssessmentKind.ASSIGNMENT, "assigment"),
         ("Tutorial #3", AssessmentKind.TUTORIAL, "tutorial"),
         ("LAB: op amps", AssessmentKind.LAB, "lab"),
-        ("studying block for circuits", AssessmentKind.STUDYING_BLOCK, "studying block"),
-        ("Studying-Block: Fourier", AssessmentKind.STUDYING_BLOCK, "studying block"),
     ],
 )
 def test_classifier_recognizes_explicit_tokens_phrase_and_small_correction(
@@ -38,14 +36,8 @@ def test_classifier_recognizes_explicit_tokens_phrase_and_small_correction(
 @pytest.mark.parametrize(
     "label",
     [
-        "Homework 2",
-        "Research paper",
-        "midterm test",
-        "exam review",
         "Quiz assignment packet",
         "tutorial lab packet",
-        "studying blocks",
-        "prelab",
     ],
 )
 def test_classifier_leaves_unclear_or_conflicting_labels_unknown(label: str) -> None:
@@ -63,8 +55,7 @@ def test_classifier_leaves_unclear_or_conflicting_labels_unknown(label: str) -> 
         ("quiz", AssessmentKind.QUIZ),
         ("Tutorial", AssessmentKind.TUTORIAL),
         ("LAB", AssessmentKind.LAB),
-        ("Studying Block", AssessmentKind.STUDYING_BLOCK),
-        ("studying_block", AssessmentKind.STUDYING_BLOCK),
+        ("event", AssessmentKind.EVENT),
     ],
 )
 def test_classifier_preserves_trusted_existing_supported_types(
@@ -81,8 +72,8 @@ def test_classifier_preserves_trusted_existing_supported_types(
     assert result.matched_token == expected.value
 
 
-@pytest.mark.parametrize("trusted_existing_kind", ["event", "Thing", "Midterm", "Final Exam"])
-def test_classifier_leaves_unsupported_trusted_existing_metadata_unknown(
+@pytest.mark.parametrize("trusted_existing_kind", ["Thing", "Midterm", "Final Exam"])
+def test_classifier_ignores_unsupported_metadata_and_keeps_ordinary_event(
     trusted_existing_kind: str,
 ) -> None:
     result = classify_assessment_label(
@@ -90,18 +81,14 @@ def test_classifier_leaves_unsupported_trusted_existing_metadata_unknown(
         trusted_existing_kind=trusted_existing_kind,
     )
 
-    assert result.kind is AssessmentKind.UNKNOWN
-    assert result.source == "unknown"
+    assert result.kind is AssessmentKind.EVENT
+    assert result.source == "label"
 
 
 def test_canonical_title_previews_add_exactly_one_prefix() -> None:
     previews = canonical_title_previews("Chapter 4")
     already_quiz = canonical_title_previews("Quiz — Chapter 4")
     already_assignment = canonical_assessment_title(AssessmentKind.QUIZ, "Assignment - Lab 2")
-    already_studying = canonical_assessment_title(
-        AssessmentKind.LAB,
-        "Studying Block - Fourier review",
-    )
     repeated_prefixes = canonical_assessment_title(
         AssessmentKind.QUIZ,
         "Lab — Assignment — Chapter 3",
@@ -111,9 +98,31 @@ def test_canonical_title_previews_add_exactly_one_prefix() -> None:
     assert previews[AssessmentKind.ASSIGNMENT] == "Assignment — Chapter 4"
     assert previews[AssessmentKind.TUTORIAL] == "Tutorial — Chapter 4"
     assert previews[AssessmentKind.LAB] == "Lab — Chapter 4"
-    assert previews[AssessmentKind.STUDYING_BLOCK] == "Studying Block — Chapter 4"
+    assert previews[AssessmentKind.EVENT] == "Chapter 4"
     assert already_quiz[AssessmentKind.QUIZ] == "Quiz — Chapter 4"
     assert already_quiz[AssessmentKind.ASSIGNMENT] == "Assignment — Chapter 4"
     assert already_assignment == "Quiz — Lab 2"
-    assert already_studying == "Lab — Fourier review"
     assert repeated_prefixes == "Quiz — Chapter 3"
+
+
+@pytest.mark.parametrize(
+    "label",
+    [
+        "Homework 2",
+        "Research paper",
+        "midterm test",
+        "exam review",
+        "Review latest lesson",
+        "Quick look on Error propagation",
+        "studying blocks",
+        "prelab",
+    ],
+)
+def test_classifier_treats_untyped_titles_as_ordinary_events_without_study_rules(
+    label: str,
+) -> None:
+    result = classify_assessment_label(label)
+
+    assert result.kind is AssessmentKind.EVENT
+    assert result.source == "label"
+    assert result.matched_token == "event"

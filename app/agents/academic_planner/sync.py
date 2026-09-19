@@ -14,6 +14,11 @@ from zoneinfo import ZoneInfo
 
 from sqlalchemy.exc import NoResultFound
 
+from app.agents.academic_planner.calendar_roles import (
+    AcademicCalendarRole,
+    academic_calendar_role,
+    canonical_misc_task_title,
+)
 from app.agents.academic_planner.classification import (
     AssessmentKind,
     canonical_title_previews,
@@ -46,14 +51,14 @@ _CLARIFICATION_ACTIONS: tuple[DiscordClarificationAction, ...] = (
     "assignment",
     "tutorial",
     "lab",
-    "studying_block",
+    "event",
 )
 _CLARIFICATION_LABELS: dict[str, str] = {
     "quiz": "Quiz",
     "assignment": "Assignment",
     "tutorial": "Tutorial",
     "lab": "Lab",
-    "studying_block": "Studying Block",
+    "event": "Event",
 }
 _SETUP_LABELS: dict[str, str] = {
     "notion_configuration_missing": "missing Notion token or Courses database ID",
@@ -65,6 +70,7 @@ _SETUP_LABELS: dict[str, str] = {
     "data_source_duplicate": "duplicate database data sources",
     "assessment_calendar_missing": "missing seeded Assessments calendar",
     "assessment_calendar_duplicate": "duplicate matching child calendars",
+    "misc_calendar_duplicate": "duplicate active misc rows",
     "assessment_calendar_inaccessible": "inaccessible seeded Assessments calendar",
     "assessment_schema_malformed": "malformed Assessments calendar schema",
     "assessment_name_property_invalid": "missing or invalid Name property",
@@ -251,6 +257,12 @@ class _AssessmentRecord:
     archived: bool
 
 
+@dataclass(frozen=True, slots=True)
+class _ResolvedClassification:
+    kind: str
+    source: str
+
+
 class AcademicNotionSync:
     """Synchronize discovered course calendars without exposing vendor envelopes."""
 
@@ -326,6 +338,26 @@ class AcademicNotionSync:
             )
 
         diagnostics = list(result.diagnostics)
+        active_misc_courses = tuple(
+            course
+            for course in result.courses
+            if not (course.archived or course.in_trash)
+            and academic_calendar_role(course.course_title) is AcademicCalendarRole.MISC
+        )
+        if len(active_misc_courses) > 1:
+            diagnostics.extend(
+                NotionDiscoveryDiagnostic(
+                    code="misc_calendar_duplicate",
+                    severity="error",
+                    message="Courses database must contain at most one active misc row",
+                    source_id=result.courses_source_id,
+                    source_type=result.courses_source_type,
+                    course_page_id=course.course_page_id,
+                    course_title=course.course_title,
+                    count=min(len(active_misc_courses), 100),
+                )
+                for course in active_misc_courses
+            )
         if result.courses_source_id is not None:
             self._store.save_sync_cursor(
                 result.courses_source_id,
@@ -361,6 +393,7 @@ class AcademicNotionSync:
                     seen.append(assessment.page_id)
                     record, classification = _assessment_record(
                         assessment,
+                        calendar_role=academic_calendar_role(course_record.title),
                         timezone=self._timezone,
                     )
                     assessment_row_id = self._store.upsert_synced_assessment(
@@ -489,7 +522,7 @@ class AcademicNotionSync:
             assignment_preview_title=previews["assignment"],
             tutorial_preview_title=previews["tutorial"],
             lab_preview_title=previews["lab"],
-            studying_block_preview_title=previews["studying_block"],
+            event_preview_title=previews["event"],
             expected_edited_at=assessment.last_edited_at,
             expires_at=now + self._clarification_ttl,
             idempotency_key=idempotency_key,
@@ -516,7 +549,7 @@ class AcademicNotionSync:
                     assignment_title_preview=previews["assignment"][:500],
                     tutorial_title_preview=previews["tutorial"][:500],
                     lab_title_preview=previews["lab"][:500],
-                    studying_block_title_preview=previews["studying_block"][:500],
+                    event_title_preview=previews["event"][:500],
                 )
             )
         except LifeAgentError:
@@ -751,21 +784,29 @@ def _course_record(course: NotionCourse) -> _CourseRecord:
 def _assessment_record(
     assessment: NotionAssessment,
     *,
+    calendar_role: AcademicCalendarRole = AcademicCalendarRole.COURSE,
     timezone: ZoneInfo,
 ) -> tuple[_AssessmentRecord, Any]:
     existing_kind = _normalized_property(assessment.properties, "type")
-    classification = classify_assessment_label(
-        assessment.current_title,
-        trusted_existing_kind=existing_kind if isinstance(existing_kind, str) else None,
-    )
+    title = assessment.current_title
+    if calendar_role is AcademicCalendarRole.MISC:
+        title = canonical_misc_task_title(title)
+        classification: Any = _ResolvedClassification(
+            kind="task",
+            source="reserved_misc_calendar",
+        )
+    else:
+        classification = classify_assessment_label(
+            assessment.current_title,
+            trusted_existing_kind=existing_kind if isinstance(existing_kind, str) else None,
+        )
     due_at = _parse_due(assessment, timezone=timezone)
     ends_at = _parse_end(assessment, timezone=timezone)
     is_all_day = _is_all_day_notion_date(assessment.due)
     reasons: list[str] = []
     if _classification_kind_value(classification.kind) == AssessmentKind.UNKNOWN.value:
         reasons.append(
-            "Confirm whether this assessment is a Quiz, Assignment, Tutorial, Lab, "
-            "or Studying Block."
+            "Confirm whether this item is a Quiz, Assignment, Tutorial, Lab, or ordinary Event."
         )
     if due_at is None:
         reasons.append("Confirm the assessment deadline in Notion.")
@@ -788,8 +829,8 @@ def _assessment_record(
         _AssessmentRecord(
             notion_id=assessment.page_id,
             page_id=assessment.page_id,
-            title=assessment.current_title,
-            current_title=assessment.current_title,
+            title=title,
+            current_title=title,
             due_at=due_at,
             ends_at=ends_at,
             weight=weight,

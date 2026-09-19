@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import asyncio
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from datetime import datetime
 from typing import Any, cast
 from zoneinfo import ZoneInfo
@@ -11,7 +11,7 @@ from zoneinfo import ZoneInfo
 import httpx
 from pydantic import BaseModel, ConfigDict, Field
 
-from app.agents.harness import NativeTool, ToolExecutionError
+from app.agents.harness import NativeTool, ToolExecutionError, ToolSideEffectClass
 from app.agents.job_interviews.contracts import (
     ApplicationInterpretation,
     CareerClarificationRequest,
@@ -43,6 +43,10 @@ class _SearchInterviewsArgs(_Args):
     query: str = Field(default="", max_length=300)
 
 
+class _SearchJobsContextArgs(_Args):
+    query: str = Field(default="", max_length=300)
+
+
 class _PrepareInterviewArgs(_Args):
     interview_page_id: str = Field(min_length=1, max_length=255)
     refresh_research: bool = False
@@ -55,6 +59,22 @@ class _ProposeInterviewDateArgs(_Args):
 
 class _ProposePlanSaveArgs(_Args):
     interview_page_id: str = Field(min_length=1, max_length=255)
+
+
+_CAREER_TOOL_ACTIVITY = {
+    "search_jobs_context": "interview_data",
+    "search_job_interviews": "interview_data",
+    "prepare_job_interview": "interview_preparation",
+    "propose_interview_date": "proposal_drafting",
+    "propose_interview_plan_save": "proposal_drafting",
+}
+_CAREER_TOOL_SIDE_EFFECT_CLASS: dict[str, ToolSideEffectClass] = {
+    "search_jobs_context": "read_only",
+    "search_job_interviews": "read_only",
+    "prepare_job_interview": "durable_local_write",
+    "propose_interview_date": "proposal_only",
+    "propose_interview_plan_save": "proposal_only",
+}
 
 
 class CareerAgentToolState:
@@ -93,10 +113,52 @@ class CareerAgentToolState:
         self._research_max_pages = research_max_pages
         self._research_max_search_results = research_max_search_results
         self._sync_attempted = False
+        self._sync_warning: dict[str, object] | None = None
         self._known_interviews: dict[str, InterviewEventSnapshot] = {}
+
+    def restore_checkpoint(self, value: Mapping[str, object] | None) -> None:
+        """Restore verified interview capabilities from host-only state."""
+
+        if value is None:
+            return
+        if value.get("version") != "career-native-tools.v1":
+            raise ValueError("career tool checkpoint version is unsupported")
+        raw_interviews: object = value.get("known_interviews", ())
+        if not isinstance(raw_interviews, Sequence) or isinstance(raw_interviews, str | bytes):
+            raise ValueError("career tool checkpoint interviews are invalid")
+        interview_values = cast(Sequence[object], raw_interviews)
+        if len(interview_values) > 100:
+            raise ValueError("career tool checkpoint interviews are invalid")
+        self._known_interviews = {
+            item.interview_page_id: item
+            for raw in interview_values
+            for item in (InterviewEventSnapshot.model_validate(raw),)
+        }
+
+    def export_checkpoint(self) -> dict[str, object]:
+        """Return the bounded host-only state needed to validate resumed tools."""
+
+        return {
+            "version": "career-native-tools.v1",
+            "known_interviews": [
+                item.model_dump(mode="json")
+                for item in sorted(
+                    self._known_interviews.values(),
+                    key=lambda item: item.interview_page_id,
+                )
+            ],
+        }
 
     def tools(self) -> tuple[NativeTool, ...]:
         return (
+            self._tool(
+                "search_jobs_context",
+                "Search the owner's Jobs application table rows and upcoming interview calendar "
+                "events together. Use first for Jobs/career questions about dates, interviews, "
+                "applications, companies, roles, or statuses.",
+                _SearchJobsContextArgs,
+                self._search_jobs_context,
+            ),
             self._tool(
                 "search_job_interviews",
                 "Search the owner's synchronized upcoming interview rounds. Use before selecting "
@@ -140,9 +202,11 @@ class CareerAgentToolState:
             },
             handler=handler,
             name=name,
+            side_effect_class=_CAREER_TOOL_SIDE_EFFECT_CLASS[name],
+            activity=_CAREER_TOOL_ACTIVITY[name],
         )
 
-    async def _ensure_synced(self) -> None:
+    async def _ensure_synced(self, *, cached_available: bool = False) -> None:
         if self._sync_attempted:
             return
         self._sync_attempted = True
@@ -152,44 +216,92 @@ class CareerAgentToolState:
                 timeout=self._sync_timeout_seconds,
             )
         except TimeoutError:
+            self._sync_warning = {
+                "status": "cached_fallback",
+                "sync_status": "timeout",
+                "message": "Jobs sync timed out; returned cached career data.",
+            }
+            if cached_available:
+                return
             raise ToolExecutionError(
-                "Jobs sync timed out. Academic data and Notion content were left unchanged."
+                "Jobs sync timed out and no cached Jobs/interview data is available."
             ) from None
         except Exception:
+            self._sync_warning = {
+                "status": "cached_fallback",
+                "sync_status": "failed",
+                "message": "Jobs sync failed; returned cached career data.",
+            }
+            if cached_available:
+                return
             raise ToolExecutionError(
-                "Jobs sync failed. Academic data and Notion content were left unchanged."
+                "Jobs sync failed and no cached Jobs/interview data is available."
             ) from None
-        if str(getattr(result, "status", "")) not in {"succeeded", "partial"}:
+        status = str(getattr(result, "status", ""))
+        if status == "partial":
             codes = tuple(str(item) for item in getattr(result, "diagnostic_codes", ()))[:5]
+            self._sync_warning = {
+                "status": "fresh_partial",
+                "sync_status": status,
+                "diagnostic_codes": list(codes),
+                "message": "Jobs sync completed partially; returned the available career data.",
+            }
+        if status not in {"succeeded", "partial"}:
+            codes = tuple(str(item) for item in getattr(result, "diagnostic_codes", ()))[:5]
+            self._sync_warning = {
+                "status": "cached_fallback",
+                "sync_status": status or "unknown",
+                "diagnostic_codes": list(codes),
+                "message": "Jobs sync needs attention; returned cached career data.",
+            }
+            if cached_available:
+                return
             suffix = f" Setup codes: {', '.join(codes)}." if codes else ""
             raise ToolExecutionError("Jobs/Interviews setup needs attention." + suffix)
 
+    async def _search_jobs_context(self, arguments: Mapping[str, object]) -> object:
+        args = _SearchJobsContextArgs.model_validate(arguments)
+        cached_interviews = self._load_interview_context()
+        cached_rows = self._load_application_table_context()
+        await self._ensure_synced(cached_available=bool(cached_interviews or cached_rows))
+        interviews = self._load_interview_context()
+        rows = self._load_application_table_context()
+        self._known_interviews.update((item.interview_page_id, item) for item in interviews)
+        return {
+            "query": args.query,
+            "sync": self._sync_warning
+            or {
+                "status": "fresh",
+                "sync_status": "succeeded",
+                "message": "Jobs sync succeeded before this lookup.",
+            },
+            "interviews": [self._interview_payload(item) for item in interviews],
+            "application_tables": _application_table_payloads(rows),
+        }
+
     async def _search_interviews(self, arguments: Mapping[str, object]) -> object:
         args = _SearchInterviewsArgs.model_validate(arguments)
-        await self._ensure_synced()
+        cached = tuple(self._store.search_interviews(args.query, now=self._now))[:50]
+        await self._ensure_synced(cached_available=bool(cached))
         results = tuple(self._store.search_interviews(args.query, now=self._now))[:50]
         self._known_interviews.update((item.interview_page_id, item) for item in results)
-        return [
-            {
-                "interview_page_id": item.interview_page_id,
-                "title": item.title,
-                "date": item.local_date.isoformat(),
-                "time": (
-                    item.date_start.isoformat(timespec="minutes")
-                    if item.date_start is not None
-                    else None
-                ),
-                "plan_available": self._store.get_current_plan(item.interview_page_id) is not None,
-            }
-            for item in results
-        ]
+        return {
+            "sync": self._sync_warning
+            or {
+                "status": "fresh",
+                "sync_status": "succeeded",
+                "message": "Jobs sync succeeded before this lookup.",
+            },
+            "interviews": [self._interview_payload(item) for item in results],
+        }
 
     async def _prepare_interview(self, arguments: Mapping[str, object]) -> object:
         args = _PrepareInterviewArgs.model_validate(arguments)
         interview = self._known_interviews.get(args.interview_page_id)
         if interview is None:
             raise ToolExecutionError(
-                "interview_page_id must come from search_job_interviews in this turn"
+                "interview_page_id must come from search_jobs_context or search_job_interviews "
+                "in this turn"
             )
         existing = self._store.get_current_plan(interview.interview_page_id)
         if existing is not None and not args.refresh_research:
@@ -435,9 +547,46 @@ class CareerAgentToolState:
         interview = self._known_interviews.get(interview_page_id)
         if interview is None:
             raise ToolExecutionError(
-                "interview_page_id must come from search_job_interviews in this turn"
+                "interview_page_id must come from search_jobs_context or search_job_interviews "
+                "in this turn"
             )
         return interview
+
+    def _interview_payload(self, item: InterviewEventSnapshot) -> Mapping[str, object]:
+        return {
+            "interview_page_id": item.interview_page_id,
+            "title": item.title,
+            "date": item.local_date.isoformat(),
+            "time": (
+                item.date_start.isoformat(timespec="minutes")
+                if item.date_start is not None
+                else None
+            ),
+            "timezone": item.timezone,
+            "is_all_day": item.is_all_day,
+            "tags": list(item.tags),
+            "calendar_semantic_overview": item.calendar_semantic_overview,
+            "calendar_semantic_description": item.calendar_semantic_description,
+            "plan_available": self._store.get_current_plan(item.interview_page_id) is not None,
+        }
+
+    def _load_interview_context(self) -> tuple[InterviewEventSnapshot, ...]:
+        loader = getattr(self._store, "load_upcoming_interviews", None)
+        if callable(loader):
+            loaded = loader(now=self._now)
+            if isinstance(loaded, Sequence):
+                return tuple(cast(Sequence[InterviewEventSnapshot], loaded))[:50]
+            return ()
+        return tuple(self._store.search_interviews("", now=self._now))[:50]
+
+    def _load_application_table_context(self) -> tuple[Any, ...]:
+        loader = getattr(self._store, "application_table_snapshots", None)
+        if callable(loader):
+            loaded = loader()
+            if isinstance(loaded, Sequence):
+                return tuple(cast(Sequence[Any], loaded))[:75]
+            return ()
+        return tuple(self._store.application_row_snapshots())[:75]
 
     def _clarify(
         self,
@@ -469,6 +618,45 @@ def _optional_text(value: object) -> str | None:
 
 def _confidence(value: object) -> float:
     return float(value) if isinstance(value, int | float) else 0.0
+
+
+def _application_table_payloads(rows: tuple[Any, ...]) -> list[dict[str, object]]:
+    grouped: dict[str, list[Any]] = {}
+    for row in rows:
+        grouped.setdefault(str(row.table_block_id), []).append(row)
+    payloads: list[dict[str, object]] = []
+    for table_block_id, table_rows in grouped.items():
+        ordered = sorted(table_rows, key=lambda row: int(getattr(row, "row_order", 0)))
+        header = next((row for row in ordered if bool(getattr(row, "is_header", False))), None)
+        headers = tuple(str(cell) for cell in getattr(header, "cells", ()) if str(cell).strip())
+        data_rows = [row for row in ordered if not bool(getattr(row, "is_header", False))]
+        max_columns = max((len(tuple(getattr(row, "cells", ()))) for row in ordered), default=0)
+        columns = [
+            {
+                "index": index,
+                "header": headers[index] if index < len(headers) else f"column_{index + 1}",
+            }
+            for index in range(max_columns)
+        ]
+        payloads.append(
+            {
+                "table_block_id": table_block_id,
+                "columns": columns,
+                "rows": [
+                    {
+                        "row_block_id": row.row_block_id,
+                        "row_order": row.row_order,
+                        "cells": list(row.cells),
+                        "column_values": {
+                            str(columns[index]["header"]): cell
+                            for index, cell in enumerate(row.cells[: len(columns)])
+                        },
+                    }
+                    for row in data_rows[:50]
+                ],
+            }
+        )
+    return payloads
 
 
 __all__ = ["CareerAgentToolState"]

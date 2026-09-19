@@ -6,28 +6,27 @@
   workflows do not import or query its memory tables.
 - Authorized users can ask to see memory with plain wording such as “see memory,”
   “show me your memory,” “what do you remember about my coursework?,” or “show my
-  learning focuses.” The top-level Qwen decision semantically separates a learning-memory
-  subrequest from any calendar operation; memory viewing cannot itself create a Notion proposal.
-- An explicit academic struggle creates or reinforces a learning focus and schedules a
-  separate practice block. It never relabels an assessment block as practice.
-- Active learning focuses are verified struggle evidence for the morning academic
-  briefing, but only bounded labels and focus IDs cross that model boundary; raw
-  reflection text, embeddings, and private Discord message bodies stay out of the
-  briefing context.
+  learning focuses.” The active native Discord handler exposes a narrow memory tool;
+  memory viewing cannot itself create a Notion proposal.
+- An explicit academic struggle creates or reinforces a learning focus and, in the same
+  interaction, proposes one or more ordinary course events for targeted review.
+- Active learning focuses are available only to owner-scoped conversational
+  memory tools. They are not injected into the automatic morning event-semantic
+  boundary; raw reflection text, embeddings, and private Discord message bodies
+  stay out of the briefing context.
 - Reflections are stored as bounded raw text together with a local Ollama embedding,
   model identity, vector dimensions, and non-secret embedding telemetry.
 - Clearing a focus is a hard delete of the focus, its reflection text, its vectors, and
-  its lifecycle events. Historical study blocks remain, but their deleted-focus foreign
-  key is cleared and their `practice` kind is retained.
+  its lifecycle events. Existing external calendar pages are not renamed or deleted.
 - The configurable default practice duration is 30 minutes.
 
 ## Runtime flow
 
 1. An authorized Discord message first preserves exact confirm/reject as formal security
-   hooks, then sends free-form prose to the top-level Qwen academic decision. Qwen owns
-   create/update/archive/clarify interpretation and may return a distinct bounded
-   learning-memory subrequest alongside calendar tools. The application layer does not
-   route ordinary prose with a keyword classifier.
+   hooks. An open owner/channel memory session resumes directly before the general model
+   loop. Otherwise, the native loop may invoke the narrow academic memory tool for an
+   explicit reflection or review request. The host supplies the authenticated raw message,
+   event id, owner, channel, and timestamp; model arguments cannot change that scope.
 2. Qwen may perform bounded read-only course, assessment, active-focus, and semantic
    searches. It returns a typed create, reinforce, resolve, or snooze action, or one
    clarification question.
@@ -35,14 +34,14 @@
    channel and user. The next authorized reply resumes that session without requiring
    another mention.
 4. A completed create or reinforce action stores the combined reflection turns and
-   embedding, and marks practice due for the next Toronto calendar day.
-5. Morning planning loads active due focuses in its first facts snapshot, allocates a
-   dedicated practice block before normal assessment allocation, and may pass a bounded
-   verified-context label to the conversational briefing. An unschedulable focus is
-   explicitly reported as deferred.
-6. The next end-of-day run asks whether practice is still needed. “Yes” reinforces the
-   focus and schedules another next-day practice block. “No,” “resolved,” or “clear”
-   hard-deletes it.
+   embedding, and marks the focus due for the next Toronto-local review cycle.
+5. Active and snoozed focuses remain available to owner-scoped memory review and
+   academic search tools. The removed study-plan allocator no longer creates automatic
+   practice blocks; targeted review time is proposed through the confirmation-gated
+   ordinary course-event path when requested.
+6. An explicit owner review request can reinforce, snooze, resolve, correct, or
+   clear a focus. No background end-of-day model workflow performs these
+   transitions.
 
 ## See-memory review
 
@@ -87,10 +86,9 @@ state, does not mutate focuses or reflections, and returns:
 Explicit deletion with a subject, such as “I am no longer struggling with circuit
 design,” is applied without another confirmation only when it uniquely matches a verified
 focus from the active memory-review session or an owner-scoped semantic search. The host
-locks the focus row, revalidates ownership and revision, hard-deletes the focus, deletes
-its raw reflection rows, vectors, and lifecycle events, and clears historical
-`study_blocks.learning_focus_id` while retaining `block_kind='practice'`. Database UUIDs
-are never exposed in Discord responses.
+locks the focus row, revalidates ownership and revision, hard-deletes the focus, and
+deletes its raw reflection rows, vectors, and lifecycle events. Database UUIDs are never
+exposed in Discord responses.
 
 Ambiguous deletion, such as “I am no longer struggling,” never mutates the database,
 even if there is only one likely focus. The host asks a grounded clarification question
@@ -101,14 +99,14 @@ or continues clarification without deletion.
 
 Explicit correction, such as “It isn’t general circuit design; I’m struggling
 specifically with nodal analysis,” is treated as replacement when it uniquely matches an
-owned verified focus. The host locks and revalidates the focus, updates canonical
-course/topic/assessment fields, deletes stale reflection-memory rows and stale vectors,
-stores the corrected user text with a new embedding, increments the focus revision,
-resets review/reminder counters, marks the focus active, and schedules a separate
-practice block for the next Toronto calendar day. Only a non-text audit fact that a
-rewrite occurred is retained outside semantic retrieval. If embedding generation fails,
-the corrected canonical focus and raw text are retained with typed failure metadata, and
-the stale vector remains deleted.
+owned verified focus. The host creates the new embedding first, then locks and revalidates
+the focus, updates canonical course/topic/assessment fields, replaces stale reflection
+memory, increments the focus revision, resets review/reminder counters, and marks the focus
+active. A replacement review event is proposed separately through the confirmation-gated
+ordinary-event tool when requested. Only a
+non-text audit fact that a rewrite occurred is retained outside semantic retrieval. If
+embedding generation fails, no canonical replacement or new raw reflection text is
+stored and Discord receives an explicit retryable failure.
 
 ## Missed check-in lifecycle
 
@@ -116,14 +114,14 @@ The default lifecycle is deterministic and configurable:
 
 | Daily sweep | Focus state | Action |
 | --- | --- | --- |
-| Initial due review | Active | Ask whether practice is still needed |
-| Miss 1 | Active | Send reminder 1; keep practice active |
-| Miss 2 | Snoozed | Send reminder 2; stop scheduling practice |
+| Initial due review | Active | Ask whether the learning focus still needs attention |
+| Miss 1 | Active | Send reminder 1; keep the focus active |
+| Miss 2 | Snoozed | Send reminder 2; pause focus reminders |
 | Misses 3–5 | Snoozed | Send one reminder per daily sweep |
 | Sweep after reminder 5 | Deleted | Hard-delete focus, raw text, vector, and events |
 
 A “yes” response at any point resets missed/reminder counters and returns the focus to
-active daily practice. An explicit user snooze uses the chosen resume timestamp.
+active status. An explicit user snooze uses the chosen resume timestamp.
 
 ## Persistence
 
@@ -135,9 +133,12 @@ Migration `0011_academic_learning_focuses` enables pgvector and creates:
 - `academic_reflection_memories` for raw text and native pgvector values; and
 - `academic_learning_focus_events` for lifecycle history until hard deletion.
 
-`study_blocks` gains `learning_focus_id` and `block_kind`. The PostgreSQL service and
-integration-test containers use the pinned `pgvector/pgvector:0.8.6-pg16-bookworm`
-image.
+Historical migration `0011` linked the former derived scheduling tables to learning
+focuses. Migration `0026_semantic_calendar_events` removes those derived tables without
+creating external events. Because that deletion is intentional, revision `0026` is
+irreversible; recovery requires a pre-upgrade backup and does not reactivate the former
+runtime. The PostgreSQL service and integration-test containers use the pinned
+`pgvector/pgvector:0.8.6-pg16-bookworm` image.
 
 Migration `0012_academic_memory_review` adds explicit Discord ownership and concurrency
 metadata to learning focuses:
@@ -152,6 +153,11 @@ The migration backfills focus ownership only when a focus points at one source
 present. Focuses without that exact owner evidence remain unowned and must not appear in
 any user’s see-memory response or owner-scoped mutation path until resolved.
 
+Migration `0025_academic_embedding_hnsw` fixes both material-chunk and reflection-memory
+columns at `vector(1024)`, clears only incompatible or identifiable legacy derived
+vectors, and adds partial HNSW cosine indexes. Raw material, reflections, focus state,
+citations, and lifecycle history are preserved for bounded re-embedding.
+
 ## Configuration
 
 - `ACADEMIC_MEMORY_ENABLED=true`
@@ -161,10 +167,13 @@ any user’s see-memory response or owner-scoped mutation path until resolved.
 - `ACADEMIC_CONFIRMATION_TTL_HOURS=24` also bounds Discord memory-review session expiry
   unless a more specific review TTL is introduced.
 - `ACADEMIC_END_OF_DAY_SCHEDULE=21:00` sets the Toronto daily review/practice cadence.
-- `EMBEDDING_MODEL=qwen3-embedding:0.6b`
+- `EMBEDDING_MODEL=qwen3-embedding:4b`
 - `EMBEDDING_MODEL_DIGEST=` (optional pin)
+- `EMBEDDING_DIMENSIONS=1024`
 - `EMBEDDING_TIMEOUT_SECONDS=30`
+- `EMBEDDING_MODEL_KEEP_ALIVE_SECONDS=300`
 
-Embedding failure is typed and does not discard the raw reflection or focus transition;
-semantic retrieval only considers memories with valid vectors of the current query
-dimension.
+Embedding failure is typed. Create, reinforce, and replace transitions commit only after
+the new vector validates; failures do not retain new raw reflection text. Semantic
+retrieval requires the current model/digest/dimension/normalization/input-policy identity
+and never treats an unavailable embedder as an empty memory set.

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import inspect
 import json
 import re
 from collections.abc import Awaitable, Callable, Mapping, Sequence
@@ -22,14 +23,73 @@ type HarnessEventKind = Literal[
     "tool_error",
     "final_response",
 ]
-type HarnessStatus = Literal["completed", "turn_limit"]
+type HarnessStatus = Literal["completed", "awaiting_user", "failed", "turn_limit"]
+type ConversationDisposition = Literal["awaiting_user", "completed"]
+type TranscriptCheckpointKind = Literal["assistant_message", "tool_result"]
 type ToolResultStatus = Literal["succeeded", "review_required"]
+type ToolSideEffectClass = Literal[
+    "read_only",
+    "proposal_only",
+    "durable_local_write",
+    "external_write",
+]
 
 type EventSink = Callable[["AgentHarnessEvent"], Awaitable[None]]
+type AbortCheck = Callable[[], Awaitable[None] | None]
+type CheckpointSink = Callable[["AgentTranscriptCheckpoint"], Awaitable[None]]
+type PreModelContextHook = Callable[
+    ["PreModelContext"],
+    Awaitable[Sequence[BaseMessage]] | Sequence[BaseMessage],
+]
+type LifecycleValidator = Callable[
+    ["ConversationLifecycle", Sequence[BaseMessage]],
+    Awaitable[str | None] | str | None,
+]
 
 DEFAULT_SYSTEM_MESSAGE = (
     "You are a helpful assistant. Use available tools when they are useful. "
     "Do not reveal hidden reasoning."
+)
+TERMINAL_RESPONSE_TOOL_NAME = "emit_conversation_response"
+TERMINAL_RESPONSE_TOOL_SCHEMA: Mapping[str, Any] = {
+    "type": "function",
+    "function": {
+        "name": TERMINAL_RESPONSE_TOOL_NAME,
+        "description": (
+            "End the current owner-visible turn with an explicit conversation lifecycle "
+            "disposition and exact response text."
+        ),
+        "parameters": {
+            "type": "object",
+            "additionalProperties": False,
+            "properties": {
+                "disposition": {
+                    "type": "string",
+                    "enum": ["awaiting_user", "completed"],
+                    "description": (
+                        "Use awaiting_user only when the owner must reply before the request "
+                        "can be completed; use completed for final answers and terminal outcomes."
+                    ),
+                },
+                "content": {
+                    "type": "string",
+                    "minLength": 1,
+                    "description": "The exact owner-visible Discord response.",
+                },
+            },
+            "required": ["disposition", "content"],
+        },
+    },
+}
+_LIFECYCLE_CORRECTION_PREFIX = (
+    "Host correction: the previous assistant message did not follow the terminal response "
+    "contract. Finish ordinary tool work first. When ready to respond to the owner, call "
+    f"{TERMINAL_RESPONSE_TOOL_NAME} as the only tool in the assistant message with "
+    'disposition "awaiting_user" or "completed" and exact owner-visible content. '
+    "Do not answer with plain assistant text in terminal-response mode."
+)
+_LIFECYCLE_FAILURE_RESPONSE = (
+    "The model did not produce a valid terminal conversation response. Please try again."
 )
 MAX_EVENT_JSON_CHARS = 4_096
 MAX_JSON_STRING_CHARS = 1_024
@@ -75,6 +135,18 @@ class ToolExecutionError(ValueError):
     """Explicit, user-safe tool error that may be shown to the model and owner."""
 
 
+class UserAbortRequested(asyncio.CancelledError):
+    """Raised when a user-requested abort has been durably observed."""
+
+
+@dataclass(frozen=True, slots=True)
+class ConversationLifecycle:
+    """Semantic owner-visible response plus host lifecycle disposition."""
+
+    disposition: ConversationDisposition
+    content: str
+
+
 @dataclass(frozen=True, slots=True)
 class NativeTool:
     """Model-facing schema plus the local handler for one tool."""
@@ -82,6 +154,8 @@ class NativeTool:
     schema: Mapping[str, Any]
     handler: NativeToolHandler
     name: str | None = None
+    side_effect_class: ToolSideEffectClass = "read_only"
+    activity: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -103,9 +177,35 @@ class AgentHarnessEvent:
     content: str | None = None
     tool_call_id: str | None = None
     tool_name: str | None = None
+    tool_activity: str | None = None
+    tool_side_effect_class: ToolSideEffectClass | None = None
+    lifecycle_disposition: ConversationDisposition | None = None
     args_json: str | None = None
     result_json: str | None = None
     error: str | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class AgentTranscriptCheckpoint:
+    """Durable checkpoint boundary for the full ordered native transcript."""
+
+    kind: TranscriptCheckpointKind
+    turn: int
+    messages: tuple[BaseMessage, ...]
+    message_index: int
+    tool_call_id: str | None = None
+    tool_name: str | None = None
+    lifecycle_disposition: ConversationDisposition | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class PreModelContext:
+    """Canonical loop state supplied to a host-owned context assembler."""
+
+    canonical_messages: tuple[BaseMessage, ...]
+    tools: tuple[Mapping[str, Any], ...]
+    turn: int
+    turn_limit: int
 
 
 @dataclass(frozen=True, slots=True)
@@ -116,6 +216,7 @@ class AgentHarnessResult:
     final_response: str
     turns: int
     messages: tuple[BaseMessage, ...]
+    lifecycle_disposition: ConversationDisposition | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -134,11 +235,17 @@ class _PendingEventBudget:
 async def run_native_tool_loop(
     *,
     gateway: AgentHarnessGateway,
-    user_input: str,
+    user_input: str | None,
     tools: Sequence[NativeTool] = (),
     system_message: str = DEFAULT_SYSTEM_MESSAGE,
     max_turns: int = 50,
     event_sink: EventSink | None = None,
+    checkpoint_sink: CheckpointSink | None = None,
+    abort_check: AbortCheck | None = None,
+    restored_messages: Sequence[BaseMessage] = (),
+    require_terminal_response: bool = False,
+    lifecycle_validator: LifecycleValidator | None = None,
+    pre_model_context_hook: PreModelContextHook | None = None,
     _model_pending_elapsed_seconds: Sequence[float] = MODEL_PENDING_ELAPSED_SECONDS,
     _model_pending_repeat_seconds: float = MODEL_PENDING_REPEAT_SECONDS,
 ) -> AgentHarnessResult:
@@ -146,28 +253,112 @@ async def run_native_tool_loop(
 
     if max_turns < 1:
         raise ValueError("max_turns must be positive")
-    tool_handlers = _tool_handlers(tools)
+    tool_map = _tool_map(tools)
+    if require_terminal_response and TERMINAL_RESPONSE_TOOL_NAME in tool_map:
+        raise ValueError(f"{TERMINAL_RESPONSE_TOOL_NAME} is reserved for lifecycle control")
     tool_schemas = tuple(tool.schema for tool in tools)
-    messages: list[BaseMessage] = [
-        SystemMessage(content=system_message),
-        HumanMessage(content=user_input),
-    ]
+    if require_terminal_response:
+        tool_schemas = (*tool_schemas, TERMINAL_RESPONSE_TOOL_SCHEMA)
+    messages: list[BaseMessage] = [SystemMessage(content=system_message), *restored_messages]
+    if user_input is not None:
+        messages.append(HumanMessage(content=user_input))
     pending_event_budget = _PendingEventBudget()
+    lifecycle_correction_used = False
+    restored_turns = _assistant_message_count(messages)
 
-    for turn in range(1, max_turns + 1):
+    resume_result = await _resume_checkpointed_tail(
+        messages=messages,
+        tool_map=tool_map,
+        require_terminal_response=require_terminal_response,
+        lifecycle_validator=lifecycle_validator,
+        checkpoint_sink=checkpoint_sink,
+        event_sink=event_sink,
+        abort_check=abort_check,
+        restored_turns=restored_turns,
+    )
+    if isinstance(resume_result, AgentHarnessResult):
+        return resume_result
+    lifecycle_correction_used = resume_result
+    restored_turns = _assistant_message_count(messages)
+
+    for attempt in range(1, max_turns + 1):
+        turn = restored_turns + attempt
+        turn_limit = restored_turns + max_turns
+        await _raise_if_abort_requested(abort_check)
+        model_messages: Sequence[BaseMessage] = tuple(messages)
+        if pre_model_context_hook is not None:
+            assembled = pre_model_context_hook(
+                PreModelContext(
+                    canonical_messages=tuple(messages),
+                    tools=tool_schemas,
+                    turn=turn,
+                    turn_limit=turn_limit,
+                )
+            )
+            if inspect.isawaitable(assembled):
+                assembled = await assembled
+            model_messages = tuple(assembled)
+            if not model_messages or not isinstance(model_messages[0], SystemMessage):
+                raise RuntimeError("context_assembly_invalid")
         assistant = await _invoke_model_turn(
             gateway=gateway,
-            messages=tuple(messages),
+            messages=model_messages,
             tools=tool_schemas,
             turn=turn,
-            turn_limit=max_turns,
+            turn_limit=turn_limit,
             event_sink=event_sink,
             pending_elapsed_seconds=_model_pending_elapsed_seconds,
             pending_repeat_seconds=_model_pending_repeat_seconds,
             pending_event_budget=pending_event_budget,
         )
         messages.append(assistant)
+        await _checkpoint(
+            checkpoint_sink,
+            AgentTranscriptCheckpoint(
+                kind="assistant_message",
+                turn=turn,
+                messages=tuple(messages),
+                message_index=len(messages) - 1,
+            ),
+        )
         calls = _tool_calls(assistant, turn)
+        if require_terminal_response:
+            lifecycle, validation_error = await _validate_lifecycle_turn(
+                assistant=assistant,
+                calls=calls,
+                messages=tuple(messages),
+                lifecycle_validator=lifecycle_validator,
+            )
+            if lifecycle is not None:
+                await _emit(
+                    event_sink,
+                    AgentHarnessEvent(
+                        kind="final_response",
+                        turn=turn,
+                        content=lifecycle.content,
+                        lifecycle_disposition=lifecycle.disposition,
+                    ),
+                )
+                return AgentHarnessResult(
+                    status=(
+                        "awaiting_user" if lifecycle.disposition == "awaiting_user" else "completed"
+                    ),
+                    final_response=lifecycle.content,
+                    turns=turn,
+                    messages=tuple(messages),
+                    lifecycle_disposition=lifecycle.disposition,
+                )
+            if validation_error is not None:
+                if lifecycle_correction_used or attempt >= max_turns:
+                    return await _fail_closed_lifecycle(
+                        event_sink=event_sink,
+                        messages=tuple(messages),
+                        turn=turn,
+                    )
+                lifecycle_correction_used = True
+                messages.append(SystemMessage(content=_lifecycle_correction(validation_error)))
+                continue
+
         if not calls:
             text = _visible_text(assistant)
             final = text
@@ -187,6 +378,8 @@ async def run_native_tool_loop(
         # verbatim; the harness must never synthesize conversational tool text.
         action_description = _visible_text(assistant)
         for index, call in enumerate(calls):
+            tool = tool_map.get(call.name)
+            await _raise_if_abort_requested(abort_check)
             await _emit(
                 event_sink,
                 AgentHarnessEvent(
@@ -195,24 +388,151 @@ async def run_native_tool_loop(
                     content=action_description if index == 0 else None,
                     tool_call_id=call.call_id,
                     tool_name=call.name,
+                    tool_activity=tool.activity if tool is not None else None,
+                    tool_side_effect_class=(tool.side_effect_class if tool is not None else None),
                     args_json=_safe_json(call.args),
                 ),
             )
-            tool_message, event = await _execute_tool_call(call, tool_handlers, turn)
+            tool_message, event = await _execute_tool_call(call, tool_map, turn, abort_check)
             messages.append(tool_message)
+            await _checkpoint(
+                checkpoint_sink,
+                AgentTranscriptCheckpoint(
+                    kind="tool_result",
+                    turn=turn,
+                    messages=tuple(messages),
+                    message_index=len(messages) - 1,
+                    tool_call_id=call.call_id,
+                    tool_name=call.name,
+                ),
+            )
             await _emit(event_sink, event)
 
     final = "The agent reached its turn limit before producing a final response."
     await _emit(
         event_sink,
-        AgentHarnessEvent(kind="final_response", turn=max_turns, content=final),
+        AgentHarnessEvent(
+            kind="final_response",
+            turn=restored_turns + max_turns,
+            content=final,
+        ),
     )
     return AgentHarnessResult(
         status="turn_limit",
         final_response=final,
-        turns=max_turns,
+        turns=restored_turns + max_turns,
         messages=tuple(messages),
     )
+
+
+async def _resume_checkpointed_tail(
+    *,
+    messages: list[BaseMessage],
+    tool_map: Mapping[str, NativeTool],
+    require_terminal_response: bool,
+    lifecycle_validator: LifecycleValidator | None,
+    checkpoint_sink: CheckpointSink | None,
+    event_sink: EventSink | None,
+    abort_check: AbortCheck | None,
+    restored_turns: int,
+) -> AgentHarnessResult | bool:
+    tail = _checkpointed_assistant_tail(messages)
+    if tail is None:
+        return False
+    _assistant_index, assistant, suffix = tail
+    turn = max(1, restored_turns)
+    calls = _tool_calls(assistant, turn)
+    if require_terminal_response:
+        lifecycle, validation_error = await _validate_lifecycle_turn(
+            assistant=assistant,
+            calls=calls,
+            messages=tuple(messages),
+            lifecycle_validator=lifecycle_validator,
+        )
+        if lifecycle is not None:
+            await _emit(
+                event_sink,
+                AgentHarnessEvent(
+                    kind="final_response",
+                    turn=turn,
+                    content=lifecycle.content,
+                    lifecycle_disposition=lifecycle.disposition,
+                ),
+            )
+            return AgentHarnessResult(
+                status=(
+                    "awaiting_user" if lifecycle.disposition == "awaiting_user" else "completed"
+                ),
+                final_response=lifecycle.content,
+                turns=turn,
+                messages=tuple(messages),
+                lifecycle_disposition=lifecycle.disposition,
+            )
+        if validation_error is not None:
+            messages.append(SystemMessage(content=_lifecycle_correction(validation_error)))
+            return True
+
+    matched_tool_call_ids = _matched_tool_call_ids(suffix)
+    for index, call in enumerate(calls):
+        if call.call_id in matched_tool_call_ids:
+            continue
+        tool = tool_map.get(call.name)
+        await _raise_if_abort_requested(abort_check)
+        await _emit(
+            event_sink,
+            AgentHarnessEvent(
+                kind="tool_call",
+                turn=turn,
+                content=_visible_text(assistant) if index == 0 else None,
+                tool_call_id=call.call_id,
+                tool_name=call.name,
+                tool_activity=tool.activity if tool is not None else None,
+                tool_side_effect_class=tool.side_effect_class if tool is not None else None,
+                args_json=_safe_json(call.args),
+            ),
+        )
+        tool_message, event = await _execute_tool_call(call, tool_map, turn, abort_check)
+        messages.append(tool_message)
+        await _checkpoint(
+            checkpoint_sink,
+            AgentTranscriptCheckpoint(
+                kind="tool_result",
+                turn=turn,
+                messages=tuple(messages),
+                message_index=len(messages) - 1,
+                tool_call_id=call.call_id,
+                tool_name=call.name,
+            ),
+        )
+        await _emit(event_sink, event)
+    return False
+
+
+def _checkpointed_assistant_tail(
+    messages: Sequence[BaseMessage],
+) -> tuple[int, AIMessage, tuple[ToolMessage, ...]] | None:
+    for index in range(len(messages) - 1, -1, -1):
+        message = messages[index]
+        if not isinstance(message, AIMessage):
+            continue
+        suffix = messages[index + 1 :]
+        if not all(isinstance(item, ToolMessage) for item in suffix):
+            return None
+        return index, message, cast(tuple[ToolMessage, ...], tuple(suffix))
+    return None
+
+
+def _matched_tool_call_ids(messages: Sequence[ToolMessage]) -> frozenset[str]:
+    return frozenset(
+        tool_call_id
+        for message in messages
+        if isinstance((tool_call_id := getattr(message, "tool_call_id", None)), str)
+        and tool_call_id
+    )
+
+
+def _assistant_message_count(messages: Sequence[BaseMessage]) -> int:
+    return sum(1 for message in messages if isinstance(message, AIMessage))
 
 
 async def _invoke_model_turn(
@@ -296,16 +616,16 @@ def _pending_elapsed_schedule(
     return tuple(elapsed[:MAX_MODEL_PENDING_EVENTS])
 
 
-def _tool_handlers(tools: Sequence[NativeTool]) -> dict[str, NativeToolHandler]:
-    handlers: dict[str, NativeToolHandler] = {}
+def _tool_map(tools: Sequence[NativeTool]) -> dict[str, NativeTool]:
+    tool_map: dict[str, NativeTool] = {}
     for tool in tools:
         name = tool.name or _schema_name(tool.schema)
         if not name:
             raise ValueError("tool schema must include a name")
-        if name in handlers:
+        if name in tool_map:
             raise ValueError(f"duplicate tool name: {name}")
-        handlers[name] = tool.handler
-    return handlers
+        tool_map[name] = tool
+    return tool_map
 
 
 def _schema_name(schema: Mapping[str, Any]) -> str | None:
@@ -426,14 +746,97 @@ def _tool_calls(message: AIMessage, turn: int) -> tuple[_ToolCall, ...]:
     return tuple(calls)
 
 
+async def _validate_lifecycle_turn(
+    *,
+    assistant: AIMessage,
+    calls: Sequence[_ToolCall],
+    messages: Sequence[BaseMessage],
+    lifecycle_validator: LifecycleValidator | None,
+) -> tuple[ConversationLifecycle | None, str | None]:
+    terminal_calls = [call for call in calls if call.name == TERMINAL_RESPONSE_TOOL_NAME]
+    if not calls:
+        return None, f"{TERMINAL_RESPONSE_TOOL_NAME} was not called"
+    if not terminal_calls:
+        return None, None
+    if len(calls) != 1:
+        return None, f"{TERMINAL_RESPONSE_TOOL_NAME} must be the only tool call"
+    call = terminal_calls[0]
+    if call.malformed_error is not None:
+        return None, call.malformed_error
+    raw_args: object = call.args
+    if not isinstance(raw_args, Mapping):
+        return None, "terminal response arguments must be an object"
+    lifecycle, error = _lifecycle_from_arguments(cast(Mapping[str, object], raw_args))
+    if lifecycle is None:
+        return None, error
+    if _visible_text(assistant):
+        return None, f"{TERMINAL_RESPONSE_TOOL_NAME} must carry the owner response in content"
+    if lifecycle_validator is not None:
+        validation = lifecycle_validator(lifecycle, messages)
+        if inspect.isawaitable(validation):
+            validation = await validation
+        if validation is not None:
+            cleaned = str(validation).strip()
+            if cleaned:
+                return None, cleaned
+    return lifecycle, None
+
+
+def _lifecycle_from_arguments(
+    arguments: Mapping[str, object],
+) -> tuple[ConversationLifecycle | None, str]:
+    disposition = arguments.get("disposition")
+    content = arguments.get("content")
+    if disposition not in {"awaiting_user", "completed"}:
+        return None, "terminal response disposition must be awaiting_user or completed"
+    if not isinstance(content, str) or not content.strip():
+        return None, "terminal response content must be non-empty text"
+    return (
+        ConversationLifecycle(
+            disposition=cast(ConversationDisposition, disposition),
+            content=content,
+        ),
+        "",
+    )
+
+
+def _lifecycle_correction(reason: str) -> str:
+    cleaned = reason.strip()[:MAX_JSON_STRING_CHARS] or "invalid terminal response"
+    return f"{_LIFECYCLE_CORRECTION_PREFIX} Contract error: {cleaned}."
+
+
+async def _fail_closed_lifecycle(
+    *,
+    event_sink: EventSink | None,
+    messages: Sequence[BaseMessage],
+    turn: int,
+) -> AgentHarnessResult:
+    await _emit(
+        event_sink,
+        AgentHarnessEvent(
+            kind="final_response",
+            turn=turn,
+            content=_LIFECYCLE_FAILURE_RESPONSE,
+        ),
+    )
+    return AgentHarnessResult(
+        status="failed",
+        final_response=_LIFECYCLE_FAILURE_RESPONSE,
+        turns=turn,
+        messages=tuple(messages),
+    )
+
+
 async def _execute_tool_call(
     call: _ToolCall,
-    handlers: Mapping[str, NativeToolHandler],
+    tools: Mapping[str, NativeTool],
     turn: int,
+    abort_check: AbortCheck | None,
 ) -> tuple[ToolMessage, AgentHarnessEvent]:
     if call.malformed_error is not None:
         return _tool_error(call, call.malformed_error, turn)
-    if call.name not in handlers:
+    tool = tools.get(call.name)
+    if tool is None:
         return _tool_error(call, f"unknown tool: {call.name}", turn)
     call_args: object = call.args
     if not isinstance(call_args, Mapping):
@@ -443,9 +846,16 @@ async def _execute_tool_call(
     for key, item in arg_mapping.items():
         args[str(key)] = item
     try:
-        result = await handlers[call.name](args)
+        await _raise_if_abort_requested(abort_check)
+        result = await tool.handler(args)
     except Exception as exc:
-        return _tool_error(call, _safe_exception_text(exc), turn)
+        return _tool_error(
+            call,
+            _safe_exception_text(exc),
+            turn,
+            tool_activity=tool.activity,
+            tool_side_effect_class=tool.side_effect_class,
+        )
     payload = _tool_result_payload(result)
     result_json = _safe_json(payload)
     return (
@@ -460,12 +870,21 @@ async def _execute_tool_call(
             turn=turn,
             tool_call_id=call.call_id,
             tool_name=call.name,
+            tool_activity=tool.activity,
+            tool_side_effect_class=tool.side_effect_class,
             result_json=result_json,
         ),
     )
 
 
-def _tool_error(call: _ToolCall, error: str, turn: int) -> tuple[ToolMessage, AgentHarnessEvent]:
+def _tool_error(
+    call: _ToolCall,
+    error: str,
+    turn: int,
+    *,
+    tool_activity: str | None = None,
+    tool_side_effect_class: ToolSideEffectClass | None = None,
+) -> tuple[ToolMessage, AgentHarnessEvent]:
     payload = {"status": "error", "error": error}
     content = _safe_json(payload)
     return (
@@ -480,6 +899,8 @@ def _tool_error(call: _ToolCall, error: str, turn: int) -> tuple[ToolMessage, Ag
             turn=turn,
             tool_call_id=call.call_id,
             tool_name=call.name,
+            tool_activity=tool_activity,
+            tool_side_effect_class=tool_side_effect_class,
             error=error,
             result_json=content,
         ),
@@ -496,6 +917,23 @@ async def _emit(sink: EventSink | None, event: AgentHarnessEvent) -> None:
     if sink is None:
         return
     await sink(event)
+
+
+async def _checkpoint(
+    sink: CheckpointSink | None,
+    checkpoint: AgentTranscriptCheckpoint,
+) -> None:
+    if sink is None:
+        return
+    await sink(checkpoint)
+
+
+async def _raise_if_abort_requested(check: AbortCheck | None) -> None:
+    if check is None:
+        return
+    result = check()
+    if inspect.isawaitable(result):
+        await result
 
 
 def _safe_exception_text(exc: Exception) -> str:
@@ -551,12 +989,23 @@ def _json_safe(value: object, *, depth: int = 0) -> object:
 
 __all__ = [
     "DEFAULT_SYSTEM_MESSAGE",
+    "TERMINAL_RESPONSE_TOOL_NAME",
+    "TERMINAL_RESPONSE_TOOL_SCHEMA",
+    "AbortCheck",
     "AgentHarnessEvent",
     "AgentHarnessGateway",
     "AgentHarnessResult",
+    "AgentTranscriptCheckpoint",
+    "CheckpointSink",
+    "ConversationDisposition",
+    "ConversationLifecycle",
+    "LifecycleValidator",
     "NativeTool",
     "NativeToolHandler",
     "ToolExecutionError",
     "ToolExecutionResult",
+    "ToolSideEffectClass",
+    "TranscriptCheckpointKind",
+    "UserAbortRequested",
     "run_native_tool_loop",
 ]

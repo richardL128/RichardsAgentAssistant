@@ -16,7 +16,6 @@ from app.db.models import (
     AcademicLearningFocusEvent,
     AcademicReflectionMemory,
     Base,
-    StudyBlock,
 )
 
 
@@ -177,35 +176,11 @@ def test_learning_focus_create_reinforce_due_listing_and_hard_delete(engine) -> 
         assert reinforced.practice_minutes == 30
 
     with Session(engine) as session, session.begin():
-        plan = AcademicRepository.upsert_study_plan(
-            session,
-            plan_key="plan-with-learning-focus-practice",
-            starts_on=date(2026, 9, 9),
-            ends_on=date(2026, 9, 9),
-            timezone="America/Toronto",
-            status="published",
-        )
-        practice = AcademicRepository.upsert_study_block(
-            session,
-            plan_id=plan.id,
-            block_key="focus-practice-recursion",
-            title="Practice recursion",
-            starts_at=now + timedelta(days=2, hours=9),
-            ends_at=now + timedelta(days=2, hours=9, minutes=30),
-            allocated_minutes=30,
-            learning_focus_id=focus_id,
-            block_kind="practice",
-        )
-        practice_id = practice.id
         deleted = AcademicRepository.hard_delete_learning_focus(session, focus_id=focus_id)
 
     with Session(engine) as session:
-        practice = session.get(StudyBlock, practice_id)
         assert deleted is True
         assert session.get(AcademicLearningFocus, focus_id) is None
-        assert practice is not None
-        assert practice.learning_focus_id is None
-        assert practice.block_kind == "practice"
         assert session.scalar(select(func.count()).select_from(AcademicLearningFocusEvent)) == 0
         assert session.scalar(select(func.count()).select_from(AcademicReflectionMemory)) == 0
         assert session.scalar(select(func.count()).select_from(AcademicDiscourseSession)) == 1

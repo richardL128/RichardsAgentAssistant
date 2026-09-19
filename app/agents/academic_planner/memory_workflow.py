@@ -80,6 +80,7 @@ class AcademicMemoryHandleResult:
         "not_applicable",
         "duplicate",
         "clarification",
+        "failed",
         "applied",
         "summarized",
         "cancelled",
@@ -141,6 +142,32 @@ class AcademicMemoryService:
         self._default_practice_minutes = default_practice_minutes
         self._end_of_day_time = end_of_day_time
         self._session_ttl_hours = session_ttl_hours
+
+    def open_memory_session_kind(
+        self,
+        *,
+        channel_id: str,
+        user_id: str,
+        now: datetime,
+    ) -> Literal["memory_review", "learning_focus"] | None:
+        """Return an open owner/channel memory session kind without starting a new one."""
+
+        current = _aware(now)
+        with Session(self._store.engine) as session, session.begin():
+            AcademicRepository.expire_discourse_sessions(session, now=current)
+            for kind in ("memory_review", "learning_focus"):
+                if (
+                    AcademicRepository.find_open_discourse_session(
+                        session,
+                        discord_channel_id=channel_id,
+                        discord_user_id=user_id,
+                        now=current,
+                        session_kind=kind,
+                    )
+                    is not None
+                ):
+                    return kind
+        return None
 
     async def handle_memory_review(
         self,
@@ -645,12 +672,17 @@ class AcademicMemoryService:
                 response="I could not verify that correction, so nothing was changed.",
             )
         embedding_result = await self._embedding_gateway.embed_reflection_text(raw_text)
-        vector = (
-            embedding_result.embedding.vector
-            if embedding_result.status is EmbeddingStatus.VALID
-            and embedding_result.embedding is not None
-            else None
-        )
+        if (
+            embedding_result.status is not EmbeddingStatus.VALID
+            or embedding_result.embedding is None
+        ):
+            self._close_failed_review(
+                session_id=session_id,
+                external_event_id=external_event_id,
+                received_at=received_at,
+            )
+            return _embedding_unavailable_result()
+        vector = embedding_result.embedding.vector
         memory = _memory_input(
             raw_text,
             vector,
@@ -720,8 +752,7 @@ class AcademicMemoryService:
             status="applied",
             response=(
                 f"Updated that learning focus to {updated_topic}. I cleared the stale reflection "
-                f"memory and scheduled a separate {updated_minutes}-minute practice "
-                "block for tomorrow."
+                "memory and kept the focus active for future personalization."
             ),
         )
 
@@ -776,10 +807,7 @@ class AcademicMemoryService:
             )
         return AcademicMemoryHandleResult(
             status="applied",
-            response=(
-                f"Kept {updated_topic} active and scheduled a separate "
-                f"{updated_minutes}-minute practice block for tomorrow."
-            ),
+            response=f"Kept {updated_topic} active for future personalization.",
         )
 
     def _memory_changed(
@@ -929,13 +957,25 @@ class AcademicMemoryService:
             else (raw_text,)
         )
         combined_text = "\n".join(messages)
-        embedding_result = await self._embedding_gateway.embed_reflection_text(combined_text)
-        vector = (
-            embedding_result.embedding.vector
-            if embedding_result.status is EmbeddingStatus.VALID
-            and embedding_result.embedding is not None
-            else None
-        )
+        needs_embedding = any(_action_requires_embedding(action) for action in result.actions)
+        embedding_result = None
+        vector: list[float] | None = None
+        if needs_embedding:
+            embedding_result = await self._embedding_gateway.embed_reflection_text(combined_text)
+            if (
+                embedding_result.status is not EmbeddingStatus.VALID
+                or embedding_result.embedding is None
+            ):
+                if not self._record_failed_learning_focus_turn(
+                    open_session_id=open_session_id,
+                    external_event_id=external_event_id,
+                    channel_id=channel_id,
+                    user_id=user_id,
+                    received_at=current,
+                ):
+                    return AcademicMemoryHandleResult(status="duplicate")
+                return _embedding_unavailable_result()
+            vector = embedding_result.embedding.vector
         responses: list[str] = []
         with Session(self._store.engine) as session, session.begin():
             discourse = (
@@ -963,6 +1003,8 @@ class AcademicMemoryService:
             for index, action in enumerate(result.actions):
                 event_key = f"{external_event_id}:focus:{index}"
                 if isinstance(action, CreateLearningFocusAction):
+                    if embedding_result is None or vector is None:
+                        raise RuntimeError("learning focus creation requires a valid embedding")
                     course_id = _uuid_or_none(action.course_id)
                     assessment_id = _uuid_or_none(action.assessment_id)
                     course = session.get(Course, course_id) if course_id is not None else None
@@ -992,12 +1034,15 @@ class AcademicMemoryService:
                     responses.append(
                         "Added "
                         f"{focus.course_code + ' ' if focus.course_code else ''}{focus.topic} "
-                        f"as an active focus. Tomorrow's planner will reserve a separate "
-                        f"{minutes}-minute practice block."
+                        "as an active focus. I will use it for future personalization."
                     )
                     continue
                 focus_id = uuid.UUID(action.focus_id)
                 if isinstance(action, ReinforceLearningFocusAction):
+                    if embedding_result is None or vector is None:
+                        raise RuntimeError(
+                            "learning focus reinforcement requires a valid embedding"
+                        )
                     existing = session.get(AcademicLearningFocus, focus_id)
                     if (
                         existing is None
@@ -1032,8 +1077,7 @@ class AcademicMemoryService:
                     )
                     responses.append(
                         f"Kept {focus.course_code + ' ' if focus.course_code else ''}{focus.topic} "
-                        f"active. Tomorrow's planner will reserve a separate {minutes}-minute "
-                        "practice block."
+                        "active for future personalization."
                     )
                     continue
                 if isinstance(action, ResolveLearningFocusAction):
@@ -1085,6 +1129,74 @@ class AcademicMemoryService:
             tzinfo=self._zone,
         )
         return next_local.astimezone(UTC)
+
+    def _close_failed_review(
+        self,
+        *,
+        session_id: uuid.UUID,
+        external_event_id: str,
+        received_at: datetime,
+    ) -> None:
+        with Session(self._store.engine) as session, session.begin():
+            review = AcademicRepository.resume_discourse_session(
+                session,
+                session_id=session_id,
+                now=received_at,
+            )
+            if review.state == "open":
+                AcademicRepository.complete_discourse_session(
+                    session,
+                    session_id=session_id,
+                    completed_at=received_at,
+                    final_state={
+                        **_cleared_review_state(external_event_id),
+                        "embedding_status": "failed",
+                    },
+                )
+
+    def _record_failed_learning_focus_turn(
+        self,
+        *,
+        open_session_id: uuid.UUID | None,
+        external_event_id: str,
+        channel_id: str,
+        user_id: str,
+        received_at: datetime,
+    ) -> bool:
+        with Session(self._store.engine) as session, session.begin():
+            discourse = (
+                session.get(AcademicDiscourseSession, open_session_id)
+                if open_session_id is not None
+                else None
+            )
+            if discourse is None:
+                discourse = AcademicRepository.create_discourse_session(
+                    session,
+                    external_event_id=external_event_id,
+                    discord_channel_id=channel_id,
+                    discord_user_id=user_id,
+                    started_at=received_at,
+                    expires_at=received_at + timedelta(hours=self._session_ttl_hours),
+                )
+            _, created = AcademicRepository.record_discourse_turn(
+                session,
+                session_id=discourse.id,
+                external_event_id=external_event_id,
+                received_at=received_at,
+            )
+            if not created:
+                return False
+            AcademicRepository.complete_discourse_session(
+                session,
+                session_id=discourse.id,
+                completed_at=received_at,
+                final_state={
+                    "continuation": None,
+                    "question": None,
+                    "embedding_status": "failed",
+                },
+            )
+        return True
 
 
 def _continuation(value: dict[str, Any] | None) -> AcademicDiscourseContinuationState | None:
@@ -1163,10 +1275,7 @@ def _fallback_summary(focuses: Sequence[AcademicLearningFocusOption], *, truncat
     for focus in focuses:
         label = f"{focus.course_code + ' ' if focus.course_code else ''}{focus.topic}"
         status = "active" if focus.status is LearningFocusStatus.ACTIVE else "snoozed"
-        timing = (
-            f" with {focus.target_minutes}-minute practice blocks" if focus.target_minutes else ""
-        )
-        clauses.append(f"{label} is {status}{timing}")
+        clauses.append(f"{label} is {status}")
     text = "Your stored academic learning focuses are: " + "; ".join(clauses) + "."
     if truncated:
         text += " This is a bounded summary; additional focuses were not included."
@@ -1201,6 +1310,20 @@ def _memory_input(
             "config_version": result.config_version,
         },
         redacted_summary=summary,
+    )
+
+
+def _action_requires_embedding(action: object) -> bool:
+    return isinstance(action, CreateLearningFocusAction | ReinforceLearningFocusAction)
+
+
+def _embedding_unavailable_result() -> AcademicMemoryHandleResult:
+    return AcademicMemoryHandleResult(
+        status="failed",
+        response=(
+            "Semantic memory is unavailable right now, so I did not store any new academic "
+            "reflection text. Please try again after embeddings are healthy."
+        ),
     )
 
 

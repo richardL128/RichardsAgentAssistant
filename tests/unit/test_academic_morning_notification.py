@@ -2,21 +2,9 @@ from __future__ import annotations
 
 from datetime import UTC, date, datetime, timedelta
 from types import SimpleNamespace
-from typing import Literal
-from uuid import UUID
 
 import pytest
 
-from app.agents.academic_planner.contracts import (
-    Assessment,
-    AssessmentType,
-    AvailabilityWindow,
-    DailyPlan,
-    IncompleteBlock,
-    PlannerFacts,
-    PracticeNeed,
-    StudyBlock,
-)
 from app.agents.academic_planner.morning_notification import (
     build_scheduled_morning_notification,
     execute_scheduled_morning_notification,
@@ -24,10 +12,14 @@ from app.agents.academic_planner.morning_notification import (
 )
 from app.agents.academic_planner.sync import AcademicNotionSync, AcademicNotionSyncResult
 from app.agents.calendar_briefing import (
+    CalendarActivityIntent,
+    CalendarActivityIntentStatus,
     CalendarEventEvidenceFragment,
     CalendarEventSemanticInterpreter,
     CalendarEventSemanticResult,
+    CalendarEventSemanticStatus,
     CalendarEventSourceKind,
+    ScheduledMorningCalendarItem,
 )
 from app.agents.calendar_briefing.semantic_interpreter import CalendarEventSemanticCritique
 from app.agents.job_interviews.contracts import (
@@ -51,17 +43,14 @@ PERIOD_KEY = stable_period_key("academic-morning", OCCURRENCE)
 
 
 class Store:
-    def __init__(self, facts: PlannerFacts | None = None) -> None:
-        self.facts = facts or PlannerFacts(horizon_days=14)
-        self.saved: list[DailyPlan] = []
+    def __init__(self, calendar_items: tuple[dict[str, object], ...] = ()) -> None:
+        self.calendar_items = calendar_items
         self.loaded_at: list[datetime] = []
 
-    def load_planner_facts(self, *, now: datetime, horizon_days: int) -> PlannerFacts:
-        self.loaded_at.append(now)
-        return self.facts.model_copy(update={"horizon_days": horizon_days})
-
-    def save_daily_plan(self, plan: DailyPlan) -> None:
-        self.saved.append(plan)
+    def load_upcoming_calendar_items(self, *, occurrence: datetime, timezone: str):
+        assert timezone == "America/Toronto"
+        self.loaded_at.append(occurrence)
+        return self.calendar_items
 
 
 class Syncer:
@@ -163,6 +152,21 @@ class ReadyRuntime:
         return SimpleNamespace(model="qwen-test")
 
 
+class ProgressRecorder:
+    def __init__(self) -> None:
+        self.records: list[tuple[str, str, int, str]] = []
+
+    def record(
+        self,
+        phase: str,
+        status: str,
+        *,
+        attempt: int,
+        diagnostic: str,
+    ) -> None:
+        self.records.append((phase, status, attempt, diagnostic))
+
+
 class SemanticGateway:
     model_identity = "qwen-test"
     config_version = "cfg-test"
@@ -176,9 +180,21 @@ class SemanticGateway:
 
 
 class SemanticStore(Store):
-    def __init__(self, *, many: int = 1) -> None:
+    def __init__(
+        self,
+        *,
+        many: int = 1,
+        source_area: str = "course",
+        source_label: str = "ECE 250",
+        display_kind: str = "Quiz",
+        title_prefix: str = "Graph traversal event",
+    ) -> None:
         super().__init__()
         self.many = many
+        self.source_area = source_area
+        self.source_label = source_label
+        self.display_kind = display_kind
+        self.title_prefix = title_prefix
         self.semantic_saves: list[tuple[str, object]] = []
 
     def load_upcoming_calendar_items(self, *, occurrence: datetime, timezone: str):
@@ -187,10 +203,10 @@ class SemanticStore(Store):
         return tuple(
             {
                 "event_id": f"event-{index}",
-                "source_area": "course",
-                "source_label": "ECE 250",
-                "title": f"Graph traversal event {index} " + "x" * 80,
-                "display_kind": "Quiz",
+                "source_area": self.source_area,
+                "source_label": self.source_label,
+                "title": f"{self.title_prefix} {index} " + "x" * 80,
+                "display_kind": self.display_kind,
                 "local_start_label": "Friday, September 11, 2026 at 10:00 EDT",
                 "relative_date_label": "Tomorrow",
                 "is_all_day": False,
@@ -292,70 +308,32 @@ class FailingConnector:
         raise self.error
 
 
-def _block(
-    block_id: str,
-    title: str,
-    start_at: datetime,
-    minutes: int,
-    *,
-    kind: Literal["assessment", "practice"] = "assessment",
-    carried: bool = False,
-) -> StudyBlock:
-    return StudyBlock(
-        id=block_id,
-        assessment_id=f"assessment-{block_id}",
-        learning_focus_id="focus-1" if kind == "practice" else None,
-        block_kind=kind,
-        title=title,
-        start_at=start_at,
-        end_at=start_at + timedelta(minutes=minutes),
-        carried_over=carried,
-        priority_score=10,
-        rationale="deterministic test allocation",
+def test_formatter_renders_neutral_calendar_agenda_without_study_blocks() -> None:
+    item = ScheduledMorningCalendarItem(
+        event_id="quiz-1",
+        source_area="course",
+        source_label="ECE 250",
+        title="Graph Traversal Quiz",
+        display_kind="Quiz",
+        local_start_label="Friday, September 11, 2026 at 10:00 EDT",
+        relative_date_label="Tomorrow",
     )
-
-
-def test_formatter_includes_only_intended_local_day_with_exact_allocator_facts() -> None:
-    plan = DailyPlan(
-        plan_id=UUID("38da2acc-f0f8-4eff-a16c-2bbc160624cf"),
-        created_at=OCCURRENCE.scheduled_at,
-        blocks=(
-            _block("later", "Tomorrow task", datetime(2026, 9, 11, 13, tzinfo=UTC), 30),
-            _block(
-                "carry",
-                "MATH 239 Assignment 2",
-                datetime(2026, 9, 10, 18, tzinfo=UTC),
-                60,
-                carried=True,
-            ),
-            _block(
-                "practice",
-                "Practice ECE 250 Graph traversals",
-                datetime(2026, 9, 10, 13, tzinfo=UTC),
-                45,
-                kind="practice",
-            ),
-        ),
-    )
-
     notification = build_scheduled_morning_notification(
-        plan,
         period_key=PERIOD_KEY,
         occurrence=OCCURRENCE,
         source_synced_at=OCCURRENCE.scheduled_at,
         timezone_name="America/Toronto",
+        course_calendar_items=(item,),
     )
 
     assert notification.intended_local_date.isoformat() == "2026-09-10"
-    assert [block.block_id for block in notification.blocks] == ["practice", "carry"]
     assert "Thursday, September 10, 2026" in notification.message_text
-    assert "09:00 — Practice ECE 250 Graph traversals (45 minutes, practice)" in (
-        notification.message_text
-    )
-    assert "14:00 — MATH 239 Assignment 2 (60 minutes, assessment, carried forward)" in (
-        notification.message_text
-    )
-    assert "Tomorrow task" not in notification.message_text
+    assert "Upcoming course dates" in notification.message_text
+    assert "Tomorrow — ECE 250 — Graph Traversal Quiz" in notification.message_text
+    assert "Quiz — Graph Traversal Quiz" not in notification.message_text
+    assert "study blocks" not in notification.message_text
+    assert "StudyBlock" not in notification.message_text
+    assert "practice)" not in notification.message_text
 
 
 async def test_successful_empty_refresh_sends_natural_light_day_message() -> None:
@@ -373,10 +351,10 @@ async def test_successful_empty_refresh_sends_natural_light_day_message() -> Non
     )
 
     assert result["status"] == "succeeded"
-    assert result["block_count"] == 0
     assert store.loaded_at == [OCCURRENCE.scheduled_at]
-    assert len(store.saved) == 1
-    assert "no scheduled study blocks today" in delivery.messages[0][0]
+    assert "Today's calendar" in delivery.messages[0][0]
+    assert "No course calendar dates in this window." in delivery.messages[0][0]
+    assert "study blocks" not in delivery.messages[0][0]
     assert delivery.messages[0][1] == f"{scheduled_delivery_key(PERIOD_KEY, OCCURRENCE)}:001"
 
 
@@ -398,7 +376,8 @@ async def test_combined_morning_delivers_academic_and_interview_once_with_audit(
 
     assert len(delivery.messages) == 1
     message = delivery.messages[0][0]
-    assert "no scheduled study blocks today" in message
+    assert "Today's calendar" in message
+    assert "study blocks" not in message
     assert "**INTERVIEW IN 7 DAYS**" in message
     assert "Thursday, September 17, 2026" in message
     assert "Practice the verified API-design requirement." in message
@@ -424,24 +403,32 @@ async def test_career_failure_keeps_academic_morning_delivery_honest() -> None:
 
     assert result["status"] == "succeeded"
     assert result["career_sync_status"] == "failed"
-    assert "no scheduled study blocks today" in delivery.messages[0][0]
-    assert "academic plan is unaffected" in delivery.messages[0][0]
+    assert "Today's calendar" in delivery.messages[0][0]
+    assert "study blocks" not in delivery.messages[0][0]
+    assert "academic calendar is unaffected" in delivery.messages[0][0]
 
 
 async def test_scheduled_path_renders_and_persists_critic_approved_semantics() -> None:
     store = SemanticStore()
     delivery = Delivery()
     fragment_id = "event-0:property:topics"
+    title_id = "event-0:host:title"
     candidate = CalendarEventSemanticResult(
         event_id="event-0",
         overview="A quiz focused on graph traversal techniques.",
         description_present=True,
         description="Prepare BFS, DFS, and runtime analysis.",
-        evidence_fragment_ids=(fragment_id,),
+        evidence_fragment_ids=(title_id, fragment_id),
         description_fragment_ids=(fragment_id,),
+        classification_rationale="The supplied topics contain substantive preparation details.",
+        activity_intent=CalendarActivityIntent.STUDY,
+        intent_status=CalendarActivityIntentStatus.VALID,
+        intent_evidence_fragment_ids=(title_id, fragment_id),
+        intent_rationale="The event title and preparation topics support study.",
     )
     critique = CalendarEventSemanticCritique(
         accepted=True,
+        intent_supported=True,
         overview_supported=True,
         description_supported=True,
         no_invented_claims=True,
@@ -470,6 +457,123 @@ async def test_scheduled_path_renders_and_persists_critic_approved_semantics() -
     assert "Overview: A quiz focused on graph traversal techniques." in delivery.messages[0][0]
     assert "Description: Prepare BFS, DFS, and runtime analysis." in delivery.messages[0][0]
     assert len(store.semantic_saves) == 1
+    saved = store.semantic_saves[0][1]
+    assert saved.intent_value == CalendarActivityIntent.STUDY.value
+    assert saved.intent_status == CalendarActivityIntentStatus.VALID.value
+    assert saved.intent_evidence_ids == (title_id, fragment_id)
+
+
+async def test_semantic_diagnostics_are_per_event_bounded_and_non_sensitive() -> None:
+    store = SemanticStore(many=2)
+    progress = ProgressRecorder()
+    interpreter = CalendarEventSemanticInterpreter(SemanticGateway([None, None]))
+
+    result = await execute_scheduled_morning_notification(
+        store=store,
+        syncer=Syncer(
+            AcademicNotionSyncResult(status="succeeded", synced_at=OCCURRENCE.scheduled_at)
+        ),
+        delivery=Delivery(),
+        occurrence=OCCURRENCE,
+        period_key=PERIOD_KEY,
+        executed_at=OCCURRENCE.scheduled_at,
+        evidence_connector=EvidenceConnector(),
+        semantic_interpreter=interpreter,
+        ollama_runtime=ReadyRuntime(),
+        progress=progress,  # type: ignore[arg-type]
+    )
+
+    semantic_records = [
+        record for record in progress.records if record[0].endswith("semantic_interpretation")
+    ]
+    assert result["unavailable_semantics"] == 2
+    assert [record[0] for record in semantic_records] == [
+        "event_001.semantic_interpretation",
+        "event_001.semantic_interpretation",
+        "event_002.semantic_interpretation",
+        "event_002.semantic_interpretation",
+    ]
+    assert [record[1] for record in semantic_records] == [
+        "running",
+        "failed",
+        "running",
+        "failed",
+    ]
+    assert semantic_records[1][3] == (
+        "semantic_status:unavailable;error_code:calendar_semantic_model_unavailable"
+    )
+    assert semantic_records[3][3] == semantic_records[1][3]
+    serialized = repr(progress.records)
+    assert "Graph traversal event" not in serialized
+    assert "Prepare BFS" not in serialized
+    assert "event-0" not in serialized
+    assert "event-1" not in serialized
+
+
+async def test_misc_calendar_items_render_separately_and_persist_academic_semantics() -> None:
+    store = SemanticStore(
+        source_area="misc",
+        source_label="misc",
+        display_kind="Task",
+        title_prefix="Task — scrub the toilets",
+    )
+    delivery = Delivery()
+    fragment_id = "event-0:property:topics"
+    title_id = "event-0:host:title"
+    candidate = CalendarEventSemanticResult(
+        event_id="event-0",
+        overview="A household task scheduled for the upcoming window.",
+        description_present=True,
+        description="Clean the bathrooms before the evening.",
+        evidence_fragment_ids=(title_id, fragment_id),
+        description_fragment_ids=(fragment_id,),
+        classification_rationale="The supplied task details contain a substantive description.",
+        activity_intent=CalendarActivityIntent.REGULAR,
+        intent_status=CalendarActivityIntentStatus.VALID,
+        intent_evidence_fragment_ids=(title_id, fragment_id),
+        intent_rationale="The task title and details support a regular non-study activity.",
+    )
+    critique = CalendarEventSemanticCritique(
+        accepted=True,
+        intent_supported=True,
+        overview_supported=True,
+        description_supported=True,
+        no_invented_claims=True,
+        no_instruction_following=True,
+        same_event=True,
+        cites_only_supplied_fragments=True,
+    )
+    interpreter = CalendarEventSemanticInterpreter(SemanticGateway([candidate, critique]))
+
+    result = await execute_scheduled_morning_notification(
+        store=store,
+        syncer=Syncer(
+            AcademicNotionSyncResult(status="succeeded", synced_at=OCCURRENCE.scheduled_at)
+        ),
+        delivery=delivery,
+        occurrence=OCCURRENCE,
+        period_key=PERIOD_KEY,
+        executed_at=OCCURRENCE.scheduled_at,
+        evidence_connector=EvidenceConnector(),
+        semantic_interpreter=interpreter,
+        ollama_runtime=ReadyRuntime(),
+    )
+
+    message = delivery.messages[0][0]
+    assert result["misc_event_count"] == 1
+    assert result["academic_event_count"] == 0
+    assert result["valid_descriptions"] == 1
+    assert "Upcoming course dates" in message
+    assert "- No course calendar dates in this window." in message
+    assert "Upcoming miscellaneous tasks:" in message
+    assert "- Tomorrow — Task — scrub the toilets 0 " in message
+    assert "Overview: A household task scheduled for the upcoming window." in message
+    assert len(store.semantic_saves) == 1
+    saved = store.semantic_saves[0][1]
+    assert saved.status == CalendarEventSemanticStatus.VALID.value
+    assert saved.intent_value == CalendarActivityIntent.REGULAR.value
+    assert saved.intent_status == CalendarActivityIntentStatus.VALID.value
+    assert saved.intent_evidence_ids == (title_id, fragment_id)
 
 
 async def test_multipart_retry_resumes_persisted_manifest_without_duplicate_part_one() -> None:
@@ -510,57 +614,39 @@ async def test_multipart_retry_resumes_persisted_manifest_without_duplicate_part
         assert combined.count(f"Graph traversal event {index} ") == 1
 
 
-async def test_allocator_output_is_authoritative_for_populated_notification() -> None:
-    facts = PlannerFacts(
-        assessments=(
-            Assessment(
-                id="quiz-1",
-                course="ECE 250",
-                title="ECE 250 Quiz 1 review",
-                assessment_type=AssessmentType.QUIZ,
-                due_at=datetime(2026, 9, 11, 20, tzinfo=UTC),
-                estimated_minutes=45,
-                weight_percent=10,
-            ),
-            Assessment(
-                id="assignment-2",
-                course="MATH 239",
-                title="MATH 239 Assignment 2",
-                assessment_type=AssessmentType.ASSIGNMENT,
-                due_at=datetime(2026, 9, 12, 20, tzinfo=UTC),
-                estimated_minutes=60,
-                weight_percent=20,
-            ),
-        ),
-        incomplete_blocks=(
-            IncompleteBlock(
-                id="old",
-                assessment_id="assignment-2",
-                title="MATH 239 Assignment 2",
-                remaining_minutes=60,
-            ),
-        ),
-        practice_needs=(
-            PracticeNeed(
-                focus_id="focus-1",
-                course_code="ECE 250",
-                assessment_id="quiz-1",
-                topic="graph traversals",
-                target_minutes=30,
-                next_review_at=datetime(2026, 9, 11, 12, tzinfo=UTC),
-                source_action="reinforce_focus",
-                rationale="verified reflection focus",
-            ),
-        ),
-        availability=(
-            AvailabilityWindow(
-                start_at=datetime(2026, 9, 10, 13, tzinfo=UTC),
-                end_at=datetime(2026, 9, 10, 21, tzinfo=UTC),
-            ),
-        ),
-        horizon_days=14,
+async def test_loaded_calendar_items_are_authoritative_for_populated_notification() -> None:
+    store = Store(
+        (
+            {
+                "event_id": "quiz-1",
+                "source_area": "course",
+                "source_label": "ECE 250",
+                "title": "ECE 250 Quiz 1 review",
+                "display_kind": "Quiz",
+                "local_start_label": "Friday, September 11, 2026 at 16:00 EDT",
+                "relative_date_label": "Tomorrow",
+                "is_all_day": False,
+                "completed": False,
+                "semantic_status": "unavailable",
+                "source_last_edited_at": OCCURRENCE.scheduled_at,
+                "semantic_cache": {},
+            },
+            {
+                "event_id": "assignment-2",
+                "source_area": "course",
+                "source_label": "MATH 239",
+                "title": "MATH 239 Assignment 2",
+                "display_kind": "Assignment",
+                "local_start_label": "Saturday, September 12, 2026 at 16:00 EDT",
+                "relative_date_label": "In 2 days",
+                "is_all_day": False,
+                "completed": False,
+                "semantic_status": "unavailable",
+                "source_last_edited_at": OCCURRENCE.scheduled_at,
+                "semantic_cache": {},
+            },
+        )
     )
-    store = Store(facts)
     delivery = Delivery()
 
     result = await execute_scheduled_morning_notification(
@@ -575,11 +661,13 @@ async def test_allocator_output_is_authoritative_for_populated_notification() ->
     )
 
     assert result["status"] == "succeeded"
-    assert result["block_count"] == 3
     message = delivery.messages[0][0]
-    assert "09:00 — Practice ECE 250 graph traversals (30 minutes, practice)" in message
-    assert "carried forward" in message
+    assert "Tomorrow — ECE 250 — ECE 250 Quiz 1 review" in message
+    assert "In 2 days — MATH 239 — MATH 239 Assignment 2" in message
+    assert "Quiz — ECE 250 Quiz 1 review" not in message
+    assert "Assignment — MATH 239 Assignment 2" not in message
     assert "ECE 250 Quiz 1 review" in message
+    assert "study blocks" not in message
 
 
 @pytest.mark.parametrize(
@@ -693,7 +781,7 @@ async def test_retry_after_grace_does_not_send_stale_morning_greeting() -> None:
     assert result["status"] == "attention"
     assert result["error_code"] == ErrorCode.SCHEDULE_LATE.value
     assert store.loaded_at == []
-    assert "no stale morning plan was sent" in delivery.messages[0][0]
+    assert "no stale morning calendar was sent" in delivery.messages[0][0]
 
 
 def test_period_key_must_match_explicit_occurrence() -> None:

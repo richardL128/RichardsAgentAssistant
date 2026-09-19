@@ -23,6 +23,15 @@ from app.core.redaction import redact_bytes
 _KEY_PATTERN = re.compile(r"\A[0-9a-f]{64}\Z")
 _CLASS_PATTERN = re.compile(r"\A[a-zA-Z][a-zA-Z0-9_.-]{0,63}\Z")
 _IMMUTABLE_CLASSES = frozenset({"audit", "audit_event", "audit_metadata", "run_summary"})
+_EXACT_PRIVATE_CLASSES = frozenset(
+    {
+        "native_conversation_summary",
+        "native_conversation_transcript",
+        "native_tool_checkpoint",
+        "user_memory_content",
+        "user_memory_evidence",
+    }
+)
 _DEFAULT_RETENTION_DAYS = 30
 
 
@@ -73,6 +82,8 @@ class ArtifactStore:
 
     ``retention_days_by_class`` maps a class to days, or ``None`` for retain
     forever.  Audit/run-summary classes are retained forever by default.
+    Lossless private content is restricted to explicitly allowlisted classes;
+    callers cannot use that mode for logs, reports, or general artifacts.
     """
 
     def __init__(
@@ -105,8 +116,13 @@ class ArtifactStore:
         data_class: str,
         secrets: tuple[str, ...] = (),
         already_redacted: bool = False,
+        preserve_private_content: bool = False,
     ) -> ArtifactMetadata:
-        """Redact and atomically persist *data*, returning typed metadata."""
+        """Redact and atomically persist *data*, returning typed metadata.
+
+        ``preserve_private_content`` is reserved for the lossless conversation
+        artifact classes and still enforces textual UTF-8 plus normal retention.
+        """
 
         data_class = _validate_data_class(data_class)
         media_type = _validate_media_type(media_type)
@@ -115,7 +131,19 @@ class ArtifactStore:
             secret and (secret in data_class or secret in media_type) for secret in literal_secrets
         ):
             raise ValueError("caller-supplied secrets cannot be included in artifact metadata")
-        if isinstance(data, str):
+        if preserve_private_content and data_class not in _EXACT_PRIVATE_CLASSES:
+            raise ValueError("exact private content is not allowed for this artifact class")
+        if preserve_private_content:
+            payload = data.encode("utf-8") if isinstance(data, str) else data
+            if not _is_text_media_type(media_type):
+                raise UnsafeArtifactError("exact private content requires a textual media type")
+            try:
+                payload.decode("utf-8")
+            except UnicodeDecodeError as exc:
+                raise UnsafeArtifactError(
+                    "exact private text artifacts must contain valid UTF-8 bytes"
+                ) from exc
+        elif isinstance(data, str):
             if not _is_text_media_type(media_type):
                 raise UnsafeArtifactError("string data requires a textual media type")
             payload = redact_bytes(

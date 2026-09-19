@@ -58,10 +58,10 @@ def _attempt_audit_delete(session: Session, event_id: uuid.UUID) -> None:
         session.flush()
 
 
-def _upgrade(database_url: str) -> None:
+def _upgrade(database_url: str, target: str = "head") -> None:
     config = Config("alembic.ini")
     config.attributes["database_url"] = database_url
-    command.upgrade(config, "head")
+    command.upgrade(config, target)
 
 
 @pytest.fixture(scope="module")
@@ -244,7 +244,7 @@ def test_assessment_material_vectors_are_active_versioned_and_scope_isolated(
                 heading="Requirements",
                 content="Review linear circuits and compare AC with DC behavior.",
                 citation=SourceCitation(block="circuit-requirements"),
-                embedding=(1.0, 0.0, 0.0),
+                embedding=(1.0, *([0.0] * 1023)),
                 embedding_model="integration-embedding:v1",
             ),
         ),
@@ -258,7 +258,7 @@ def test_assessment_material_vectors_are_active_versioned_and_scope_isolated(
                 heading="Requirements",
                 content="Compare two primary historical sources.",
                 citation=SourceCitation(block="essay-requirements"),
-                embedding=(0.0, 1.0, 0.0),
+                embedding=(0.0, 1.0, *([0.0] * 1022)),
                 embedding_model="integration-embedding:v1",
             ),
         ),
@@ -269,12 +269,230 @@ def test_assessment_material_vectors_are_active_versioned_and_scope_isolated(
     matches = AcademicRepository.search_semantic_document_chunks(
         db_session,
         assessment_id=first_assessment.id,
-        query_embedding=(1.0, 0.0, 0.0),
+        query_embedding=(1.0, *([0.0] * 1023)),
         embedding_model="integration-embedding:v1",
         limit=8,
     )
 
     assert [(row.id, score) for row, score in matches] == [(first_chunks[0].id, 1.0)]
+
+    query_vector = "[1," + ",".join("0" for _ in range(1023)) + "]"
+    db_session.execute(
+        text(
+            """
+            INSERT INTO academic_document_chunks (
+                id, document_id, ordinal, content, content_hash,
+                embedding, embedding_model, embedding_dimensions
+            )
+            SELECT
+                md5(:seed || series::text)::uuid,
+                :document_id,
+                1000 + series,
+                'indexed retrieval fixture',
+                repeat('e', 64),
+                CAST(:embedding AS vector(1024)),
+                :embedding_model,
+                1024
+            FROM generate_series(1, 512) AS series
+            """
+        ),
+        {
+            "seed": suffix,
+            "document_id": first_document.id,
+            "embedding": query_vector,
+            "embedding_model": "integration-embedding:v1",
+        },
+    )
+    db_session.execute(text("ANALYZE academic_document_chunks"))
+    db_session.execute(text("SET LOCAL enable_seqscan = off"))
+    plan = "\n".join(
+        row[0]
+        for row in db_session.execute(
+            text(
+                """
+                EXPLAIN
+                SELECT id
+                FROM academic_document_chunks
+                WHERE embedding IS NOT NULL
+                ORDER BY embedding <=> CAST(:embedding AS vector(1024))
+                LIMIT 8
+                """
+            ),
+            {"embedding": query_vector},
+        )
+    )
+    assert "ix_academic_chunks_embedding_hnsw" in plan
+
+    index_names = set(
+        db_session.scalars(
+            text(
+                """
+                SELECT indexname
+                FROM pg_indexes
+                WHERE schemaname = current_schema()
+                  AND tablename IN (
+                    'academic_document_chunks',
+                    'academic_reflection_memories'
+                  )
+                """
+            )
+        )
+    )
+    assert "ix_academic_chunks_embedding_hnsw" in index_names
+    assert "ix_academic_reflections_embedding_hnsw" in index_names
+
+
+def test_embedding_migration_preserves_raw_rows_and_clears_only_stale_vectors() -> None:
+    container = PostgresContainer(
+        "pgvector/pgvector:0.8.6-pg16-bookworm",
+        driver="psycopg",
+    )
+    container.start()
+    database_url = container.get_connection_url()
+    engine: Engine | None = None
+    try:
+        _upgrade(database_url, "0024_career_link_schema_repair")
+        engine = create_engine(database_url, pool_pre_ping=True)
+        stale_id = uuid.uuid4()
+        current_id = uuid.uuid4()
+        null_id = uuid.uuid4()
+        stale_memory_id = uuid.uuid4()
+        current_memory_id = uuid.uuid4()
+        null_memory_id = uuid.uuid4()
+        document_id = uuid.uuid4()
+        focus_id = uuid.uuid4()
+        current_vector = "[1," + ",".join("0" for _ in range(1023)) + "]"
+        with engine.begin() as connection:
+            connection.exec_driver_sql("SET session_replication_role = replica")
+            for ordinal, row_id, vector, model, dimensions in (
+                (1, stale_id, "[1,0,0]", "qwen3-embedding:0.6b", 3),
+                (2, current_id, current_vector, "qwen3-embedding:4b@current", 1024),
+                (3, null_id, None, None, None),
+            ):
+                connection.execute(
+                    text(
+                        """
+                        INSERT INTO academic_document_chunks (
+                            id, document_id, ordinal, content, content_hash,
+                            embedding, embedding_model, embedding_dimensions
+                        ) VALUES (
+                            :id, :document_id, :ordinal, :content, repeat('a', 64),
+                            CAST(:embedding AS vector), :model, :dimensions
+                        )
+                        """
+                    ),
+                    {
+                        "id": row_id,
+                        "document_id": document_id,
+                        "ordinal": ordinal,
+                        "content": f"preserved chunk {ordinal}",
+                        "embedding": vector,
+                        "model": model,
+                        "dimensions": dimensions,
+                    },
+                )
+            for row_id, raw_text, vector, model, dimensions in (
+                (
+                    stale_memory_id,
+                    "preserved stale reflection",
+                    "[1,0,0]",
+                    "qwen3-embedding:0.6b",
+                    3,
+                ),
+                (
+                    current_memory_id,
+                    "preserved current reflection",
+                    current_vector,
+                    "qwen3-embedding:4b@current",
+                    1024,
+                ),
+                (null_memory_id, "preserved null reflection", None, None, None),
+            ):
+                connection.execute(
+                    text(
+                        """
+                        INSERT INTO academic_reflection_memories (
+                            id, focus_id, raw_text, embedding, embedding_model,
+                            embedding_dimensions, recorded_at
+                        ) VALUES (
+                            :id, :focus_id, :raw_text, CAST(:embedding AS vector),
+                            :model, :dimensions, CURRENT_TIMESTAMP
+                        )
+                        """
+                    ),
+                    {
+                        "id": row_id,
+                        "focus_id": focus_id,
+                        "raw_text": raw_text,
+                        "embedding": vector,
+                        "model": model,
+                        "dimensions": dimensions,
+                    },
+                )
+            connection.exec_driver_sql("SET session_replication_role = origin")
+        engine.dispose()
+        engine = None
+
+        _upgrade(database_url)
+        engine = create_engine(database_url, pool_pre_ping=True)
+        with engine.connect() as connection:
+            chunks = {
+                row.id: row
+                for row in connection.execute(
+                    text(
+                        """
+                        SELECT id, content, vector_dims(embedding) AS dimensions, embedding_model
+                        FROM academic_document_chunks
+                        WHERE id IN (:stale_id, :current_id, :null_id)
+                        """
+                    ),
+                    {
+                        "stale_id": stale_id,
+                        "current_id": current_id,
+                        "null_id": null_id,
+                    },
+                )
+            }
+            memories = {
+                row.id: row
+                for row in connection.execute(
+                    text(
+                        """
+                        SELECT id, raw_text, vector_dims(embedding) AS dimensions, embedding_model
+                        FROM academic_reflection_memories
+                        WHERE id IN (:stale_id, :current_id, :null_id)
+                        """
+                    ),
+                    {
+                        "stale_id": stale_memory_id,
+                        "current_id": current_memory_id,
+                        "null_id": null_memory_id,
+                    },
+                )
+            }
+
+        assert {row.content for row in chunks.values()} == {
+            "preserved chunk 1",
+            "preserved chunk 2",
+            "preserved chunk 3",
+        }
+        assert chunks[stale_id].dimensions is None
+        assert chunks[stale_id].embedding_model is None
+        assert chunks[current_id].dimensions == 1024
+        assert chunks[null_id].dimensions is None
+        assert {row.raw_text for row in memories.values()} == {
+            "preserved stale reflection",
+            "preserved current reflection",
+            "preserved null reflection",
+        }
+        assert memories[stale_memory_id].dimensions is None
+        assert memories[stale_memory_id].embedding_model is None
+        assert memories[current_memory_id].dimensions == 1024
+        assert memories[null_memory_id].dimensions is None
+    finally:
+        if engine is not None:
+            engine.dispose()
+        container.stop()
 
 
 def test_audit_events_are_append_only(db_session: Session) -> None:

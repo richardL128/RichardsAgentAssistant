@@ -21,7 +21,7 @@ _ACTION_LABELS: dict[str, str] = {
     "assignment": "Assignment",
     "tutorial": "Tutorial",
     "lab": "Lab",
-    "studying_block": "Studying Block",
+    "event": "Event",
     "ignore": "Ignore",
 }
 

@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Iterator, Sequence
-from datetime import UTC, date, datetime, timedelta
+from datetime import UTC, datetime
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -21,7 +21,6 @@ from app.agents.academic_planner.contracts import (
     SearchLearningFocusesCall,
 )
 from app.agents.academic_planner.memory_workflow import AcademicMemoryService
-from app.agents.academic_planner.workflow import build_daily_plan
 from app.db.academic import (
     AcademicRepository,
     LearningFocusMemoryInput,
@@ -33,9 +32,8 @@ from app.db.models import (
     AcademicLearningFocus,
     AcademicReflectionMemory,
     Base,
-    PlanningPreference,
 )
-from app.llm.embeddings import EmbeddingStatus
+from app.llm.embeddings import EmbeddingErrorCode, EmbeddingStatus
 
 
 class Gateway:
@@ -64,6 +62,18 @@ class Embeddings:
         )
 
 
+class FailingEmbeddings:
+    async def embed_reflection_text(self, text: str) -> object:
+        del text
+        return SimpleNamespace(
+            status=EmbeddingStatus.FAILED,
+            embedding=None,
+            model_identity="test-embedding-v1",
+            config_version="test-config-v1",
+            error_code=EmbeddingErrorCode.MODEL_ERROR,
+        )
+
+
 @pytest.fixture
 def engine(tmp_path: Path) -> Iterator[Engine]:
     created = create_engine(f"sqlite+pysqlite:///{tmp_path / 'memory-workflow.db'}")
@@ -89,7 +99,7 @@ def _service(
 
 
 @pytest.mark.asyncio
-async def test_explicit_struggle_persists_raw_text_vector_and_next_day_practice(
+async def test_explicit_struggle_persists_raw_text_vector_without_practice_block_promise(
     engine: Engine,
 ) -> None:
     raw_text = "I really struggled with my ECE 250 quiz on recursion."
@@ -125,7 +135,8 @@ async def test_explicit_struggle_persists_raw_text_vector_and_next_day_practice(
     )
 
     assert result.status == "applied"
-    assert "separate 30-minute practice block" in str(result.response)
+    assert "future personalization" in str(result.response)
+    assert "scheduled study time" not in str(result.response)
     assert duplicate.status == "duplicate"
     with Session(engine) as session:
         focus = session.scalar(select(AcademicLearningFocus))
@@ -145,6 +156,50 @@ async def test_explicit_struggle_persists_raw_text_vector_and_next_day_practice(
         assert discourse.state == "completed"
         assert discourse.discord_channel_id == "123456"
         assert discourse.discord_user_id == "654321"
+
+
+@pytest.mark.asyncio
+async def test_embedding_failure_does_not_persist_new_raw_reflection(engine: Engine) -> None:
+    raw_text = "I really struggled with my ECE 250 quiz on recursion."
+    store = SQLAlchemyAcademicPlannerStore(engine, default_practice_minutes=30)
+    service = AcademicMemoryService(
+        store=store,
+        model_gateway=Gateway(
+            (
+                AcademicDiscourseDecision(
+                    actions=(
+                        CreateLearningFocusAction(
+                            action="create_focus",
+                            topic="recursion",
+                            evidence_text=raw_text,
+                        ),
+                    )
+                ),
+            )
+        ),
+        embedding_gateway=FailingEmbeddings(),
+        timezone="America/Toronto",
+        default_practice_minutes=30,
+    )
+
+    result = await service.handle_reflection(
+        external_event_id="discord-memory-create-embedding-failed",
+        channel_id="123456",
+        user_id="654321",
+        raw_text=raw_text,
+        received_at=datetime(2026, 9, 8, 2, tzinfo=UTC),
+    )
+
+    assert result.status == "failed"
+    assert "did not store" in str(result.response)
+    with Session(engine) as session:
+        assert session.scalar(select(func.count()).select_from(AcademicLearningFocus)) == 0
+        assert session.scalar(select(func.count()).select_from(AcademicReflectionMemory)) == 0
+        assert session.scalar(select(func.count()).select_from(AcademicDiscourseTurn)) == 1
+        discourse = session.scalar(select(AcademicDiscourseSession))
+        assert discourse is not None
+        assert discourse.state == "completed"
+        assert discourse.partial_state["embedding_status"] == "failed"
 
 
 @pytest.mark.asyncio
@@ -301,48 +356,3 @@ async def test_semantic_search_returns_the_nearest_active_raw_reflection(engine:
     assert candidates[0].focus is not None
     assert candidates[0].focus.topic == "recursion"
     assert candidates[0].text == "Recursive stack-frame tracing is difficult."
-
-
-def test_active_focus_enters_first_planner_snapshot_as_separate_practice(engine: Engine) -> None:
-    now = datetime(2026, 9, 8, 12, tzinfo=UTC)
-    with Session(engine) as session, session.begin():
-        focus = AcademicRepository.create_learning_focus(
-            session,
-            topic="recursion",
-            course_code="ECE 250",
-            now=now - timedelta(hours=10),
-            next_review_at=datetime(2026, 9, 9, 1, tzinfo=UTC),
-            practice_due_on=date(2026, 9, 8),
-            practice_minutes=30,
-        )
-        session.add(
-            PlanningPreference(
-                scope="academic",
-                timezone="America/Toronto",
-                availability={
-                    "windows": [
-                        {
-                            "start_at": "2026-09-08T13:00:00+00:00",
-                            "end_at": "2026-09-08T15:00:00+00:00",
-                        }
-                    ]
-                },
-                daily_capacity_minutes=120,
-                buffer_minutes=15,
-                version="test",
-            )
-        )
-        focus_id = focus.id
-    store = SQLAlchemyAcademicPlannerStore(engine)
-
-    facts = store.load_planner_facts(now=now, horizon_days=7)
-    plan = build_daily_plan(facts, now=now)
-    store.save_daily_plan(plan)
-    reloaded = store.get_latest_daily_plan()
-
-    assert len(plan.blocks) == 1
-    assert plan.blocks[0].block_kind == "practice"
-    assert plan.blocks[0].learning_focus_id == str(focus_id)
-    assert reloaded is not None
-    assert reloaded.blocks[0].block_kind == "practice"
-    assert reloaded.blocks[0].learning_focus_id == str(focus_id)

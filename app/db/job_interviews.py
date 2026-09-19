@@ -147,6 +147,10 @@ class CalendarSemanticResultInput:
     analyzed_at: datetime
     overview: str | None = None
     description: str | None = None
+    intent_value: str | None = None
+    intent_status: CalendarSemanticStatus | None = None
+    intent_rationale: str | None = None
+    intent_evidence_ids: Sequence[str] = ()
     evidence_ids: Sequence[str] = ()
     description_evidence_ids: Sequence[str] = ()
 
@@ -457,17 +461,27 @@ class JobInterviewRepository:
 
     @staticmethod
     def list_active_application_rows(session: Session) -> list[dict[str, Any]]:
+        return JobInterviewRepository.list_application_table_rows(session, include_headers=False)
+
+    @staticmethod
+    def list_application_table_rows(
+        session: Session,
+        *,
+        include_headers: bool = True,
+    ) -> list[dict[str, Any]]:
+        conditions = [
+            CareerApplicationRow.active.is_(True),
+            CareerApplicationTable.active.is_(True),
+        ]
+        if not include_headers:
+            conditions.append(CareerApplicationRow.is_header.is_(False))
         rows = session.execute(
             select(CareerApplicationRow, CareerApplicationTable.table_block_id)
             .join(
                 CareerApplicationTable,
                 CareerApplicationRow.table_id == CareerApplicationTable.id,
             )
-            .where(
-                CareerApplicationRow.active.is_(True),
-                CareerApplicationRow.is_header.is_(False),
-                CareerApplicationTable.active.is_(True),
-            )
+            .where(*conditions)
             .order_by(CareerApplicationTable.table_order, CareerApplicationRow.row_order)
         )
         result: list[dict[str, Any]] = []
@@ -484,6 +498,7 @@ class JobInterviewRepository:
                     "table_id": row.table_id,
                     "table_block_id": table_block_id,
                     "row_order": row.row_order,
+                    "is_header": row.is_header,
                     "cells": row.cells,
                     "normalized_cells": row.normalized_cells,
                     "content_fingerprint": row.content_fingerprint,
@@ -1472,6 +1487,13 @@ class SQLAlchemyJobInterviewStore:
         with Session(self.engine) as session:
             return JobInterviewRepository.list_active_application_rows(session)
 
+    def list_application_table_rows(self, *, include_headers: bool = True) -> list[dict[str, Any]]:
+        with Session(self.engine) as session:
+            return JobInterviewRepository.list_application_table_rows(
+                session,
+                include_headers=include_headers,
+            )
+
     def application_row_snapshots(self) -> tuple[ApplicationRowSnapshot, ...]:
         now = datetime.now(UTC)
         return tuple(
@@ -1487,6 +1509,24 @@ class SQLAlchemyJobInterviewStore:
                 last_seen_at=now,
             )
             for row in self.list_active_application_rows()
+        )
+
+    def application_table_snapshots(self) -> tuple[ApplicationRowSnapshot, ...]:
+        now = datetime.now(UTC)
+        return tuple(
+            ApplicationRowSnapshot(
+                table_block_id=str(row["table_block_id"]),
+                row_block_id=str(row["row_block_id"]),
+                row_order=int(row["row_order"]),
+                is_header=bool(row.get("is_header")),
+                cells=tuple(cast(Sequence[str], row.get("cells") or ())),
+                normalized_cells=tuple(
+                    cast(Sequence[str], row.get("normalized_cells") or row.get("cells") or ())
+                ),
+                content_fingerprint=str(row["content_fingerprint"]),
+                last_seen_at=now,
+            )
+            for row in self.list_application_table_rows(include_headers=True)
         )
 
     def save_application_interpretation(
@@ -1702,6 +1742,12 @@ def _apply_calendar_semantics(
         raise ValueError("invalid calendar semantic status")
     overview = _bounded_optional(semantics.overview, 700)
     description = _bounded_optional(semantics.description, 1_500)
+    intent_value = _bounded_optional(semantics.intent_value, 128)
+    if intent_value is not None and intent_value not in {"study", "regular"}:
+        raise ValueError("invalid calendar semantic intent value")
+    intent_status = semantics.intent_status
+    intent_rationale = _bounded_optional(semantics.intent_rationale, 500)
+    intent_evidence_ids = _bounded_semantic_ids(semantics.intent_evidence_ids)
     evidence_ids = _bounded_semantic_ids(semantics.evidence_ids)
     description_ids = _bounded_semantic_ids(semantics.description_evidence_ids)
     if semantics.status in {"unavailable", "invalid"}:
@@ -1712,9 +1758,19 @@ def _apply_calendar_semantics(
     elif semantics.status == "not_substantive":
         description = None
         description_ids = []
+    if intent_status is not None and intent_status not in {"valid", "unavailable", "invalid"}:
+        raise ValueError("invalid calendar semantic intent status")
+    if intent_status in {"unavailable", "invalid"}:
+        intent_value = None
+        intent_rationale = None
+        intent_evidence_ids = []
     row.calendar_semantic_overview = overview
     row.calendar_semantic_description = description
     row.calendar_semantic_status = semantics.status
+    row.calendar_semantic_intent_value = intent_value
+    row.calendar_semantic_intent_status = intent_status
+    row.calendar_semantic_intent_rationale = intent_rationale
+    row.calendar_semantic_intent_evidence_ids = intent_evidence_ids
     row.calendar_semantic_evidence_ids = evidence_ids
     row.calendar_semantic_description_evidence_ids = description_ids
     row.calendar_semantic_source_fingerprint = _bounded(semantics.source_fingerprint, 128)
@@ -1777,6 +1833,12 @@ def _interview_calendar_item(
         "is_all_day": row.is_all_day,
         "completed": False,
         "semantic_status": semantic_status,
+        "semantic_intent_value": row.calendar_semantic_intent_value,
+        "semantic_intent_status": row.calendar_semantic_intent_status,
+        "semantic_intent_rationale": row.calendar_semantic_intent_rationale,
+        "semantic_intent_evidence_fragment_ids": tuple(
+            row.calendar_semantic_intent_evidence_ids or ()
+        ),
         "semantic_overview": overview,
         "semantic_description": description,
         "semantic_evidence_fragment_ids": tuple(row.calendar_semantic_evidence_ids or ()),
@@ -1799,6 +1861,10 @@ def _calendar_semantic_cache(row: Any) -> Mapping[str, Any]:
         "config_version": row.calendar_semantic_config_version,
         "prompt_version": row.calendar_semantic_prompt_version,
         "analyzed_at": row.calendar_semantic_analyzed_at,
+        "intent_value": row.calendar_semantic_intent_value,
+        "intent_status": row.calendar_semantic_intent_status,
+        "intent_rationale": row.calendar_semantic_intent_rationale,
+        "intent_evidence_ids": tuple(row.calendar_semantic_intent_evidence_ids or ()),
     }
 
 
@@ -1845,6 +1911,10 @@ def _interview_public(session: Session, row: CareerInterviewEvent) -> dict[str, 
         "url_candidates": row.url_candidates,
         "content_fingerprint": row.content_fingerprint,
         "calendar_semantic_status": row.calendar_semantic_status,
+        "calendar_semantic_intent_value": row.calendar_semantic_intent_value,
+        "calendar_semantic_intent_status": row.calendar_semantic_intent_status,
+        "calendar_semantic_intent_rationale": row.calendar_semantic_intent_rationale,
+        "calendar_semantic_intent_evidence_ids": row.calendar_semantic_intent_evidence_ids,
         "calendar_semantic_overview": row.calendar_semantic_overview,
         "calendar_semantic_description": row.calendar_semantic_description,
         "calendar_semantic_evidence_ids": row.calendar_semantic_evidence_ids,

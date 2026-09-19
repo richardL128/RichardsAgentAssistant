@@ -64,6 +64,9 @@ class NativeInvocationResult(BaseModel):
     request_id: UUID
     status: InvocationStatus
     output: AIMessage | None = None
+    estimated_input_tokens: int = Field(default=0, ge=0)
+    reported_input_tokens: int | None = Field(default=None, ge=0)
+    reported_output_tokens: int | None = Field(default=None, ge=0)
     raw_text: str = Field(default="", repr=False)
     telemetry: list[ModelCallTelemetry] = Field(default_factory=lambda: list[ModelCallTelemetry]())
     error_code: str | None = None

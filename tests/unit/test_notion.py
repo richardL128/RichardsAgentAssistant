@@ -21,7 +21,7 @@ from app.connectors.notion import (
 )
 from app.core.errors import LifeAgentError
 
-IDS = {"courses": "courses-id", "assessments": "assessments-id", "study_blocks": "blocks-id"}
+IDS = {"courses": "courses-id", "assessments": "assessments-id"}
 EDITED = "2026-09-03T12:00:00.000Z"
 EDITED_AT = datetime(2026, 9, 3, 12, 0, tzinfo=UTC)
 
@@ -147,13 +147,6 @@ def _legacy_properties() -> dict[str, dict[str, str]]:
                 "scope",
                 "status",
                 "estimated_time",
-            },
-            "study_blocks": {
-                "assessment",
-                "planned_duration",
-                "actual_duration",
-                "completion_state",
-                "notes",
             },
         }.items()
     }
@@ -621,7 +614,12 @@ async def test_retrieves_assessment_body_material_with_nesting_pagination_and_fi
 
     async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
         connector = NotionConnector(token="secret", courses_database_id="courses-db", client=client)
-        materials = await connector.retrieve_assessment_materials("assessment-1", page_size=2)
+        materials = await connector.retrieve_assessment_materials(
+            "assessment-1",
+            page_size=2,
+            max_depth=8,
+            max_blocks=1_000,
+        )
 
     assert materials.assessment_page_id == "assessment-1"
     assert [block.source_block_id for block in materials.text_blocks] == [

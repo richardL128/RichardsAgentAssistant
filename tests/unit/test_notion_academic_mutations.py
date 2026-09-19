@@ -85,7 +85,7 @@ async def test_create_assessment_page_posts_data_source_parent_with_title_and_da
 
 
 @pytest.mark.asyncio
-async def test_create_assessment_page_posts_optional_date_end_for_study_range() -> None:
+async def test_create_assessment_page_posts_optional_date_end_for_event_range() -> None:
     requests: list[httpx.Request] = []
 
     def handler(request: httpx.Request) -> httpx.Response:
@@ -99,7 +99,7 @@ async def test_create_assessment_page_posts_optional_date_end_for_study_range() 
             data_source_id="assessments-source-1",
             title_property_id="title-prop",
             date_property_id="date-prop",
-            title="Studying Block - Race conditions",
+            title="Review race conditions",
             due=datetime(2026, 9, 10, 23, 0, tzinfo=UTC),
             ends_at=datetime(2026, 9, 10, 23, 45, tzinfo=UTC),
         )
@@ -149,7 +149,7 @@ async def test_create_assessment_page_rejects_invalid_date_ranges_without_reques
                 data_source_id="assessments-source-1",
                 title_property_id="title-prop",
                 date_property_id="date-prop",
-                title="Studying Block - Race conditions",
+                title="Review race conditions",
                 due=due,
                 ends_at=ends_at,
             )

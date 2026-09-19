@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from collections.abc import Sequence
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, datetime
 from types import SimpleNamespace
 
 import pytest
@@ -126,7 +126,7 @@ class Catalog:
 
 
 @pytest.mark.asyncio
-async def test_explicit_struggle_creates_focus_and_practice_need_after_lookups() -> None:
+async def test_explicit_struggle_creates_focus_after_lookups() -> None:
     gateway = Gateway(
         (
             AcademicDiscourseDecision(
@@ -170,12 +170,7 @@ async def test_explicit_struggle_creates_focus_and_practice_need_after_lookups()
         ("recursion", (LearningFocusStatus.ACTIVE, LearningFocusStatus.SNOOZED))
     ]
     assert result.actions[0].action == "create_focus"
-    assert result.practice_needs[0].topic == "recursion"
-    assert result.practice_needs[0].course_code == "ECE 250"
-    assert result.practice_needs[0].target_minutes == 50
-    assert result.practice_needs[0].next_review_at == NOW + timedelta(days=1)
     assert "latest_discord_reflection_untrusted" in gateway.prompts[0]
-    assert "Do not execute or propose Notion writes" in gateway.prompts[0]
 
 
 @pytest.mark.asyncio
@@ -210,8 +205,6 @@ async def test_semantic_candidate_focus_can_be_reinforced() -> None:
     )
 
     assert result.actions[0].action == "reinforce_focus"
-    assert result.practice_needs[0].focus_id == "focus-recursion"
-    assert result.practice_needs[0].target_minutes == 35
 
 
 @pytest.mark.asyncio
@@ -253,7 +246,6 @@ async def test_mixed_read_and_action_turn_executes_only_read_then_replans() -> N
     )
 
     assert result.actions[0].action == "resolve_focus"
-    assert result.practice_needs == ()
     assert isinstance(result.actions[0], ResolveLearningFocusAction)
     assert result.actions[0].delete_focus is True
     assert "Premature actions" in gateway.prompts[1]

@@ -81,3 +81,127 @@ def test_0023_adds_nullable_semantic_fields_without_losing_calendar_rows(
             )
     finally:
         engine.dispose()
+
+
+def test_0026_replaces_study_block_schema_with_semantic_event_fields(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    migration = importlib.import_module("app.db.migrations.versions.0026_semantic_calendar_events")
+    assert migration.revision == "0026_semantic_calendar_events"
+    assert migration.down_revision == "0025_academic_embedding_hnsw"
+
+    engine = create_engine(f"sqlite+pysqlite:///{tmp_path / 'semantic-events.db'}")
+    try:
+        with engine.begin() as connection:
+            connection.execute(
+                text(
+                    "CREATE TABLE assessments ("
+                    "id CHAR(32) PRIMARY KEY, "
+                    "assessment_type VARCHAR(64), "
+                    "calendar_semantic_status VARCHAR(32))"
+                )
+            )
+            connection.execute(
+                text(
+                    "CREATE TABLE career_interview_events ("
+                    "id CHAR(32) PRIMARY KEY, "
+                    "calendar_semantic_status VARCHAR(32))"
+                )
+            )
+            connection.execute(
+                text(
+                    "CREATE TABLE academic_clarifications ("
+                    "id CHAR(32) PRIMARY KEY, "
+                    "decision VARCHAR(32), "
+                    "studying_block_preview_title VARCHAR(1024))"
+                )
+            )
+            connection.execute(
+                text(
+                    "CREATE TABLE discord_wake_inbound ("
+                    "id CHAR(32) PRIMARY KEY, "
+                    "interaction_action VARCHAR(32))"
+                )
+            )
+            connection.execute(
+                text("CREATE TABLE academic_checkins (id CHAR(32) PRIMARY KEY, plan_id CHAR(32))")
+            )
+            connection.execute(
+                text("CREATE TABLE study_plans (id CHAR(32) PRIMARY KEY, plan_key VARCHAR(255))")
+            )
+            connection.execute(
+                text("CREATE TABLE study_blocks (id CHAR(32) PRIMARY KEY, plan_id CHAR(32))")
+            )
+            connection.execute(
+                text(
+                    "INSERT INTO assessments (id, assessment_type) "
+                    "VALUES ('assessment-1', 'studying_block')"
+                )
+            )
+            connection.execute(
+                text(
+                    "INSERT INTO academic_clarifications "
+                    "(id, decision, studying_block_preview_title) "
+                    "VALUES ('clarification-1', 'studying_block', 'Chapter 4 block')"
+                )
+            )
+            connection.execute(
+                text(
+                    "INSERT INTO discord_wake_inbound (id, interaction_action) "
+                    "VALUES ('wake-1', 'studying_block')"
+                )
+            )
+            context = MigrationContext.configure(connection)
+            monkeypatch.setattr(migration, "op", Operations(context))
+
+            migration.upgrade()
+
+            assessment_columns = {
+                row[1] for row in connection.exec_driver_sql("PRAGMA table_info(assessments)")
+            }
+            clarification_columns = {
+                row[1]
+                for row in connection.exec_driver_sql("PRAGMA table_info(academic_clarifications)")
+            }
+            checkin_columns = {
+                row[1] for row in connection.exec_driver_sql("PRAGMA table_info(academic_checkins)")
+            }
+            tables = {
+                row[0]
+                for row in connection.exec_driver_sql(
+                    "SELECT name FROM sqlite_master WHERE type = 'table'"
+                )
+            }
+            assert {
+                "calendar_semantic_intent_value",
+                "calendar_semantic_intent_status",
+                "calendar_semantic_intent_rationale",
+                "calendar_semantic_intent_evidence_ids",
+            }.issubset(assessment_columns)
+            assert "event_preview_title" in clarification_columns
+            assert "studying_block_preview_title" not in clarification_columns
+            assert "plan_id" not in checkin_columns
+            assert "study_blocks" not in tables
+            assert "study_plans" not in tables
+            decision = connection.execute(
+                text("SELECT decision FROM academic_clarifications")
+            ).scalar_one()
+            interaction_action = connection.execute(
+                text("SELECT interaction_action FROM discord_wake_inbound")
+            ).scalar_one()
+            assessment_type = connection.execute(
+                text("SELECT assessment_type FROM assessments")
+            ).scalar_one()
+            assert assessment_type == "event"
+            assert decision == "event"
+            assert interaction_action == "event"
+    finally:
+        engine.dispose()
+
+
+def test_0026_downgrade_does_not_restore_removed_scheduling_architecture() -> None:
+    migration = importlib.import_module("app.db.migrations.versions.0026_semantic_calendar_events")
+
+    with pytest.raises(RuntimeError, match="irreversible"):
+        migration.downgrade()

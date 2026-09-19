@@ -2,14 +2,16 @@ from __future__ import annotations
 
 import asyncio
 from collections.abc import Mapping, Sequence
-from datetime import UTC, datetime
+from datetime import UTC, date, datetime
 from types import SimpleNamespace
 from uuid import UUID
 from zoneinfo import ZoneInfo
 
 import pytest
-from langchain_core.messages import AIMessage, BaseMessage
+from langchain_core.messages import AIMessage, BaseMessage, HumanMessage, SystemMessage, ToolMessage
 from pydantic import SecretStr
+from sqlalchemy import create_engine, select
+from sqlalchemy.orm import Session
 
 from app.agents.academic_planner.contracts import (
     AcademicAssessmentOption,
@@ -23,9 +25,30 @@ from app.agents.academic_planner.discord_harness import (
     _progress_for_harness_event,
     _proposal_has_inbound_material,
     _render_event,
+    _validate_conversation_lifecycle,
 )
-from app.agents.harness import AgentHarnessEvent, ToolExecutionError
+from app.agents.calendar_briefing import (
+    CalendarActivityIntent,
+    CalendarActivityIntentStatus,
+    CalendarEventSemanticOutcome,
+    CalendarEventSemanticResult,
+    CalendarEventSemanticStatus,
+)
+from app.agents.conversation import NativeConversationService
+from app.agents.conversation.context import ConversationContextAssembler
+from app.agents.harness import (
+    AgentHarnessEvent,
+    ConversationLifecycle,
+    ToolExecutionError,
+    UserAbortRequested,
+)
+from app.agents.job_interviews.agent_loop import CareerAgentToolState
+from app.agents.job_interviews.contracts import ApplicationRowSnapshot, InterviewEventSnapshot
+from app.agents.memory import UserMemoryOwnerScope, UserMemoryService
+from app.artifacts.store import ArtifactStore
 from app.connectors.discord_gateway import DiscordAcademicMessageCreate
+from app.db.models import Base, NativeConversationSession
+from app.db.user_memory import SQLAlchemyUserMemoryStore
 
 NOW = datetime(2026, 9, 9, 14, tzinfo=UTC)
 
@@ -37,6 +60,85 @@ def test_pdf_confirmation_progress_requires_material_on_stored_proposal() -> Non
     assert _proposal_has_inbound_material(SimpleNamespace(changes=(material_change,)))
     assert not _proposal_has_inbound_material(SimpleNamespace(changes=(text_change,)))
     assert not _proposal_has_inbound_material(None)
+
+
+def test_academic_tool_checkpoint_round_trips_trusted_capabilities() -> None:
+    state = _AcademicToolState(
+        catalog=None,
+        now=NOW,
+        timezone=ZoneInfo("America/Toronto"),
+    )
+    course = AcademicCourseOption(
+        course_id="course-1",
+        course_code="ECE 202",
+        title="Circuits",
+    )
+    assessment = AcademicAssessmentOption(
+        assessment_id="assessment-1",
+        course_id=course.course_id,
+        course_code=course.course_code,
+        title="Lab 1",
+        assessment_type=AssessmentType.LAB,
+    )
+    state._courses[course.course_id] = course
+    state._assessments[assessment.assessment_id] = assessment
+
+    restored = _AcademicToolState(
+        catalog=None,
+        now=NOW,
+        timezone=ZoneInfo("America/Toronto"),
+    )
+    restored.restore_checkpoint(state.export_checkpoint())
+
+    assert restored._courses == {course.course_id: course}
+    assert restored._assessments == {assessment.assessment_id: assessment}
+
+
+def test_career_tool_checkpoint_round_trips_verified_interview() -> None:
+    interview = InterviewEventSnapshot(
+        interview_page_id="interview-1",
+        title="Systems interview",
+        local_date=date(2026, 9, 20),
+        is_all_day=True,
+        last_edited_at=NOW,
+        content_fingerprint="f" * 64,
+    )
+    state = object.__new__(CareerAgentToolState)
+    state._known_interviews = {interview.interview_page_id: interview}
+    checkpoint = state.export_checkpoint()
+
+    restored = object.__new__(CareerAgentToolState)
+    restored._known_interviews = {}
+    restored.restore_checkpoint(checkpoint)
+
+    assert restored._known_interviews == {interview.interview_page_id: interview}
+
+
+def test_answered_duplicate_clarification_is_rejected() -> None:
+    prior = AIMessage(
+        content="",
+        tool_calls=[
+            {
+                "id": "terminal-1",
+                "name": "emit_conversation_response",
+                "args": {
+                    "disposition": "awaiting_user",
+                    "content": "Which course should I use?",
+                },
+            }
+        ],
+    )
+
+    error = _validate_conversation_lifecycle(
+        ConversationLifecycle(
+            disposition="awaiting_user",
+            content="Which course should I use?",
+        ),
+        (prior, HumanMessage(content="ECE 202"), AIMessage(content="")),
+    )
+
+    assert error is not None
+    assert "already answered" in error
 
 
 class _Gateway:
@@ -85,6 +187,51 @@ class _Runtime:
         if self.fail:
             raise RuntimeError("private runtime detail")
         return object()
+
+
+class _CalendarSemanticInterpreter:
+    def __init__(
+        self,
+        statuses: Sequence[CalendarEventSemanticStatus],
+        *,
+        cite_title: bool = True,
+        study_intent: bool = True,
+    ) -> None:
+        self.statuses = list(statuses)
+        self.cite_title = cite_title
+        self.study_intent = study_intent
+        self.events = []
+
+    async def analyze(self, event):
+        self.events.append(event)
+        status = self.statuses.pop(0)
+        if status is not CalendarEventSemanticStatus.VALID:
+            return CalendarEventSemanticOutcome(status=status)
+        cited_id = f"{event.event_id}:host:title" if self.cite_title else "course"
+        activity_intent = (
+            CalendarActivityIntent.STUDY if self.study_intent else CalendarActivityIntent.REGULAR
+        )
+        result = CalendarEventSemanticResult(
+            event_id=event.event_id,
+            overview="Review work for the course.",
+            description_present=True,
+            description="Review work for the course.",
+            evidence_fragment_ids=(cited_id,),
+            description_fragment_ids=(cited_id,),
+            classification_rationale="The supplied event details are substantive.",
+            activity_intent=activity_intent,
+            intent_status=CalendarActivityIntentStatus.VALID,
+            intent_evidence_fragment_ids=(cited_id,),
+            intent_rationale="The title describes the activity.",
+        )
+        return CalendarEventSemanticOutcome(
+            status=status,
+            result=result,
+            activity_intent=activity_intent,
+            intent_status=CalendarActivityIntentStatus.VALID,
+            intent_evidence_fragment_ids=(cited_id,),
+            intent_rationale="The title describes the activity.",
+        )
 
 
 @pytest.mark.asyncio
@@ -148,12 +295,25 @@ class _Store:
     def __init__(self) -> None:
         self.proposals = []
 
-    def get_latest_daily_plan(self):
-        return None
-
     def save_discord_checkin(self, proposal, **_kwargs):
         self.proposals.append(proposal)
         return SimpleNamespace(status="created")
+
+
+class _IdempotentProposalStore(_Store):
+    def __init__(self) -> None:
+        super().__init__()
+        self._by_id = {}
+
+    def save_discord_checkin(self, proposal, **_kwargs):
+        if proposal.proposal_id in self._by_id:
+            return SimpleNamespace(status="replayed")
+        self._by_id[proposal.proposal_id] = proposal
+        self.proposals.append(proposal)
+        return SimpleNamespace(status="created")
+
+    def get_checkin_proposal(self, proposal_id):
+        return self._by_id.get(proposal_id)
 
 
 class _Delivery:
@@ -197,6 +357,18 @@ class _Delivery:
         return object()
 
 
+class _ConfirmationFailsOnce(_Delivery):
+    def __init__(self) -> None:
+        super().__init__()
+        self._failed = False
+
+    async def send_confirmation(self, proposal, *, idempotency_key: str) -> object:
+        if not self._failed:
+            self._failed = True
+            raise RuntimeError("connector_transient")
+        return await super().send_confirmation(proposal, idempotency_key=idempotency_key)
+
+
 class _RecordingProgressReporter:
     def __init__(self, events: list[str] | None = None) -> None:
         self.events = events if events is not None else []
@@ -224,6 +396,9 @@ class _RecordingProgressReporter:
     async def finish_failed(self) -> None:
         self.events.append("progress:failed")
 
+    async def finish_aborted(self) -> None:
+        self.events.append("progress:aborted")
+
 
 def _progress_phase(event: object | None) -> str:
     if isinstance(event, Mapping):
@@ -235,12 +410,14 @@ def _message(
     content: str,
     *,
     inbound_material_ids: tuple[UUID, ...] = (),
+    message_id: str = "111111111111111111",
+    timestamp: datetime = NOW,
 ) -> DiscordAcademicMessageCreate:
     return DiscordAcademicMessageCreate(
-        message_id="111111111111111111",
+        message_id=message_id,
         channel_id="222222222222222222",
         author_id="333333333333333333",
-        timestamp=NOW,
+        timestamp=timestamp,
         content=SecretStr(content),
         inbound_material_ids=inbound_material_ids,
         mentioned_user_ids=("444444444444444444",),
@@ -280,6 +457,14 @@ def _handler(
     syncer: _Syncer | None = None,
     runtime: _Runtime | None = None,
     material_intake: object | None = None,
+    calendar_semantic_interpreter: object | None = None,
+    career_tool_state_factory: object | None = None,
+    memory_service: object | None = None,
+    user_memory_service: object | None = None,
+    context_assembler: object | None = None,
+    abort_check: object | None = None,
+    activity_sink: object | None = None,
+    conversation_service: object | None = None,
     model_pending_elapsed_seconds: Sequence[float] = (8.0, 20.0, 45.0),
     model_pending_repeat_seconds: float = 30.0,
 ):
@@ -295,10 +480,655 @@ def _handler(
         assistant_user_id="444444444444444444",
         catalog_syncer=syncer or _Syncer(),
         catalog_sync_timeout_seconds=1.0,
+        career_tool_state_factory=career_tool_state_factory,  # type: ignore[arg-type]
         material_intake=material_intake,
+        calendar_semantic_interpreter=calendar_semantic_interpreter,
+        memory_service=memory_service,
+        user_memory_service=user_memory_service,
+        context_assembler=context_assembler,  # type: ignore[arg-type]
+        abort_check=abort_check,  # type: ignore[arg-type]
+        activity_sink=activity_sink,  # type: ignore[arg-type]
+        conversation_service=conversation_service,
         model_pending_elapsed_seconds=model_pending_elapsed_seconds,
         model_pending_repeat_seconds=model_pending_repeat_seconds,
     )
+
+
+@pytest.mark.asyncio
+async def test_durable_two_wake_clarification_replays_native_context_and_tool_state(
+    tmp_path,
+) -> None:
+    engine = create_engine(f"sqlite+pysqlite:///{tmp_path / 'conversation.db'}")
+    Base.metadata.create_all(engine)
+    artifact_store = ArtifactStore(tmp_path / "artifacts")
+    first_service = NativeConversationService(engine=engine, artifact_store=artifact_store)
+    first_catalog_events: list[str] = []
+    first_gateway = _Gateway(
+        [
+            AIMessage(
+                content="I will search your synchronized courses.",
+                additional_kwargs={"reasoning_content": "private selection reasoning"},
+                tool_calls=[
+                    {
+                        "id": "search-1",
+                        "name": "search_courses",
+                        "args": {"query": "ECE 202"},
+                    }
+                ],
+            ),
+            AIMessage(
+                content="",
+                tool_calls=[
+                    {
+                        "id": "terminal-1",
+                        "name": "emit_conversation_response",
+                        "args": {
+                            "disposition": "awaiting_user",
+                            "content": "Which ECE 202 assessment should I schedule?",
+                        },
+                    }
+                ],
+            ),
+        ]
+    )
+    first_delivery = _Delivery()
+
+    first = await _handler(
+        first_gateway,
+        _Store(),
+        first_delivery,
+        catalog=_Catalog(first_catalog_events),
+        conversation_service=first_service,
+    )(_message("Schedule review time for ECE 202."))
+
+    assert first.status == "handled"
+    assert first_catalog_events == ["search_courses"]
+    assert first_delivery.responses[-1] == "Which ECE 202 assessment should I schedule?"
+
+    # Recreate every handler/tool object and the service facade over the same durable stores.
+    second_service = NativeConversationService(engine=engine, artifact_store=artifact_store)
+    second_catalog_events: list[str] = []
+    second_gateway = _Gateway(
+        [
+            AIMessage(
+                content="I will use the verified course selection.",
+                tool_calls=[
+                    {
+                        "id": "assessment-1",
+                        "name": "search_assessments",
+                        "args": {"query": "lab", "course_id": "course-1"},
+                    }
+                ],
+            ),
+            AIMessage(
+                content="",
+                tool_calls=[
+                    {
+                        "id": "terminal-2",
+                        "name": "emit_conversation_response",
+                        "args": {
+                            "disposition": "completed",
+                            "content": "I found no matching lab, so no change was proposed.",
+                        },
+                    }
+                ],
+            ),
+        ]
+    )
+    second_delivery = _Delivery()
+
+    second = await _handler(
+        second_gateway,
+        _Store(),
+        second_delivery,
+        catalog=_Catalog(second_catalog_events),
+        conversation_service=second_service,
+    )(
+        _message(
+            "The lab.",
+            message_id="111111111111111112",
+            timestamp=NOW,
+        )
+    )
+
+    assert second.status == "handled"
+    assert second_catalog_events == ["search_assessments"]
+    replay = second_gateway.inputs[0]
+    assert [message.type for message in replay] == [
+        "system",
+        "human",
+        "ai",
+        "tool",
+        "ai",
+        "human",
+    ]
+    assert isinstance(replay[1], HumanMessage)
+    assert replay[1].content == "Schedule review time for ECE 202."
+    assert isinstance(replay[2], AIMessage)
+    assert replay[2].tool_calls[0]["id"] == "search-1"
+    assert replay[2].additional_kwargs["reasoning_content"] == "private selection reasoning"
+    assert isinstance(replay[3], ToolMessage)
+    assert replay[3].tool_call_id == "search-1"
+    assert "ECE 202" in str(replay[3].content)
+    assert isinstance(replay[4], AIMessage)
+    assert replay[4].tool_calls[0]["args"]["content"] == (
+        "Which ECE 202 assessment should I schedule?"
+    )
+    assert isinstance(replay[5], HumanMessage)
+    assert replay[5].content == "The lab."
+    assert second_delivery.responses[-1] == ("I found no matching lab, so no change was proposed.")
+    engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_durable_session_supports_two_clarifications_and_owner_topic_pivot(
+    tmp_path,
+) -> None:
+    engine = create_engine(f"sqlite+pysqlite:///{tmp_path / 'pivot.db'}")
+    Base.metadata.create_all(engine)
+    artifacts = ArtifactStore(tmp_path / "pivot-artifacts")
+    store = _Store()
+
+    first = await _handler(
+        _Gateway(
+            [
+                AIMessage(
+                    content="",
+                    tool_calls=[
+                        {
+                            "id": "terminal-1",
+                            "name": "emit_conversation_response",
+                            "args": {
+                                "disposition": "awaiting_user",
+                                "content": "Which course should I use?",
+                            },
+                        }
+                    ],
+                )
+            ]
+        ),
+        store,
+        _Delivery(),
+        conversation_service=NativeConversationService(
+            engine=engine,
+            artifact_store=artifacts,
+        ),
+    )(_message("Help me schedule a review."))
+    assert first.status == "handled"
+
+    second_gateway = _Gateway(
+        [
+            AIMessage(
+                content="",
+                tool_calls=[
+                    {
+                        "id": "terminal-2",
+                        "name": "emit_conversation_response",
+                        "args": {
+                            "disposition": "awaiting_user",
+                            "content": "How many minutes should the review last?",
+                        },
+                    }
+                ],
+            )
+        ]
+    )
+    second = await _handler(
+        second_gateway,
+        store,
+        _Delivery(),
+        conversation_service=NativeConversationService(
+            engine=engine,
+            artifact_store=artifacts,
+        ),
+    )(_message("ECE 202.", message_id="111111111111111112"))
+    assert second.status == "handled"
+
+    pivot_gateway = _Gateway(
+        [
+            AIMessage(
+                content="",
+                tool_calls=[
+                    {
+                        "id": "terminal-3",
+                        "name": "emit_conversation_response",
+                        "args": {
+                            "disposition": "completed",
+                            "content": "Sure—here is a concise summary instead.",
+                        },
+                    }
+                ],
+            )
+        ]
+    )
+    pivot = await _handler(
+        pivot_gateway,
+        store,
+        _Delivery(),
+        conversation_service=NativeConversationService(
+            engine=engine,
+            artifact_store=artifacts,
+        ),
+    )(
+        _message(
+            "Actually, skip scheduling and summarize the course plan instead.",
+            message_id="111111111111111113",
+        )
+    )
+
+    assert pivot.status == "handled"
+    assert [message.content for message in pivot_gateway.inputs[0] if message.type == "human"] == [
+        "Help me schedule a review.",
+        "ECE 202.",
+        "Actually, skip scheduling and summarize the course plan instead.",
+    ]
+    with Session(engine) as session:
+        row = session.scalar(select(NativeConversationSession))
+        assert row is not None
+        assert row.state == "completed"
+    engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_completed_proposal_replay_recovers_confirmation_without_duplicate_proposal(
+    tmp_path,
+) -> None:
+    engine = create_engine(f"sqlite+pysqlite:///{tmp_path / 'proposal-replay.db'}")
+    Base.metadata.create_all(engine)
+    artifact_store = ArtifactStore(tmp_path / "proposal-replay-artifacts")
+    conversation_service = NativeConversationService(
+        engine=engine,
+        artifact_store=artifact_store,
+    )
+    store = _IdempotentProposalStore()
+    delivery = _ConfirmationFailsOnce()
+    gateway = _Gateway(
+        [
+            AIMessage(
+                content="",
+                tool_calls=[
+                    {
+                        "id": "search-1",
+                        "name": "search_courses",
+                        "args": {"query": "ECE 202"},
+                    }
+                ],
+            ),
+            AIMessage(
+                content="",
+                tool_calls=[
+                    {
+                        "id": "create-1",
+                        "name": "create_assessment",
+                        "args": {
+                            "course_id": "course-1",
+                            "title": "Lab 2",
+                            "due_at": "2026-09-12T17:00:00",
+                            "assessment_type": "lab",
+                        },
+                    }
+                ],
+            ),
+            AIMessage(
+                content="",
+                tool_calls=[
+                    {
+                        "id": "terminal-1",
+                        "name": "emit_conversation_response",
+                        "args": {
+                            "disposition": "completed",
+                            "content": "The proposed lab is ready for review.",
+                        },
+                    }
+                ],
+            ),
+        ]
+    )
+    message = _message("Create Lab 2 for ECE 202 due Friday at 5 PM.")
+
+    with pytest.raises(RuntimeError, match="connector_transient"):
+        await _handler(
+            gateway,
+            store,
+            delivery,
+            conversation_service=conversation_service,
+        )(message)
+
+    assert len(store.proposals) == 1
+    with Session(engine) as session:
+        row = session.scalar(select(NativeConversationSession))
+        assert row is not None
+        assert row.state == "completed"
+
+    replay_gateway = _Gateway([])
+    replay = await _handler(
+        replay_gateway,
+        store,
+        delivery,
+        conversation_service=NativeConversationService(
+            engine=engine,
+            artifact_store=artifact_store,
+        ),
+    )(message)
+
+    assert replay.status == "duplicate"
+    assert replay_gateway.inputs == []
+    assert len(store.proposals) == 1
+    assert len(delivery.confirmations) == 1
+    assert delivery.confirmations[0].proposal_id == store.proposals[0].proposal_id
+    engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_context_capacity_failure_preserves_open_session(tmp_path) -> None:
+    engine = create_engine(f"sqlite+pysqlite:///{tmp_path / 'capacity.db'}")
+    Base.metadata.create_all(engine)
+    conversation_service = NativeConversationService(
+        engine=engine,
+        artifact_store=ArtifactStore(tmp_path / "capacity-artifacts"),
+    )
+
+    class CapacityGateway:
+        model_identity = "qwen@test"
+        native_config_version = "native-v1"
+
+        async def invoke_tools(self, _messages, _tools):
+            raise RuntimeError("input_token_budget_exceeded")
+
+    delivery = _Delivery()
+    result = await _handler(
+        CapacityGateway(),  # type: ignore[arg-type]
+        _Store(),
+        delivery,
+        conversation_service=conversation_service,
+    )(_message("A request whose active transcript is too large."))
+
+    assert result.status == "failed"
+    assert "preserved it without dropping prior messages" in delivery.responses[-1]
+    with Session(engine) as session:
+        row = session.scalar(select(NativeConversationSession))
+        assert row is not None
+        assert row.state == "awaiting_user"
+        assert row.error_code == "input_token_budget_exceeded"
+        assert conversation_service.load_messages(session_id=row.id)[0].content == (
+            "A request whose active transcript is too large."
+        )
+    engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_explicit_generic_memory_round_trips_through_discord_boundary(tmp_path) -> None:
+    engine = create_engine(f"sqlite+pysqlite:///{tmp_path / 'generic-memory.db'}")
+    Base.metadata.create_all(engine)
+    artifacts = ArtifactStore(
+        tmp_path / "generic-memory-artifacts",
+        retention_days_by_class={"user_memory_content": None},
+    )
+    conversation_service = NativeConversationService(
+        engine=engine,
+        artifact_store=artifacts,
+    )
+    user_memory_service = UserMemoryService(
+        store=SQLAlchemyUserMemoryStore(engine=engine, artifact_store=artifacts)
+    )
+    settings = SimpleNamespace(
+        conversation_compaction_trigger_tokens=10_368,
+        conversation_compaction_target_tokens=7_168,
+        conversation_recent_tail_max_tokens=4_096,
+        conversation_summary_enabled=True,
+        ollama_max_input_tokens=13_824,
+        user_memory_enabled=True,
+        user_memory_retrieval_limit=8,
+        user_memory_context_max_chars=3_000,
+    )
+    gateway = _Gateway(
+        [
+            AIMessage(
+                content="I will store that owner preference.",
+                tool_calls=[
+                    {
+                        "id": "memory-1",
+                        "name": "manage_user_memory",
+                        "args": {
+                            "action": "remember",
+                            "content": "I prefer concise replies.",
+                            "kind": "preference",
+                        },
+                    }
+                ],
+            ),
+            AIMessage(
+                content="",
+                tool_calls=[
+                    {
+                        "id": "terminal-memory-1",
+                        "name": "emit_conversation_response",
+                        "args": {
+                            "disposition": "completed",
+                            "content": "I'll remember that you prefer concise replies.",
+                        },
+                    }
+                ],
+            ),
+        ]
+    )
+    assembler = ConversationContextAssembler(
+        settings=settings,
+        gateway=gateway,  # type: ignore[arg-type]
+        conversation_service=conversation_service,
+        artifact_store=artifacts,
+        user_memory_service=user_memory_service,
+    )
+    reporter = _RecordingProgressReporter()
+    delivery = _Delivery(progress_reporter=reporter)
+
+    result = await _handler(
+        gateway,
+        _Store(),
+        delivery,
+        conversation_service=conversation_service,
+        user_memory_service=user_memory_service,
+        context_assembler=assembler,
+    )(_message("Please remember that I prefer concise replies."))
+
+    assert result.status == "handled"
+    assert delivery.responses[-1] == "I'll remember that you prefer concise replies."
+    assert len(gateway.inputs) == 2
+    assert any(
+        "untrusted_owner_memory" in str(item.content)
+        and "prefer concise replies" in str(item.content)
+        for item in gateway.inputs[1]
+        if isinstance(item, SystemMessage)
+    )
+    retrieval = await user_memory_service.retrieve(
+        owner_scope=UserMemoryOwnerScope(
+            owner_user_id="333333333333333333",
+            owner_channel_id="222222222222222222",
+        ),
+        query="concise replies",
+    )
+    assert [item.content for item in retrieval.items] == ["I prefer concise replies."]
+    with Session(engine) as session:
+        row = session.scalar(select(NativeConversationSession))
+        assert row is not None
+        transcript = conversation_service.load_transcript(session_id=row.id)
+    assert not any(isinstance(item, SystemMessage) for item in transcript.to_messages())
+    assert any(isinstance(item, ToolMessage) for item in transcript.to_messages())
+    phases = [_progress_phase(item) for item in reporter.updates]
+    assert phases.index("runtime_checking") < phases.index("context_preparing")
+
+
+@pytest.mark.asyncio
+async def test_generic_memory_tool_rejects_model_supplied_owner_scope(tmp_path) -> None:
+    engine = create_engine(f"sqlite+pysqlite:///{tmp_path / 'bad-memory.db'}")
+    Base.metadata.create_all(engine)
+    artifacts = ArtifactStore(tmp_path / "bad-memory-artifacts")
+    memory = UserMemoryService(
+        store=SQLAlchemyUserMemoryStore(engine=engine, artifact_store=artifacts)
+    )
+    gateway = _Gateway(
+        [
+            AIMessage(
+                content="",
+                tool_calls=[
+                    {
+                        "id": "bad-memory-1",
+                        "name": "manage_user_memory",
+                        "args": {
+                            "action": "remember",
+                            "content": "A forged memory.",
+                            "owner_user_id": "999999999999999999",
+                        },
+                    }
+                ],
+            ),
+            AIMessage(content="The invalid memory request was rejected."),
+        ]
+    )
+    delivery = _Delivery()
+
+    result = await _handler(
+        gateway,
+        _Store(),
+        delivery,
+        user_memory_service=memory,
+    )(_message("Remember this safely."))
+
+    assert result.status == "handled"
+    assert delivery.responses[-1] == "The invalid memory request was rejected."
+    assert (
+        await memory.retrieve(
+            owner_scope=UserMemoryOwnerScope(
+                owner_user_id="333333333333333333",
+                owner_channel_id="222222222222222222",
+            ),
+            query="forged",
+        )
+    ).items == ()
+
+
+@pytest.mark.asyncio
+async def test_long_discord_conversation_uses_summary_tail_but_preserves_transcript(
+    tmp_path,
+) -> None:
+    engine = create_engine(f"sqlite+pysqlite:///{tmp_path / 'long-context.db'}")
+    Base.metadata.create_all(engine)
+    artifacts = ArtifactStore(tmp_path / "long-context-artifacts")
+    conversations = NativeConversationService(engine=engine, artifact_store=artifacts)
+    session_id = None
+    for index in range(6):
+        turn = conversations.begin_turn(
+            external_event_id=f"seed-{index}",
+            discord_channel_id="222222222222222222",
+            owner_discord_user_id="333333333333333333",
+            content=f"Prior owner turn {index}: " + ("x" * 8_000),
+            model_identity="qwen@test",
+            prompt_config_version="native-v1",
+            now=NOW,
+        )
+        assert turn.session_id is not None
+        session_id = turn.session_id
+        conversations.append_checkpoint_message(
+            session_id=turn.session_id,
+            message=AIMessage(
+                content="",
+                tool_calls=[
+                    {
+                        "id": f"seed-terminal-{index}",
+                        "name": "emit_conversation_response",
+                        "args": {
+                            "disposition": "awaiting_user",
+                            "content": f"Seed clarification {index}?",
+                        },
+                    }
+                ],
+            ),
+            now=NOW,
+        )
+        conversations.finish_turn(
+            session_id=turn.session_id,
+            disposition="awaiting_user",
+            content=f"Seed clarification {index}?",
+            now=NOW,
+        )
+    assert session_id is not None
+    original = conversations.load_transcript(session_id=session_id).to_messages()
+
+    class CompactingGateway(_Gateway):
+        model_identity = "qwen@test"
+        native_config_version = "native-v1"
+
+        async def invoke_structured(self, *, prompt, response_model):
+            assert "private scratch" not in prompt
+            return SimpleNamespace(
+                status="valid",
+                output=response_model(
+                    conversation_state="Several prior clarification turns occurred.",
+                    answered_questions=(),
+                    open_threads=("Answer the latest owner message",),
+                    tool_outcomes=(),
+                    user_statements=(),
+                ),
+            )
+
+    gateway = CompactingGateway(
+        [
+            AIMessage(
+                content="",
+                tool_calls=[
+                    {
+                        "id": "long-terminal",
+                        "name": "emit_conversation_response",
+                        "args": {
+                            "disposition": "completed",
+                            "content": "The long conversation is still available.",
+                        },
+                    }
+                ],
+            )
+        ]
+    )
+    settings = SimpleNamespace(
+        conversation_compaction_trigger_tokens=11_000,
+        conversation_compaction_target_tokens=10_000,
+        conversation_recent_tail_max_tokens=4_096,
+        conversation_summary_enabled=True,
+        ollama_max_input_tokens=13_824,
+        user_memory_enabled=False,
+        user_memory_retrieval_limit=8,
+        user_memory_context_max_chars=3_000,
+    )
+    assembler = ConversationContextAssembler(
+        settings=settings,
+        gateway=gateway,  # type: ignore[arg-type]
+        conversation_service=conversations,
+        artifact_store=artifacts,
+    )
+
+    result = await _handler(
+        gateway,
+        _Store(),
+        _Delivery(),
+        conversation_service=conversations,
+        context_assembler=assembler,
+    )(
+        _message(
+            "Please answer using the bounded context.",
+            message_id="999999999999999999",
+        )
+    )
+
+    assert result.status == "handled"
+    assert len(gateway.inputs) == 1
+    assert any(
+        "untrusted_session_summary" in str(item.content)
+        for item in gateway.inputs[0]
+        if isinstance(item, SystemMessage)
+    )
+    assert len(gateway.inputs[0]) < len(original)
+    final_transcript = conversations.load_transcript(session_id=session_id).to_messages()
+    assert len(final_transcript) == len(original) + 2
+    assert final_transcript[: len(original)] == original
 
 
 @pytest.mark.asyncio
@@ -350,6 +1180,137 @@ async def test_configured_harness_answers_arbitrary_input_without_semantic_route
 
 
 @pytest.mark.asyncio
+async def test_open_memory_session_resumes_before_runtime_and_general_loop() -> None:
+    events: list[str] = []
+    reporter = _RecordingProgressReporter(events)
+    delivery = _Delivery(progress_reporter=reporter, events=events)
+
+    class Memory:
+        def open_memory_session_kind(self, **scope):
+            assert scope == {
+                "channel_id": "222222222222222222",
+                "user_id": "333333333333333333",
+                "now": NOW,
+            }
+            return "learning_focus"
+
+        async def handle_reflection(self, **kwargs):
+            assert kwargs["external_event_id"] == "111111111111111111"
+            assert kwargs["channel_id"] == "222222222222222222"
+            assert kwargs["user_id"] == "333333333333333333"
+            assert kwargs["raw_text"] == "recursion"
+            assert kwargs["received_at"] == NOW
+            return SimpleNamespace(status="clarification", response="Which course topic?")
+
+    result = await _handler(
+        _Gateway([AIMessage(content="unused")]),
+        _Store(),
+        delivery,
+        runtime=_Runtime(events, fail=True),
+        memory_service=Memory(),
+    )(_message("recursion"))
+
+    assert result.status == "handled"
+    assert delivery.responses == ["Which course topic?"]
+    assert delivery.response_keys == [
+        "academic-discord-message:111111111111111111:memory-session:v1"
+    ]
+    assert "runtime_check" not in events
+
+
+@pytest.mark.asyncio
+async def test_memory_tool_uses_authenticated_message_and_falls_back_to_memory_response() -> None:
+    class Memory:
+        def open_memory_session_kind(self, **_scope):
+            return None
+
+        async def handle_reflection(self, **kwargs):
+            assert kwargs["external_event_id"] == "111111111111111111"
+            assert kwargs["channel_id"] == "222222222222222222"
+            assert kwargs["user_id"] == "333333333333333333"
+            assert kwargs["raw_text"] == "Remember I struggle with recursion."
+            assert kwargs["received_at"] == NOW
+            return SimpleNamespace(status="applied", response="Added recursion as an active focus.")
+
+    gateway = _Gateway(
+        [
+            AIMessage(
+                content="I'll update your local academic memory.",
+                tool_calls=[
+                    {
+                        "id": "memory-1",
+                        "name": "manage_academic_memory",
+                        "args": {"action": "reflection"},
+                    }
+                ],
+            ),
+            AIMessage(content=""),
+        ]
+    )
+    delivery = _Delivery()
+
+    result = await _handler(
+        gateway,
+        _Store(),
+        delivery,
+        memory_service=Memory(),
+    )(_message("Remember I struggle with recursion."))
+
+    assert result.status == "handled"
+    assert delivery.responses == [
+        "I'll update your local academic memory.",
+        "Added recursion as an active focus.",
+    ]
+    tool_context = str(gateway.inputs[1][-1].content)
+    assert "Added recursion as an active focus." in tool_context
+    assert "owner" not in tool_context.casefold()
+
+
+@pytest.mark.asyncio
+async def test_memory_tool_failure_is_terminal_and_does_not_claim_empty_memory() -> None:
+    class Memory:
+        def open_memory_session_kind(self, **_scope):
+            return None
+
+        async def handle_reflection(self, **_kwargs):
+            return SimpleNamespace(
+                status="failed",
+                response=(
+                    "Semantic memory is unavailable right now, so I did not store any new "
+                    "academic reflection text."
+                ),
+            )
+
+    gateway = _Gateway(
+        [
+            AIMessage(
+                content="I'll try to save that locally.",
+                tool_calls=[
+                    {
+                        "id": "memory-1",
+                        "name": "manage_academic_memory",
+                        "args": {"action": "reflection"},
+                    }
+                ],
+            ),
+            AIMessage(content=""),
+        ]
+    )
+    delivery = _Delivery()
+
+    result = await _handler(
+        gateway,
+        _Store(),
+        delivery,
+        memory_service=Memory(),
+    )(_message("Remember this study struggle."))
+
+    assert result.status == "failed"
+    assert "did not store" in delivery.responses[-1]
+    assert "no memories" not in delivery.responses[-1].casefold()
+
+
+@pytest.mark.asyncio
 async def test_blank_tool_call_text_is_skipped_while_the_tool_loop_continues() -> None:
     events: list[str] = []
     gateway = _Gateway(
@@ -386,6 +1347,100 @@ async def test_blank_tool_call_text_is_skipped_while_the_tool_loop_continues() -
 
 
 @pytest.mark.asyncio
+async def test_career_date_question_uses_jobs_context_tool_and_answers_with_progress() -> None:
+    events: list[str] = []
+    reporter = _RecordingProgressReporter(events)
+    delivery = _Delivery(progress_reporter=reporter, events=events)
+    gateway = _Gateway(
+        [
+            AIMessage(
+                content="",
+                tool_calls=[
+                    {
+                        "id": "jobs-context-1",
+                        "name": "search_jobs_context",
+                        "args": {"query": "when is my Shopify interview?"},
+                    }
+                ],
+            ),
+            AIMessage(content="Your Shopify technical interview is on September 20, 2026."),
+        ]
+    )
+
+    class CareerStore:
+        def load_upcoming_interviews(self, *, now):
+            assert now == NOW
+            return (
+                InterviewEventSnapshot(
+                    interview_page_id="interview-1",
+                    title="Shopify Technical Interview",
+                    local_date=date(2026, 9, 20),
+                    is_all_day=True,
+                    last_edited_at=NOW,
+                    content_fingerprint="interview-fingerprint",
+                ),
+            )
+
+        def search_interviews(self, query, *, now):
+            assert now == NOW
+            assert query == ""
+            return self.load_upcoming_interviews(now=now)
+
+        def application_table_snapshots(self):
+            return (
+                ApplicationRowSnapshot(
+                    table_block_id="jobs-table",
+                    row_block_id="jobs-header",
+                    row_order=0,
+                    is_header=True,
+                    cells=("Company", "Role", "Status"),
+                    normalized_cells=("company", "role", "status"),
+                    content_fingerprint="header-fingerprint",
+                    last_seen_at=NOW,
+                ),
+                ApplicationRowSnapshot(
+                    table_block_id="jobs-table",
+                    row_block_id="jobs-row",
+                    row_order=1,
+                    cells=("Shopify", "Backend Developer", "Interviewing"),
+                    normalized_cells=("shopify", "backend developer", "interviewing"),
+                    content_fingerprint="row-fingerprint",
+                    last_seen_at=NOW,
+                ),
+            )
+
+        def application_row_snapshots(self):
+            return self.application_table_snapshots()[1:]
+
+        def get_current_plan(self, interview_page_id):
+            assert interview_page_id == "interview-1"
+
+    career_store = CareerStore()
+    career_syncer = _Syncer(events)
+
+    result = await _handler(
+        gateway,
+        _Store(),
+        delivery,
+        career_tool_state_factory=lambda message: CareerAgentToolState(
+            store=career_store,
+            syncer=career_syncer,
+            gateway=gateway,
+            now=message.timestamp,
+        ),
+    )(_message("when is my Shopify interview?"))
+
+    assert result.status == "handled"
+    assert career_syncer.calls == 1
+    assert delivery.responses == ["Your Shopify technical interview is on September 20, 2026."]
+    assert {"phase": "tool_activity", "tool_activity": "interview_data"} in reporter.updates
+    tool_result = str(gateway.inputs[1][-1].content)
+    assert "2026-09-20" in tool_result
+    assert "Company" in tool_result
+    assert "Role" in tool_result
+
+
+@pytest.mark.asyncio
 async def test_progress_lifecycle_orders_runtime_model_delivery_and_completion() -> None:
     events: list[str] = []
     reporter = _RecordingProgressReporter(events)
@@ -409,6 +1464,51 @@ async def test_progress_lifecycle_orders_runtime_model_delivery_and_completion()
         "response",
         "progress:completed",
     ]
+
+
+@pytest.mark.asyncio
+async def test_user_abort_before_tool_finishes_aborted_progress_and_no_response() -> None:
+    events: list[str] = []
+    activities: list[dict[str, object]] = []
+    checks = 0
+    reporter = _RecordingProgressReporter(events)
+    delivery = _Delivery(progress_reporter=reporter, events=events)
+    gateway = _Gateway(
+        [
+            AIMessage(
+                content="I will check the course catalog.",
+                tool_calls=[
+                    {"id": "call-1", "name": "search_courses", "args": {"query": "ECE 202"}}
+                ],
+            )
+        ]
+    )
+
+    def abort_before_tool() -> None:
+        nonlocal checks
+        checks += 1
+        if checks >= 6:
+            raise UserAbortRequested()
+
+    async def activity_sink(event: Mapping[str, object]) -> None:
+        activities.append(dict(event))
+
+    handler = _handler(
+        gateway,
+        _Store(),
+        delivery,
+        abort_check=abort_before_tool,
+        activity_sink=activity_sink,
+    )
+
+    with pytest.raises(UserAbortRequested):
+        await handler(_message("What is due for ECE 202?"))
+
+    assert delivery.responses == []
+    assert events[-1] == "progress:aborted"
+    assert {"phase": "model_waiting", "model_turn": 1, "tool_status": "not_started"} in activities
+    assert not any(activity.get("phase") == "tool_started" for activity in activities)
+    assert "ECE 202" not in str(activities)
 
 
 @pytest.mark.asyncio
@@ -442,15 +1542,38 @@ async def test_blocked_direct_answer_emits_pending_progress_without_standalone_r
     ]
 
 
+@pytest.mark.asyncio
+async def test_worker_shutdown_cancellation_is_not_reported_as_user_abort() -> None:
+    events: list[str] = []
+    reporter = _RecordingProgressReporter(events)
+    delivery = _Delivery(progress_reporter=reporter, events=events)
+    gateway = _BlockingGateway(events)
+    handler = _handler(gateway, _Store(), delivery, abort_check=lambda: None)
+
+    task = asyncio.create_task(handler(_message("Take your time.")))
+    await asyncio.wait_for(gateway.started.wait(), timeout=0.5)
+    task.cancel()
+
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+    assert delivery.responses == []
+    assert events[-1] == "progress:failed"
+    assert "progress:aborted" not in events
+
+
 @pytest.mark.parametrize(
     ("tool_name", "activity"),
     [
         ("search_courses", "course_data"),
         ("search_assessments", "assessment_data"),
         ("create_assessment", "proposal_drafting"),
-        ("create_study_session", "proposal_drafting"),
+        ("find_course_event_slots", "availability_data"),
+        ("create_course_event", "proposal_drafting"),
+        ("manage_academic_memory", "memory_data"),
         ("update_assessment", "proposal_drafting"),
         ("archive_assessment", "proposal_drafting"),
+        ("search_jobs_context", "interview_data"),
         ("search_job_interviews", "interview_data"),
         ("prepare_job_interview", "interview_preparation"),
         ("propose_interview_date", "proposal_drafting"),
@@ -478,6 +1601,20 @@ def test_unknown_tool_does_not_generate_progress_copy() -> None:
         )
         is None
     )
+
+
+def test_course_event_progress_uses_semantic_validation_when_required() -> None:
+    progress = _progress_for_harness_event(
+        AgentHarnessEvent(
+            kind="tool_call",
+            turn=1,
+            tool_name="create_course_event",
+            args_json='{"requires_study_intent":true,"title":"Review filters"}',
+        )
+    )
+
+    assert progress == {"phase": "tool_activity", "tool_activity": "semantic_validation"}
+    assert "Review filters" not in str(progress)
 
 
 @pytest.mark.parametrize(
@@ -553,10 +1690,203 @@ async def test_system_message_supplies_current_owner_local_time() -> None:
     assert "Follow explicit response-format requests exactly" in system_content
     assert "Keep calculations, scratch work, and" in system_content
     assert "do not call academic tools" in system_content
+    assert "course-event tools" in system_content
+    assert "study-session tools" not in system_content
 
 
 @pytest.mark.asyncio
-async def test_study_session_wall_time_is_converted_from_owner_timezone() -> None:
+async def test_struggle_turn_stores_memory_and_proposes_next_safe_course_event() -> None:
+    class Memory:
+        calls = 0
+
+        def open_memory_session_kind(self, **_scope):
+            return None
+
+        async def handle_reflection(self, **kwargs):
+            self.calls += 1
+            assert kwargs["raw_text"] == "I'm struggling with filters in ECE 202."
+            return SimpleNamespace(
+                status="applied",
+                response="Added filters as an active ECE 202 learning focus.",
+            )
+
+    class AvailabilityCatalog(_Catalog):
+        def load_calendar_availability(self, *, now: datetime, horizon_days: int):
+            assert now == NOW
+            assert horizon_days == 7
+            return SimpleNamespace(
+                buffer_minutes=0,
+                availability=(
+                    SimpleNamespace(
+                        start_at=datetime(2026, 9, 9, 14, tzinfo=UTC),
+                        end_at=datetime(2026, 9, 9, 17, tzinfo=UTC),
+                    ),
+                ),
+                commitments=(
+                    SimpleNamespace(
+                        start_at=datetime(2026, 9, 9, 14, 30, tzinfo=UTC),
+                        end_at=datetime(2026, 9, 9, 15, tzinfo=UTC),
+                    ),
+                ),
+            )
+
+    gateway = _Gateway(
+        [
+            AIMessage(
+                content=(
+                    "I understand--you're struggling with filters. I'll remember that and find "
+                    "a focused review slot."
+                ),
+                tool_calls=[
+                    {
+                        "id": "memory-1",
+                        "name": "manage_academic_memory",
+                        "args": {"action": "reflection"},
+                    }
+                ],
+            ),
+            AIMessage(
+                content="I'll resolve the course before checking availability.",
+                tool_calls=[
+                    {
+                        "id": "course-1",
+                        "name": "search_courses",
+                        "args": {"query": "ECE 202"},
+                    }
+                ],
+            ),
+            AIMessage(
+                content="I'll check your calendar for a conflict-free time.",
+                tool_calls=[
+                    {
+                        "id": "slots-1",
+                        "name": "find_course_event_slots",
+                        "args": {"course_id": "course-1", "duration_minutes": 30},
+                    }
+                ],
+            ),
+            AIMessage(
+                content="I found a safe time and will validate the natural event title.",
+                tool_calls=[
+                    {
+                        "id": "create-1",
+                        "name": "create_course_event",
+                        "args": {
+                            "course_id": "course-1",
+                            "title": "Review ECE 202 filters",
+                            "starts_at": "2026-09-09T11:00:00",
+                            "duration_minutes": 30,
+                            "requires_study_intent": True,
+                        },
+                    }
+                ],
+            ),
+            AIMessage(content="Your review event is ready for confirmation."),
+        ]
+    )
+    memory = Memory()
+    semantic = _CalendarSemanticInterpreter((CalendarEventSemanticStatus.VALID,))
+    store = _Store()
+    reporter = _RecordingProgressReporter()
+    delivery = _Delivery(progress_reporter=reporter)
+
+    result = await _handler(
+        gateway,
+        store,
+        delivery,
+        catalog=AvailabilityCatalog(),
+        memory_service=memory,
+        calendar_semantic_interpreter=semantic,
+    )(_message("I'm struggling with filters in ECE 202."))
+
+    assert result.status == "handled"
+    assert memory.calls == 1
+    assert len(store.proposals) == 1
+    assert len(delivery.confirmations) == 1
+    change = delivery.confirmations[0].changes[0]
+    assert change.title == "Review ECE 202 filters"
+    assert change.assessment_type is AssessmentType.EVENT
+    assert change.due_at == datetime(2026, 9, 9, 15, tzinfo=UTC)
+    assert change.ends_at == datetime(2026, 9, 9, 15, 30, tzinfo=UTC)
+    assert delivery.responses == [
+        "I understand--you're struggling with filters. I'll remember that and find a focused "
+        "review slot.",
+        "I'll resolve the course before checking availability.",
+        "I'll check your calendar for a conflict-free time.",
+        "I found a safe time and will validate the natural event title.",
+        "Local academic memory: Added filters as an active ECE 202 learning focus.\n\n"
+        "Pending calendar proposal: Your review event is ready for confirmation.",
+    ]
+    tool_activities = {
+        str(update.get("tool_activity"))
+        for update in reporter.updates
+        if isinstance(update, Mapping) and update.get("phase") == "tool_activity"
+    }
+    assert {"memory_data", "availability_data", "semantic_validation"} <= tool_activities
+
+
+@pytest.mark.asyncio
+async def test_course_event_semantic_unavailability_clarifies_without_proposal() -> None:
+    semantic = _CalendarSemanticInterpreter((CalendarEventSemanticStatus.UNAVAILABLE,))
+    gateway = _Gateway(
+        [
+            AIMessage(
+                content="I'll verify the course.",
+                tool_calls=[
+                    {
+                        "id": "search-1",
+                        "name": "search_courses",
+                        "args": {"query": "ECE 202"},
+                    }
+                ],
+            ),
+            AIMessage(
+                content="I'll validate the review title before preparing a proposal.",
+                tool_calls=[
+                    {
+                        "id": "create-1",
+                        "name": "create_course_event",
+                        "args": {
+                            "course_id": "course-1",
+                            "title": "Review ECE 202 filters",
+                            "starts_at": "2026-09-15T18:00:00",
+                            "duration_minutes": 60,
+                            "requires_study_intent": True,
+                        },
+                    }
+                ],
+            ),
+            AIMessage(
+                content=(
+                    "I couldn't semantically verify the review title right now. What wording "
+                    "would you like on the event?"
+                )
+            ),
+        ]
+    )
+    store = _Store()
+    delivery = _Delivery()
+
+    result = await _handler(
+        gateway,
+        store,
+        delivery,
+        calendar_semantic_interpreter=semantic,
+    )(_message("Schedule a filters review for September 15 at 6 PM."))
+
+    assert result.status == "handled"
+    assert len(semantic.events) == 1
+    assert store.proposals == []
+    assert delivery.confirmations == []
+    assert delivery.responses[-1] == (
+        "I couldn't semantically verify the review title right now. What wording would you like "
+        "on the event?"
+    )
+
+
+@pytest.mark.asyncio
+async def test_course_event_wall_time_is_converted_from_owner_timezone() -> None:
+    semantic = _CalendarSemanticInterpreter((CalendarEventSemanticStatus.VALID,))
     gateway = _Gateway(
         [
             AIMessage(
@@ -570,34 +1900,232 @@ async def test_study_session_wall_time_is_converted_from_owner_timezone() -> Non
                 ],
             ),
             AIMessage(
-                content="I will prepare the requested local-time session.",
+                content="I will prepare the requested local-time event.",
                 tool_calls=[
                     {
                         "id": "create-1",
-                        "name": "create_study_session",
+                        "name": "create_course_event",
                         "args": {
                             "course_id": "course-1",
-                            "topic": "filters",
+                            "title": "Review filters",
                             "starts_at": "2026-09-15T18:00:00",
                             "duration_minutes": 60,
+                            "requires_study_intent": True,
                         },
                     }
                 ],
             ),
-            AIMessage(content="The 6 PM session is ready for review."),
+            AIMessage(content="The 6 PM event is ready for review."),
         ]
     )
     delivery = _Delivery()
 
-    result = await _handler(gateway, _Store(), delivery)(
-        _message("Schedule ECE 202 filters for September 15 at 6 PM.")
-    )
+    result = await _handler(
+        gateway,
+        _Store(),
+        delivery,
+        calendar_semantic_interpreter=semantic,
+    )(_message("Schedule ECE 202 filters for September 15 at 6 PM."))
 
     assert result.status == "handled"
     assert len(delivery.confirmations) == 1
+    assert len(semantic.events) == 1
+    assert semantic.events[0].title == "Review filters"
     change = delivery.confirmations[0].changes[0]
     assert change.due_at == datetime(2026, 9, 15, 22, tzinfo=UTC)
     assert change.ends_at == datetime(2026, 9, 15, 23, tzinfo=UTC)
+    assert change.title == "Review filters"
+    assert change.assessment_type is AssessmentType.EVENT
+
+
+@pytest.mark.asyncio
+async def test_multi_lesson_request_can_propose_separate_ordered_course_events() -> None:
+    semantic = _CalendarSemanticInterpreter(
+        (CalendarEventSemanticStatus.VALID, CalendarEventSemanticStatus.VALID)
+    )
+    gateway = _Gateway(
+        [
+            AIMessage(
+                content="I'll verify the course.",
+                tool_calls=[
+                    {
+                        "id": "search-1",
+                        "name": "search_courses",
+                        "args": {"query": "ECE 202"},
+                    }
+                ],
+            ),
+            AIMessage(
+                content="I'll prepare two separate review events.",
+                tool_calls=[
+                    {
+                        "id": "create-1",
+                        "name": "create_course_event",
+                        "args": {
+                            "course_id": "course-1",
+                            "title": "Review ECE 202 lesson 3",
+                            "starts_at": "2026-09-15T18:00:00",
+                            "duration_minutes": 30,
+                            "requires_study_intent": True,
+                        },
+                    },
+                    {
+                        "id": "create-2",
+                        "name": "create_course_event",
+                        "args": {
+                            "course_id": "course-1",
+                            "title": "Review ECE 202 lesson 4",
+                            "starts_at": "2026-09-15T19:00:00",
+                            "duration_minutes": 30,
+                            "requires_study_intent": True,
+                        },
+                    },
+                ],
+            ),
+            AIMessage(content="Both review events are ready for confirmation."),
+        ]
+    )
+    delivery = _Delivery()
+
+    result = await _handler(
+        gateway,
+        _Store(),
+        delivery,
+        calendar_semantic_interpreter=semantic,
+    )(_message("Schedule separate ECE 202 reviews for lessons 3 and 4."))
+
+    assert result.status == "handled"
+    assert len(semantic.events) == 2
+    assert len(delivery.confirmations) == 1
+    changes = delivery.confirmations[0].changes
+    assert [change.title for change in changes] == [
+        "Review ECE 202 lesson 3",
+        "Review ECE 202 lesson 4",
+    ]
+    assert all(change.assessment_type is AssessmentType.EVENT for change in changes)
+
+
+@pytest.mark.asyncio
+async def test_course_event_semantic_failure_allows_one_title_repair() -> None:
+    semantic = _CalendarSemanticInterpreter(
+        (CalendarEventSemanticStatus.INVALID, CalendarEventSemanticStatus.VALID)
+    )
+    gateway = _Gateway(
+        [
+            AIMessage(
+                content="I will verify the course.",
+                tool_calls=[
+                    {"id": "search-1", "name": "search_courses", "args": {"query": "ECE 202"}}
+                ],
+            ),
+            AIMessage(
+                content="I will try the requested event title.",
+                tool_calls=[
+                    {
+                        "id": "create-1",
+                        "name": "create_course_event",
+                        "args": {
+                            "course_id": "course-1",
+                            "title": "Thing",
+                            "starts_at": "2026-09-15T18:00:00",
+                            "duration_minutes": 60,
+                            "requires_study_intent": True,
+                        },
+                    }
+                ],
+            ),
+            AIMessage(
+                content="I will retry with a clearer review title.",
+                tool_calls=[
+                    {
+                        "id": "create-2",
+                        "name": "create_course_event",
+                        "args": {
+                            "course_id": "course-1",
+                            "title": "Review filters",
+                            "starts_at": "2026-09-15T18:00:00",
+                            "duration_minutes": 60,
+                            "requires_study_intent": True,
+                        },
+                    }
+                ],
+            ),
+            AIMessage(content="The review event is ready for confirmation."),
+        ]
+    )
+    store = _Store()
+    delivery = _Delivery()
+
+    result = await _handler(
+        gateway,
+        store,
+        delivery,
+        calendar_semantic_interpreter=semantic,
+    )(_message("Help me catch up on ECE 202 filters at 6 PM."))
+
+    assert result.status == "handled"
+    assert len(semantic.events) == 2
+    assert len(store.proposals) == 1
+    assert "The event title did not pass semantic study-intent validation" in "\n".join(
+        delivery.responses
+    )
+    assert delivery.confirmations[0].changes[0].title == "Review filters"
+
+
+@pytest.mark.asyncio
+async def test_course_event_availability_slots_skip_host_calendar_commitments() -> None:
+    class AvailabilityCatalog(_Catalog):
+        def load_calendar_availability(self, *, now: datetime, horizon_days: int):
+            assert now == NOW
+            assert horizon_days == 7
+            return SimpleNamespace(
+                buffer_minutes=0,
+                availability=(
+                    SimpleNamespace(
+                        start_at=datetime(2026, 9, 9, 14, tzinfo=UTC),
+                        end_at=datetime(2026, 9, 9, 16, tzinfo=UTC),
+                    ),
+                ),
+                commitments=(
+                    SimpleNamespace(
+                        start_at=datetime(2026, 9, 9, 14, 30, tzinfo=UTC),
+                        end_at=datetime(2026, 9, 9, 15, tzinfo=UTC),
+                    ),
+                ),
+            )
+
+    state = _AcademicToolState(
+        catalog=AvailabilityCatalog(),
+        now=NOW,
+        timezone=ZoneInfo("America/Toronto"),
+        syncer=_Syncer(),
+    )
+    tools = {tool.name: tool for tool in state.tools()}
+
+    await tools["search_courses"].handler({"query": "ECE 202"})
+    slots = await tools["find_course_event_slots"].handler(
+        {
+            "course_id": "course-1",
+            "duration_minutes": 30,
+            "earliest_start_at": "2026-09-09T10:00:00",
+            "limit": 2,
+        }
+    )
+
+    assert slots == [
+        {
+            "starts_at": "2026-09-09T10:00",
+            "ends_at": "2026-09-09T10:30",
+            "timezone": "America/Toronto",
+            "duration_minutes": 30,
+        },
+        {
+            "starts_at": "2026-09-09T11:00",
+            "ends_at": "2026-09-09T11:30",
+            "timezone": "America/Toronto",
+            "duration_minutes": 30,
+        },
+    ]
 
 
 @pytest.mark.asyncio
@@ -615,9 +2143,9 @@ async def test_assessment_search_answers_with_owner_local_times() -> None:
             assessment_id="study-1",
             course_id="course-1",
             course_code="ECE 250",
-            title="Studying Block — insertion sort",
+            title="Review insertion sort",
             due_at=datetime(2026, 9, 15, 22, tzinfo=UTC),
-            assessment_type=AssessmentType.STUDYING_BLOCK,
+            assessment_type=AssessmentType.EVENT,
         ),
     )
 
@@ -640,7 +2168,7 @@ async def test_assessment_search_answers_with_owner_local_times() -> None:
             AIMessage(
                 content=(
                     "Download Analysis Software and Study Notes is due Saturday, September 12. "
-                    "The insertion sort study block starts Tuesday, September 15 at 6:00 PM."
+                    "Review insertion sort starts Tuesday, September 15 at 6:00 PM."
                 )
             ),
         ]
@@ -648,7 +2176,7 @@ async def test_assessment_search_answers_with_owner_local_times() -> None:
     delivery = _Delivery()
 
     result = await _handler(gateway, _Store(), delivery, catalog=Catalog())(
-        _message("When are my download-analysis event and insertion-sort study block?")
+        _message("When are my download-analysis event and insertion-sort review?")
     )
 
     assert result.status == "handled"
@@ -656,7 +2184,7 @@ async def test_assessment_search_answers_with_owner_local_times() -> None:
         "I'll check those calendar entries.",
         (
             "Download Analysis Software and Study Notes is due Saturday, September 12. "
-            "The insertion sort study block starts Tuesday, September 15 at 6:00 PM."
+            "Review insertion sort starts Tuesday, September 15 at 6:00 PM."
         ),
     ]
     model_context = "\n".join(str(message.content) for message in gateway.inputs[1])
@@ -668,7 +2196,7 @@ async def test_assessment_search_answers_with_owner_local_times() -> None:
 
 
 @pytest.mark.asyncio
-async def test_study_session_rejects_model_supplied_utc_timestamp() -> None:
+async def test_course_event_rejects_model_supplied_utc_timestamp() -> None:
     gateway = _Gateway(
         [
             AIMessage(
@@ -682,16 +2210,17 @@ async def test_study_session_rejects_model_supplied_utc_timestamp() -> None:
                 ],
             ),
             AIMessage(
-                content="I will prepare the session.",
+                content="I will prepare the event.",
                 tool_calls=[
                     {
                         "id": "create-1",
-                        "name": "create_study_session",
+                        "name": "create_course_event",
                         "args": {
                             "course_id": "course-1",
-                            "topic": "filters",
+                            "title": "Review filters",
                             "starts_at": "2026-09-15T18:00:00Z",
                             "duration_minutes": 60,
+                            "requires_study_intent": True,
                         },
                     }
                 ],
@@ -1175,6 +2704,89 @@ async def test_pdf_attach_requires_current_turn_assessment_and_owner_scoped_inta
     assert change.field == "attach_assessment_material"
     assert change.expected_title == "Assignment 2"
     assert change.inbound_material_ids == (material_id,)
+
+
+@pytest.mark.asyncio
+async def test_assessment_material_empty_semantic_result_does_not_fall_back_to_lexical() -> None:
+    assessment = AcademicAssessmentOption(
+        assessment_id="assessment-1",
+        course_id="course-1",
+        course_code="ECE 222",
+        title="Assignment 2",
+        due_at=datetime(2026, 10, 8, tzinfo=UTC),
+        assessment_type=AssessmentType.ASSIGNMENT,
+        expected_last_edited_at=NOW,
+    )
+
+    class Catalog:
+        lexical_called = False
+
+        def search_assessments(self, _query, _course_id=None):
+            return (assessment,)
+
+        async def search_semantic_assessment_materials(self, assessment_id, query, *, limit):
+            assert assessment_id == "assessment-1"
+            assert query == "recursion"
+            assert limit == 8
+            return ()
+
+        def search_document_chunks(self, **_kwargs):
+            self.lexical_called = True
+            return [{"content": "lexical fallback must not be used", "page": 1}]
+
+    catalog = Catalog()
+    state = _AcademicToolState(
+        catalog=catalog,
+        now=NOW,
+        timezone=ZoneInfo("America/Toronto"),
+        syncer=_Syncer(),
+    )
+    tools = {tool.name: tool for tool in state.tools()}
+
+    await tools["search_assessments"].handler({"query": "ECE 222 A2"})
+    rows = await tools["search_assessment_materials"].handler(
+        {"assessment_id": "assessment-1", "query": "recursion"}
+    )
+
+    assert rows == []
+    assert catalog.lexical_called is False
+
+
+@pytest.mark.asyncio
+async def test_assessment_material_semantic_unavailable_is_safe_tool_error() -> None:
+    assessment = AcademicAssessmentOption(
+        assessment_id="assessment-1",
+        course_id="course-1",
+        course_code="ECE 222",
+        title="Assignment 2",
+        due_at=datetime(2026, 10, 8, tzinfo=UTC),
+        assessment_type=AssessmentType.ASSIGNMENT,
+        expected_last_edited_at=NOW,
+    )
+
+    class Catalog:
+        def search_assessments(self, _query, _course_id=None):
+            return (assessment,)
+
+        async def search_semantic_assessment_materials(self, *_args, **_kwargs):
+            raise RuntimeError("semantic embeddings unavailable")
+
+        def search_document_chunks(self, **_kwargs):
+            raise AssertionError("lexical fallback must not run")
+
+    state = _AcademicToolState(
+        catalog=Catalog(),
+        now=NOW,
+        timezone=ZoneInfo("America/Toronto"),
+        syncer=_Syncer(),
+    )
+    tools = {tool.name: tool for tool in state.tools()}
+
+    await tools["search_assessments"].handler({"query": "ECE 222 A2"})
+    with pytest.raises(ToolExecutionError, match="semantic retrieval is unavailable"):
+        await tools["search_assessment_materials"].handler(
+            {"assessment_id": "assessment-1", "query": "recursion"}
+        )
 
 
 @pytest.mark.asyncio

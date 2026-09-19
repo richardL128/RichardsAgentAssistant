@@ -121,6 +121,9 @@ def test_application_rows_soft_deactivate_and_links_are_replay_safe(engine) -> N
     with Session(engine) as session, session.begin():
         active = JobInterviewRepository.list_active_application_rows(session)
         assert [row["row_block_id"] for row in active] == ["row-shopify"]
+        table_rows = JobInterviewRepository.list_application_table_rows(session)
+        assert [row["row_block_id"] for row in table_rows] == ["header", "row-shopify"]
+        assert table_rows[0]["is_header"] is True
         link = JobInterviewRepository.save_interview_link(
             session,
             link=InterviewLinkInput(
@@ -162,6 +165,21 @@ def test_application_rows_soft_deactivate_and_links_are_replay_safe(engine) -> N
         assert persisted is not None
         assert persisted["interview_content_fingerprint"] == "interview-hash"
         assert persisted["application_content_fingerprint"] == "row-hash"
+
+
+def test_sqlalchemy_store_exposes_application_table_headers_for_read_only_context(engine) -> None:
+    with Session(engine) as session, session.begin():
+        _seed_sources(session)
+
+    store = SQLAlchemyJobInterviewStore(engine)
+
+    matching_rows = store.application_row_snapshots()
+    table_rows = store.application_table_snapshots()
+
+    assert [row.row_block_id for row in matching_rows] == ["row-shopify"]
+    assert [row.row_block_id for row in table_rows] == ["header", "row-shopify"]
+    assert table_rows[0].is_header is True
+    assert table_rows[0].cells == ("Company", "Job")
 
 
 def test_current_plan_versions_only_material_changes(engine) -> None:
@@ -382,6 +400,10 @@ def test_jobs_calendar_items_are_upper_bounded_and_semantic_cache_is_optimistic(
                 analyzed_at=datetime(2026, 9, 9, 13, tzinfo=UTC),
                 evidence_ids=("frag-1",),
                 description_evidence_ids=("frag-1",),
+                intent_value="regular",
+                intent_status="valid",
+                intent_rationale="Career interviews are ordinary calendar events.",
+                intent_evidence_ids=("frag-2",),
             ),
         )
         stale = JobInterviewRepository.save_interview_calendar_semantics(
@@ -415,4 +437,8 @@ def test_jobs_calendar_items_are_upper_bounded_and_semantic_cache_is_optimistic(
     assert items[0]["is_all_day"] is True
     assert items[1]["semantic_status"] == "valid"
     assert items[1]["semantic_description"] == "The event is exactly at noon Toronto time."
+    assert items[1]["semantic_intent_value"] == "regular"
+    assert items[1]["semantic_intent_status"] == "valid"
+    assert items[1]["semantic_cache"]["intent_value"] == "regular"
+    assert items[1]["semantic_cache"]["intent_evidence_ids"] == ("frag-2",)
     assert items[1]["semantic_cache"]["source_fingerprint"] == "endpoint-source"

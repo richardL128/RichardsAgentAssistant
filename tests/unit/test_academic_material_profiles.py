@@ -192,11 +192,15 @@ def test_profile_repository_activates_last_good_and_feeds_planner_facts(engine: 
             == 1
         )
 
-    facts = store.load_planner_facts(now=NOW, horizon_days=14)
-    assert len(facts.assessments) == 1
-    assert facts.assessments[0].material_signals is not None
-    assert facts.assessments[0].material_signals.effort_lower_minutes == 120
-    assert facts.assessments[0].material_signals.evidence_chunk_ids == (str(chunk["chunk_id"]),)
+    with Session(engine) as session:
+        active = session.scalar(
+            select(AcademicAssessmentMaterialProfile).where(
+                AcademicAssessmentMaterialProfile.state == "active"
+            )
+        )
+        assert active is not None
+        assert active.effort_lower_minutes == 120
+        assert active.evidence_chunk_ids == [str(chunk["chunk_id"])]
 
 
 def test_profile_repository_rejects_stale_or_cross_assessment_evidence(engine: Engine) -> None:

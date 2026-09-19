@@ -98,6 +98,18 @@ class Database:
         }
         return self._check_tables(required, "LangGraph checkpoint schema")
 
+    def check_native_conversation_schema(self) -> tuple[bool, str]:
+        """Check the metadata tables required for restart-safe Discord sessions."""
+
+        required = {
+            "native_conversation_compactions",
+            "native_conversation_inbound_events",
+            "native_conversation_sessions",
+            "user_memory_events",
+            "user_memory_facts",
+        }
+        return self._check_tables(required, "Native context and memory schema")
+
     def check_code_review_schema(self) -> tuple[bool, str]:
         """Check the Phase 3 repository/review persistence tables."""
 

@@ -12,6 +12,7 @@ from sqlalchemy import create_engine, func, select
 from sqlalchemy.engine import Engine
 from sqlalchemy.orm import Session
 
+from app.agents.academic_planner.documents import DocumentChunk, PageCitation
 from app.agents.academic_planner.material_ingestion import (
     AssessmentMaterialIngestionService,
     assessment_material_fingerprint,
@@ -46,6 +47,32 @@ class _EmbeddingGateway:
             status="valid",
             model_identity=self.model_identity,
             embedding=SimpleNamespace(vector=[seed, 1.0]),
+        )
+
+
+class _BatchEmbeddingGateway:
+    model_identity = "fake-embedding:v2"
+
+    def __init__(self) -> None:
+        self.batch_calls: list[list[str]] = []
+        self.single_calls: list[str] = []
+
+    async def embed_academic_texts(self, texts: list[str]) -> SimpleNamespace:
+        self.batch_calls.append(texts)
+        return SimpleNamespace(
+            status="valid",
+            model_identity=self.model_identity,
+            embeddings=[
+                SimpleNamespace(vector=[float(index + 1), 1.0]) for index, _text in enumerate(texts)
+            ],
+        )
+
+    async def embed_academic_text(self, text: str) -> SimpleNamespace:
+        self.single_calls.append(text)
+        return SimpleNamespace(
+            status="valid",
+            model_identity=self.model_identity,
+            embedding=SimpleNamespace(vector=[1.0, 1.0]),
         )
 
 
@@ -244,6 +271,48 @@ def test_queue_fingerprint_uses_only_stable_metadata() -> None:
     assert first == assessment_material_fingerprint("assessment-page", NOW)
     assert first != assessment_material_fingerprint("assessment-page", NOW.replace(hour=13))
     assert len(first) == 64
+
+
+@pytest.mark.asyncio
+async def test_material_ingestion_prefers_batch_embedding_gateway(
+    material_runtime: tuple[Engine, ArtifactStore],
+) -> None:
+    engine, artifacts = material_runtime
+    gateway = _BatchEmbeddingGateway()
+    service = AssessmentMaterialIngestionService(
+        engine=engine,
+        connector=_Connector(
+            NotionAssessmentMaterials(assessment_page_id="assessment-page", last_edited_at=NOW)
+        ),  # type: ignore[arg-type]
+        artifact_store=artifacts,
+        embedding_gateway=gateway,
+        max_bytes=1024 * 1024,
+    )
+    chunks = (
+        DocumentChunk(
+            document_id="doc",
+            chunk_index=0,
+            content="first chunk",
+            page=1,
+            heading=None,
+            citation=PageCitation(1, "page 1"),
+        ),
+        DocumentChunk(
+            document_id="doc",
+            chunk_index=1,
+            content="second chunk",
+            page=2,
+            heading=None,
+            citation=PageCitation(2, "page 2"),
+        ),
+    )
+
+    embedded = await service._embed_chunks(chunks)
+
+    assert gateway.batch_calls == [["first chunk", "second chunk"]]
+    assert gateway.single_calls == []
+    assert [chunk.embedding for chunk in embedded] == [(1.0, 1.0), (2.0, 1.0)]
+    assert {chunk.embedding_model for chunk in embedded} == {"fake-embedding:v2"}
 
 
 @pytest.mark.asyncio

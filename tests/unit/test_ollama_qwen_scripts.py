@@ -34,6 +34,7 @@ BASH_SYNTAX_SCRIPT_PATHS = [
     DISCORD_WAKE_DAEMON_SCRIPT,
     LAUNCHD_COMMON_SCRIPT,
 ]
+DEFAULT_EMBEDDING_MODEL = "qwen3-embedding:4b"
 
 
 def _write_executable(path: Path, content: str) -> None:
@@ -59,8 +60,12 @@ def _fake_tool_env(tmp_path: Path) -> tuple[dict[str, str], Path, Path, Path, Pa
     calls_file = state_dir / "calls.log"
     tags_file = state_dir / "tags.json"
     ps_file = state_dir / "ps.json"
+    show_file = state_dir / "show.json"
+    embed_file = state_dir / "embed.json"
     _write_json(tags_file, {"models": []})
     _write_json(ps_file, {"models": []})
+    _write_json(show_file, {"capabilities": ["embedding"]})
+    _write_json(embed_file, {"embeddings": [[0.0] * 1024]})
     calls_file.write_text("", encoding="utf-8")
 
     _write_executable(
@@ -77,6 +82,12 @@ case "$url" in
     ;;
   */api/ps)
     cat "$OLLAMA_FAKE_PS_FILE"
+    ;;
+  */api/show)
+    cat "${OLLAMA_FAKE_SHOW_FILE:-$OLLAMA_FAKE_STATE_DIR/show.json}"
+    ;;
+  */api/embed)
+    cat "${OLLAMA_FAKE_EMBED_FILE:-$OLLAMA_FAKE_STATE_DIR/embed.json}"
     ;;
   *)
     exit 22
@@ -286,6 +297,8 @@ printf 'python:%s\n' "$*" >> "$OLLAMA_FAKE_CALLS_FILE"
             "OLLAMA_FAKE_STATE_DIR": str(state_dir),
             "OLLAMA_FAKE_TAGS_FILE": str(tags_file),
             "OLLAMA_FAKE_PS_FILE": str(ps_file),
+            "OLLAMA_FAKE_SHOW_FILE": str(show_file),
+            "OLLAMA_FAKE_EMBED_FILE": str(embed_file),
             "OLLAMA_FAKE_CALLS_FILE": str(calls_file),
             "OLLAMA_QWEN_RUNTIME_DIR": str(runtime_dir),
             "LIFEAGENT_LAUNCH_AGENTS_DIR": str(launch_agents_dir),
@@ -343,7 +356,15 @@ def test_start_uses_safe_env_allowlist_and_is_idempotent(tmp_path: Path) -> None
     env, calls_file, tags_file, _ps_file, _runtime_dir = _fake_tool_env(tmp_path)
     model = "qwen-env:latest"
     digest = "sha256-good"
-    _write_json(tags_file, {"models": [{"name": model, "digest": digest}]})
+    _write_json(
+        tags_file,
+        {
+            "models": [
+                {"name": model, "digest": digest},
+                {"name": DEFAULT_EMBEDDING_MODEL, "digest": "embedding-digest"},
+            ]
+        },
+    )
     pwned_file = tmp_path / "pwned"
     env_file = tmp_path / "life.env"
     env_file.write_text(
@@ -383,7 +404,15 @@ def test_start_requires_explicit_pull_for_missing_model(tmp_path: Path) -> None:
         encoding="utf-8",
     )
     after_pull_file = tmp_path / "after-pull.json"
-    _write_json(after_pull_file, {"models": [{"name": model, "digest": "after-pull"}]})
+    _write_json(
+        after_pull_file,
+        {
+            "models": [
+                {"name": model, "digest": "after-pull"},
+                {"name": DEFAULT_EMBEDDING_MODEL, "digest": "embedding-after-pull"},
+            ]
+        },
+    )
     env["OLLAMA_FAKE_TAGS_AFTER_PULL"] = str(after_pull_file)
 
     missing = _run_script(START_SCRIPT, "--env-file", str(env_file), env=env)
@@ -393,7 +422,9 @@ def test_start_requires_explicit_pull_for_missing_model(tmp_path: Path) -> None:
 
     pulled = _run_script(START_SCRIPT, "--env-file", str(env_file), "--pull", env=env)
     assert pulled.returncode == 0
-    assert f"pull:{model}" in calls_file.read_text(encoding="utf-8")
+    calls = calls_file.read_text(encoding="utf-8")
+    assert f"pull:{model}" in calls
+    assert f"pull:{DEFAULT_EMBEDDING_MODEL}" in calls
     assert json.loads(tags_file.read_text(encoding="utf-8"))["models"][0]["name"] == model
 
 
@@ -401,7 +432,15 @@ def test_start_installs_launchagent_and_waits_for_bounded_readiness(tmp_path: Pa
     env, calls_file, tags_file, _ps_file, _runtime_dir = _fake_tool_env(tmp_path)
     model = "qwen-start:latest"
     digest = "digest-start"
-    _write_json(tags_file, {"models": [{"name": model, "digest": digest}]})
+    _write_json(
+        tags_file,
+        {
+            "models": [
+                {"name": model, "digest": digest},
+                {"name": DEFAULT_EMBEDDING_MODEL, "digest": "embedding-digest"},
+            ]
+        },
+    )
     env_file = tmp_path / "life.env"
     env_file.write_text(
         f"OLLAMA_MODEL={model}\nOLLAMA_MODEL_DIGEST={digest}\nOLLAMA_STARTUP_TIMEOUT_SECONDS=3\n",
@@ -468,29 +507,60 @@ def test_status_reports_exit_codes_without_model_metadata(tmp_path: Path) -> Non
         f"OLLAMA_MODEL={model}\nOLLAMA_MODEL_DIGEST={digest}\n",
         encoding="utf-8",
     )
-    _write_json(tags_file, {"models": [{"name": model, "digest": digest, "size": 12345}]})
-    _write_json(ps_file, {"models": [{"name": model, "size": 99999}]})
+    _write_json(
+        tags_file,
+        {
+            "models": [
+                {"name": model, "digest": digest, "size": 12345},
+                {"name": DEFAULT_EMBEDDING_MODEL, "digest": "embedding-digest", "size": 678},
+            ]
+        },
+    )
+    _write_json(
+        ps_file,
+        {
+            "models": [
+                {"name": model, "size": 99999, "context_length": 16384, "size_vram": 25000},
+                {
+                    "name": DEFAULT_EMBEDDING_MODEL,
+                    "size": 888,
+                    "context_length": 2048,
+                    "size_vram": 777,
+                },
+            ]
+        },
+    )
     (tmp_path / "state" / "loaded-com.lifeagent.ollama").touch()
 
     ok = _run_script(STATUS_SCRIPT, "--env-file", str(env_file), env=env)
     assert ok.returncode == 0
     assert "ollama_launchd=running" in ok.stdout
     assert "ollama_api=reachable" in ok.stdout
-    assert "model_installed=yes" in ok.stdout
-    assert "digest_match=yes" in ok.stdout
-    assert "qwen_resident=yes" in ok.stdout
+    assert "reasoning_model_installed=yes" in ok.stdout
+    assert "reasoning_digest_match=yes" in ok.stdout
+    assert "embedding_model_installed=yes" in ok.stdout
+    assert "embedding_digest_match=unchecked" in ok.stdout
+    assert "embedding_capability=yes" in ok.stdout
+    assert "reasoning_resident=yes" in ok.stdout
+    assert "reasoning_context_length=16384" in ok.stdout
+    assert "reasoning_size_vram=25000" in ok.stdout
+    assert "embedding_resident=yes" in ok.stdout
+    assert "embedding_context_length=2048" in ok.stdout
+    assert "embedding_size_vram=777" in ok.stdout
+    assert "host_memory_free_percent=" in ok.stdout
+    assert "host_swapouts=" in ok.stdout
+    assert "host_swapout_bytes=" in ok.stdout
     assert "12345" not in ok.stdout
-    assert "99999" not in ok.stdout
 
     _write_json(tags_file, {"models": []})
     missing = _run_script(STATUS_SCRIPT, "--env-file", str(env_file), env=env)
     assert missing.returncode == 2
-    assert "model_installed=no" in missing.stdout
+    assert "reasoning_model_installed=no" in missing.stdout
 
     _write_json(tags_file, {"models": [{"name": model, "digest": "wrong"}]})
     mismatch = _run_script(STATUS_SCRIPT, "--env-file", str(env_file), env=env)
     assert mismatch.returncode == 3
-    assert "digest_match=no" in mismatch.stdout
+    assert "reasoning_digest_match=no" in mismatch.stdout
 
     (tmp_path / "state" / "api_down").touch()
     unreachable = _run_script(STATUS_SCRIPT, "--env-file", str(env_file), env=env)
@@ -601,8 +671,16 @@ def test_host_runtime_status_and_uninstall_report_both_launchagents(tmp_path: Pa
     digest = "digest-status"
     env_file = tmp_path / "life.env"
     env_file.write_text(f"OLLAMA_MODEL={model}\nOLLAMA_MODEL_DIGEST={digest}\n", encoding="utf-8")
-    _write_json(tags_file, {"models": [{"name": model, "digest": digest}]})
-    _write_json(ps_file, {"models": [{"name": model}]})
+    _write_json(
+        tags_file,
+        {
+            "models": [
+                {"name": model, "digest": digest},
+                {"name": DEFAULT_EMBEDDING_MODEL, "digest": "embedding-digest"},
+            ]
+        },
+    )
+    _write_json(ps_file, {"models": [{"name": model}, {"name": DEFAULT_EMBEDDING_MODEL}]})
     _seed_installed_image_marker(_runtime_dir)
 
     install = _run_script(HOST_RUNTIME_SCRIPT, "install", "--env-file", str(env_file), env=env)
@@ -756,7 +834,15 @@ def test_status_rejects_loaded_but_inactive_launchagent(tmp_path: Path) -> None:
         f"OLLAMA_MODEL={model}\nOLLAMA_MODEL_DIGEST={digest}\n",
         encoding="utf-8",
     )
-    _write_json(tags_file, {"models": [{"name": model, "digest": digest}]})
+    _write_json(
+        tags_file,
+        {
+            "models": [
+                {"name": model, "digest": digest},
+                {"name": DEFAULT_EMBEDDING_MODEL, "digest": "embedding-digest"},
+            ]
+        },
+    )
     _write_json(ps_file, {"models": []})
     _seed_installed_image_marker(_runtime_dir)
     installed = _run_script(HOST_RUNTIME_SCRIPT, "install", "--env-file", str(env_file), env=env)
@@ -780,7 +866,15 @@ def test_ollama_status_rejects_crash_loop_even_when_api_is_reachable(tmp_path: P
         f"OLLAMA_MODEL={model}\nOLLAMA_MODEL_DIGEST={digest}\n",
         encoding="utf-8",
     )
-    _write_json(tags_file, {"models": [{"name": model, "digest": digest}]})
+    _write_json(
+        tags_file,
+        {
+            "models": [
+                {"name": model, "digest": digest},
+                {"name": DEFAULT_EMBEDDING_MODEL, "digest": "embedding-digest"},
+            ]
+        },
+    )
     _write_json(ps_file, {"models": []})
     state_dir = tmp_path / "state"
     (state_dir / "loaded-com.lifeagent.ollama").touch()

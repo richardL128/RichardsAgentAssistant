@@ -27,6 +27,7 @@ from app.db.models import (
     AcademicCourseCalendar,
     AcademicDocument,
     AcademicDocumentChunk,
+    AcademicInboundMaterial,
     AcademicProposalOperationJournal,
     AcademicProposedChange,
     AcademicSetupReminder,
@@ -35,8 +36,6 @@ from app.db.models import (
     AuditEvent,
     Base,
     Course,
-    StudyBlock,
-    StudyPlan,
 )
 
 
@@ -89,6 +88,34 @@ def _checkin_proposal(
         payload={"completed": True},
         redacted_preview="Mark the assessment complete.",
         confirmation_token=confirmation_event,
+        expires_at=expires_at,
+    )
+
+
+def _inbound_material_row(
+    message_id: str,
+    attachment_id: str,
+    *,
+    owner: str,
+    channel: str,
+    state: str,
+    expires_at: datetime,
+    proposal_id: UUID | None = None,
+) -> AcademicInboundMaterial:
+    suffix = int(attachment_id[-6:])
+    return AcademicInboundMaterial(
+        discord_message_id=message_id,
+        discord_attachment_id=attachment_id,
+        owner_discord_user_id=owner,
+        discord_channel_id=channel,
+        filename=f"material-{suffix}.pdf",
+        media_type="application/pdf",
+        declared_byte_size=10,
+        observed_byte_size=10,
+        content_hash=f"{suffix:064x}",
+        raw_artifact_key=f"{suffix + 100:064x}",
+        state=state,
+        proposal_id=proposal_id,
         expires_at=expires_at,
     )
 
@@ -153,14 +180,6 @@ def test_delta_upserts_preserve_typed_citations_and_ambiguity(engine) -> None:
         stored = session.get(Assessment, revised_id)
         assert stored is not None
         assert stored.source_page == 4
-        facts = SQLAlchemyAcademicPlannerStore(engine).load_planner_facts(
-            now=datetime(2026, 10, 1, tzinfo=UTC), horizon_days=14
-        )
-    assert [assessment.id for assessment in facts.assessments] == ["notion-assignment-1"]
-    assert facts.assessments[0].estimated_minutes == 240
-    assert facts.assessments[0].course_priority == 80
-    assert [item.id for item in facts.ambiguous_facts] == ["notion-quiz-1"]
-    assert facts.ambiguous_facts[0].source_citation == "page 3, block schedule"
 
 
 def test_assessment_end_range_is_nullable_and_validated(engine) -> None:
@@ -173,8 +192,8 @@ def test_assessment_end_range_is_nullable_and_validated(engine) -> None:
             session,
             notion_id="notion-study-1",
             course_id=course,
-            title="Studying Block - Race conditions",
-            assessment_type="studying_block",
+            title="Course Event - Race conditions",
+            assessment_type="event",
             due_at=starts,
             ends_at=ends,
             grade_weight_percent=None,
@@ -201,8 +220,8 @@ def test_assessment_end_range_is_nullable_and_validated(engine) -> None:
                 session,
                 notion_id="notion-invalid-range",
                 course_id=course,
-                title="Invalid studying block",
-                assessment_type="studying_block",
+                title="Invalid event",
+                assessment_type="event",
                 due_at=starts,
                 ends_at=starts,
                 grade_weight_percent=None,
@@ -322,12 +341,11 @@ def test_store_preserves_expanded_todo_types_for_generic_scheduling(engine) -> N
     from app.agents.academic_planner.contracts import AssessmentType
 
     course = _course(engine)
-    now = datetime(2026, 10, 1, 12, tzinfo=UTC)
     due = datetime(2026, 10, 3, 15, tzinfo=UTC)
     expected_types = {
         "notion-tutorial-1": AssessmentType.TUTORIAL,
         "notion-lab-1": AssessmentType.LAB,
-        "notion-studying-block-1": AssessmentType.STUDYING_BLOCK,
+        "notion-event-1": AssessmentType.EVENT,
     }
     with Session(engine) as session, session.begin():
         for index, (notion_id, assessment_type) in enumerate(expected_types.items()):
@@ -345,11 +363,67 @@ def test_store_preserves_expanded_todo_types_for_generic_scheduling(engine) -> N
                 citation=SourceCitation(),
             )
 
-    facts = SQLAlchemyAcademicPlannerStore(engine).load_planner_facts(now=now, horizon_days=7)
+    with Session(engine) as session:
+        stored = session.scalars(select(Assessment).where(Assessment.notion_id.in_(expected_types)))
+        assert {
+            assessment.notion_id: AssessmentType(assessment.assessment_type)
+            for assessment in stored
+        } == expected_types
 
-    assert {assessment.id: assessment.assessment_type for assessment in facts.assessments} == (
-        expected_types
+
+def test_calendar_availability_includes_fixed_and_timed_calendar_events(engine) -> None:
+    course = _course(engine)
+    now = datetime(2026, 10, 1, 12, tzinfo=UTC)
+    with Session(engine) as session, session.begin():
+        AcademicRepository.upsert_fixed_commitment(
+            session,
+            notion_id="class-ece250",
+            title="ECE 250 lecture",
+            commitment_type="class",
+            starts_at=now + timedelta(hours=1),
+            ends_at=now + timedelta(hours=2),
+            timezone="America/Toronto",
+            citation=SourceCitation(),
+            confidence=1,
+            fact_state="confirmed",
+        )
+        AcademicRepository.upsert_assessment(
+            session,
+            notion_id="event-review",
+            course_id=course,
+            title="Review graph traversal",
+            assessment_type="event",
+            due_at=now + timedelta(hours=3),
+            ends_at=now + timedelta(hours=4),
+            grade_weight_percent=None,
+            confidence=1,
+            fact_state="confirmed",
+            citation=SourceCitation(),
+        )
+        AcademicRepository.upsert_preferences(
+            session,
+            scope="owner",
+            timezone="America/Toronto",
+            availability={
+                "windows": [
+                    {
+                        "start_at": (now + timedelta(minutes=30)).isoformat(),
+                        "end_at": (now + timedelta(hours=5)).isoformat(),
+                    }
+                ]
+            },
+            daily_capacity_minutes=240,
+            buffer_minutes=10,
+        )
+
+    facts = SQLAlchemyAcademicPlannerStore(engine).load_calendar_availability(
+        now=now,
+        horizon_days=7,
     )
+
+    assert [item.id for item in facts.commitments] == ["class-ece250", "event-review"]
+    assert len(facts.availability) == 1
+    assert facts.buffer_minutes == 10
 
 
 def test_upcoming_calendar_items_use_local_window_and_semantic_cache(engine) -> None:
@@ -416,6 +490,10 @@ def test_upcoming_calendar_items_use_local_window_and_semantic_cache(engine) -> 
                 prompt_version="prompt-v1",
                 analyzed_at=datetime(2026, 9, 9, 13, tzinfo=UTC),
                 evidence_ids=("frag-1",),
+                intent_value="study",
+                intent_status="valid",
+                intent_rationale="Quiz prep is study-related.",
+                intent_evidence_ids=("frag-2",),
             ),
         )
         stale = AcademicRepository.save_assessment_calendar_semantics(
@@ -450,6 +528,10 @@ def test_upcoming_calendar_items_use_local_window_and_semantic_cache(engine) -> 
     assert items[1]["is_all_day"] is True
     assert items[1]["semantic_status"] == "not_substantive"
     assert items[1]["semantic_overview"] == "A quiz scheduled as an all-day course date."
+    assert items[1]["semantic_intent_value"] == "study"
+    assert items[1]["semantic_intent_status"] == "valid"
+    assert items[1]["semantic_cache"]["intent_value"] == "study"
+    assert items[1]["semantic_cache"]["intent_evidence_ids"] == ("frag-2",)
     assert items[1]["semantic_cache"]["source_fingerprint"] == "academic-source-v1"
 
 
@@ -1050,7 +1132,7 @@ def test_clarification_claims_ignore_and_write_states_are_replay_safe(engine) ->
 
 def test_clarification_persists_all_todo_previews_and_write_decisions(engine) -> None:
     expected = datetime(2026, 9, 5, 15, tzinfo=UTC)
-    actions = ("quiz", "assignment", "tutorial", "lab", "studying_block", "ignore")
+    actions = ("quiz", "assignment", "tutorial", "lab", "event", "ignore")
     with Session(engine) as session, session.begin():
         for action in actions:
             row = AcademicRepository.create_or_get_clarification(
@@ -1063,7 +1145,7 @@ def test_clarification_persists_all_todo_previews_and_write_decisions(engine) ->
                     assignment_preview_title="Assignment - Chapter 4",
                     tutorial_preview_title="Tutorial - Chapter 4",
                     lab_preview_title="Lab - Chapter 4",
-                    studying_block_preview_title="Studying Block - Chapter 4",
+                    event_preview_title="Course Event - Chapter 4",
                     expected_edited_at=expected,
                     expires_at=expected + timedelta(hours=24),
                     idempotency_key=f"clarification:{action}:v1",
@@ -1114,12 +1196,12 @@ def test_clarification_persists_all_todo_previews_and_write_decisions(engine) ->
     with Session(engine) as session:
         stored = session.scalar(
             select(AcademicClarification).where(
-                AcademicClarification.event_notion_id == "event-studying_block"
+                AcademicClarification.event_notion_id == "event-event"
             )
         )
         assert stored is not None
-        assert stored.decision == "studying_block"
-        assert stored.studying_block_preview_title == "Studying Block - Chapter 4"
+        assert stored.decision == "event"
+        assert stored.event_preview_title == "Course Event - Chapter 4"
         assert session.scalar(select(func.count()).select_from(AcademicClarification)) == 7
 
 
@@ -1189,6 +1271,122 @@ def test_store_reads_and_expires_clarifications_without_secret_payloads(engine) 
     assert expired["state"] == "expired"
 
 
+def test_abort_owner_channel_continuations_closes_only_resumable_state(engine) -> None:
+    now = datetime(2026, 9, 15, 12, tzinfo=UTC)
+    channel_id = "222222222222222222"
+    user_id = "333333333333333333"
+    with Session(engine) as session, session.begin():
+        learning = AcademicRepository.create_discourse_session(
+            session,
+            external_event_id="learning-session",
+            discord_channel_id=channel_id,
+            discord_user_id=user_id,
+            session_kind="learning_focus",
+            partial_state={"private": "removed on abort"},
+            started_at=now - timedelta(minutes=5),
+        )
+        review = AcademicRepository.create_discourse_session(
+            session,
+            external_event_id="memory-review-session",
+            discord_channel_id=channel_id,
+            discord_user_id=user_id,
+            session_kind="memory_review",
+            partial_state={"step": "reviewing"},
+            started_at=now - timedelta(minutes=4),
+        )
+        unrelated = AcademicRepository.create_discourse_session(
+            session,
+            external_event_id="other-channel-session",
+            discord_channel_id="444444444444444444",
+            discord_user_id=user_id,
+            session_kind="memory_review",
+            partial_state={"step": "reviewing"},
+            started_at=now - timedelta(minutes=4),
+        )
+        later_session = AcademicRepository.create_discourse_session(
+            session,
+            external_event_id="later-session",
+            discord_channel_id=channel_id,
+            discord_user_id=user_id,
+            session_kind="memory_review",
+            partial_state={"step": "later"},
+            started_at=now + timedelta(seconds=1),
+        )
+        proposal = _checkin_proposal(
+            session,
+            event_id="proposal-kept",
+            idempotency_key="proposal-kept",
+            expires_at=now + timedelta(hours=1),
+        )
+        captured = _inbound_material_row(
+            "111111111111111111",
+            "111111111111111112",
+            owner=user_id,
+            channel=channel_id,
+            state="captured",
+            expires_at=now + timedelta(hours=1),
+        )
+        awaiting = _inbound_material_row(
+            "111111111111111113",
+            "111111111111111114",
+            owner=user_id,
+            channel=channel_id,
+            state="awaiting_target",
+            expires_at=now + timedelta(hours=1),
+        )
+        proposal_linked = _inbound_material_row(
+            "111111111111111115",
+            "111111111111111116",
+            owner=user_id,
+            channel=channel_id,
+            state="awaiting_target",
+            proposal_id=proposal.id,
+            expires_at=now + timedelta(hours=1),
+        )
+        later_material = _inbound_material_row(
+            "111111111111111117",
+            "111111111111111118",
+            owner=user_id,
+            channel=channel_id,
+            state="captured",
+            expires_at=now + timedelta(hours=1),
+        )
+        session.add_all((captured, awaiting, proposal_linked, later_material))
+        session.flush()
+        captured.created_at = now - timedelta(minutes=2)
+        awaiting.created_at = now - timedelta(minutes=2)
+        proposal_linked.created_at = now - timedelta(minutes=2)
+        later_material.created_at = now + timedelta(seconds=1)
+
+        result = AcademicRepository.abort_owner_channel_continuations(
+            session,
+            discord_channel_id=channel_id,
+            discord_user_id=user_id,
+            abort_event_id="999999999999999999",
+            aborted_at=now,
+        )
+
+        assert result == {
+            "discourse_sessions_closed": 2,
+            "inbound_materials_expired": 2,
+        }
+        assert learning.state == "completed"
+        assert review.state == "completed"
+        assert learning.partial_state == {
+            "outcome": "aborted",
+            "abort_discord_event_id": "999999999999999999",
+            "aborted_at": now.isoformat(),
+        }
+        assert unrelated.state == "open"
+        assert later_session.state == "open"
+        assert captured.state == "expired"
+        assert captured.error_code == "user_abort"
+        assert awaiting.state == "expired"
+        assert proposal_linked.state == "awaiting_target"
+        assert later_material.state == "captured"
+        assert proposal.state == "pending"
+
+
 def test_store_serializes_expanded_clarification_previews(engine) -> None:
     store = SQLAlchemyAcademicPlannerStore(engine)
     expected = datetime(2026, 9, 5, 15, tzinfo=UTC)
@@ -1200,7 +1398,7 @@ def test_store_serializes_expanded_clarification_previews(engine) -> None:
         assignment_preview_title="Assignment - Chapter 8",
         tutorial_preview_title="Tutorial - Chapter 8",
         lab_preview_title="Lab - Chapter 8",
-        studying_block_preview_title="Studying Block - Chapter 8",
+        event_preview_title="Course Event - Chapter 8",
         expected_edited_at=expected,
         expires_at=expected + timedelta(hours=24),
         idempotency_key="clarification:event-expanded-store:v1",
@@ -1209,20 +1407,20 @@ def test_store_serializes_expanded_clarification_previews(engine) -> None:
 
     first, row = store.claim_clarification(
         clarification_id,
-        "studying_block",
+        "event",
         123456789,
         now=expected + timedelta(minutes=1),
     )
 
     assert first == "ready"
-    assert row["decision"] == "studying_block"
-    assert row["studying_block_preview_title"] == "Studying Block - Chapter 8"
+    assert row["decision"] == "event"
+    assert row["event_preview_title"] == "Course Event - Chapter 8"
     assert row["preview_titles"] == {
         "quiz": "Quiz - Chapter 8",
         "assignment": "Assignment - Chapter 8",
         "tutorial": "Tutorial - Chapter 8",
         "lab": "Lab - Chapter 8",
-        "studying_block": "Studying Block - Chapter 8",
+        "event": "Course Event - Chapter 8",
     }
 
 
@@ -1307,57 +1505,6 @@ def test_clarification_expiry_reminders_and_health_snapshot(engine) -> None:
             .where(AcademicSetupReminder.state != "cleared")
         )
         assert active_reminders == 1
-
-
-def test_plan_replay_and_incomplete_carry_forward_are_visible(engine) -> None:
-    starts = datetime(2026, 9, 4, 14, tzinfo=UTC)
-    with Session(engine) as session, session.begin():
-        source = AcademicRepository.upsert_study_plan(
-            session,
-            plan_key="plan-2026-09-04",
-            starts_on=date(2026, 9, 4),
-            ends_on=date(2026, 9, 10),
-            timezone="America/Toronto",
-        )
-        target = AcademicRepository.upsert_study_plan(
-            session,
-            plan_key="plan-2026-09-11",
-            starts_on=date(2026, 9, 11),
-            ends_on=date(2026, 9, 17),
-            timezone="America/Toronto",
-        )
-        block = AcademicRepository.upsert_study_block(
-            session,
-            plan_id=source.id,
-            block_key="assessment-1-block-1",
-            title="Carry this work",
-            starts_at=starts,
-            ends_at=starts + timedelta(minutes=60),
-            allocated_minutes=60,
-            status="incomplete",
-            notes="20 minutes remain.",
-        )
-        carried = AcademicRepository.carry_forward_incomplete_blocks(
-            session,
-            source_plan_id=source.id,
-            target_plan_id=target.id,
-            starts_at=datetime(2026, 9, 11, 14, tzinfo=UTC),
-        )
-        replay = AcademicRepository.carry_forward_incomplete_blocks(
-            session,
-            source_plan_id=source.id,
-            target_plan_id=target.id,
-            starts_at=datetime(2026, 9, 11, 14, tzinfo=UTC),
-        )
-        assert len(carried) == len(replay) == 1
-        assert carried[0].id == replay[0].id
-        assert carried[0].carry_forward_from_id == block.id
-        assert carried[0].status == "carried_forward"
-        assert carried[0].ends_at > carried[0].starts_at
-
-    with Session(engine) as session:
-        assert session.scalar(select(func.count()).select_from(StudyPlan)) == 2
-        assert session.scalar(select(func.count()).select_from(StudyBlock)) == 2
 
 
 def test_checkin_proposal_requires_exact_confirmation_and_is_replay_safe(engine) -> None:
@@ -1454,7 +1601,6 @@ def test_checkin_proposal_rejection_is_atomic_audited_and_replay_safe(engine) ->
         assert audit_events[0].target_id == proposal_public_id
         assert audit_events[0].result == "rejected"
         assert session.scalar(select(func.count()).select_from(Assessment)) == 0
-        assert session.scalar(select(func.count()).select_from(StudyBlock)) == 0
 
 
 def test_rejecting_expired_or_non_pending_proposal_never_audits(engine) -> None:
@@ -1657,46 +1803,6 @@ def test_store_persists_discord_checkin_with_external_event_dedupe(engine) -> No
         }
         assert "raw private text" not in str(checkin)
         assert "raw private text" not in str(proposed.payload)
-
-
-def test_store_resolves_public_daily_plan_key_for_discord_checkin(engine) -> None:
-    from app.agents.academic_planner.contracts import CheckinProposal, ProposedChange
-
-    store = SQLAlchemyAcademicPlannerStore(engine)
-    public_plan_id = uuid4()
-    with Session(engine) as session, session.begin():
-        plan = AcademicRepository.upsert_study_plan(
-            session,
-            plan_key=str(public_plan_id),
-            starts_on=date(2026, 9, 3),
-            ends_on=date(2026, 9, 3),
-            timezone="America/Toronto",
-            status="published",
-        )
-        internal_plan_id = plan.id
-
-    result = store.save_discord_checkin(
-        CheckinProposal(
-            proposal_id=uuid4(),
-            confirmation_event="confirm 01234567-89ab-4def-8123-456789abcdef",
-            changes=(
-                ProposedChange(
-                    field="completed",
-                    value="true",
-                    assessment_id="notion-assignment-1",
-                ),
-            ),
-            source_plan_id=public_plan_id,
-        ),
-        external_event_id="discord-message-with-plan",
-        channel="discord",
-        received_at=datetime(2026, 9, 3, 22, tzinfo=UTC),
-    )
-
-    with Session(engine) as session:
-        checkin = session.get(AcademicCheckIn, result.checkin_id)
-        assert checkin is not None
-        assert checkin.plan_id == internal_plan_id
 
 
 def test_store_persists_zero_change_discord_checkin_as_questioned_only(engine) -> None:

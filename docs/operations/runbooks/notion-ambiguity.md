@@ -2,19 +2,20 @@
 
 ## Symptom
 
-The academic planner sends a Discord clarification question to Richard instead
-of publishing a completed plan. The clarification asks about ambiguous data such
-as a deadline with multiple possible interpretations, a time zone mismatch, or
-conflicting weights for a course. The operations console shows the academic
-planner card as `Attention` with a `waiting_for_approval` state.
+The academic Notion sync sends a Discord clarification question to Richard
+instead of guessing a typed calendar fact. The clarification asks about
+ambiguous data such as a deadline with multiple possible interpretations, a
+time zone mismatch, or conflicting weights for a course. The operations console
+shows the academic planner card as `Attention` with a `waiting_for_approval`
+state.
 
-This runbook covers deterministic academic planning and Discord clarification
-workflow. Assessment material may improve Discord-triggered guidance, but it never
+This runbook covers deterministic fact synchronization and Discord clarification.
+Assessment material may improve Discord-triggered guidance, but it never
 silently resolves an ambiguous deadline or conflicting weight.
 
 Ambiguous facts must not automatically become hard schedule constraints. The
-planner identifies ambiguous data in Notion, asks for clarification through
-Discord, and waits for Richard's response before finalizing the schedule.
+sync identifies ambiguous data in Notion, asks for clarification through
+Discord, and waits for Richard's response before finalizing the fact.
 
 ## Diagnosis
 
@@ -163,7 +164,7 @@ automatically. Inspect the operation journal and Notion assessment page first.
 **To respond to an approval request:**
 
 The planner sends clarification questions to Discord. Use the Quiz, Assignment,
-Tutorial, Lab, Studying Block, or Ignore button on the relevant message.
+Tutorial, Lab, Event, or Ignore button on the relevant message.
 LifeAgent changes that message to a queued state immediately, removes its
 buttons, and processes the guarded Notion write through the API runtime.
 Multiple clarification messages can be queued without one slow Notion request

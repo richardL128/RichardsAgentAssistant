@@ -22,9 +22,9 @@ owner allowlist must not load Qwen.
 
 The one executable automatic planner schedule is the combined morning
 notification. Host code refreshes Notion, builds the intended local day's
-academic plan, selects course and Jobs events in the exact 10-day-12-hour local
-window, validates Qwen-produced event semantics, and sends a persisted,
-idempotent multipart Discord briefing.
+calendar agenda, selects course, misc, and Jobs events in the exact
+10-day-12-hour local window, validates Qwen-produced event semantics, and sends
+a persisted, idempotent multipart Discord briefing.
 
 ## 1. Start the platform
 
@@ -110,12 +110,16 @@ environment overrides, and never evaluate `.env` as shell code.
 scripts/ollama_qwen_status.sh
 ```
 
-Set `OLLAMA_MODEL` to the exact configured Qwen model and pin
-`OLLAMA_MODEL_DIGEST` after verifying the installed model:
+Configure the reasoning and embedding roles separately. Pin each digest after
+verifying the installed model:
 
 ```dotenv
 OLLAMA_MODEL=qwen3-32gb:latest
 OLLAMA_MODEL_DIGEST=
+EMBEDDING_MODEL=qwen3-embedding:4b
+EMBEDDING_MODEL_DIGEST=
+EMBEDDING_DIMENSIONS=1024
+EMBEDDING_MODEL_KEEP_ALIVE_SECONDS=300
 MODEL_TRIGGER_MODE=authorized_discord_channel
 OLLAMA_MODEL_KEEP_ALIVE_SECONDS=300
 OLLAMA_STARTUP_TIMEOUT_SECONDS=30
@@ -126,9 +130,20 @@ private Discord channel. Study-plan, code-review, and finance Qwen schedules are
 not configured. The separate academic morning schedule is host-controlled and
 uses the same configured model only for bounded event semantics.
 
-Clearing `OLLAMA_MODEL_DIGEST` skips digest pinning during first setup. Pin the
-actual digest later after verifying the model, by copying the digest returned
-from `/api/tags`.
+Clearing either digest skips that role's digest pin during first setup. Pin the
+actual digests later after verifying both models in `/api/tags`. The 32B model
+is used for reasoning; the 4B model produces normalized 1,024-dimensional
+vectors for assessment materials, durable academic memory, and generic
+owner-scoped preference/fact retrieval. Generic user memory remains separate
+from academic learning-focus memory and is activated only by explicit owner
+management requests.
+
+The checked-in default remains the measured-safe 16K profile. A 32K rollout is
+allowed only after `scripts/phase1_benchmark.py` passes the target-Mac combined
+generation and embedding residency gate and its artifact is retained under
+`docs/benchmarks/`. Context assembly itself is always enabled: full transcripts
+remain durable, while model calls use validated summaries, a bounded recent
+tail, relevant active owner memory, and current tool-loop state.
 
 Install or verify the supervised Ollama LaunchAgent with the fixed script:
 
@@ -136,14 +151,35 @@ Install or verify the supervised Ollama LaunchAgent with the fixed script:
 scripts/ollama_qwen_start.sh
 ```
 
-The script loads or kickstarts `com.lifeagent.ollama`, checks the configured
-model and optional digest, and exits nonzero with a bounded diagnostic if
-readiness fails. It does not use `nohup` or a PID file and never pulls a large
-model unless the operator explicitly opts in:
+The script loads or kickstarts `com.lifeagent.ollama`, checks both configured
+model roles and optional digests, verifies the embedding capability and vector
+dimension, and exits nonzero with a bounded diagnostic if readiness fails. It
+does not use `nohup` or a PID file and never pulls a model unless the operator
+explicitly opts in:
 
 ```bash
 scripts/ollama_qwen_start.sh --pull
 ```
+
+After the embedding model is installed and its digest is pinned, migrate and
+inspect the required vector rebuild without writing any vectors:
+
+```bash
+docker compose --env-file .env run --rm api alembic upgrade head
+.venv/bin/python -m app.agents.academic_planner.material_embedding_backfill \
+  --batch-size 64 --max-batches 1
+```
+
+Apply the bounded, resumable backfill only after that dry run is correct:
+
+```bash
+.venv/bin/python -m app.agents.academic_planner.material_embedding_backfill \
+  --apply --batch-size 64 --max-batches 10 --bootstrap-empty-corpus
+```
+
+The command prints counts only. It does not print material text, reflection
+text, vectors, URLs, or owner identifiers. Repeat it until `remaining_count` is
+zero, then deploy through `scripts/lifeagent_host_runtime.sh deploy`.
 
 Do not forward port 11434 through your router or expose it to the public
 internet. Docker Compose maps `host.docker.internal` to the local host; the
@@ -197,10 +233,12 @@ password or browser cookie.
 
 ### Courses database configuration
 
-The academic planner accepts one top-level Courses database ID. Each course is
-a row/page in that database and owns one seeded inline Assessments database.
-Calendar views are presentation only: LifeAgent discovers and queries the
-underlying database and data source.
+The academic planner accepts one top-level Courses database ID. Each ordinary
+course is a row/page in that database and owns one seeded inline Assessments
+database. Calendar views are presentation only: LifeAgent discovers and queries
+the underlying database and data source. Reserved `Jobs` and `misc` rows live in
+the same top-level Courses database; do not configure separate Notion IDs for
+them.
 
 1. Open the [Notion integrations page](https://www.notion.so/profile/integrations).
 2. Create an internal integration named `LifeAgent`.
@@ -217,10 +255,8 @@ NOTION_TOKEN=secret-or-ntn-token
 NOTION_COURSES_DATABASE_ID=...
 ```
 
-`NOTION_ASSESSMENTS_DATABASE_ID` and `NOTION_STUDY_BLOCKS_DATABASE_ID` are
-accepted only as deprecated migration metadata. They are never queried and can
-be removed after confirming the Courses-only sync is healthy. Do not configure
-child calendar or data-source IDs; LifeAgent discovers them.
+Do not configure child calendar or data-source IDs; LifeAgent discovers them
+from the top-level Courses database.
 
 LifeAgent uses Notion API version `2025-09-03`: it retrieves each database
 container to discover its physical data-source ID, then queries that data
@@ -268,6 +304,33 @@ named `Assessments` or `Assessment Calendar`, exactly one underlying data
 source, one `Name` title property, and one `Date` date property. Zero or
 multiple matches are reported as setup problems rather than guessed.
 
+### Misc task structure
+
+Create exactly one active top-level Courses row/page titled `misc`. The title is
+reserved only when its normalized value is exactly `misc`; names such as
+`Miscellaneous`, `Personal`, or `Tasks` are ordinary course titles and are not
+used for the misc route. Do not paste a Notion page ID, data-source ID, or
+calendar-view ID for this row anywhere in `.env`.
+
+Inside the `misc` page, add the same seeded inline child database used by
+courses, named `Assessments` or `Assessment Calendar`. It requires exactly one
+title property named `Name` and one date property named `Date`; optional
+properties and page-body notes are allowed, but not required. LifeAgent
+discovers this child data source from the reserved row, then writes only the
+discovered `Name` and `Date` properties after confirmation.
+
+General timed to-dos such as `scrub toilets @6 pm tdy` are routed semantically
+to the dedicated `create_misc_task` proposal tool. They must not be forced into
+an academic course or the `Jobs` career workflow. The Discord preview shows the
+canonical `Task — <title>` entry and the Toronto-local due time, and no Notion
+change is made until the owner sends the exact `confirm <proposal-id>` command.
+Misc deadlines remain ordinary calendar to-dos.
+
+If the `misc` row is missing, duplicated, inaccessible, missing its seeded child
+database, or missing the required `Name`/`Date` properties, LifeAgent fails
+closed with an actionable setup message. It does not guess a target calendar or
+fall back to a hardcoded Notion identifier.
+
 ### Jobs and Interviews structure
 
 Create exactly one active top-level Courses row/page titled `Jobs`. Inside it,
@@ -298,32 +361,31 @@ curl --fail -X POST http://127.0.0.1:8000/job-interviews/sync
 curl --fail http://127.0.0.1:8000/job-interviews/health
 ```
 
-The complete user-directed todo-type allowlist is `Quiz`, `Assignment`,
-`Tutorial`, `Lab`, and the complete phrase `Studying Block`. Matching is
-deterministic, case-insensitive, and respects word or phrase boundaries; the
-explicit `Assigment` spelling correction remains accepted as `Assignment`.
-Labels such as `Homework`, `Paper`, `Test`, and `Thing` remain unknown, and a
-request containing conflicting supported labels (for example,
-`quiz assignment`) is also unresolved. Unknown or conflicting labels ask for
-clarification and cannot create a write-capable proposal. Ambiguous labels
-imported from Notion are persisted for Discord clarification and are not
-scheduled or sent to Qwen while pending.
+Explicit assessment labels `Quiz`, `Assignment`, `Tutorial`, and `Lab` remain
+available. Other natural titles are ordinary events. A request containing
+conflicting explicit assessment labels (for example, `quiz assignment`) asks
+for clarification; `Event` preserves it as an ordinary calendar item.
 
-Confirmed creations use one canonical title format: `Quiz — <title>`,
-`Assignment — <title>`, `Tutorial — <title>`, `Lab — <title>`, or
-`Studying Block — <title>`. LifeAgent replaces an existing supported prefix
-instead of stacking prefixes. A conversation-triggered `Studying Block` todo is
-a timed item in a course's Notion Assessments calendar with both Date `start`
-and Date `end`; it is distinct from planner-generated PostgreSQL study-block
-allocations, which are not exported to Notion automatically.
+Confirmed assessment creations use canonical titles such as `Quiz — <title>`.
+Confirmed course events preserve their exact natural title and use a Notion
+Date range with both `start` and `end`. Study intent is inferred semantically
+from the title plus legitimate event/course context; no prefix or keyword table
+classifies it.
+
+Personal/general timed tasks are not part of that academic type allowlist. Qwen
+must select the dedicated `create_misc_task` mutation only when the synchronized
+catalog contains exactly one valid reserved `misc` row with a valid seeded
+Assessments/Assessment Calendar child database. The host canonicalizes these
+titles as `Task — <title>` and rejects past due times before any proposal can be
+confirmed.
 
 If the Courses database is absent, inaccessible, or not shared with the
 `LifeAgent` connection, the academic workflow sends a Discord setup
 reminder instead of calling the model or attempting a Notion write. It will do
-the same when a course page is missing the seeded `Assessments` calendar or
-that calendar lacks its required `Name` title or `Date` date property. The
-message will direct the user back to this setup section and confirm that no
-Notion changes were made.
+the same when a course or reserved `misc` page is missing the seeded
+`Assessments`/`Assessment Calendar` child database or that calendar lacks its
+required `Name` title or `Date` date property. The message will direct the user
+back to this setup section and confirm that no Notion changes were made.
 
 Configuration reminders will be deduplicated so an unchanged problem produces
 at most one reminder per day. When only some course pages are misconfigured,
@@ -332,8 +394,8 @@ continue syncing. If Discord is unavailable, the same actionable, non-secret
 condition remains visible in persisted health. A successful discovery clears
 the active reminder condition.
 
-Academic sync and deterministic schedule construction remain model-free. The
-automatic morning notification may call Qwen after host code selects in-window
+Academic sync and deterministic in-window event selection remain model-free.
+The automatic morning notification may call Qwen after host code selects those
 events and collects bounded event-local textual properties and supported page
 blocks. Raw Notion envelopes, relations, files, attachment/OCR content,
 credentials, unauthorized Discord message bodies, embeddings, and unrelated
@@ -363,13 +425,16 @@ manifest derives ordered delivery keys as
 2,000 characters, and the persisted manifest lets retries skip parts already
 delivered.
 
-Before sending a normal morning plan, the job completes the academic sync and
-then the Jobs/Interviews sync. A career failure is disclosed in the combined
-message but does not hide a valid academic plan; one invalid interview does not
-hide other valid interview reminders. Missing academic sharing, stale academic
-sync, or Discord delivery uncertainty remains fail-closed. Semantic model or
-critic failure does not suppress trusted event titles and dates; the message
-omits unverified prose and includes one bounded availability condition.
+Before sending a normal morning agenda, the job completes the academic sync and
+then the Jobs/Interviews sync. The combined message renders course dates, misc
+tasks, and job events as separate sections so general to-dos are not blended
+with coursework or interview preparation. A career failure is disclosed in the
+combined message but does not hide a valid academic agenda; one invalid interview
+does not hide other valid interview reminders. Missing academic sharing, stale
+academic sync, malformed/duplicate misc setup, or Discord delivery uncertainty
+remains fail-closed. Semantic model or critic failure does not suppress trusted
+event titles and dates; the message omits unverified prose and includes one
+bounded availability condition.
 
 For setup recovery or an immediate refresh after fixing a template/share
 problem, run the same idempotent boundary manually:
@@ -537,28 +602,46 @@ response or proposal preview is authoritative and is delivered before the
 progress message reports successful completion.
 
 When facts are missing or ambiguous, the model asks a natural follow-up through
-the same harness. The owner's next private-channel message is ordinary input;
-there is no keyword-based continuation router or fixed clarification counter.
+the typed `emit_conversation_response` lifecycle tool. The owner's next
+private-channel message resumes the same durable owner/channel session with the
+original request, assistant messages, native tool calls and matching results,
+private provider reasoning, prior clarification, and a host-trusted tool-state
+checkpoint in their original order. Raw content remains in private immutable
+artifacts; database rows and readiness diagnostics expose only metadata and
+artifact keys. There is no keyword or punctuation-based continuation router.
+Exact `cancel`, `start over`, and `never mind` controls close the open session.
 
-Conversation-triggered study sessions are the current user-facing path for
-placing new study time on the Notion calendar. Qwen reasons over the unsanitized,
-free-form request and native tool results to select create, update, or archive
-proposal tools; there is no keyword workflow for those operations. Deterministic code validates only authorization, typed
-schemas, known owner-scoped targets, bounds, confirmation, idempotency, and
-stale-write preconditions. A create request must resolve to exactly one synchronized course. The bot may ask for the
-start time, duration, and whether multiple topics should be combined or
-separate. For separate blocks such as `45 minutes each`, LifeAgent proposes
-ordered, sequential blocks with no invented gap. The Discord proposal preview
-is deterministic and Toronto-local; it shows every course, canonical
-`Studying Block — <topic>` title, start, end, and duration before exact
-confirmation. Confirmation creates Notion pages under the course's discovered
-Assessments data source using only the discovered `Name` and `Date` property
-IDs. The Date payload includes both `start` and `end`.
+The worker reuses one lazily initialized Discord service and gateway, while
+Ollama `keep_alive` only controls model-weight residency. Session continuity is
+restart-safe and does not keep a model request or database transaction open
+while waiting for the owner. An expired or corrupt session fails closed and asks
+for a complete resend. If the pinned active transcript exceeds the configured
+input capacity, LifeAgent preserves it and reports an actionable capacity
+failure instead of dropping or summarizing prior evidence.
 
-These study sessions do not use Google Calendar, Apple Calendar, Microsoft
-Calendar, or a separate Notion Calendar API. They also do not auto-export
-planner-generated PostgreSQL `StudyBlock` rows; the generated daily plan remains
-separate from explicitly confirmed Notion assessment pages.
+Conversation-triggered course events are the user-facing path for placing new
+academic time on the Notion calendar. Misc tasks are the equivalent
+path for placing personal/general timed to-dos on the reserved `misc`
+Assessments calendar. Qwen reasons over the unsanitized, free-form request and
+native tool results to select create, update, archive, `create_course_event`, or `create_misc_task`
+proposal tools; there is no keyword workflow for those operations.
+Deterministic code validates only authorization, typed schemas, known
+owner-scoped targets, bounds, confirmation, idempotency, and stale-write
+preconditions. A course create request must resolve to exactly one synchronized
+course; a misc task must resolve to the unique valid reserved `misc` row. The
+bot may ask for the start time, due time, duration, and whether multiple topics
+should be combined or separate. For separate sessions such as `45 minutes each`,
+LifeAgent proposes ordered, sequential events with no invented gap. The Discord
+proposal preview is deterministic and Toronto-local; it shows every target,
+the exact natural course-event title or `Task — <title>`, start or due time,
+and duration when applicable before exact confirmation. Confirmation creates
+Notion pages under the target's discovered Assessments data source using only
+the discovered `Name` and `Date` property IDs. Timed course-event Date payloads
+include both `start` and `end`; misc tasks use the selected future due time.
+
+These course events do not use Google Calendar, Apple Calendar, Microsoft
+Calendar, or a separate Notion Calendar API. Misc tasks follow
+the same Notion-only confirmation boundary and do not use an external calendar.
 
 Only user-answerable ambiguity consumes the clarification budget. Ollama
 unavailability, timeout, invalid structured output, database/Discord failure,
@@ -574,11 +657,10 @@ claim complete success; inspect the operation journal and the relevant course
 Assessments calendar before deciding on manual repair.
 
 Qwen maps misspellings, paraphrases, pronouns, and non-schema-compliant wording
-onto the five typed creation capabilities: Quiz, Assignment, Tutorial, Lab, and
-Studying Block. If the meaning remains materially ambiguous, Qwen asks one
-bounded clarification and emits no mutation tool. The host never guesses or
-re-parses the user's label; it accepts only a valid enum in structured output
-and shows the canonicalized result in the confirmation preview.
+onto explicit assessment types or an ordinary course event. If the meaning
+remains materially ambiguous, Qwen asks one bounded clarification and emits no
+mutation tool. The host never guesses study intent from a title; it accepts only
+schema-valid tools and independently validates study intent semantically.
 
 Confirmation and rejection commands must match exactly, with no extra spaces or
 arguments. Every other authorized private-channel message reaches the native
@@ -600,24 +682,28 @@ surface bounded counts for intake awaiting a target, pending proposals, active
 seeding, uncertain writes, orphan uploads, and delayed indexing; they never
 include URLs, PDF bytes, or extracted text.
 
-Confirmed Notion writes remain unavailable until a host integration supplies a
-reviewed `AcademicNotionWriter` containing the exact discovered page targets and
-allowlisted property IDs. Courses-only read synchronization does not invent
-write mappings. Proposal creation and rejection continue to work while that
-writer is unavailable; confirmation returns an actionable fail-closed response.
+When Notion is configured, the Discord service constructs a reviewed
+`AcademicNotionWriter` from the connector and synchronized target store. It
+still writes only exact discovered page targets and allowlisted property IDs;
+read synchronization never invents mappings. If the connector or a required
+mapping is unavailable, proposal creation and rejection continue to work while
+confirmation returns an actionable fail-closed response.
 
 For an ambiguous assessment label, LifeAgent first persists the request and
-then sends `Quiz`, `Assignment`, `Tutorial`, `Lab`, `Studying Block`, and
-`Ignore` buttons. Each type choice shows and confirms one exact canonical
+then sends `Quiz`, `Assignment`, `Tutorial`, `Lab`, `Event`, and `Ignore`
+buttons. Each type choice shows and confirms one exact canonical
 title, such as `Tutorial — Chapter 4`. Before PATCHing, LifeAgent rechecks the
 stored title and edited timestamp, then changes only the discovered title
 property. A concurrent Notion edit cancels the write. Ignore records the
 decision and performs no write; repeated interactions are harmless.
 
-For study-session proposals, the same confirmation boundary creates new pages
+For course-event proposals, the same confirmation boundary creates new pages
 in the relevant course's discovered Assessments data source. The writer sends
 only the allowlisted `Name` title property and `Date` date property; no external
-calendar, hidden automation database, or planner `StudyBlock` export is used.
+calendar or hidden automation database is used.
+For misc-task proposals, the same boundary creates pages only under the unique
+reserved `misc` Assessments data source after rechecking that the row and
+properties are still valid.
 
 ## 5. Configure finance sources
 

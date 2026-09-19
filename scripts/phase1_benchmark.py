@@ -120,14 +120,62 @@ async def _sample_memory(
             await asyncio.wait_for(stop.wait(), timeout=1.0)
 
 
+async def _embedding_probe(
+    client: httpx.AsyncClient,
+    *,
+    model: str,
+    expected_dimensions: int,
+) -> dict[str, object]:
+    started_at = datetime.now(UTC)
+    try:
+        payload = await _ollama_json(
+            client,
+            "POST",
+            "/api/embed",
+            {
+                "model": model,
+                "input": "LifeAgent benchmark embedding residency probe.",
+                "dimensions": expected_dimensions,
+                "keep_alive": "300s",
+            },
+        )
+        raw_embeddings = payload.get("embeddings")
+        embeddings = cast(list[object], raw_embeddings) if isinstance(raw_embeddings, list) else []
+        first = embeddings[0] if embeddings else None
+        dimensions = len(cast(list[object], first)) if isinstance(first, list) else None
+        return {
+            "status": "valid" if dimensions == expected_dimensions else "invalid_dimensions",
+            "model": model,
+            "expected_dimensions": expected_dimensions,
+            "observed_dimensions": dimensions,
+            "started_at": started_at.isoformat(),
+            "finished_at": datetime.now(UTC).isoformat(),
+        }
+    except (httpx.HTTPError, RuntimeError, TypeError, ValueError) as exc:
+        return {
+            "status": "failed",
+            "model": model,
+            "expected_dimensions": expected_dimensions,
+            "observed_dimensions": None,
+            "error_code": exc.__class__.__name__,
+            "started_at": started_at.isoformat(),
+            "finished_at": datetime.now(UTC).isoformat(),
+        }
+
+
 def _memory_summary(
     samples: list[dict[str, object]],
     before: Mapping[str, object],
     after: Mapping[str, object],
+    *,
+    reasoning_model: str,
 ) -> dict[str, object]:
     peak_size = 0
     peak_vram = 0
+    peak_combined_size = 0
+    peak_combined_vram = 0
     context_lengths: set[int] = set()
+    reasoning_context_lengths: set[int] = set()
     free_percentages: list[float] = []
     sample_errors = 0
     for sample in samples:
@@ -141,19 +189,28 @@ def _memory_summary(
         models = sample.get("models")
         if not isinstance(models, list):
             continue
+        sample_size = 0
+        sample_vram = 0
         for model in cast(list[object], models):
             if not isinstance(model, dict):
                 continue
             model_record = cast(dict[str, object], model)
+            name = model_record.get("name")
             size = model_record.get("size")
             size_vram = model_record.get("size_vram")
             context = model_record.get("context_length")
             if isinstance(size, int):
                 peak_size = max(peak_size, size)
+                sample_size += size
             if isinstance(size_vram, int):
                 peak_vram = max(peak_vram, size_vram)
+                sample_vram += size_vram
             if isinstance(context, int):
                 context_lengths.add(context)
+                if name == reasoning_model:
+                    reasoning_context_lengths.add(context)
+        peak_combined_size = max(peak_combined_size, sample_size)
+        peak_combined_vram = max(peak_combined_vram, sample_vram)
     before_swapouts = before.get("swapouts")
     after_swapouts = after.get("swapouts")
     swapout_delta_pages = None
@@ -168,13 +225,20 @@ def _memory_summary(
         "sample_errors": sample_errors,
         "peak_model_size_bytes": peak_size,
         "peak_model_vram_bytes": peak_vram,
+        "peak_combined_model_size_bytes": peak_combined_size,
+        "peak_combined_model_vram_bytes": peak_combined_vram,
         "observed_context_lengths": sorted(context_lengths),
+        "observed_reasoning_context_lengths": sorted(reasoning_context_lengths),
         "minimum_host_free_percent": min(free_percentages) if free_percentages else None,
         "swapout_delta_pages": swapout_delta_pages,
         "swapout_delta_bytes": swapout_delta_bytes,
         "before": dict(before),
         "after": dict(after),
     }
+
+
+def _benchmark_gate_passed(checks: Mapping[str, bool], advisories: Mapping[str, bool]) -> bool:
+    return all(checks.values()) and all(advisories.values())
 
 
 async def _run(args: argparse.Namespace) -> dict[str, object]:
@@ -221,6 +285,12 @@ async def _run(args: argparse.Namespace) -> dict[str, object]:
         if resident_models:
             await asyncio.sleep(5)
 
+        benchmark_reserve = min(4096, max(0, args.num_ctx // 8))
+        benchmark_max_input = args.num_ctx - args.max_output_tokens - benchmark_reserve
+        if benchmark_max_input <= 2:
+            raise RuntimeError("benchmark context window is too small for the requested output")
+        compaction_trigger = max(2, int(benchmark_max_input * 0.75))
+        compaction_target = max(1, int(benchmark_max_input * 0.5))
         settings = Settings(
             ollama_base_url=base_url,
             ollama_model=args.model,
@@ -228,9 +298,17 @@ async def _run(args: argparse.Namespace) -> dict[str, object]:
             ollama_num_ctx=args.num_ctx,
             ollama_num_batch=args.num_batch,
             ollama_max_concurrency=1,
+            ollama_max_input_tokens=benchmark_max_input,
             ollama_max_output_tokens=args.max_output_tokens,
+            ollama_context_reserve_tokens=benchmark_reserve,
             ollama_timeout_seconds=args.timeout_seconds,
             ollama_seed=args.seed,
+            ollama_reasoning=args.reasoning,
+            ollama_structured_output_transport=args.structured_output_transport,
+            conversation_compaction_trigger_tokens=compaction_trigger,
+            conversation_compaction_target_tokens=compaction_target,
+            conversation_recent_tail_max_tokens=max(1, min(8192, compaction_target)),
+            conversation_compaction_max_output_tokens=args.max_output_tokens,
         )
         gateway = LLMGateway(settings)
         harness = EvaluationHarness(gateway, benchmark_version="phase1-live-v1")
@@ -253,6 +331,12 @@ async def _run(args: argparse.Namespace) -> dict[str, object]:
                     fixture for _ in range(args.warm_repetitions) for fixture in valid_fixtures
                 ]
                 warm = await harness.run(warm_inputs, report_root / "warm.json", max_concurrency=1)
+                embedding_probe = await _embedding_probe(
+                    client,
+                    model=args.embedding_model,
+                    expected_dimensions=args.embedding_dimensions,
+                )
+                await asyncio.sleep(5)
 
             markers = ("CONCURRENCY-MARKER-ONE", "CONCURRENCY-MARKER-TWO")
 
@@ -310,23 +394,31 @@ async def _run(args: argparse.Namespace) -> dict[str, object]:
         cold_memory_samples,
         cold_memory_before,
         cold_memory_after,
+        reasoning_model=args.model,
     )
-    memory = _memory_summary(memory_samples, warm_memory_before, warm_memory_after)
+    memory = _memory_summary(
+        memory_samples,
+        warm_memory_before,
+        warm_memory_after,
+        reasoning_model=args.model,
+    )
     minimum_free = memory["minimum_host_free_percent"]
-    peak_model_vram = max(
-        cast(int, cold_memory["peak_model_vram_bytes"]),
-        cast(int, memory["peak_model_vram_bytes"]),
+    peak_combined_model_vram = max(
+        cast(int, cold_memory["peak_combined_model_vram_bytes"]),
+        cast(int, memory["peak_combined_model_vram_bytes"]),
     )
-    observed_context_lengths = sorted(
-        set(cast(list[int], cold_memory["observed_context_lengths"]))
-        | set(cast(list[int], memory["observed_context_lengths"]))
+    observed_reasoning_context_lengths = sorted(
+        set(cast(list[int], cold_memory["observed_reasoning_context_lengths"]))
+        | set(cast(list[int], memory["observed_reasoning_context_lengths"]))
     )
     checks: dict[str, bool] = {
         "cold_fixture_passed": cold.metrics.pass_rate == 1,
         "warm_fixtures_passed": warm.metrics.pass_rate == 1,
         "warm_p95_within_timeout": warm.metrics.p95_latency_ms <= LATENCY_P95_LIMIT_MS,
-        "model_allocation_within_limit": 0 < peak_model_vram <= MODEL_ALLOCATION_LIMIT_BYTES,
-        "context_length_matches": observed_context_lengths == [args.num_ctx],
+        "model_allocation_within_limit": 0
+        < peak_combined_model_vram
+        <= MODEL_ALLOCATION_LIMIT_BYTES,
+        "context_length_matches": observed_reasoning_context_lengths == [args.num_ctx],
         "two_tasks_completed": all(
             result.status is InvocationStatus.VALID for result in marker_results
         ),
@@ -334,6 +426,7 @@ async def _run(args: argparse.Namespace) -> dict[str, object]:
         "concurrent_results_not_mixed": marker_outputs == list(markers),
         "model_intervals_non_overlapping": non_overlapping,
         "model_identity_stable": identity_stable,
+        "embedding_residency_probe_passed": embedding_probe["status"] == "valid",
     }
     advisories: dict[str, bool] = {
         "steady_host_headroom_observed": (
@@ -344,6 +437,7 @@ async def _run(args: argparse.Namespace) -> dict[str, object]:
             and memory["swapout_delta_bytes"] <= STEADY_SWAPOUT_LIMIT_BYTES
         ),
     }
+    gate_passed = _benchmark_gate_passed(checks, advisories)
     return {
         "benchmark_version": "phase1-live-v1",
         "generated_at": datetime.now(UTC).isoformat(),
@@ -368,11 +462,16 @@ async def _run(args: argparse.Namespace) -> dict[str, object]:
             "num_ctx": args.num_ctx,
             "num_batch": args.num_batch,
             "max_output_tokens": args.max_output_tokens,
+            "max_input_tokens": benchmark_max_input,
+            "context_reserve_tokens": benchmark_reserve,
             "max_concurrency": 1,
+            "embedding_model": args.embedding_model,
+            "embedding_dimensions": args.embedding_dimensions,
             "timeout_seconds": args.timeout_seconds,
             "seed": args.seed,
             "temperature": 0,
             "reasoning": settings.ollama_reasoning,
+            "structured_output_transport": settings.ollama_structured_output_transport,
             "repair_attempts": settings.ollama_repair_attempts,
             "config_version": gateway.config_version,
         },
@@ -385,11 +484,12 @@ async def _run(args: argparse.Namespace) -> dict[str, object]:
         "cold": cold.model_dump(mode="json"),
         "warm": warm.model_dump(mode="json"),
         "concurrency": concurrency,
+        "embedding_probe": embedding_probe,
         "cold_start_memory": cold_memory,
         "memory": memory,
         "acceptance_checks": checks,
         "advisory_checks": advisories,
-        "gate_passed": all(checks.values()),
+        "gate_passed": gate_passed,
     }
 
 
@@ -404,6 +504,20 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--num-ctx", type=int, default=2048)
     parser.add_argument("--num-batch", type=int, default=32)
     parser.add_argument("--max-output-tokens", type=int, default=384)
+    parser.add_argument(
+        "--reasoning",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="enable or disable model reasoning during the benchmark",
+    )
+    parser.add_argument(
+        "--structured-output-transport",
+        choices=("json_schema", "json"),
+        default="json_schema",
+        help="use constrained JSON Schema decoding or JSON mode with schema validation",
+    )
+    parser.add_argument("--embedding-model", default="qwen3-embedding:4b")
+    parser.add_argument("--embedding-dimensions", type=int, default=1024)
     parser.add_argument("--timeout-seconds", type=float, default=300)
     parser.add_argument("--seed", type=int, default=1729)
     return parser

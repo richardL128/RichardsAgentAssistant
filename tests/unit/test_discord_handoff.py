@@ -24,8 +24,16 @@ from app.connectors.discord import (
     DiscordPdfAttachmentDownload,
 )
 from app.core.config import Settings
-from app.db.models import AcademicInboundMaterial, Base, DiscordWakeInbound
+from app.db.academic import AcademicRepository
+from app.db.models import (
+    AcademicDiscourseSession,
+    AcademicInboundMaterial,
+    Base,
+    DiscordAbortRequest,
+    DiscordWakeInbound,
+)
 from app.host.handoff import (
+    DiscordHostAbortEvent,
     DiscordHostHandoffEvent,
     DiscordHostInteractionHandoffEvent,
     canonical_handoff_body,
@@ -94,6 +102,18 @@ def _message_event(
     )
 
 
+def _abort_event(*, content_time: datetime = EVENT_TIME) -> DiscordHostAbortEvent:
+    return DiscordHostAbortEvent(
+        abort_message_id=MESSAGE_ID,
+        channel_id=CHANNEL_ID,
+        author_id=USER_ID,
+        event_timestamp=content_time,
+        acknowledgement_message_id=ACK_ID,
+        handoff_timestamp=datetime.now(UTC),
+        nonce=handoff_nonce(MESSAGE_ID),
+    )
+
+
 def _signed_request(event, secret: SecretStr) -> tuple[bytes, dict[str, str]]:
     body = canonical_handoff_body(event)
     return body, {"x-lifeagent-handoff-signature": sign_handoff_body(body, secret)}
@@ -131,6 +151,87 @@ def _install_valid_discord_refetch(monkeypatch: pytest.MonkeyPatch) -> None:
     )
 
 
+def _install_valid_abort_refetch(
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    content: str = "ABORT",
+) -> None:
+    async def fetch(_adapter, *, channel_id: str, message_id: str):
+        assert channel_id == CHANNEL_ID
+        assert message_id == MESSAGE_ID
+        return DiscordFetchedMessage(
+            id=MESSAGE_ID,
+            channel_id=CHANNEL_ID,
+            author=DiscordFetchedAuthor(id=USER_ID),
+            timestamp=EVENT_TIME,
+            content=SecretStr(content),
+        )
+
+    async def validate(_adapter, *, channel_id: str, message_id: str, bot_user_id: str):
+        assert (channel_id, message_id, bot_user_id) == (CHANNEL_ID, ACK_ID, BOT_ID)
+        return DiscordFetchedMessage(
+            id=ACK_ID,
+            channel_id=CHANNEL_ID,
+            author=DiscordFetchedAuthor(id=BOT_ID, bot=True),
+            timestamp=EVENT_TIME,
+            content=SecretStr("abort acknowledgement"),
+        )
+
+    async def edit(_adapter, *, channel_id: str, message_id: str, content: str):
+        assert channel_id == CHANNEL_ID
+        assert message_id == "888888888888888888"
+        assert content.startswith("Aborted.")
+        return SimpleNamespace(external_id=message_id)
+
+    monkeypatch.setattr(
+        "app.api.discord_handoff.DiscordAcademicPlannerAdapter.fetch_message",
+        fetch,
+    )
+    monkeypatch.setattr(
+        "app.api.discord_handoff.DiscordAcademicPlannerAdapter.validate_wake_acknowledgement",
+        validate,
+    )
+    monkeypatch.setattr(
+        "app.api.discord_handoff.DiscordAcademicPlannerAdapter.edit_academic_message",
+        edit,
+    )
+
+
+def _store_abort_target(
+    engine,
+    *,
+    event_id: str = "777777777777777777",
+    channel_id: str = CHANNEL_ID,
+    user_id: str = USER_ID,
+    received_at: datetime = EVENT_TIME - timedelta(minutes=1),
+    queue_job_id: int | None = 41,
+    running: bool = False,
+):
+    from app.db.discord_wake import DiscordWakeInboundInput, DiscordWakeRepository
+
+    with Session(engine) as session, session.begin():
+        accepted = DiscordWakeRepository.accept_verified_event(
+            session,
+            DiscordWakeInboundInput(
+                discord_event_id=event_id,
+                handoff_nonce=f"nonce-{event_id}",
+                event_kind="message",
+                action="academic_checkin",
+                content_artifact_key=f"artifact-{event_id}",
+                received_at=received_at,
+                discord_channel_id=channel_id,
+                discord_user_id=user_id,
+                discord_message_id=event_id,
+                ack_message_id="888888888888888888",
+            ),
+        )
+        if queue_job_id is not None:
+            DiscordWakeRepository.bind_queue_job_id(session, accepted.wake_id, queue_job_id)
+        if running:
+            DiscordWakeRepository.mark_running(session, accepted.wake_id)
+        return accepted.wake_id
+
+
 def test_signed_message_handoff_refetches_persists_and_queues_once(
     handoff_app, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -155,6 +256,154 @@ def test_signed_message_handoff_refetches_persists_and_queues_once(
         assert stored.discord_event_id == MESSAGE_ID
         assert stored.ack_message_id == ACK_ID
         assert stored.enqueued_at is not None
+        assert stored.queue_job_id == 1
+
+
+def test_signed_abort_cancels_earlier_queued_wake_and_is_idempotent(
+    handoff_app,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    app, settings, engine, _queued = handoff_app
+    _install_valid_abort_refetch(monkeypatch)
+    wake_id = _store_abort_target(engine)
+    cancelled: list[tuple[int, bool]] = []
+
+    async def cancel(job_id: int, abort: bool = False) -> bool:
+        cancelled.append((job_id, abort))
+        return True
+
+    monkeypatch.setattr(
+        "app.api.discord_handoff.queue_tasks.procrastinate_app.job_manager.cancel_job_by_id_async",
+        cancel,
+    )
+    body, headers = _signed_request(_abort_event(), settings.discord_host_handoff_secret)
+    with TestClient(app) as client:
+        first = client.post("/internal/discord/academic/abort", content=body, headers=headers)
+        replay = client.post("/internal/discord/academic/abort", content=body, headers=headers)
+
+    assert first.status_code == 200, first.text
+    assert first.json() == {
+        "status": "accepted",
+        "target_count": 1,
+        "running_count": 0,
+        "queued_count": 1,
+        "safe_activity_label": "queue handoff",
+        "safe_tool_status": "cancelled",
+    }
+    assert replay.status_code == 200
+    assert replay.json()["status"] == "duplicate"
+    assert replay.json()["queued_count"] == 1
+    assert cancelled == [(41, True)]
+    with Session(engine) as session:
+        row = session.get(DiscordWakeInbound, wake_id)
+        assert row is not None
+        assert row.state == "aborted"
+        assert row.abort_requested_by_event_id == MESSAGE_ID
+        abort_record = session.get(DiscordAbortRequest, MESSAGE_ID)
+        assert abort_record is not None
+        assert abort_record.status == "accepted"
+        assert abort_record.target_count == 1
+        assert "content" not in DiscordAbortRequest.__table__.columns
+
+
+def test_abort_rejects_non_exact_content_without_cancelling(
+    handoff_app,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    app, settings, engine, _queued = handoff_app
+    _install_valid_abort_refetch(monkeypatch, content="abort")
+    wake_id = _store_abort_target(engine)
+    body, headers = _signed_request(_abort_event(), settings.discord_host_handoff_secret)
+
+    with TestClient(app) as client:
+        response = client.post("/internal/discord/academic/abort", content=body, headers=headers)
+
+    assert response.status_code == 422
+    with Session(engine) as session:
+        row = session.get(DiscordWakeInbound, wake_id)
+        assert row is not None
+        assert row.state == "queued"
+
+
+def test_abort_does_not_touch_other_owner_or_later_wake(
+    handoff_app,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    app, settings, engine, _queued = handoff_app
+    _install_valid_abort_refetch(monkeypatch)
+    earlier = _store_abort_target(engine, event_id="700000000000000001", queue_job_id=None)
+    other = _store_abort_target(
+        engine,
+        event_id="700000000000000002",
+        user_id="999999999999999999",
+        queue_job_id=None,
+    )
+    later = _store_abort_target(
+        engine,
+        event_id="700000000000000003",
+        received_at=EVENT_TIME + timedelta(seconds=1),
+        queue_job_id=None,
+    )
+    with Session(engine) as session, session.begin():
+        continuation = AcademicRepository.create_discourse_session(
+            session,
+            external_event_id="open-memory-review",
+            discord_channel_id=CHANNEL_ID,
+            discord_user_id=USER_ID,
+            session_kind="memory_review",
+            partial_state={"private": "discarded"},
+            started_at=EVENT_TIME - timedelta(minutes=2),
+        )
+        continuation_id = continuation.id
+    body, headers = _signed_request(_abort_event(), settings.discord_host_handoff_secret)
+
+    with TestClient(app) as client:
+        response = client.post("/internal/discord/academic/abort", content=body, headers=headers)
+
+    assert response.status_code == 200
+    assert response.json()["target_count"] == 1
+    with Session(engine) as session:
+        assert session.get(DiscordWakeInbound, earlier).state == "aborted"
+        assert session.get(DiscordWakeInbound, other).state == "queued"
+        assert session.get(DiscordWakeInbound, later).state == "queued"
+        closed = session.get(AcademicDiscourseSession, continuation_id)
+        assert closed is not None
+        assert closed.state == "completed"
+        assert closed.partial_state["outcome"] == "aborted"
+
+
+def test_running_abort_returns_bounded_unconfirmed_receipt(
+    handoff_app,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    app, settings, engine, _queued = handoff_app
+    settings.discord_abort_wait_timeout_seconds = 0.01
+    _install_valid_abort_refetch(monkeypatch)
+    wake_id = _store_abort_target(engine, running=True)
+
+    async def cancel(_job_id: int, abort: bool = False) -> bool:
+        assert abort is True
+        return True
+
+    monkeypatch.setattr(
+        "app.api.discord_handoff.queue_tasks.procrastinate_app.job_manager.cancel_job_by_id_async",
+        cancel,
+    )
+    body, headers = _signed_request(_abort_event(), settings.discord_host_handoff_secret)
+    with TestClient(app) as client:
+        response = client.post("/internal/discord/academic/abort", content=body, headers=headers)
+
+    assert response.status_code == 200
+    assert response.json() == {
+        "status": "unconfirmed",
+        "target_count": 1,
+        "running_count": 1,
+        "queued_count": 0,
+        "safe_activity_label": "runtime check",
+        "safe_tool_status": "cancellation_requested",
+    }
+    with Session(engine) as session:
+        assert session.get(DiscordWakeInbound, wake_id).state == "abort_requested"
 
 
 def test_pdf_only_handoff_captures_private_artifact_and_reference_manifest(

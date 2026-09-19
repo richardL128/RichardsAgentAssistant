@@ -13,6 +13,8 @@ from app.agents.calendar_briefing.cache import (
     decide_calendar_semantic_cache_reuse,
 )
 from app.agents.calendar_briefing.contracts import (
+    CalendarActivityIntent,
+    CalendarActivityIntentStatus,
     CalendarEventEvidenceFragment,
     CalendarEventSemanticInput,
     CalendarEventSemanticResult,
@@ -20,6 +22,7 @@ from app.agents.calendar_briefing.contracts import (
     CalendarEventSourceArea,
     CalendarEventSourceKind,
     fingerprint_event_evidence,
+    with_title_evidence_fragment,
 )
 from app.agents.calendar_briefing.multipart import build_calendar_briefing_manifest
 from app.agents.calendar_briefing.semantic_interpreter import (
@@ -63,15 +66,21 @@ def _fragment(
     )
 
 
-def _event(*fragments: CalendarEventEvidenceFragment) -> CalendarEventSemanticInput:
-    supplied = fragments or (
-        _fragment("frag-1", "Study breadth-first search and runtime analysis."),
+def _event(
+    *fragments: CalendarEventEvidenceFragment,
+    title: str = "Graph Traversal Quiz",
+) -> CalendarEventSemanticInput:
+    supplied = with_title_evidence_fragment(
+        event_id="event-1",
+        title=title,
+        fragments=fragments
+        or (_fragment("frag-1", "Study breadth-first search and runtime analysis."),),
     )
     return CalendarEventSemanticInput(
         event_id="event-1",
         source_area=CalendarEventSourceArea.COURSE,
         source_label="ECE 250",
-        title="Graph Traversal Quiz",
+        title=title,
         event_kind="Quiz",
         local_date_label="Friday, September 11, 2026",
         local_time_label="10:00 EDT",
@@ -87,6 +96,11 @@ def _result(
     evidence_fragment_ids: tuple[str, ...] = ("frag-1",),
     description_fragment_ids: tuple[str, ...] = ("frag-1",),
     description: str | None = "Prepare breadth-first search and runtime analysis.",
+    classification_rationale: str | None = "The supplied topics describe substantive prep.",
+    activity_intent: CalendarActivityIntent | None = CalendarActivityIntent.STUDY,
+    intent_status: CalendarActivityIntentStatus = CalendarActivityIntentStatus.VALID,
+    intent_evidence_fragment_ids: tuple[str, ...] = ("event-1:host:title", "frag-1"),
+    intent_rationale: str | None = "Title and topics support a study-oriented event.",
 ) -> CalendarEventSemanticResult:
     return CalendarEventSemanticResult(
         event_id="event-1",
@@ -95,18 +109,33 @@ def _result(
         description=description,
         evidence_fragment_ids=evidence_fragment_ids,
         description_fragment_ids=description_fragment_ids,
+        classification_rationale=classification_rationale,
+        activity_intent=activity_intent,
+        intent_status=intent_status,
+        intent_evidence_fragment_ids=intent_evidence_fragment_ids,
+        intent_rationale=intent_rationale,
     )
 
 
-def _critique(accepted: bool, reason: str | None = None) -> CalendarEventSemanticCritique:
+def _critique(
+    accepted: bool,
+    reason: str | None = None,
+    *,
+    intent_supported: bool | None = None,
+    overview_supported: bool | None = None,
+    description_supported: bool | None = None,
+    common_supported: bool | None = None,
+) -> CalendarEventSemanticCritique:
+    common = accepted if common_supported is None else common_supported
     return CalendarEventSemanticCritique(
         accepted=accepted,
-        overview_supported=accepted,
-        description_supported=accepted,
-        no_invented_claims=accepted,
-        no_instruction_following=accepted,
-        same_event=accepted,
-        cites_only_supplied_fragments=accepted,
+        intent_supported=accepted if intent_supported is None else intent_supported,
+        overview_supported=accepted if overview_supported is None else overview_supported,
+        description_supported=accepted if description_supported is None else description_supported,
+        no_invented_claims=common,
+        no_instruction_following=common,
+        same_event=common,
+        cites_only_supplied_fragments=common,
         reason=reason,
     )
 
@@ -130,10 +159,142 @@ def test_semantic_result_enforces_description_invariants() -> None:
     assert no_description.description is None
 
 
+def test_semantic_result_schema_requires_conditionally_validated_fields() -> None:
+    schema = CalendarEventSemanticResult.model_json_schema()
+
+    assert {
+        "activity_intent",
+        "intent_status",
+        "intent_evidence_fragment_ids",
+        "intent_rationale",
+        "description",
+        "description_fragment_ids",
+        "classification_rationale",
+    }.issubset(set(schema["required"]))
+
+
+def test_semantic_result_enforces_intent_invariants() -> None:
+    with pytest.raises(ValidationError, match="valid calendar intent requires"):
+        _result(intent_evidence_fragment_ids=())
+
+    with pytest.raises(ValidationError, match="valid calendar intent requires host title citation"):
+        _result(intent_evidence_fragment_ids=("frag-1",))
+
+    with pytest.raises(
+        ValidationError,
+        match="invalid or unavailable calendar intent must not include intent",
+    ):
+        _result(
+            activity_intent=CalendarActivityIntent.STUDY,
+            intent_status=CalendarActivityIntentStatus.INVALID,
+            intent_evidence_fragment_ids=(),
+            intent_rationale=None,
+        )
+
+    with pytest.raises(
+        ValidationError,
+        match="invalid or unavailable calendar intent must not include a rationale",
+    ):
+        _result(
+            activity_intent=None,
+            intent_status=CalendarActivityIntentStatus.INVALID,
+            intent_evidence_fragment_ids=(),
+            intent_rationale="unsupported",
+        )
+
+
+def test_semantic_result_accepts_unavailable_intent_only_without_payload() -> None:
+    unavailable = _result(
+        activity_intent=None,
+        intent_status=CalendarActivityIntentStatus.UNAVAILABLE,
+        intent_evidence_fragment_ids=(),
+        intent_rationale=None,
+    )
+
+    assert unavailable.activity_intent is None
+    assert unavailable.intent_evidence_fragment_ids == ()
+    assert unavailable.intent_rationale is None
+
+    with pytest.raises(
+        ValidationError,
+        match="invalid or unavailable calendar intent must not include intent",
+    ):
+        _result(
+            activity_intent=CalendarActivityIntent.REGULAR,
+            intent_status=CalendarActivityIntentStatus.UNAVAILABLE,
+            intent_evidence_fragment_ids=(),
+            intent_rationale=None,
+        )
+
+    with pytest.raises(
+        ValidationError,
+        match="invalid or unavailable calendar intent must not include citations",
+    ):
+        _result(
+            activity_intent=None,
+            intent_status=CalendarActivityIntentStatus.UNAVAILABLE,
+            intent_evidence_fragment_ids=("event-1:host:title",),
+            intent_rationale=None,
+        )
+
+    with pytest.raises(
+        ValidationError,
+        match="invalid or unavailable calendar intent must not include a rationale",
+    ):
+        _result(
+            activity_intent=None,
+            intent_status=CalendarActivityIntentStatus.UNAVAILABLE,
+            intent_evidence_fragment_ids=(),
+            intent_rationale="still unsupported",
+        )
+
+
+def test_semantic_result_rejects_missing_required_conditional_keys() -> None:
+    payload = _result().model_dump()
+    payload.pop("intent_evidence_fragment_ids")
+
+    with pytest.raises(ValidationError, match="Field required"):
+        CalendarEventSemanticResult.model_validate(payload)
+
+    payload = _result().model_dump()
+    payload.pop("description")
+
+    with pytest.raises(ValidationError, match="Field required"):
+        CalendarEventSemanticResult.model_validate(payload)
+
+    payload = _result().model_dump()
+    payload.pop("classification_rationale")
+
+    with pytest.raises(ValidationError, match="Field required"):
+        CalendarEventSemanticResult.model_validate(payload)
+
+
 def test_source_fingerprint_changes_with_supplied_evidence_text() -> None:
     original = (_fragment("frag-1", "Topic A"),)
     changed = (_fragment("frag-1", "Topic B"),)
 
+    assert fingerprint_event_evidence(original, event_id="event-1") != fingerprint_event_evidence(
+        changed,
+        event_id="event-1",
+    )
+
+
+def test_source_fingerprint_changes_with_synthesized_title_evidence() -> None:
+    fragment = _fragment("frag-1", "Topic A")
+    original = with_title_evidence_fragment(
+        event_id="event-1",
+        title="Graph Traversal Quiz",
+        fragments=(fragment,),
+    )
+    changed = with_title_evidence_fragment(
+        event_id="event-1",
+        title="Graph Traversal Review",
+        fragments=(fragment,),
+    )
+
+    assert original[0].fragment_id == "event-1:host:title"
+    assert original[0].source_label == "Title"
+    assert [item.ordinal for item in original] == [0, 1]
     assert fingerprint_event_evidence(original, event_id="event-1") != fingerprint_event_evidence(
         changed,
         event_id="event-1",
@@ -145,6 +306,23 @@ def test_source_fingerprint_rejects_cross_event_fragments() -> None:
 
     with pytest.raises(ValueError, match="another event"):
         fingerprint_event_evidence(fragments, event_id="event-1")
+
+
+@pytest.mark.parametrize(
+    "title",
+    ["Review latest lesson", "Quick look on Error propagation"],
+)
+@pytest.mark.asyncio
+async def test_natural_unprefixed_titles_can_receive_cited_study_intent(title: str) -> None:
+    event = _event(_fragment("frag-1", "Course context: ECE 222."), title=title)
+    gateway = _FakeGateway([_result(), _critique(True)])
+
+    outcome = await CalendarEventSemanticInterpreter(gateway).analyze(event)
+
+    assert outcome.intent_status is CalendarActivityIntentStatus.VALID
+    assert outcome.activity_intent is CalendarActivityIntent.STUDY
+    assert outcome.intent_evidence_fragment_ids[0] == "event-1:host:title"
+    assert f'"text":"{title}"' in gateway.prompts[0]
 
 
 @pytest.mark.asyncio
@@ -221,22 +399,32 @@ async def test_description_named_field_is_not_privileged_when_model_rejects_it()
 
 
 @pytest.mark.asyncio
-async def test_host_rejects_cross_event_citations_before_critic() -> None:
+async def test_unknown_prose_citation_preserves_supported_intent() -> None:
     gateway = _FakeGateway(
         [
             _result(
                 evidence_fragment_ids=("frag-1", "other-event-frag"),
                 description_fragment_ids=("frag-1",),
-            )
+            ),
+            _critique(
+                False,
+                reason="overview cites an unavailable fragment",
+                intent_supported=True,
+                overview_supported=True,
+                description_supported=True,
+                common_supported=True,
+            ),
+            None,
         ]
     )
 
     outcome = await CalendarEventSemanticInterpreter(gateway).analyze(_event())
 
     assert outcome.status == CalendarEventSemanticStatus.INVALID
-    assert outcome.error_code == "calendar_semantic_invalid_output"
-    assert outcome.reason == "calendar semantic result cited unknown event fragments"
-    assert len(gateway.prompts) == 1
+    assert outcome.intent_status == CalendarActivityIntentStatus.VALID
+    assert outcome.activity_intent == CalendarActivityIntent.STUDY
+    assert outcome.error_code == "calendar_semantic_prose_invalid"
+    assert len(gateway.prompts) == 3
 
 
 @pytest.mark.asyncio
@@ -248,6 +436,11 @@ async def test_host_rejects_changed_event_id_before_critic() -> None:
         description=None,
         evidence_fragment_ids=("frag-1",),
         description_fragment_ids=(),
+        classification_rationale=None,
+        activity_intent=None,
+        intent_status=CalendarActivityIntentStatus.UNAVAILABLE,
+        intent_evidence_fragment_ids=(),
+        intent_rationale=None,
     )
     gateway = _FakeGateway([bad_result])
 
@@ -272,10 +465,67 @@ async def test_critic_rejection_allows_one_repair_then_invalid() -> None:
     outcome = await CalendarEventSemanticInterpreter(gateway).analyze(_event())
 
     assert outcome.status == CalendarEventSemanticStatus.INVALID
-    assert outcome.error_code == "calendar_semantic_critic_rejected"
-    assert outcome.reason == "repair still overstates the evidence"
+    assert outcome.error_code == "calendar_semantic_prose_invalid"
+    assert outcome.reason == (
+        "Unsupported calendar semantic component(s): prose, intent: repair still overstates the "
+        "evidence"
+    )
     assert len(gateway.prompts) == 4
     assert "Repair the previous rejected result" in gateway.prompts[2]
+
+
+@pytest.mark.asyncio
+async def test_critic_rejects_prose_without_discarding_supported_intent() -> None:
+    gateway = _FakeGateway(
+        [
+            _result(),
+            _critique(
+                False,
+                reason="overview invents an unsupported topic",
+                intent_supported=True,
+                overview_supported=False,
+                description_supported=False,
+                common_supported=True,
+            ),
+            None,
+        ]
+    )
+
+    outcome = await CalendarEventSemanticInterpreter(gateway).analyze(_event())
+
+    assert outcome.status == CalendarEventSemanticStatus.INVALID
+    assert outcome.intent_status == CalendarActivityIntentStatus.VALID
+    assert outcome.activity_intent == CalendarActivityIntent.STUDY
+    assert outcome.result is not None
+    assert outcome.reason == (
+        "Unsupported calendar semantic component(s): prose: overview invents an unsupported topic"
+    )
+
+
+@pytest.mark.asyncio
+async def test_critic_rejects_intent_without_discarding_supported_prose() -> None:
+    gateway = _FakeGateway(
+        [
+            _result(),
+            _critique(
+                False,
+                reason="intent is unsupported by the title",
+                intent_supported=False,
+                overview_supported=True,
+                description_supported=True,
+                common_supported=True,
+            ),
+            None,
+        ]
+    )
+
+    outcome = await CalendarEventSemanticInterpreter(gateway).analyze(_event())
+
+    assert outcome.status == CalendarEventSemanticStatus.VALID
+    assert outcome.intent_status == CalendarActivityIntentStatus.INVALID
+    assert outcome.activity_intent is None
+    assert outcome.result is not None
+    assert outcome.result.description == "Prepare breadth-first search and runtime analysis."
 
 
 @pytest.mark.asyncio
@@ -290,6 +540,19 @@ async def test_model_failure_omits_semantics_without_description_fallback() -> N
     assert len(gateway.prompts) == 1
 
 
+@pytest.mark.asyncio
+async def test_critic_unavailability_omits_semantics_and_intent() -> None:
+    gateway = _FakeGateway([_result(), None])
+
+    outcome = await CalendarEventSemanticInterpreter(gateway).analyze(_event())
+
+    assert outcome.status is CalendarEventSemanticStatus.UNAVAILABLE
+    assert outcome.intent_status is CalendarActivityIntentStatus.UNAVAILABLE
+    assert outcome.result is None
+    assert outcome.error_code == "calendar_semantic_critic_unavailable"
+    assert len(gateway.prompts) == 2
+
+
 def _cache_record(**overrides: Any) -> CalendarSemanticCacheRecord:
     data = {
         "event_id": "event-1",
@@ -298,8 +561,12 @@ def _cache_record(**overrides: Any) -> CalendarSemanticCacheRecord:
         "source_last_edited_at": _event().source_last_edited_at,
         "model_identity": "qwen-test",
         "config_version": "cfg-test",
-        "prompt_version": "calendar-event-semantics-v1",
+        "prompt_version": "calendar-event-semantics-v3",
         "result": _result(),
+        "activity_intent": CalendarActivityIntent.STUDY,
+        "intent_status": CalendarActivityIntentStatus.VALID,
+        "intent_evidence_fragment_ids": ("event-1:host:title", "frag-1"),
+        "intent_rationale": "Title and topics support a study-oriented event.",
     }
     data.update(overrides)
     return CalendarSemanticCacheRecord(**data)
@@ -342,6 +609,10 @@ def test_cache_reuse_rejects_failed_or_cross_event_records() -> None:
     failed = _cache_record(
         semantic_status=CalendarEventSemanticStatus.INVALID,
         result=None,
+        activity_intent=None,
+        intent_status=CalendarActivityIntentStatus.UNAVAILABLE,
+        intent_evidence_fragment_ids=(),
+        intent_rationale=None,
     )
     failed_decision = decide_calendar_semantic_cache_reuse(
         event,
@@ -356,7 +627,12 @@ def test_cache_reuse_rejects_failed_or_cross_event_records() -> None:
     with pytest.raises(ValidationError, match="belongs to another event"):
         _cache_record(
             event_id="event-1",
-            result=_result().model_copy(update={"event_id": "event-2"}),
+            result=_result().model_copy(
+                update={
+                    "event_id": "event-2",
+                    "intent_evidence_fragment_ids": ("event-2:host:title", "frag-1"),
+                }
+            ),
         )
 
 

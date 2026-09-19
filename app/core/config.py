@@ -49,23 +49,36 @@ class Settings(BaseSettings):
     ollama_base_url: AnyHttpUrl = AnyHttpUrl("http://host.docker.internal:11434")
     ollama_model: str = "qwen3-32gb:latest"
     model_trigger_mode: Literal["authorized_discord_channel"] = "authorized_discord_channel"
-    ollama_max_concurrency: Annotated[int, Field(gt=0, le=128)] = 1
-    ollama_num_ctx: Annotated[int, Field(gt=0)] = 2048
+    ollama_max_concurrency: Annotated[int, Field(ge=1, le=1)] = 1
+    ollama_num_ctx: Annotated[int, Field(gt=0)] = 16_384
     ollama_num_batch: Annotated[int, Field(ge=32, le=512)] = 32
     ollama_timeout_seconds: Annotated[float, Field(gt=0, le=1800)] = 300.0
     ollama_model_keep_alive_seconds: Annotated[int, Field(gt=0, le=3600)] = 300
     ollama_startup_timeout_seconds: Annotated[float, Field(gt=0, le=300)] = 30.0
-    ollama_max_input_tokens: Annotated[int, Field(gt=0)] = 6000
-    ollama_max_output_tokens: Annotated[int, Field(gt=0)] = 384
+    ollama_max_input_tokens: Annotated[int, Field(gt=0)] = 13_824
+    ollama_max_output_tokens: Annotated[int, Field(gt=0)] = 1_024
+    ollama_context_reserve_tokens: Annotated[int, Field(ge=0)] = 1_536
     ollama_repair_attempts: Annotated[int, Field(ge=0, le=1)] = 1
     ollama_seed: int = 1729
     ollama_reasoning: bool = False
+    ollama_structured_output_transport: Literal["json_schema", "json"] = "json_schema"
     ollama_model_digest: str | None = (
         "d039cde69ac1f5a43d5134182adfefa65bdb533362a625b936e6171a53296eb3"
     )
-    embedding_model: str = "qwen3-embedding:0.6b"
+    embedding_model: str = "qwen3-embedding:4b"
     embedding_model_digest: str | None = None
+    embedding_dimensions: Annotated[int, Field(gt=0, le=2_000)] = 1024
     embedding_timeout_seconds: Annotated[float, Field(gt=0, le=300)] = 30.0
+    embedding_model_keep_alive_seconds: Annotated[int, Field(gt=0, le=3600)] = 300
+    user_memory_enabled: bool = True
+    user_memory_retrieval_limit: Annotated[int, Field(gt=0, le=32)] = 8
+    user_memory_context_max_chars: Annotated[int, Field(gt=0, le=12_000)] = 3_000
+    conversation_summary_enabled: bool = True
+    conversation_compaction_trigger_tokens: Annotated[int, Field(gt=0)] = 10_368
+    conversation_compaction_target_tokens: Annotated[int, Field(gt=0)] = 7_168
+    conversation_recent_tail_max_tokens: Annotated[int, Field(gt=0)] = 4_096
+    conversation_compaction_max_output_tokens: Annotated[int, Field(gt=0)] = 1_024
+    conversation_context_manifest_retention_days: Annotated[int, Field(gt=0, le=365)] = 30
     discord_api_base_url: AnyHttpUrl = AnyHttpUrl(DISCORD_API_BASE_URL)
 
     # Connector settings are declared now so all deployment configuration has
@@ -82,7 +95,6 @@ class Settings(BaseSettings):
     ops_console_password: SecretValue = None
     notion_courses_database_id: str | None = None
     notion_assessments_database_id: str | None = None
-    notion_study_blocks_database_id: str | None = None
     finance_source_allowlist_version: str = "finance-sources-2026.09-v2"
     finance_eia_mode: Literal["bulk", "api"] = "bulk"
     sec_user_agent: str = "LifeAgent/0.1 contact@example.com"
@@ -116,6 +128,7 @@ class Settings(BaseSettings):
     discord_handoff_max_clock_skew_seconds: Annotated[int, Field(gt=0, le=300)] = 60
     discord_handoff_request_timeout_seconds: Annotated[float, Field(gt=0, le=30)] = 10.0
     discord_handoff_retry_attempts: Annotated[int, Field(gt=0, le=5)] = 3
+    discord_abort_wait_timeout_seconds: Annotated[float, Field(gt=0, le=9)] = 2.0
     discord_academic_pdf_max_attachments: Annotated[int, Field(gt=0, le=5)] = 5
     discord_academic_pdf_max_bytes: Annotated[int, Field(gt=0, le=20_971_520)] = 20_971_520
     discord_academic_pdf_download_timeout_seconds: Annotated[float, Field(gt=0, le=60)] = 15.0
@@ -209,7 +222,6 @@ class Settings(BaseSettings):
         "discord_application_id",
         "notion_courses_database_id",
         "notion_assessments_database_id",
-        "notion_study_blocks_database_id",
         "embedding_model_digest",
         mode="before",
     )
@@ -286,6 +298,28 @@ class Settings(BaseSettings):
             )
         if self.finance_eia_mode == "api" and self.eia_api_key is None:
             raise ValueError("FINANCE_EIA_MODE=api requires EIA_API_KEY")
+        if (
+            self.ollama_max_input_tokens
+            + self.ollama_max_output_tokens
+            + self.ollama_context_reserve_tokens
+            > self.ollama_num_ctx
+        ):
+            raise ValueError(
+                "Ollama token budget must satisfy "
+                "max input + max output + reserve <= context window"
+            )
+        if not (
+            self.conversation_compaction_target_tokens
+            < self.conversation_compaction_trigger_tokens
+            < self.ollama_max_input_tokens
+        ):
+            raise ValueError(
+                "conversation compaction tokens must satisfy target < trigger < max input"
+            )
+        if self.conversation_recent_tail_max_tokens >= self.ollama_max_input_tokens:
+            raise ValueError("conversation recent tail max tokens must be below max input tokens")
+        if self.conversation_compaction_max_output_tokens > self.ollama_max_output_tokens:
+            raise ValueError("conversation compaction output cannot exceed model output tokens")
         if (
             self.academic_memory_snooze_after_missed_checkins
             > self.academic_memory_delete_after_missed_checkins
@@ -367,15 +401,32 @@ class Settings(BaseSettings):
             "ollama_num_batch": self.ollama_num_batch,
             "ollama_max_input_tokens": self.ollama_max_input_tokens,
             "ollama_max_output_tokens": self.ollama_max_output_tokens,
+            "ollama_context_reserve_tokens": self.ollama_context_reserve_tokens,
             "ollama_model_keep_alive_seconds": self.ollama_model_keep_alive_seconds,
             "ollama_startup_timeout_seconds": self.ollama_startup_timeout_seconds,
             "ollama_repair_attempts": self.ollama_repair_attempts,
             "ollama_seed": self.ollama_seed,
             "ollama_reasoning": self.ollama_reasoning,
+            "ollama_structured_output_transport": self.ollama_structured_output_transport,
             "ollama_model_digest": self.ollama_model_digest,
             "embedding_model": self.embedding_model,
             "embedding_model_digest": self.embedding_model_digest,
+            "embedding_dimensions": self.embedding_dimensions,
             "embedding_timeout_seconds": self.embedding_timeout_seconds,
+            "embedding_model_keep_alive_seconds": self.embedding_model_keep_alive_seconds,
+            "user_memory_enabled": self.user_memory_enabled,
+            "user_memory_retrieval_limit": self.user_memory_retrieval_limit,
+            "user_memory_context_max_chars": self.user_memory_context_max_chars,
+            "conversation_summary_enabled": self.conversation_summary_enabled,
+            "conversation_compaction_trigger_tokens": (self.conversation_compaction_trigger_tokens),
+            "conversation_compaction_target_tokens": (self.conversation_compaction_target_tokens),
+            "conversation_recent_tail_max_tokens": self.conversation_recent_tail_max_tokens,
+            "conversation_compaction_max_output_tokens": (
+                self.conversation_compaction_max_output_tokens
+            ),
+            "conversation_context_manifest_retention_days": (
+                self.conversation_context_manifest_retention_days
+            ),
             "discord_api_base_url": self._safe_url(str(self.discord_api_base_url)),
             "retry_max_attempts": self.retry_max_attempts,
             "retry_base_delay_seconds": self.retry_base_delay_seconds,
@@ -410,6 +461,7 @@ class Settings(BaseSettings):
                 self.discord_handoff_request_timeout_seconds
             ),
             "discord_handoff_retry_attempts": self.discord_handoff_retry_attempts,
+            "discord_abort_wait_timeout_seconds": self.discord_abort_wait_timeout_seconds,
             "discord_academic_pdf_max_attachments": self.discord_academic_pdf_max_attachments,
             "discord_academic_pdf_max_bytes": self.discord_academic_pdf_max_bytes,
             "discord_academic_pdf_download_timeout_seconds": (
@@ -452,17 +504,12 @@ class Settings(BaseSettings):
                 for value in (
                     self.notion_courses_database_id,
                     self.notion_assessments_database_id,
-                    self.notion_study_blocks_database_id,
                 )
             ),
             "notion_token_configured": self.notion_token is not None,
             "notion_courses_database_configured": self.notion_courses_database_id is not None,
             "notion_deprecated_database_metadata_count": sum(
-                value is not None
-                for value in (
-                    self.notion_assessments_database_id,
-                    self.notion_study_blocks_database_id,
-                )
+                value is not None for value in (self.notion_assessments_database_id,)
             ),
             "github_app_configured": all(
                 (

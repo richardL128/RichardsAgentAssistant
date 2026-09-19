@@ -9,9 +9,10 @@ the bounded unavailable response:
 Qwen is unavailable on this Mac; run scripts/ollama_qwen_start.sh and try again.
 ```
 
-The operations console or `/health/ready` may also show `ollama=attention` with
-a diagnostic such as `Ollama unavailable`, `configured Ollama model is not
-installed`, or `configured Ollama model digest does not match`.
+The operations console or `/health/ready` may also show `ollama=attention` or
+`academic_embeddings=failed`. Embedding failure codes distinguish a missing
+model, digest mismatch, unsupported capability, bad 1,024-dimensional probe,
+timeout, and stale material/reflection vectors.
 
 In the default runtime, Qwen-powered work starts from a message sent by an
 authorized owner in the configured private Discord academic channel or from the
@@ -27,9 +28,11 @@ Check the API readiness endpoint:
 curl http://127.0.0.1:8000/health/ready | jq .
 ```
 
-The readiness probe checks Ollama's non-secret `/api/tags` endpoint only. It can
-observe whether the host API is reachable and whether the configured model and
-optional digest are present; it must not send a generation request or load Qwen.
+Reasoning readiness uses Ollama's non-secret model metadata without generating
+text. Academic embedding readiness additionally checks `/api/show`, sends one
+fixed non-private embedding probe, validates 1,024 finite values, and checks
+counts of stale material and reflection vectors. It never sends user content as
+part of health checking.
 
 Check the host-managed Ollama state from the repository root:
 
@@ -38,10 +41,30 @@ scripts/ollama_qwen_status.sh
 ```
 
 The status script reports, with meaningful exit codes, whether the local Ollama
-API is reachable, whether the configured model is installed, whether the
-optional digest matches, and whether Qwen is currently resident according to
-`/api/ps`. It does not print prompts, Discord messages, unrelated model
-metadata, or secrets.
+API is reachable, whether both the reasoning and embedding models are
+installed, whether optional digests match, whether the embedding role advertises
+its capability, and whether either role is resident according to `/api/ps`. It
+does not print prompts, Discord messages, unrelated model metadata, or secrets.
+
+The default native context budget is `OLLAMA_NUM_CTX=16384`,
+`OLLAMA_MAX_INPUT_TOKENS=13824`, `OLLAMA_MAX_OUTPUT_TOKENS=1024`, and
+`OLLAMA_CONTEXT_RESERVE_TOKENS=1536`. Startup validates that the input budget,
+output budget, and reserve fit inside the configured context window before a
+model request is accepted.
+
+Native conversations no longer replay the entire transcript into each model
+call. The exact artifact-backed transcript remains canonical for audit and
+restart recovery, while every model boundary receives a budgeted assembly of a
+validated cumulative session summary, an adjacency-safe recent tail, relevant
+active generic owner memories, and current tool-loop messages. Summary and
+memory blocks are explicitly untrusted and are never checkpointed into the
+canonical transcript. If summary validation or compaction fails, the session
+pauses with its complete transcript intact; there is no full-replay fallback.
+
+The `/health/ready` response also checks the metadata tables for durable native
+conversation sessions, compactions, and generic owner memory. It reports only
+schema presence; transcript, summary, memory, tool-result, reasoning, and
+trusted checkpoint content never appears in health diagnostics.
 
 Verify Docker can reach the host endpoint without loading Qwen:
 
@@ -53,11 +76,12 @@ Use queue inspection only to diagnose operational backlog. Queue and health
 checks should not be treated as permission to start any model workflow beyond
 the configured private-channel conversation and morning event-semantic paths.
 
-For a morning run, inspect `calendar_briefing.semantic_interpretation` and
-`calendar_briefing.semantic_validation` rows in `run_steps`. If Ollama cannot
-become ready inside the configured event/total deadlines, the briefing should
-still contain trusted event titles and dates, omit unverified semantic prose,
-and show one aggregate availability condition.
+For a morning run, inspect ordinal-specific rows such as
+`calendar_briefing.event_001.semantic_interpretation` and
+`calendar_briefing.event_001.semantic_validation` in `run_steps`. If Ollama
+cannot become ready inside the configured event/total deadlines, the briefing
+should still contain trusted event titles and dates, omit unverified semantic
+prose, and show one aggregate availability condition.
 
 ## Fix
 
@@ -78,23 +102,36 @@ be reachable from the host network/LAN unless protected. Keep the Mac on a
 trusted network, protect the port with the macOS firewall, never add a router
 port-forward, and never publish port 11434 from Compose.
 
-If the model is missing, the script still must not pull it by default. Pull only
-when the operator explicitly requests the large download:
+If either model is missing, the script still must not pull by default. Pull only
+when the operator explicitly requests the download:
 
 ```bash
 scripts/ollama_qwen_start.sh --pull
 ```
 
-If the digest does not match, first confirm the configured `OLLAMA_MODEL` and
-the installed model returned by:
+If a digest does not match, first confirm `OLLAMA_MODEL`, `EMBEDDING_MODEL`, and
+the installed roles returned by:
 
 ```bash
 scripts/ollama_qwen_status.sh
 ```
 
-If the new digest is intentional, update `OLLAMA_MODEL_DIGEST` in the deployment
-environment after benchmarking the model. If it is not intentional, reinstall or
-pull the expected model with `--pull`.
+If a new digest is intentional, update the matching `OLLAMA_MODEL_DIGEST` or
+`EMBEDDING_MODEL_DIGEST` after verification. If it is not intentional, reinstall
+or pull the expected model with `--pull`.
+
+If the models are healthy but `academic_embeddings` reports stale vectors, run
+the counts-only dry run, then the bounded backfill:
+
+```bash
+.venv/bin/python -m app.agents.academic_planner.material_embedding_backfill \
+  --batch-size 64 --max-batches 1
+.venv/bin/python -m app.agents.academic_planner.material_embedding_backfill \
+  --apply --batch-size 64 --max-batches 10 --bootstrap-empty-corpus
+```
+
+Repeat the apply command until `remaining_count` is zero. Semantic retrieval
+does not silently fall back to keyword search while embeddings are unavailable.
 
 After changing `.env`, deploy the shared image and restart the native runtime:
 
@@ -140,6 +177,28 @@ five idle minutes. To unload immediately without deleting model files:
 ```bash
 scripts/ollama_qwen_unload.sh
 ```
+
+Model residency is not conversation memory. While an owner is answering a
+clarification, no generation request or database transaction stays open. The
+next wake reloads the complete canonical transcript and trusted tool checkpoint,
+then assembles bounded summary-plus-tail model context, so an unload or worker
+restart is safe. If a turn still reports context capacity exhaustion after safe
+compaction, do not delete the session or retry with full replay; ask the owner to
+shorten the current request or cancel and resend a narrower request. Expired or
+corrupt sessions require a complete resend.
+
+Generic durable memory is owner-and-channel scoped and separate from academic
+learning-focus memory. Active writes require explicit owner language such as
+"remember", "forget", or "correct what you remember". Semantic retrieval may
+be unavailable while exact/category retrieval continues; that state must not be
+reported as proof that memory is empty.
+
+Do not promote this Mac to the 32K profile until the checked-in 32K benchmark
+artifact reports `gate_passed=true`, observed resident context exactly `32768`,
+stable model identity, physical model concurrency one, successful combined
+generation-plus-embedding residency, p95 below 300 seconds, at least 10% host
+free memory, and no more than 1 GiB steady swap growth. Until then, keep the
+single 16K configured default; do not add a legacy/full-replay alternate profile.
 
 ## Gateway and local handoff
 

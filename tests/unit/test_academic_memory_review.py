@@ -9,19 +9,15 @@ from types import SimpleNamespace
 from typing import Any
 
 import pytest
-from pydantic import SecretStr
 from sqlalchemy import Engine, create_engine, func, select
 from sqlalchemy.orm import Session
 
 from app.agents.academic_planner.contracts import (
     AcademicMemoryReviewDecision,
     AcademicMemorySummary,
-    AcademicRequestRouteDecision,
     MemoryManagementOutcome,
 )
-from app.agents.academic_planner.discord_checkin import AcademicDiscordCheckinHandler
 from app.agents.academic_planner.memory_workflow import AcademicMemoryService
-from app.connectors.discord_gateway import DiscordAcademicMessageCreate
 from app.db.academic import (
     AcademicRepository,
     LearningFocusMemoryInput,
@@ -34,7 +30,6 @@ from app.db.models import (
     AcademicLearningFocusEvent,
     AcademicReflectionMemory,
     Base,
-    StudyBlock,
 )
 from app.llm.embeddings import EmbeddingErrorCode, EmbeddingStatus
 
@@ -205,85 +200,6 @@ async def _start_review(
 
 
 @pytest.mark.asyncio
-async def test_unmentioned_see_memory_routes_before_reflection_and_notion() -> None:
-    class SemanticRouter:
-        async def invoke_structured(self, **_kwargs: Any) -> object:
-            return SimpleNamespace(
-                output=AcademicRequestRouteDecision(
-                    memory_request="see memory",
-                )
-            )
-
-    class Memory:
-        review_calls = 0
-
-        async def handle_memory_review(self, **_kwargs: Any) -> object:
-            self.review_calls += 1
-            return SimpleNamespace(status="summarized", response="Grounded academic summary.")
-
-        async def handle_reflection(self, **_kwargs: Any) -> object:
-            raise AssertionError("see memory must not reach reflection handling")
-
-    class Delivery:
-        def __init__(self) -> None:
-            self.responses: list[str] = []
-
-        async def send_response(self, content: str, *, idempotency_key: str) -> object:
-            del idempotency_key
-            self.responses.append(content)
-            return object()
-
-        async def send_confirmation(self, *_args: Any, **_kwargs: Any) -> object:
-            raise AssertionError("see memory must not create a Notion proposal")
-
-    class Store:
-        confirmation_ttl_hours = 24
-
-        def get_latest_daily_plan(self) -> None:
-            raise AssertionError("see memory must not load the Notion proposal flow")
-
-        def save_discord_checkin(self, *_args: Any, **_kwargs: Any) -> object:
-            raise AssertionError("see memory must not persist a Notion proposal")
-
-    class Runtime:
-        async def ensure_ready(self) -> object:
-            return object()
-
-    memory = Memory()
-    delivery = Delivery()
-    handler = AcademicDiscordCheckinHandler(
-        store=Store(),  # type: ignore[arg-type]
-        delivery=delivery,  # type: ignore[arg-type]
-        allowed_channel_ids={CHANNEL},
-        authorized_user_ids={OWNER},
-        writer_provider=lambda: None,
-        ollama_runtime=Runtime(),  # type: ignore[arg-type]
-        agent_gateway=object(),  # type: ignore[arg-type]
-        semantic_router_gateway=SemanticRouter(),
-        agent_catalog=object(),  # type: ignore[arg-type]
-        assistant_user_id="777777777777777777",
-        memory_service=memory,  # type: ignore[arg-type]
-    )
-
-    result = await handler(
-        DiscordAcademicMessageCreate(
-            message_id="333334444455555666",
-            channel_id=CHANNEL,
-            author_id=OWNER,
-            timestamp=NOW,
-            content=SecretStr("<@777777777777777777> see memory"),
-            mentioned_user_ids=("777777777777777777",),
-        )
-    )
-
-    assert result.status == "handled"
-    assert memory.review_calls == 1
-    # This fake delivery does not expose the editable progress-reporter API;
-    # the durable memory response still remains authoritative.
-    assert delivery.responses == ["Grounded academic summary."]
-
-
-@pytest.mark.asyncio
 async def test_see_memory_summary_is_qwen_grounded_and_creates_durable_session(
     engine: Engine,
 ) -> None:
@@ -428,7 +344,7 @@ async def test_hallucinated_summary_id_uses_fallback_without_discord_uuid(engine
     result = await _start_review(_service(engine, gateway))
 
     assert result.status == "summarized"
-    assert "nodal analysis is active with 30-minute practice blocks" in str(result.response)
+    assert "ECE 250 nodal analysis is active" in str(result.response)
     assert str(focus_id) not in str(result.response)
 
 
@@ -531,32 +447,12 @@ async def test_cancel_closes_review_without_mutation_and_duplicate_is_harmless(
 
 
 @pytest.mark.asyncio
-async def test_explicit_deletion_cleans_memory_events_and_preserves_practice_block(
+async def test_explicit_deletion_cleans_memory_events(
     engine: Engine,
 ) -> None:
     with Session(engine) as session, session.begin():
         focus = _create_focus(session, topic="circuit design", event_id="focus-explicit-delete")
         focus_id = focus.id
-        plan = AcademicRepository.upsert_study_plan(
-            session,
-            plan_key="plan-delete",
-            starts_on=date(2026, 9, 9),
-            ends_on=date(2026, 9, 9),
-            timezone="America/Toronto",
-            status="published",
-        )
-        block = AcademicRepository.upsert_study_block(
-            session,
-            plan_id=plan.id,
-            block_key="practice-delete",
-            title="Practice circuit design",
-            starts_at=NOW + timedelta(hours=1),
-            ends_at=NOW + timedelta(hours=1, minutes=30),
-            allocated_minutes=30,
-            learning_focus_id=focus_id,
-            block_kind="practice",
-        )
-        block_id = block.id
     gateway = Gateway(
         summaries=(
             AcademicMemorySummary(
@@ -595,10 +491,6 @@ async def test_explicit_deletion_cleans_memory_events_and_preserves_practice_blo
         assert session.get(AcademicLearningFocus, focus_id) is None
         assert session.scalar(select(func.count()).select_from(AcademicReflectionMemory)) == 0
         assert session.scalar(select(func.count()).select_from(AcademicLearningFocusEvent)) == 0
-        block = session.get(StudyBlock, block_id)
-        assert block is not None
-        assert block.learning_focus_id is None
-        assert block.block_kind == "practice"
 
 
 @pytest.mark.asyncio
@@ -671,7 +563,7 @@ async def test_rewrite_replaces_raw_text_vector_topic_and_resets_review_state(
 
 
 @pytest.mark.asyncio
-async def test_embedding_failure_during_rewrite_removes_stale_vector(engine: Engine) -> None:
+async def test_embedding_failure_during_rewrite_preserves_existing_memory(engine: Engine) -> None:
     with Session(engine) as session, session.begin():
         focus = _create_focus(
             session,
@@ -707,15 +599,17 @@ async def test_embedding_failure_during_rewrite_removes_stale_vector(engine: Eng
         raw_text="Actually, the focus is nodal analysis.",
     )
 
-    assert result.status == "applied"
+    assert result.status == "failed"
+    assert "did not store" in str(result.response)
     with Session(engine) as session:
+        focus = session.get(AcademicLearningFocus, focus_id)
         memory = session.scalar(select(AcademicReflectionMemory))
+        assert focus is not None
+        assert focus.topic == "circuit design"
         assert memory is not None
-        assert memory.raw_text == "Actually, the focus is nodal analysis."
-        assert memory.embedding is None
-        assert memory.embedding_model is None
-        assert memory.embedding_metadata["status"] == "failed"
-        assert memory.embedding_metadata["error_code"] == "embedding_model_error"
+        assert memory.raw_text == "Old stale reflection text."
+        assert memory.embedding == [0.1, 0.2, 0.3]
+        assert memory.embedding_model == "test-embedding-v1"
 
 
 @pytest.mark.asyncio

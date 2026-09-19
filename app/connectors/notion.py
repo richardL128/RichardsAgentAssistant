@@ -25,11 +25,11 @@ from app.core.errors import (
 
 NOTION_API_BASE_URL: Final[str] = "https://api.notion.com/v1"
 NOTION_API_VERSION: Final[str] = "2025-09-03"
-DatabaseName = Literal["courses", "assessments", "study_blocks"]
+DatabaseName = Literal["courses", "assessments"]
 NotionSourceType = Literal["database", "data_source"]
 DiagnosticSeverity = Literal["info", "warning", "error"]
 NotionMaterialSourceKind = Literal["notion_page_body", "notion_property_file", "notion_block_file"]
-_DATABASES: Final[frozenset[str]] = frozenset({"courses", "assessments", "study_blocks"})
+_DATABASES: Final[frozenset[str]] = frozenset({"courses", "assessments"})
 _REQUIRED_PROPERTIES: Final[dict[str, frozenset[str]]] = {
     "courses": frozenset({"course", "term", "priority", "outline", "policy"}),
     "assessments": frozenset(
@@ -44,9 +44,6 @@ _REQUIRED_PROPERTIES: Final[dict[str, frozenset[str]]] = {
             "status",
             "estimated_time",
         }
-    ),
-    "study_blocks": frozenset(
-        {"assessment", "planned_duration", "actual_duration", "completion_state", "notes"}
     ),
 }
 _ID_PATTERN: Final[re.Pattern[str]] = re.compile(r"^[A-Za-z0-9_-]{1,128}$")
@@ -80,9 +77,9 @@ MAX_INTERVIEW_URL_CANDIDATES = 50
 MAX_CALENDAR_EVIDENCE_FRAGMENTS = 40
 MAX_CALENDAR_EVIDENCE_FRAGMENT_CHARS = 4_000
 MAX_CALENDAR_EVIDENCE_TOTAL_CHARS = 10_000
-MAX_ASSESSMENT_MATERIAL_BLOCKS = 500
+MAX_ASSESSMENT_MATERIAL_BLOCKS = 5_000
 MAX_ASSESSMENT_MATERIAL_REQUESTS = 100
-MAX_ASSESSMENT_MATERIAL_DEPTH = 4
+MAX_ASSESSMENT_MATERIAL_DEPTH = 16
 MAX_ASSESSMENT_MATERIAL_TEXT_CHARS = 50_000
 MAX_ASSESSMENT_MATERIAL_FILES = 100
 _TEXT_BLOCK_TYPES: Final[frozenset[str]] = frozenset(
@@ -1058,7 +1055,7 @@ def _date_property_value(
         if duration.total_seconds() < 5 * 60 or duration.total_seconds() > 240 * 60:
             raise permanent_error(
                 ErrorCode.INPUT_INVALID,
-                "Studying Block duration must be between 5 and 240 minutes",
+                "Notion event duration must be between 5 and 240 minutes",
             )
         date_value["end"] = end_at.isoformat().replace("+00:00", "Z")
     return {"date": date_value}
@@ -1401,16 +1398,6 @@ def _notion_value_for_change(change: PlannerProposedChange) -> Any:
         return {"status": {"name": status}}
     if change.field == "new_deadline":
         return {"date": {"start": change.value.strip()}}
-    if change.field == "actual_minutes":
-        try:
-            minutes = int(change.value)
-        except ValueError:
-            raise permanent_error(
-                ErrorCode.INPUT_INVALID, "actual minutes must be an integer"
-            ) from None
-        if minutes < 0:
-            raise permanent_error(ErrorCode.INPUT_INVALID, "actual minutes must not be negative")
-        return {"number": minutes}
     raise permanent_error(
         ErrorCode.INPUT_INVALID, "planner change is not an allowlisted Notion write"
     )
@@ -1440,9 +1427,7 @@ class NotionConnector:
             and selected_ids is not None
             and frozenset(selected_ids) != _DATABASES
         ):
-            raise ValueError(
-                "Notion legacy mapping must cover courses, assessments, and study_blocks"
-            )
+            raise ValueError("Notion legacy mapping must cover courses and assessments")
         self._legacy_collection_endpoint = (
             "data_sources" if data_source_ids is not None and database_ids is None else "databases"
         )
@@ -1465,7 +1450,7 @@ class NotionConnector:
         """Validate stable Notion property-ID mappings before sync startup."""
 
         if frozenset(property_ids) != _DATABASES:
-            raise ValueError("Notion property mapping must cover all three databases")
+            raise ValueError("Notion property mapping must cover courses and assessments")
         normalized: dict[str, dict[str, str]] = {}
         for database, values in property_ids.items():
             missing = _REQUIRED_PROPERTIES[database] - set(values)
@@ -2416,11 +2401,11 @@ class NotionConnector:
         source_page_id = _validate_page_id(page_id)
         if not 1 <= page_size <= 100:
             raise permanent_error(ErrorCode.INPUT_INVALID, "Notion block page size is invalid")
-        if not 0 <= max_depth <= MAX_ASSESSMENT_MATERIAL_DEPTH:
+        if not 0 <= max_depth <= MAX_INTERVIEW_BODY_DEPTH:
             raise permanent_error(ErrorCode.INPUT_INVALID, "Notion evidence depth is invalid")
-        if not 1 <= max_blocks <= MAX_ASSESSMENT_MATERIAL_BLOCKS:
+        if not 1 <= max_blocks <= MAX_INTERVIEW_BODY_BLOCKS:
             raise permanent_error(ErrorCode.INPUT_INVALID, "Notion evidence block limit is invalid")
-        if not 1 <= max_requests <= MAX_ASSESSMENT_MATERIAL_REQUESTS:
+        if not 1 <= max_requests <= MAX_INTERVIEW_BODY_REQUESTS:
             raise permanent_error(
                 ErrorCode.INPUT_INVALID, "Notion evidence request limit is invalid"
             )
@@ -4209,7 +4194,6 @@ class AcademicNotionWriter:
     _FIELD_TO_PROPERTY: Final[dict[str, tuple[DatabaseName, str]]] = {
         "completed": ("assessments", "status"),
         "new_deadline": ("assessments", "due"),
-        "actual_minutes": ("study_blocks", "actual_duration"),
     }
 
     def __init__(

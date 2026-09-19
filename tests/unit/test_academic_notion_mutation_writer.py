@@ -355,7 +355,51 @@ async def test_confirmed_batch_applies_ordered_create_update_and_archive() -> No
 
 
 @pytest.mark.asyncio
-async def test_study_create_passes_scheduled_end_and_records_receipt() -> None:
+async def test_confirmed_misc_task_writes_only_resolved_misc_name_and_date_properties() -> None:
+    connector = _Connector()
+    targets = _Targets()
+    targets.course = AcademicCourseMutationTarget(
+        course_id="misc-course",
+        course_code="misc",
+        data_source_id="misc-source",
+        title_property_id="misc-title",
+        date_property_id="misc-date",
+    )
+    writer = DiscoveredAcademicNotionWriter(
+        connector=connector,  # type: ignore[arg-type]
+        target_store=targets,
+    )
+    due = datetime(2026, 9, 14, 22, tzinfo=UTC)
+    changes = (
+        ProposedChange(
+            field="create_assessment",
+            value="Task — scrub the toilets",
+            course_id="misc-course",
+            course_code="misc",
+            title="Task — scrub the toilets",
+            due_at=due,
+            assessment_type=AssessmentType.TASK,
+        ),
+    )
+
+    await writer.apply_confirmed_changes(
+        changes,
+        proposal_id=PROPOSAL_ID,
+        confirmation_event=f"confirm {PROPOSAL_ID}",
+        review=_review(changes),
+    )
+
+    assert [name for name, _ in connector.calls] == ["create"]
+    payload = connector.calls[0][1]
+    assert payload["data_source_id"] == "misc-source"
+    assert payload["title_property_id"] == "misc-title"
+    assert payload["date_property_id"] == "misc-date"
+    assert payload["title"] == "Task — scrub the toilets"
+    assert payload["due"] == due
+
+
+@pytest.mark.asyncio
+async def test_course_event_create_passes_scheduled_end_and_records_receipt() -> None:
     connector = _Connector()
     targets = _Targets()
     writer = DiscoveredAcademicNotionWriter(
@@ -366,12 +410,12 @@ async def test_study_create_passes_scheduled_end_and_records_receipt() -> None:
     ends_at = datetime(2026, 9, 10, 23, 45, tzinfo=UTC)
     change = SimpleNamespace(
         field="create_assessment",
-        value="Studying Block - Race conditions",
+        value="Review race conditions",
         course_id="course-1",
-        title="Studying Block - Race conditions",
+        title="Review race conditions",
         due_at=starts_at,
         ends_at=ends_at,
-        assessment_type=AssessmentType.STUDYING_BLOCK,
+        assessment_type=AssessmentType.EVENT,
     )
 
     await writer.apply_confirmed_changes(

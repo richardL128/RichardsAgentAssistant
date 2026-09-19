@@ -1,0 +1,39 @@
+"""Reserved semantic roles for Notion rows in the Courses database."""
+
+from __future__ import annotations
+
+import re
+from enum import StrEnum
+
+
+class AcademicCalendarRole(StrEnum):
+    """Host-derived role for one discovered Courses row."""
+
+    COURSE = "course"
+    MISC = "misc"
+
+
+_TASK_PREFIX = re.compile(r"^\s*task\b\s*(?:[—:-]\s*)?", re.IGNORECASE)
+
+
+def academic_calendar_role(title: str) -> AcademicCalendarRole:
+    """Reserve only an exact, normalized ``misc`` title for general to-dos."""
+
+    normalized = " ".join(title.casefold().split())
+    if normalized == AcademicCalendarRole.MISC.value:
+        return AcademicCalendarRole.MISC
+    return AcademicCalendarRole.COURSE
+
+
+def canonical_misc_task_title(title: str) -> str:
+    """Build the stable title written into the reserved misc calendar."""
+
+    body = _TASK_PREFIX.sub("", title.strip(), count=1).strip() or "Untitled task"
+    return f"Task — {body}"[:500]
+
+
+__all__ = [
+    "AcademicCalendarRole",
+    "academic_calendar_role",
+    "canonical_misc_task_title",
+]

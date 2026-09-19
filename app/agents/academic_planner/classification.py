@@ -14,7 +14,7 @@ class AssessmentKind(StrEnum):
     ASSIGNMENT = "assignment"
     TUTORIAL = "tutorial"
     LAB = "lab"
-    STUDYING_BLOCK = "studying_block"
+    EVENT = "event"
     UNKNOWN = "unknown"
 
 
@@ -35,7 +35,7 @@ _SUPPORTED_KINDS: frozenset[AssessmentKind] = frozenset(
         AssessmentKind.ASSIGNMENT,
         AssessmentKind.TUTORIAL,
         AssessmentKind.LAB,
-        AssessmentKind.STUDYING_BLOCK,
+        AssessmentKind.EVENT,
     }
 )
 _CANONICAL_LABELS: dict[AssessmentKind, str] = {
@@ -43,7 +43,7 @@ _CANONICAL_LABELS: dict[AssessmentKind, str] = {
     AssessmentKind.ASSIGNMENT: "Assignment",
     AssessmentKind.TUTORIAL: "Tutorial",
     AssessmentKind.LAB: "Lab",
-    AssessmentKind.STUDYING_BLOCK: "Studying Block",
+    AssessmentKind.EVENT: "Event",
 }
 _SINGLE_TOKEN_KINDS: dict[str, AssessmentKind] = {
     AssessmentKind.QUIZ.value: AssessmentKind.QUIZ,
@@ -57,11 +57,11 @@ _TRUSTED_KIND_ALIASES: dict[str, AssessmentKind] = {
     "assignment": AssessmentKind.ASSIGNMENT,
     "tutorial": AssessmentKind.TUTORIAL,
     "lab": AssessmentKind.LAB,
-    "studying_block": AssessmentKind.STUDYING_BLOCK,
+    "event": AssessmentKind.EVENT,
 }
 _TOKEN_PATTERN = re.compile(r"[A-Za-z]+")
 _PREFIX_PATTERN = re.compile(
-    r"^\s*(quiz|assignment|tutorial|lab|studying\s+block)\s+[—-]\s*",
+    r"^\s*(quiz|assignment|tutorial|lab)\s+[—-]\s*",
     re.IGNORECASE,
 )
 
@@ -106,7 +106,8 @@ def canonical_title_previews(label: str) -> dict[AssessmentKind, str]:
 
     body = _title_body(label)
     return {
-        kind: _bounded_title(f"{display} — {body}") for kind, display in _CANONICAL_LABELS.items()
+        kind: _bounded_title(body if kind is AssessmentKind.EVENT else f"{display} — {body}")
+        for kind, display in _CANONICAL_LABELS.items()
     }
 
 
@@ -135,12 +136,12 @@ def _trusted_kind_key(value: str) -> str:
 def _label_matches(label: str) -> tuple[tuple[AssessmentKind, str], ...]:
     tokens = tuple(match.group(0).lower() for match in _TOKEN_PATTERN.finditer(label))
     matches: list[tuple[AssessmentKind, str]] = []
-    for index, word in enumerate(tokens):
+    for word in tokens:
         kind = _SINGLE_TOKEN_KINDS.get(word)
         if kind is not None:
             matches.append((kind, word))
-        if word == "studying" and index + 1 < len(tokens) and tokens[index + 1] == "block":
-            matches.append((AssessmentKind.STUDYING_BLOCK, "studying block"))
+    if not matches:
+        return ((AssessmentKind.EVENT, "event"),)
     return tuple(matches)
 
 

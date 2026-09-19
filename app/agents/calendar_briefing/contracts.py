@@ -17,6 +17,7 @@ class CalendarBriefingModel(BaseModel):
 
 class CalendarEventSourceArea(StrEnum):
     COURSE = "course"
+    MISC = "misc"
     JOBS = "jobs"
 
 
@@ -28,6 +29,17 @@ class CalendarEventSourceKind(StrEnum):
 class CalendarEventSemanticStatus(StrEnum):
     VALID = "valid"
     NOT_SUBSTANTIVE = "not_substantive"
+    UNAVAILABLE = "unavailable"
+    INVALID = "invalid"
+
+
+class CalendarActivityIntent(StrEnum):
+    STUDY = "study"
+    REGULAR = "regular"
+
+
+class CalendarActivityIntentStatus(StrEnum):
+    VALID = "valid"
     UNAVAILABLE = "unavailable"
     INVALID = "invalid"
 
@@ -92,12 +104,20 @@ class CalendarEventSemanticResult(CalendarBriefingModel):
     event_id: str = Field(min_length=1, max_length=255)
     overview: str = Field(min_length=1, max_length=700)
     description_present: bool
-    description: str | None = Field(default=None, min_length=1, max_length=1_500)
+    description: str | None = Field(min_length=1, max_length=1_500)
     evidence_fragment_ids: tuple[str, ...] = Field(min_length=1, max_length=12)
-    description_fragment_ids: tuple[str, ...] = Field(default=(), max_length=12)
-    classification_rationale: str | None = Field(default=None, max_length=500)
+    description_fragment_ids: tuple[str, ...] = Field(max_length=12)
+    classification_rationale: str | None = Field(max_length=500)
+    activity_intent: CalendarActivityIntent | None
+    intent_status: CalendarActivityIntentStatus
+    intent_evidence_fragment_ids: tuple[str, ...] = Field(max_length=12)
+    intent_rationale: str | None = Field(min_length=1, max_length=500)
 
-    @field_validator("evidence_fragment_ids", "description_fragment_ids")
+    @field_validator(
+        "evidence_fragment_ids",
+        "description_fragment_ids",
+        "intent_evidence_fragment_ids",
+    )
     @classmethod
     def cited_fragment_ids_are_unique(cls, value: tuple[str, ...]) -> tuple[str, ...]:
         if len(value) != len(set(value)):
@@ -116,6 +136,30 @@ class CalendarEventSemanticResult(CalendarBriefingModel):
                 raise ValueError("no-description results must not include description text")
             if self.description_fragment_ids:
                 raise ValueError("no-description results must not include description citations")
+        return self
+
+    @model_validator(mode="after")
+    def intent_fields_match_decision(self) -> CalendarEventSemanticResult:
+        if self.intent_status == CalendarActivityIntentStatus.VALID:
+            if self.activity_intent is None:
+                raise ValueError("valid calendar intent requires an activity intent")
+            if not self.intent_evidence_fragment_ids:
+                raise ValueError("valid calendar intent requires intent citations")
+            if f"{self.event_id}:host:title" not in self.intent_evidence_fragment_ids:
+                raise ValueError("valid calendar intent requires host title citation")
+            if self.intent_rationale is None:
+                raise ValueError("valid calendar intent requires a rationale")
+        else:
+            if self.activity_intent is not None:
+                raise ValueError("invalid or unavailable calendar intent must not include intent")
+            if self.intent_evidence_fragment_ids:
+                raise ValueError(
+                    "invalid or unavailable calendar intent must not include citations"
+                )
+            if self.intent_rationale is not None:
+                raise ValueError(
+                    "invalid or unavailable calendar intent must not include a rationale"
+                )
         return self
 
 
@@ -137,6 +181,10 @@ class ScheduledMorningCalendarItem(CalendarBriefingModel):
     semantic_description: str | None = Field(default=None, min_length=1, max_length=1_500)
     semantic_evidence_fragment_ids: tuple[str, ...] = Field(default=(), max_length=12)
     semantic_description_fragment_ids: tuple[str, ...] = Field(default=(), max_length=12)
+    activity_intent: CalendarActivityIntent | None = None
+    intent_status: CalendarActivityIntentStatus = CalendarActivityIntentStatus.UNAVAILABLE
+    intent_evidence_fragment_ids: tuple[str, ...] = Field(default=(), max_length=12)
+    intent_rationale: str | None = Field(default=None, min_length=1, max_length=500)
     source_url: str | None = Field(default=None, max_length=1_000)
 
     @model_validator(mode="after")
@@ -155,7 +203,58 @@ class ScheduledMorningCalendarItem(CalendarBriefingModel):
             self.semantic_overview is None or self.semantic_description is None
         ):
             raise ValueError("valid calendar semantics require overview and description")
+        if self.intent_status == CalendarActivityIntentStatus.VALID:
+            if self.activity_intent is None:
+                raise ValueError("valid calendar intent requires an activity intent")
+            if not self.intent_evidence_fragment_ids:
+                raise ValueError("valid calendar intent requires citations")
+            if self.intent_rationale is None:
+                raise ValueError("valid calendar intent requires a rationale")
+        else:
+            if self.activity_intent is not None:
+                raise ValueError("invalid or unavailable calendar intent cannot carry intent")
+            if self.intent_evidence_fragment_ids:
+                raise ValueError("invalid or unavailable calendar intent cannot carry citations")
         return self
+
+
+def calendar_title_evidence_fragment(
+    *,
+    event_id: str,
+    title: str,
+) -> CalendarEventEvidenceFragment:
+    """Return the host-owned normalized title as the first citable event fragment."""
+
+    normalized = " ".join(title.split())
+    return CalendarEventEvidenceFragment(
+        fragment_id=f"{event_id}:host:title",
+        event_id=event_id,
+        source_kind=CalendarEventSourceKind.PROPERTY,
+        source_label="Title",
+        text=normalized,
+        ordinal=0,
+    )
+
+
+def with_title_evidence_fragment(
+    *,
+    event_id: str,
+    title: str,
+    fragments: Sequence[CalendarEventEvidenceFragment],
+) -> tuple[CalendarEventEvidenceFragment, ...]:
+    """Prepend normalized title evidence and re-ordinal connector fragments deterministically."""
+
+    title_fragment = calendar_title_evidence_fragment(event_id=event_id, title=title)
+    normalized: list[CalendarEventEvidenceFragment] = [title_fragment]
+    seen = {title_fragment.fragment_id}
+    for fragment in fragments:
+        if fragment.event_id != event_id:
+            raise ValueError("calendar title evidence cannot mix events")
+        if fragment.fragment_id in seen:
+            continue
+        normalized.append(fragment.model_copy(update={"ordinal": len(normalized)}))
+        seen.add(fragment.fragment_id)
+    return tuple(normalized)
 
 
 def fingerprint_event_evidence(
@@ -192,6 +291,8 @@ def fingerprint_event_evidence(
 
 
 __all__ = [
+    "CalendarActivityIntent",
+    "CalendarActivityIntentStatus",
     "CalendarEventEvidenceFragment",
     "CalendarEventSemanticInput",
     "CalendarEventSemanticResult",
@@ -199,5 +300,7 @@ __all__ = [
     "CalendarEventSourceArea",
     "CalendarEventSourceKind",
     "ScheduledMorningCalendarItem",
+    "calendar_title_evidence_fragment",
     "fingerprint_event_evidence",
+    "with_title_evidence_fragment",
 ]

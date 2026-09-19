@@ -11,14 +11,17 @@ from app.connectors.discord_gateway import (
     DiscordAcademicMessageCreate,
     DiscordClarificationInteraction,
 )
+from app.discord_commands import is_discord_abort_command
 from app.host.commands import HostWakeError
 from app.host.coordinator import (
     HOST_WAKE_ACKNOWLEDGEMENT,
     HOST_WAKE_HANDOFF_PROGRESS,
     HostWakeCoordinator,
 )
-from app.host.discord import HOST_COMMAND_ACKNOWLEDGEMENT
+from app.host.discord import HOST_ABORT_ACKNOWLEDGEMENT, HOST_COMMAND_ACKNOWLEDGEMENT
 from app.host.handoff import (
+    DiscordHostAbortEvent,
+    DiscordHostAbortReceipt,
     DiscordHostHandoff,
     DiscordHostHandoffAccepted,
     DiscordHostHandoffEvent,
@@ -26,6 +29,16 @@ from app.host.handoff import (
 )
 from app.host.outbox import WakeOutbox
 from app.host.settings import HostWakeSettings
+
+
+@pytest.mark.parametrize("content", ["ABORT", " ABORT\n", "\tABORT "])
+def test_abort_parser_accepts_only_exact_code_word_after_strip(content: str) -> None:
+    assert is_discord_abort_command(content)
+
+
+@pytest.mark.parametrize("content", ["abort", "Abort", "ABORT now", "ABORT!", "please ABORT"])
+def test_abort_parser_rejects_every_non_exact_form(content: str) -> None:
+    assert not is_discord_abort_command(content)
 
 
 class FakeDiscord:
@@ -90,11 +103,21 @@ class FakeHandoff:
     def __init__(self, events: list[str]) -> None:
         self.events = events
         self.events_submitted: list[DiscordHostHandoff] = []
+        self.abort_events_submitted: list[DiscordHostAbortEvent] = []
+        self.abort_receipt = DiscordHostAbortReceipt(status="accepted", target_count=1)
+        self.abort_error: Exception | None = None
 
     async def submit(self, event: DiscordHostHandoff) -> DiscordHostHandoffAccepted:
         self.events.append("handoff")
         self.events_submitted.append(event)
         return DiscordHostHandoffAccepted(status="accepted")
+
+    async def submit_abort(self, event: DiscordHostAbortEvent) -> DiscordHostAbortReceipt:
+        self.events.append("abort_handoff")
+        self.abort_events_submitted.append(event)
+        if self.abort_error is not None:
+            raise self.abort_error
+        return self.abort_receipt
 
 
 class FakeClock:
@@ -132,16 +155,36 @@ def _message(
     message_id: str = "555555555555555555",
     *,
     mentioned: bool = True,
+    content: str | None = None,
+    timestamp: datetime = datetime(2026, 9, 9, tzinfo=UTC),
 ) -> DiscordAcademicMessageCreate:
-    content = "<@111111111111111111> create a study block" if mentioned else "create a study block"
+    content = content or (
+        "<@111111111111111111> create a study block" if mentioned else "create a study block"
+    )
     mentions = ("111111111111111111",) if mentioned else ()
     return DiscordAcademicMessageCreate(
         message_id=message_id,
         channel_id="222222222222222222",
         author_id="333333333333333333",
-        timestamp=datetime(2026, 9, 9, tzinfo=UTC),
+        timestamp=timestamp,
         content=SecretStr(content),
         mentioned_user_ids=mentions,
+    )
+
+
+def _abort_message(
+    message_id: str = "999999999999999999",
+    *,
+    content: str = "ABORT",
+    channel_id: str = "222222222222222222",
+    author_id: str = "333333333333333333",
+) -> DiscordAcademicMessageCreate:
+    return DiscordAcademicMessageCreate(
+        message_id=message_id,
+        channel_id=channel_id,
+        author_id=author_id,
+        timestamp=datetime(2026, 9, 9, 0, 1, tzinfo=UTC),
+        content=SecretStr(content),
     )
 
 
@@ -290,6 +333,135 @@ async def test_exact_confirmation_command_uses_model_free_ack_and_handoff(tmp_pa
     submitted = handoff.events_submitted[0]
     assert isinstance(submitted, DiscordHostHandoffEvent)
     assert submitted.message_id == message.message_id
+
+
+@pytest.mark.asyncio
+async def test_exact_abort_acknowledges_cancels_host_wake_and_submits_abort_event(
+    tmp_path: Path,
+) -> None:
+    settings = _settings(tmp_path)
+    events: list[str] = []
+    release = asyncio.Event()
+    discord = FakeDiscord()
+    handoff = FakeHandoff(events)
+    outbox = WakeOutbox(settings.outbox_path)
+    coordinator = HostWakeCoordinator(
+        settings=settings,
+        outbox=outbox,
+        discord=discord,
+        docker=FakeService("docker", events, release=release),
+        compose=FakeService("compose", events),
+        ollama=FakeService("ollama", events, release=release),
+        deployment=FakeService("deploy", events),
+        backend_live=FakeService("api", events),
+        handoff=handoff,
+    )
+
+    active = asyncio.create_task(coordinator.process_message(_message()))
+    for _ in range(20):
+        if discord.acks:
+            break
+        await asyncio.sleep(0)
+
+    assert await coordinator.process_message(_abort_message()) == "handled"
+    with pytest.raises(asyncio.CancelledError):
+        await active
+    release.set()
+    wake_task = coordinator._wake_task
+    if wake_task is not None:
+        await wake_task
+
+    assert discord.ack_contents == [HOST_WAKE_ACKNOWLEDGEMENT, HOST_ABORT_ACKNOWLEDGEMENT]
+    assert outbox.get("555555555555555555").state == "aborted"
+    assert outbox.get("999999999999999999").state == "accepted"
+    assert handoff.events_submitted == []
+    assert len(handoff.abort_events_submitted) == 1
+    abort_event = handoff.abort_events_submitted[0]
+    assert abort_event.abort_message_id == "999999999999999999"
+    assert abort_event.acknowledgement_message_id == "449999999999999999"
+    assert "Aborted." in discord.edits[-1]
+
+
+@pytest.mark.asyncio
+async def test_abort_without_active_turn_reports_no_active(tmp_path: Path) -> None:
+    coordinator, outbox, discord, handoff = _coordinator(tmp_path)
+    handoff.abort_receipt = DiscordHostAbortReceipt(status="no_active")
+
+    assert await coordinator.process_message(_abort_message()) == "handled"
+
+    assert discord.ack_contents == [HOST_ABORT_ACKNOWLEDGEMENT]
+    assert discord.edits == [
+        "Abort received, but there was no active Discord turn for you in this channel."
+    ]
+    assert outbox.get("999999999999999999").request_kind == "abort"
+    assert outbox.get("999999999999999999").state == "accepted"
+    assert len(handoff.abort_events_submitted) == 1
+
+
+@pytest.mark.asyncio
+async def test_abort_unconfirmed_receipt_never_claims_turn_was_aborted(tmp_path: Path) -> None:
+    coordinator, _outbox, discord, handoff = _coordinator(tmp_path)
+    handoff.abort_receipt = DiscordHostAbortReceipt(
+        status="unconfirmed",
+        target_count=1,
+        running_count=1,
+        safe_activity_label="tool activity: calendar_sync",
+        safe_tool_status="unknown",
+    )
+
+    assert await coordinator.process_message(_abort_message()) == "handled"
+
+    final = discord.edits[-1]
+    assert final.startswith("Abort received.")
+    assert "Aborted." not in final
+    assert "final external state is unknown" in final
+
+
+@pytest.mark.asyncio
+async def test_abort_backend_failure_is_replayed_and_later_finalized(tmp_path: Path) -> None:
+    coordinator, outbox, discord, handoff = _coordinator(tmp_path)
+    handoff.abort_error = RuntimeError("backend unavailable")
+
+    assert await coordinator.process_message(_abort_message()) == "handled"
+    assert outbox.get("999999999999999999").state == "acknowledged"
+    assert "unconfirmed" in discord.edits[-1]
+
+    handoff.abort_error = None
+    handoff.abort_receipt = DiscordHostAbortReceipt(status="no_active")
+    assert await coordinator.replay_pending() == 1
+
+    assert outbox.get("999999999999999999").state == "accepted"
+    assert discord.edits[-1] == (
+        "Abort received, but there was no active Discord turn for you in this channel."
+    )
+
+
+@pytest.mark.parametrize("content", ["abort", "ABORT now", "please ABORT", "ABORT!"])
+@pytest.mark.asyncio
+async def test_non_exact_abort_text_is_normal_prose(tmp_path: Path, content: str) -> None:
+    coordinator, outbox, discord, handoff = _coordinator(tmp_path)
+
+    result = await coordinator.process_message(
+        _message(content=content, mentioned=False, message_id="666666666666666666")
+    )
+
+    assert result == "handled"
+    assert discord.ack_contents == [HOST_WAKE_ACKNOWLEDGEMENT]
+    assert outbox.get("666666666666666666").request_kind == "mention"
+    assert len(handoff.events_submitted) == 1
+    assert handoff.abort_events_submitted == []
+
+
+@pytest.mark.asyncio
+async def test_unauthorized_abort_is_ignored(tmp_path: Path) -> None:
+    coordinator, _outbox, discord, handoff = _coordinator(tmp_path)
+
+    assert await coordinator.process_message(_abort_message(author_id="444444444444444444")) == (
+        "ignored"
+    )
+
+    assert discord.acks == []
+    assert handoff.abort_events_submitted == []
 
 
 @pytest.mark.asyncio

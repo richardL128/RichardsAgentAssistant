@@ -9,7 +9,7 @@ import json
 import time
 from collections.abc import Mapping, Sequence
 from datetime import UTC, datetime
-from typing import Any, TypeVar
+from typing import Any, Literal, TypeVar, cast
 from uuid import UUID, uuid4
 
 from langchain_core.messages import AIMessage, BaseMessage
@@ -35,8 +35,9 @@ AsyncModel = Any
 
 # This is intentionally process-wide.  All workers have a separate process,
 # while every gateway instance within one process must share this backpressure
-# gate.  The safe Phase 1 default is one physical Ollama call at a time.
-_MODEL_SEMAPHORE = asyncio.Semaphore(1)
+# gate.  This Mac profile supports one physical Ollama call at a time.
+_MODEL_SEMAPHORE_LIMIT = 1
+_MODEL_SEMAPHORE = asyncio.Semaphore(_MODEL_SEMAPHORE_LIMIT)
 _active_model_calls = 0
 _max_active_model_calls = 0
 
@@ -60,6 +61,8 @@ class LLMGateway:
             self._native_model = self._build_native_chat_model()
         else:
             self._native_model = self._model
+        if self.settings.ollama_max_concurrency != _MODEL_SEMAPHORE_LIMIT:
+            raise ValueError("OLLAMA_MAX_CONCURRENCY must be exactly 1 for this runtime")
         self.model_identity = self._model_identity()
         self.config_version = self._config_version()
         self.native_config_version = self._config_version(native=True)
@@ -91,7 +94,7 @@ class LLMGateway:
                 request_id=request_id,
                 attempt=attempt,
                 prompt=call_prompt,
-                response_schema=response_model.model_json_schema(),
+                response_format=self._structured_response_format(response_model),
                 telemetry=telemetry,
             )
             if outcome.error_code is not None:
@@ -112,15 +115,7 @@ class LLMGateway:
                 telemetry[-1].error_code = "invalid_json"
             except ValidationError as exc:
                 parsed = None
-                locations = sorted(
-                    {
-                        ".".join(str(part) for part in error["loc"]) or "$"
-                        for error in exc.errors(include_input=False)
-                    }
-                )
-                validation_diagnostic = (
-                    "Response failed schema validation at " + ", ".join(locations) + "."
-                )
+                validation_diagnostic = _safe_validation_diagnostic(exc)
                 telemetry[-1].error_code = "schema_validation_failed"
             except (TypeError, ValueError):
                 parsed = None
@@ -135,7 +130,12 @@ class LLMGateway:
                     telemetry=telemetry,
                 )
             if attempt <= self.settings.ollama_repair_attempts:
-                call_prompt = self._repair_prompt(prompt, raw_text, response_model)
+                call_prompt = self._repair_prompt(
+                    prompt,
+                    raw_text,
+                    response_model,
+                    validation_diagnostic,
+                )
                 if estimate_tokens(call_prompt) > self.settings.ollama_max_input_tokens:
                     return self._result(
                         request_id=request_id,
@@ -175,6 +175,7 @@ class LLMGateway:
             return self._native_result(
                 request_id=request_id,
                 status=InvocationStatus.FAILED,
+                estimated_input_tokens=estimated_input_tokens,
                 error_code="input_token_budget_exceeded",
                 error_diagnostic="Messages exceed the configured input token budget.",
             )
@@ -194,6 +195,9 @@ class LLMGateway:
                 status=InvocationStatus.FAILED,
                 telemetry=telemetry,
                 raw_text=outcome.raw_text,
+                estimated_input_tokens=estimated_input_tokens,
+                reported_input_tokens=_reported_input_tokens(telemetry),
+                reported_output_tokens=_reported_output_tokens(telemetry),
                 error_code=outcome.error_code,
                 error_diagnostic=outcome.error_diagnostic,
             )
@@ -205,6 +209,9 @@ class LLMGateway:
                 status=InvocationStatus.FAILED,
                 telemetry=telemetry,
                 raw_text=outcome.raw_text,
+                estimated_input_tokens=estimated_input_tokens,
+                reported_input_tokens=_reported_input_tokens(telemetry),
+                reported_output_tokens=_reported_output_tokens(telemetry),
                 error_code="invalid_native_response",
                 error_diagnostic="Model response was not an AI message.",
             )
@@ -216,6 +223,9 @@ class LLMGateway:
             output=outcome.message,
             telemetry=telemetry,
             raw_text=outcome.raw_text,
+            estimated_input_tokens=estimated_input_tokens,
+            reported_input_tokens=_reported_input_tokens(telemetry),
+            reported_output_tokens=_reported_output_tokens(telemetry),
         )
 
     async def invoke_tools(
@@ -236,7 +246,7 @@ class LLMGateway:
         request_id: UUID,
         attempt: int,
         prompt: str,
-        response_schema: dict[str, Any],
+        response_format: dict[str, Any] | Literal["json"],
         telemetry: list[ModelCallTelemetry],
     ) -> _CallOutcome:
         started_at = datetime.now(UTC)
@@ -259,7 +269,7 @@ class LLMGateway:
                 _max_active_model_calls = max(_max_active_model_calls, _active_model_calls)
                 try:
                     response = await asyncio.wait_for(
-                        self._ainvoke(prompt, response_schema),
+                        self._ainvoke(prompt, response_format),
                         timeout=self.settings.ollama_timeout_seconds,
                     )
                 finally:
@@ -390,13 +400,13 @@ class LLMGateway:
             error_diagnostic=error_diagnostic,
         )
 
-    async def _ainvoke(self, prompt: str, response_schema: dict[str, Any]) -> Any:
+    async def _ainvoke(self, prompt: str, response_format: dict[str, Any] | Literal["json"]) -> Any:
         invoker = getattr(self._model, "ainvoke", None)
         if invoker is None or not callable(invoker):
             raise TypeError("injected chat model does not provide ainvoke")
         result = invoker(
             prompt,
-            format=response_schema,
+            format=response_format,
             keep_alive=f"{self.settings.ollama_model_keep_alive_seconds}s",
             options={
                 "num_ctx": self.settings.ollama_num_ctx,
@@ -481,6 +491,7 @@ class LLMGateway:
             "max_output_tokens": self.settings.ollama_max_output_tokens,
             "timeout_seconds": self.settings.ollama_timeout_seconds,
             "max_input_tokens": self.settings.ollama_max_input_tokens,
+            "context_reserve_tokens": self.settings.ollama_context_reserve_tokens,
             "repair_attempts": self.settings.ollama_repair_attempts,
             "reasoning": self.settings.ollama_reasoning,
             "keep_alive_seconds": self.settings.ollama_model_keep_alive_seconds,
@@ -489,6 +500,7 @@ class LLMGateway:
             "seed": self.settings.ollama_seed,
         }
         if not native:
+            config["structured_output_transport"] = self.settings.ollama_structured_output_transport
             config["format"] = "json"
         serialized = json.dumps(config, sort_keys=True, separators=(",", ":"))
         return hashlib.sha256(serialized.encode("utf-8")).hexdigest()
@@ -503,6 +515,14 @@ class LLMGateway:
             "absent from the schema.\n"
             f"JSON schema:\n{encoded_schema}\nRequest:\n{original_prompt}"
         )
+
+    def _structured_response_format(
+        self,
+        response_model: type[BaseModel],
+    ) -> dict[str, Any] | Literal["json"]:
+        if self.settings.ollama_structured_output_transport == "json_schema":
+            return response_model.model_json_schema()
+        return "json"
 
     @staticmethod
     def reset_concurrency_metrics() -> None:
@@ -520,7 +540,7 @@ class LLMGateway:
         return {
             "active": _active_model_calls,
             "peak": _max_active_model_calls,
-            "limit": 1,
+            "limit": _MODEL_SEMAPHORE_LIMIT,
         }
 
     @staticmethod
@@ -528,6 +548,7 @@ class LLMGateway:
         original_prompt: str,
         invalid_output: str,
         response_model: type[BaseModel],
+        validation_diagnostic: str,
     ) -> str:
         schema = response_model.model_json_schema()
         encoded_schema = json.dumps(schema, sort_keys=True, separators=(",", ":"))
@@ -535,6 +556,7 @@ class LLMGateway:
             "Repair the previous response. Return only one valid JSON object "
             "matching this JSON schema; do not use model-native tool execution or include "
             "markdown, commentary, or fields absent from the schema.\n"
+            f"Validation failure reason:\n{validation_diagnostic}\n"
             f"Original request:\n{original_prompt}\nPrevious response:\n{invalid_output}\n"
             f"{encoded_schema}"
         )
@@ -581,6 +603,9 @@ class LLMGateway:
         output: AIMessage | None = None,
         telemetry: list[ModelCallTelemetry] | None = None,
         raw_text: str = "",
+        estimated_input_tokens: int = 0,
+        reported_input_tokens: int | None = None,
+        reported_output_tokens: int | None = None,
         error_code: str | None = None,
         error_diagnostic: str | None = None,
     ) -> NativeInvocationResult:
@@ -588,11 +613,61 @@ class LLMGateway:
             request_id=request_id,
             status=status,
             output=output,
+            estimated_input_tokens=estimated_input_tokens,
+            reported_input_tokens=reported_input_tokens,
+            reported_output_tokens=reported_output_tokens,
             telemetry=telemetry or [],
             raw_text=raw_text,
             error_code=error_code,
             error_diagnostic=error_diagnostic,
         )
+
+
+def _reported_input_tokens(telemetry: Sequence[ModelCallTelemetry]) -> int | None:
+    if not telemetry:
+        return None
+    return telemetry[-1].reported_input_tokens
+
+
+def _reported_output_tokens(telemetry: Sequence[ModelCallTelemetry]) -> int | None:
+    if not telemetry:
+        return None
+    return telemetry[-1].reported_output_tokens
+
+
+def _safe_validation_diagnostic(exc: ValidationError) -> str:
+    errors = exc.errors(include_input=False, include_context=False)
+    if not errors:
+        return "Response failed schema validation."
+
+    details: list[str] = []
+    for error in errors[:5]:
+        loc_value = error.get("loc", ())
+        location = _safe_validation_location(loc_value)
+        message_value = error.get("msg") or error.get("type") or "validation failed"
+        message = _safe_validation_text(str(message_value))
+        details.append(f"{location}: {message}")
+    if len(errors) > 5:
+        details.append(f"{len(errors) - 5} additional validation errors")
+    return "Response failed schema validation: " + "; ".join(details) + "."
+
+
+def _safe_validation_location(loc_value: object) -> str:
+    if isinstance(loc_value, Sequence) and not isinstance(loc_value, str | bytes):
+        location_parts = cast(Sequence[object], loc_value)
+        location = ".".join(str(part) for part in location_parts)
+        return location or "$"
+    return "$"
+
+
+def _safe_validation_text(value: str, *, max_length: int = 240) -> str:
+    printable = "".join(char if char.isprintable() else " " for char in value)
+    cleaned = " ".join(printable.split())
+    if not cleaned:
+        return "validation failed"
+    if len(cleaned) <= max_length:
+        return cleaned
+    return cleaned[: max_length - 3].rstrip() + "..."
 
 
 class _CallOutcome:

@@ -9,6 +9,7 @@ from sqlalchemy import create_engine
 from sqlalchemy.orm import Session
 
 from app.agents.academic_planner import discord_wake_job
+from app.agents.harness import UserAbortRequested
 from app.artifacts.store import ArtifactStore
 from app.core.config import Settings
 from app.db.discord_wake import DiscordWakeInboundInput, DiscordWakeRepository
@@ -77,7 +78,11 @@ async def test_message_worker_preserves_content_without_synthetic_mention(monkey
         closed = True
 
     service = SimpleNamespace(handler=handler, close=close)
-    monkeypatch.setattr(discord_wake_job, "create_academic_discord_service", lambda _: service)
+    monkeypatch.setattr(
+        discord_wake_job,
+        "create_academic_discord_service",
+        lambda _, *, database: service,
+    )
     row = SimpleNamespace(
         event_kind="message",
         action="academic_checkin",
@@ -94,6 +99,8 @@ async def test_message_worker_preserves_content_without_synthetic_mention(monkey
     status = await job._run_message(discord_wake_job._WakeSnapshot(row))
 
     assert status == "handled"
+    assert closed is False
+    job.close()
     assert closed is True
     assert len(captured) == 1
     assert captured[0].content.get_secret_value() == raw_content
@@ -126,7 +133,11 @@ async def test_message_worker_reconstructs_attachment_only_manifest(monkeypatch,
         return SimpleNamespace(status="handled")
 
     service = SimpleNamespace(handler=handler, close=lambda: None)
-    monkeypatch.setattr(discord_wake_job, "create_academic_discord_service", lambda _: service)
+    monkeypatch.setattr(
+        discord_wake_job,
+        "create_academic_discord_service",
+        lambda _, *, database: service,
+    )
     row = SimpleNamespace(
         event_kind="message",
         action="academic_checkin",
@@ -146,3 +157,188 @@ async def test_message_worker_reconstructs_attachment_only_manifest(monkeypatch,
     assert captured[0].content.get_secret_value() == ""
     assert captured[0].attachments == ()
     assert captured[0].inbound_material_ids == (material_id,)
+
+
+@pytest.mark.asyncio
+async def test_message_worker_reuses_one_lazy_service_across_wakes(monkeypatch) -> None:
+    engine = create_engine("sqlite+pysqlite:///:memory:")
+    monkeypatch.setattr(discord_wake_job, "Database", lambda _: SimpleNamespace(engine=engine))
+    job = discord_wake_job.DiscordWakeJob(Settings(_env_file=None))
+    monkeypatch.setattr(job, "_load_content", lambda _: "wake text")
+    created: list[object] = []
+    captured: list[str] = []
+
+    class ReusedService:
+        def __init__(self) -> None:
+            self.close_count = 0
+
+        async def handle(self, message, *, abort_check=None, activity_sink=None):
+            captured.append(message.message_id)
+            assert abort_check is None
+            assert activity_sink is None
+            return SimpleNamespace(status="handled")
+
+        def close(self) -> None:
+            self.close_count += 1
+
+    def factory(settings, *, database):
+        assert database is job._database
+        service = ReusedService()
+        created.append(service)
+        return service
+
+    monkeypatch.setattr(discord_wake_job, "create_academic_discord_service", factory)
+    base = {
+        "event_kind": "message",
+        "action": "academic_checkin",
+        "interaction_action": None,
+        "clarification_id": None,
+        "discord_channel_id": "222222222222222222",
+        "discord_user_id": "333333333333333333",
+        "ack_message_id": None,
+        "content_artifact_key": "artifact-key",
+        "received_at": datetime(2026, 9, 9, tzinfo=UTC),
+    }
+
+    first = await job._run_message(
+        discord_wake_job._WakeSnapshot(
+            SimpleNamespace(**base, discord_message_id="111111111111111111")
+        )
+    )
+    second = await job._run_message(
+        discord_wake_job._WakeSnapshot(
+            SimpleNamespace(**base, discord_message_id="111111111111111112")
+        )
+    )
+
+    assert first == "handled"
+    assert second == "handled"
+    assert len(created) == 1
+    assert captured == ["111111111111111111", "111111111111111112"]
+    assert created[0].close_count == 0
+    job.close()
+    assert created[0].close_count == 1
+
+
+@pytest.mark.asyncio
+async def test_run_discord_wake_reuses_injected_worker_job_and_reset_closes_it() -> None:
+    calls: list[tuple[str, int, int]] = []
+
+    class InjectedJob:
+        def __init__(self) -> None:
+            self.closed = 0
+
+        async def __call__(
+            self,
+            wake_id: str,
+            attempt: int,
+            attempt_limit: int,
+        ) -> dict[str, object]:
+            calls.append((wake_id, attempt, attempt_limit))
+            return {"status": "handled", "wake_id": wake_id}
+
+        def close(self) -> None:
+            self.closed += 1
+
+    injected = InjectedJob()
+    discord_wake_job.set_worker_discord_wake_job(injected)  # type: ignore[arg-type]
+    try:
+        first = await discord_wake_job.run_discord_wake(
+            "00000000-0000-0000-0000-000000000001",
+            1,
+            3,
+        )
+        second = await discord_wake_job.run_discord_wake(
+            "00000000-0000-0000-0000-000000000002",
+            2,
+            3,
+        )
+    finally:
+        discord_wake_job.close_worker_discord_wake_job()
+
+    assert first["status"] == "handled"
+    assert second["status"] == "handled"
+    assert calls == [
+        ("00000000-0000-0000-0000-000000000001", 1, 3),
+        ("00000000-0000-0000-0000-000000000002", 2, 3),
+    ]
+    assert injected.closed == 1
+
+
+@pytest.mark.asyncio
+async def test_wake_job_marks_user_abort_and_reraises_queue_cancellation(monkeypatch) -> None:
+    engine = create_engine("sqlite+pysqlite:///:memory:")
+    Base.metadata.create_all(engine)
+    monkeypatch.setattr(discord_wake_job, "Database", lambda _: SimpleNamespace(engine=engine))
+    job = discord_wake_job.DiscordWakeJob(Settings(_env_file=None))
+    monkeypatch.setattr(job, "_abort_requested", lambda _wake_id: True)
+    monkeypatch.setattr(job, "_run_message", AsyncMock(side_effect=UserAbortRequested()))
+    with Session(engine) as session, session.begin():
+        accepted = DiscordWakeRepository.accept_verified_event(
+            session,
+            DiscordWakeInboundInput(
+                discord_event_id="123456789012345678",
+                handoff_nonce="test-wake-abort-nonce",
+                event_kind="message",
+                action="academic_checkin",
+                content_artifact_key="test-artifact",
+                received_at=datetime(2026, 9, 9, tzinfo=UTC),
+            ),
+        )
+
+    try:
+        with pytest.raises(UserAbortRequested):
+            await job(str(accepted.wake_id), 1, 3)
+
+        with Session(engine) as session:
+            row = session.get(DiscordWakeInbound, accepted.wake_id)
+            assert row is not None
+            assert row.state == "aborted"
+            assert row.abort_reason_code == "user_abort"
+    finally:
+        engine.dispose()
+
+
+def test_wake_job_persists_allowlisted_activity_without_private_tool_data(monkeypatch) -> None:
+    engine = create_engine("sqlite+pysqlite:///:memory:")
+    Base.metadata.create_all(engine)
+    monkeypatch.setattr(discord_wake_job, "Database", lambda _: SimpleNamespace(engine=engine))
+    job = discord_wake_job.DiscordWakeJob(Settings(_env_file=None))
+    try:
+        with Session(engine) as session, session.begin():
+            accepted = DiscordWakeRepository.accept_verified_event(
+                session,
+                DiscordWakeInboundInput(
+                    discord_event_id="123456789012345679",
+                    handoff_nonce="test-wake-activity-nonce",
+                    event_kind="message",
+                    action="academic_checkin",
+                    content_artifact_key="test-artifact",
+                    received_at=datetime(2026, 9, 9, tzinfo=UTC),
+                ),
+            )
+
+        job._record_safe_activity(
+            accepted.wake_id,
+            {
+                "phase": "tool_started",
+                "model_turn": 2,
+                "tool_name": "search_courses",
+                "tool_activity": "course_data",
+                "tool_status": "in_flight",
+                "side_effect_class": "read_only",
+                "args": {"private": "must not persist"},
+            },
+        )
+
+        with Session(engine) as session:
+            row = session.get(DiscordWakeInbound, accepted.wake_id)
+            assert row is not None
+            assert row.activity_phase == "tool_started"
+            assert row.activity_model_turn == 2
+            assert row.activity_tool_name == "search_courses"
+            assert row.activity_tool_status == "running"
+            assert row.activity_side_effect_class == "read_only"
+            assert "private" not in str(row.__dict__)
+    finally:
+        engine.dispose()

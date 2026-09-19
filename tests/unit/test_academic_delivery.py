@@ -85,7 +85,6 @@ async def test_academic_delivery_uses_nonce_and_is_idempotent(engine: Engine) ->
                     "Good morning, Richard. Review calculus for 30 minutes. "
                     "@everyone should remain inert. Have a good day!"
                 ),
-                referenced_block_ids=("block-calculus",),
             ),
             idempotency_key=key,
         )
@@ -738,6 +737,40 @@ async def test_progress_reporter_replaces_active_heartbeats_and_freezes_terminal
     assert "8s elapsed" not in patches[-1]
     assert "45s elapsed" not in patches[-1]
     assert "75s elapsed" not in patches[-1]
+
+
+@pytest.mark.asyncio
+async def test_progress_reporter_renders_aborted_as_terminal(engine: Engine) -> None:
+    calls: list[httpx.Request] = []
+
+    def respond(request: httpx.Request) -> httpx.Response:
+        calls.append(request)
+        return httpx.Response(200, json={"id": "123456789012345678", "guild_id": "42"})
+
+    async with httpx.AsyncClient(
+        base_url="https://discord.com/api/v10", transport=httpx.MockTransport(respond)
+    ) as client:
+        delivery = DiscordAcademicResponseDelivery(
+            engine=engine,
+            channel_id=CHANNEL,
+            adapter=DiscordAcademicPlannerAdapter(
+                token=SecretStr("academic-token"),
+                allowed_channel_ids={CHANNEL},
+                client=client,
+            ),
+        )
+        reporter = delivery.create_progress_reporter(root_event_id="777777777777777779")
+        await reporter.start({"phase": "model_turn_started", "model_turn_number": 1})
+        await reporter.finish_aborted()
+        await reporter.update({"phase": "completed"})
+
+    patches = [
+        json.loads(request.content)["content"] for request in calls if request.method == "PATCH"
+    ]
+    assert patches[-1].splitlines() == [
+        "- Qwen is thinking through your request (turn 1).",
+        "- Aborted. I stopped this Discord turn.",
+    ]
 
 
 def test_progress_event_accepts_native_turn_limit_without_rendering_ceiling() -> None:

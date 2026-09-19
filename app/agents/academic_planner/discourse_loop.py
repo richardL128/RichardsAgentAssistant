@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import json
 from collections.abc import Mapping, Sequence
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, datetime
 from typing import Any, Protocol
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
@@ -25,7 +25,6 @@ from app.agents.academic_planner.contracts import (
     DiscoursePartialFacts,
     LearningFocusStatus,
     MemoryManagementOutcome,
-    PracticeNeed,
     ReinforceLearningFocusAction,
     ResolveLearningFocusAction,
     SearchAssessmentsCall,
@@ -37,7 +36,6 @@ from app.agents.academic_planner.contracts import (
 
 MAX_DISCOURSE_TURNS = 4
 MAX_DISCOURSE_ACTIONS = 20
-DEFAULT_PRACTICE_TARGET_MINUTES = 30
 
 
 class AcademicDiscourseCatalog(Protocol):
@@ -266,7 +264,6 @@ async def run_academic_discourse_loop(
                 )
             return AcademicDiscourseLoopResult(
                 actions=(),
-                practice_needs=(),
                 clarification=None,
                 continuation_state=None,
                 applicable=False,
@@ -333,13 +330,6 @@ async def run_academic_discourse_loop(
                 )
             return AcademicDiscourseLoopResult(
                 actions=actions,
-                practice_needs=_practice_needs(
-                    actions,
-                    known_courses=known_courses,
-                    known_assessments=known_assessments,
-                    known_focuses=known_focuses,
-                    now=current,
-                ),
                 clarification=None,
                 continuation_state=None,
                 turns=turn,
@@ -348,7 +338,6 @@ async def run_academic_discourse_loop(
         if decision.clarification is not None:
             return AcademicDiscourseLoopResult(
                 actions=(),
-                practice_needs=(),
                 clarification=decision.clarification,
                 continuation_state=_continuation_state(
                     message=content,
@@ -515,72 +504,6 @@ def _validate_create_action(
     return None
 
 
-def _practice_needs(
-    actions: Sequence[
-        CreateLearningFocusAction
-        | ReinforceLearningFocusAction
-        | ResolveLearningFocusAction
-        | SnoozeLearningFocusAction
-    ],
-    *,
-    known_courses: Mapping[str, AcademicCourseOption],
-    known_assessments: Mapping[str, AcademicAssessmentOption],
-    known_focuses: Mapping[str, AcademicLearningFocusOption],
-    now: datetime,
-) -> tuple[PracticeNeed, ...]:
-    needs: list[PracticeNeed] = []
-    for action in actions:
-        if isinstance(action, CreateLearningFocusAction):
-            course = known_courses.get(action.course_id) if action.course_id is not None else None
-            assessment = (
-                known_assessments.get(action.assessment_id)
-                if action.assessment_id is not None
-                else None
-            )
-            needs.append(
-                PracticeNeed(
-                    topic=action.topic,
-                    target_minutes=action.target_minutes,
-                    next_review_at=action.next_review_at or _default_next_review(now),
-                    source_action=action.action,
-                    course_id=action.course_id or (assessment.course_id if assessment else None),
-                    course_code=(course.course_code if course else assessment.course_code)
-                    if assessment
-                    else (course.course_code if course else None),
-                    assessment_id=action.assessment_id,
-                    assessment_title=assessment.title if assessment else None,
-                    rationale=(
-                        "Schedule a separate practice block because the reflection says this "
-                        "academic topic is still difficult."
-                    ),
-                )
-            )
-            continue
-
-        if isinstance(action, ReinforceLearningFocusAction):
-            focus = known_focuses[action.focus_id]
-            needs.append(
-                PracticeNeed(
-                    topic=focus.topic,
-                    target_minutes=action.target_minutes or focus.target_minutes,
-                    next_review_at=action.next_review_at
-                    or focus.next_review_at
-                    or _default_next_review(now),
-                    source_action=action.action,
-                    focus_id=focus.focus_id,
-                    course_id=focus.course_id,
-                    course_code=focus.course_code,
-                    assessment_id=focus.assessment_id,
-                    assessment_title=focus.assessment_title,
-                    rationale=(
-                        "Keep scheduling separate practice because the user confirmed this "
-                        "focus still needs work."
-                    ),
-                )
-            )
-    return tuple(needs)
-
-
 def _clarifying_result(
     question: str,
     *,
@@ -600,7 +523,6 @@ def _clarifying_result(
     )
     return AcademicDiscourseLoopResult(
         actions=(),
-        practice_needs=(),
         clarification=clarification,
         continuation_state=_continuation_state(
             message=message,
@@ -693,9 +615,9 @@ def _build_prompt(
             "Never invent opaque ids and never ask the user to provide opaque ids.",
             "Search active and snoozed learning focuses plus semantic candidates before "
             "creating a new focus when a similar topic may already exist.",
-            "For explicit academic struggle, return create_focus or reinforce_focus so the "
-            "host can schedule a separate practice block. Use 30 minutes unless the user or "
-            "existing focus implies a better target.",
+            "For explicit academic struggle, return create_focus or reinforce_focus for durable "
+            "memory only. A separate calendar tool owns any ordinary event proposal in the same "
+            "Discord turn.",
             "If the user says they no longer need practice, are done, or wants to clear the "
             "topic, return resolve_focus with delete_focus=true.",
             "Use snooze_focus only when the user asks to pause the topic or the host-provided "
@@ -780,10 +702,6 @@ def _duplicate_id(values: Sequence[str]) -> str | None:
     return None
 
 
-def _default_next_review(now: datetime) -> datetime:
-    return now + timedelta(days=1)
-
-
 def _aware(value: datetime) -> datetime:
     if value.tzinfo is None or value.utcoffset() is None:
         raise ValueError("now must be timezone-aware")
@@ -791,7 +709,6 @@ def _aware(value: datetime) -> datetime:
 
 
 __all__ = [
-    "DEFAULT_PRACTICE_TARGET_MINUTES",
     "MAX_DISCOURSE_ACTIONS",
     "MAX_DISCOURSE_TURNS",
     "AcademicDiscourseCatalog",

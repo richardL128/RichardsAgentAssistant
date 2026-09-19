@@ -6,6 +6,8 @@ import re
 import uuid
 from typing import Literal, cast
 
+from app.discord_commands import is_discord_abort_command
+
 AcademicCommandAction = Literal["confirm", "reject"]
 
 _COMMAND_PATTERN = re.compile(
@@ -27,4 +29,4 @@ def parse_academic_command(content: str) -> tuple[AcademicCommandAction, uuid.UU
     return cast(AcademicCommandAction, match.group("action")), proposal_id
 
 
-__all__ = ["AcademicCommandAction", "parse_academic_command"]
+__all__ = ["AcademicCommandAction", "is_discord_abort_command", "parse_academic_command"]

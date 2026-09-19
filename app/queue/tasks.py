@@ -50,7 +50,7 @@ AcademicClarificationAction = Literal[
     "assignment",
     "tutorial",
     "lab",
-    "studying_block",
+    "event",
     "ignore",
 ]
 AcademicClarificationHandler = Callable[
@@ -131,13 +131,13 @@ def register_discord_wake_handler(handler: DiscordWakeHandler) -> None:
 def register_academic_morning_notification_handler(
     handler: AcademicMorningNotificationHandler,
 ) -> None:
-    """Register the focused model-free scheduled morning notifier."""
+    """Register the focused semantic scheduled morning notifier."""
 
     global _academic_morning_notification_handler
     _academic_morning_notification_handler = handler
 
 
-async def defer_discord_wake(wake_id: str) -> Any:
+async def defer_discord_wake(wake_id: str) -> int:
     """Enqueue one durable inbound row without raw content or credentials."""
 
     parsed_wake_id = str(UUID(wake_id))
@@ -148,7 +148,17 @@ async def defer_discord_wake(wake_id: str) -> Any:
             queueing_lock=queueing_lock,
         ).defer_async(wake_id=parsed_wake_id)
     except AlreadyEnqueued:
-        return {"status": "already_enqueued", "wake_id": parsed_wake_id}
+        # The durable wake row must retain the exact infrastructure job ID so an
+        # ABORT can target it. A retry can reach this branch after Procrastinate
+        # accepted the job but before the API attached that ID to the wake row.
+        jobs = await procrastinate_app.job_manager.list_jobs_async(
+            task="lifeagent.discord_academic",
+            queueing_lock=queueing_lock,
+        )
+        matching_ids = [job.id for job in jobs if job.id is not None]
+        if not matching_ids:
+            raise RuntimeError("already-enqueued Discord wake job could not be resolved") from None
+        return max(matching_ids)
 
 
 async def defer_academic_material_ingestion(
@@ -206,7 +216,7 @@ def _terminal_academic_morning_status(status: str) -> bool:
 
 
 async def defer_academic_morning_notification(occurrence: PeriodicOccurrence) -> Any:
-    """Queue one model-free morning notification for a stable local period."""
+    """Queue one semantic morning notification for a stable local period."""
 
     period_key = stable_period_key(_ACADEMIC_MORNING_SCHEDULE_NAME, occurrence)
     validate_idempotency_key(period_key)
@@ -253,7 +263,7 @@ def _academic_clarification_args(
         "assignment",
         "tutorial",
         "lab",
-        "studying_block",
+        "event",
         "ignore",
     }:
         raise ValueError("academic clarification action is invalid")
@@ -425,7 +435,7 @@ async def academic_morning_notification_task(
     run_id: str,
     period_key: str,
 ) -> dict[str, Any]:
-    """Execute one anchored model-free morning notification attempt."""
+    """Execute one anchored semantic morning notification attempt."""
 
     if _academic_morning_notification_handler is None:
         raise RuntimeError("no handler registered for academic_morning_notification")

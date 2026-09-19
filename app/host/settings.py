@@ -46,6 +46,10 @@ class HostWakeSettings:
     ollama_local_base_url: str = "http://127.0.0.1:11434"
     ollama_model: str = "qwen3-32gb:latest"
     ollama_model_digest: str | None = None
+    embedding_model: str = "qwen3-embedding:4b"
+    embedding_model_digest: str | None = None
+    embedding_dimensions: int = 1024
+    embedding_model_keep_alive_seconds: int = 300
     ollama_launch_agent_label: str = "com.lifeagent.ollama"
     docker_desktop_timeout_seconds: int = 120
     compose_wait_timeout_seconds: int = 180
@@ -99,6 +103,17 @@ class HostWakeSettings:
         _require_http_url("Ollama URL", self.ollama_local_base_url)
         if not self.ollama_model.strip():
             raise HostWakeSettingsError("OLLAMA_MODEL is required")
+        if not self.embedding_model.strip():
+            raise HostWakeSettingsError("EMBEDDING_MODEL is required")
+        if self.embedding_dimensions <= 0 or self.embedding_dimensions > 2_000:
+            raise HostWakeSettingsError("EMBEDDING_DIMENSIONS must be positive and <= 2000")
+        if (
+            self.embedding_model_keep_alive_seconds <= 0
+            or self.embedding_model_keep_alive_seconds > 3600
+        ):
+            raise HostWakeSettingsError(
+                "EMBEDDING_MODEL_KEEP_ALIVE_SECONDS must be positive and <= 3600"
+            )
         for name, value, upper in (
             ("docker_desktop_timeout_seconds", self.docker_desktop_timeout_seconds, 300),
             ("compose_wait_timeout_seconds", self.compose_wait_timeout_seconds, 600),
@@ -156,6 +171,14 @@ class HostWakeSettings:
             ollama_local_base_url=env.get("OLLAMA_LOCAL_BASE_URL", "http://127.0.0.1:11434"),
             ollama_model=env.get("OLLAMA_MODEL", "qwen3-32gb:latest"),
             ollama_model_digest=env.get("OLLAMA_MODEL_DIGEST") or None,
+            embedding_model=env.get("EMBEDDING_MODEL", "qwen3-embedding:4b"),
+            embedding_model_digest=env.get("EMBEDDING_MODEL_DIGEST") or None,
+            embedding_dimensions=_env_int(env, "EMBEDDING_DIMENSIONS", 1024),
+            embedding_model_keep_alive_seconds=_env_int(
+                env,
+                "EMBEDDING_MODEL_KEEP_ALIVE_SECONDS",
+                300,
+            ),
             ollama_launch_agent_label=env.get(
                 "LIFEAGENT_OLLAMA_LAUNCH_AGENT_LABEL",
                 "com.lifeagent.ollama",

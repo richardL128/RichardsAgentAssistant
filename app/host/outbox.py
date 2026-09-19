@@ -11,8 +11,8 @@ from pathlib import Path
 from typing import Literal, cast
 from uuid import UUID
 
-OutboxState = Literal["pending", "acknowledged", "accepted", "failed"]
-WakeRequestKind = Literal["mention", "command", "continuation"]
+OutboxState = Literal["pending", "acknowledged", "accepted", "failed", "aborted"]
+WakeRequestKind = Literal["mention", "command", "continuation", "abort"]
 _DISCORD_ID = re.compile(r"^[0-9]{5,24}$")
 _SAFE_ERROR = re.compile(r"^[a-z0-9_]{1,64}$")
 
@@ -70,7 +70,7 @@ class WakeOutbox:
         _require_id(message_id)
         _require_id(channel_id)
         _require_id(author_id)
-        if request_kind not in {"mention", "command", "continuation"}:
+        if request_kind not in {"mention", "command", "continuation", "abort"}:
             raise ValueError("wake request kind is invalid")
         now = _utc_now()
         with self._connect() as connection:
@@ -111,7 +111,10 @@ class WakeOutbox:
                 """
                 UPDATE wake_events
                    SET acknowledgement_message_id = ?,
-                       state = CASE WHEN state = 'accepted' THEN state ELSE 'acknowledged' END,
+                       state = CASE
+                           WHEN state IN ('accepted', 'aborted') THEN state
+                           ELSE 'acknowledged'
+                       END,
                        updated_at = ?
                  WHERE message_id = ?
                 """,
@@ -127,8 +130,11 @@ class WakeOutbox:
             connection.execute(
                 """
                 UPDATE wake_events
-                   SET state = 'accepted',
-                       safe_error_code = NULL,
+                   SET state = CASE WHEN state = 'aborted' THEN state ELSE 'accepted' END,
+                       safe_error_code = CASE
+                           WHEN state = 'aborted' THEN safe_error_code
+                           ELSE NULL
+                       END,
                        updated_at = ?
                  WHERE message_id = ?
                 """,
@@ -146,9 +152,15 @@ class WakeOutbox:
             connection.execute(
                 """
                 UPDATE wake_events
-                   SET state = 'failed',
-                       retry_count = retry_count + 1,
-                       safe_error_code = ?,
+                   SET state = CASE WHEN state = 'aborted' THEN state ELSE 'failed' END,
+                       retry_count = CASE
+                           WHEN state = 'aborted' THEN retry_count
+                           ELSE retry_count + 1
+                       END,
+                       safe_error_code = CASE
+                           WHEN state = 'aborted' THEN safe_error_code
+                           ELSE ?
+                       END,
                        updated_at = ?
                  WHERE message_id = ?
                 """,
@@ -156,6 +168,97 @@ class WakeOutbox:
             )
             connection.commit()
         return self.get(message_id)
+
+    def active_rows_for_scope(
+        self,
+        *,
+        channel_id: str,
+        author_id: str,
+        before: datetime,
+    ) -> tuple[WakeOutboxRow, ...]:
+        _require_id(channel_id)
+        _require_id(author_id)
+        with self._connect() as connection:
+            rows = connection.execute(
+                """
+                SELECT message_id, channel_id, author_id, event_timestamp, request_kind,
+                       acknowledgement_message_id, state, retry_count, safe_error_code,
+                       created_at, updated_at
+                  FROM wake_events
+                 WHERE channel_id = ?
+                   AND author_id = ?
+                   AND event_timestamp < ?
+                   AND request_kind != 'abort'
+                   AND state IN ('pending', 'acknowledged')
+                 ORDER BY event_timestamp ASC, created_at ASC
+                """,
+                (channel_id, author_id, _to_text(before)),
+            ).fetchall()
+        return tuple(_row_from_sqlite(row) for row in rows)
+
+    def mark_aborted(
+        self,
+        message_id: str,
+        safe_error_code: str = "user_abort",
+    ) -> WakeOutboxRow:
+        _require_id(message_id)
+        if _SAFE_ERROR.fullmatch(safe_error_code) is None:
+            raise ValueError("safe error code is invalid")
+        now = _utc_now()
+        with self._connect() as connection:
+            connection.execute(
+                """
+                UPDATE wake_events
+                   SET state = CASE
+                           WHEN state IN ('accepted', 'failed') THEN state
+                           ELSE 'aborted'
+                       END,
+                       safe_error_code = CASE
+                           WHEN state IN ('accepted', 'failed') THEN safe_error_code
+                           ELSE ?
+                       END,
+                       updated_at = ?
+                 WHERE message_id = ?
+                """,
+                (safe_error_code, _to_text(now), message_id),
+            )
+            connection.commit()
+        return self.get(message_id)
+
+    def mark_scope_aborted(
+        self,
+        *,
+        channel_id: str,
+        author_id: str,
+        before: datetime,
+        safe_error_code: str = "user_abort",
+    ) -> tuple[WakeOutboxRow, ...]:
+        _require_id(channel_id)
+        _require_id(author_id)
+        if _SAFE_ERROR.fullmatch(safe_error_code) is None:
+            raise ValueError("safe error code is invalid")
+        targets = self.active_rows_for_scope(
+            channel_id=channel_id,
+            author_id=author_id,
+            before=before,
+        )
+        if not targets:
+            return ()
+        now = _utc_now()
+        with self._connect() as connection:
+            connection.executemany(
+                """
+                UPDATE wake_events
+                   SET state = 'aborted',
+                       safe_error_code = ?,
+                       updated_at = ?
+                 WHERE message_id = ?
+                   AND state IN ('pending', 'acknowledged')
+                """,
+                tuple((safe_error_code, _to_text(now), row.message_id) for row in targets),
+            )
+            connection.commit()
+        return tuple(self.get(row.message_id) for row in targets)
 
     def record_interaction(
         self,
@@ -170,7 +273,7 @@ class WakeOutbox:
         _require_id(interaction_id)
         _require_id(channel_id)
         _require_id(user_id)
-        if action not in {"quiz", "assignment", "tutorial", "lab", "studying_block", "ignore"}:
+        if action not in {"quiz", "assignment", "tutorial", "lab", "event", "ignore"}:
             raise ValueError("interaction action is invalid")
         now = _utc_now()
         with self._connect() as connection:
@@ -302,7 +405,7 @@ class WakeOutbox:
             cursor = connection.execute(
                 """
                 DELETE FROM wake_events
-                 WHERE state IN ('accepted', 'failed') AND updated_at < ?
+                 WHERE state IN ('accepted', 'failed', 'aborted') AND updated_at < ?
                 """,
                 (_to_text(threshold),),
             )
@@ -345,11 +448,11 @@ class WakeOutbox:
                     author_id TEXT NOT NULL,
                     event_timestamp TEXT NOT NULL,
                     request_kind TEXT NOT NULL DEFAULT 'mention' CHECK (
-                        request_kind IN ('mention', 'command', 'continuation')
+                        request_kind IN ('mention', 'command', 'continuation', 'abort')
                     ),
                     acknowledgement_message_id TEXT,
                     state TEXT NOT NULL CHECK (
-                        state IN ('pending', 'acknowledged', 'accepted', 'failed')
+                        state IN ('pending', 'acknowledged', 'accepted', 'failed', 'aborted')
                     ),
                     retry_count INTEGER NOT NULL CHECK (retry_count >= 0),
                     safe_error_code TEXT,
@@ -368,7 +471,11 @@ class WakeOutbox:
                 "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'wake_events'"
             ).fetchone()
             schema = str(schema_row[0]) if schema_row is not None else ""
-            if "'continuation'" not in schema:
+            if (
+                "'continuation'" not in schema
+                or "'abort'" not in schema
+                or "'aborted'" not in schema
+            ):
                 connection.execute("ALTER TABLE wake_events RENAME TO wake_events_legacy_kind")
                 connection.execute(
                     """
@@ -378,11 +485,11 @@ class WakeOutbox:
                         author_id TEXT NOT NULL,
                         event_timestamp TEXT NOT NULL,
                         request_kind TEXT NOT NULL DEFAULT 'mention' CHECK (
-                            request_kind IN ('mention', 'command', 'continuation')
+                            request_kind IN ('mention', 'command', 'continuation', 'abort')
                         ),
                         acknowledgement_message_id TEXT,
                         state TEXT NOT NULL CHECK (
-                            state IN ('pending', 'acknowledged', 'accepted', 'failed')
+                            state IN ('pending', 'acknowledged', 'accepted', 'failed', 'aborted')
                         ),
                         retry_count INTEGER NOT NULL CHECK (retry_count >= 0),
                         safe_error_code TEXT,
@@ -413,13 +520,19 @@ class WakeOutbox:
             )
             connection.execute(
                 """
+                CREATE INDEX IF NOT EXISTS ix_wake_events_scope_active
+                    ON wake_events(channel_id, author_id, event_timestamp, state)
+                """
+            )
+            connection.execute(
+                """
                 CREATE TABLE IF NOT EXISTS interaction_events (
                     interaction_id TEXT PRIMARY KEY,
                     channel_id TEXT NOT NULL,
                     user_id TEXT NOT NULL,
                     clarification_id TEXT NOT NULL,
                     action TEXT NOT NULL CHECK (
-                        action IN ('quiz','assignment','tutorial','lab','studying_block','ignore')
+                        action IN ('quiz','assignment','tutorial','lab','event','ignore')
                     ),
                     event_timestamp TEXT NOT NULL,
                     state TEXT NOT NULL CHECK (
@@ -432,6 +545,51 @@ class WakeOutbox:
                 )
                 """
             )
+            interaction_schema_row = connection.execute(
+                "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'interaction_events'"
+            ).fetchone()
+            interaction_schema = (
+                str(interaction_schema_row[0]) if interaction_schema_row is not None else ""
+            )
+            if "studying_block" in interaction_schema:
+                connection.execute(
+                    "ALTER TABLE interaction_events RENAME TO interaction_events_legacy_action"
+                )
+                connection.execute(
+                    """
+                    CREATE TABLE interaction_events (
+                        interaction_id TEXT PRIMARY KEY,
+                        channel_id TEXT NOT NULL,
+                        user_id TEXT NOT NULL,
+                        clarification_id TEXT NOT NULL,
+                        action TEXT NOT NULL CHECK (
+                            action IN ('quiz','assignment','tutorial','lab','event','ignore')
+                        ),
+                        event_timestamp TEXT NOT NULL,
+                        state TEXT NOT NULL CHECK (
+                            state IN ('pending', 'accepted', 'failed')
+                        ),
+                        retry_count INTEGER NOT NULL CHECK (retry_count >= 0),
+                        safe_error_code TEXT,
+                        created_at TEXT NOT NULL,
+                        updated_at TEXT NOT NULL
+                    )
+                    """
+                )
+                connection.execute(
+                    """
+                    INSERT INTO interaction_events (
+                        interaction_id, channel_id, user_id, clarification_id, action,
+                        event_timestamp, state, retry_count, safe_error_code, created_at, updated_at
+                    )
+                    SELECT interaction_id, channel_id, user_id, clarification_id,
+                           CASE action WHEN 'studying_block' THEN 'event' ELSE action END,
+                           event_timestamp, state, retry_count, safe_error_code,
+                           created_at, updated_at
+                      FROM interaction_events_legacy_action
+                    """
+                )
+                connection.execute("DROP TABLE interaction_events_legacy_action")
             connection.execute(
                 """
                 CREATE INDEX IF NOT EXISTS ix_interaction_events_state_created
@@ -447,10 +605,10 @@ class WakeOutbox:
 
 def _row_from_sqlite(row: sqlite3.Row | tuple[object, ...]) -> WakeOutboxRow:
     request_kind = str(row[4])
-    if request_kind not in {"mention", "command", "continuation"}:
+    if request_kind not in {"mention", "command", "continuation", "abort"}:
         raise ValueError("invalid outbox request kind")
     state = str(row[6])
-    if state not in {"pending", "acknowledged", "accepted", "failed"}:
+    if state not in {"pending", "acknowledged", "accepted", "failed", "aborted"}:
         raise ValueError("invalid outbox state")
     return WakeOutboxRow(
         message_id=str(row[0]),

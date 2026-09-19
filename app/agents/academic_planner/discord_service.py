@@ -2,15 +2,24 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+import asyncio
+from collections.abc import Awaitable, Callable, Mapping
+from dataclasses import dataclass, field
+from typing import Any, cast
 
 from app.agents.academic_planner.discord_harness import NativeAcademicDiscordHandler
 from app.agents.academic_planner.material_intake import AcademicMaterialIntakeService
+from app.agents.academic_planner.memory_workflow import AcademicMemoryService
 from app.agents.academic_planner.notion_mutations import DiscoveredAcademicNotionWriter
 from app.agents.academic_planner.sync import AcademicNotionSync
+from app.agents.calendar_briefing.semantic_interpreter import CalendarEventSemanticInterpreter
+from app.agents.conversation.context import ConversationContextAssembler
+from app.agents.conversation.service import NativeConversationService
+from app.agents.harness import AbortCheck
 from app.agents.job_interviews.agent_loop import CareerAgentToolState
 from app.agents.job_interviews.notion_mutations import DiscoveredCareerNotionWriter
 from app.agents.job_interviews.sync import JobInterviewNotionSync
+from app.agents.memory.service import UserMemoryService
 from app.artifacts.store import ArtifactStore
 from app.connectors.discord import (
     DiscordAcademicPlannerAdapter,
@@ -22,6 +31,8 @@ from app.core.errors import LifeAgentError
 from app.db.academic import SQLAlchemyAcademicPlannerStore
 from app.db.job_interviews import SQLAlchemyJobInterviewStore
 from app.db.session import Database
+from app.db.user_memory import SQLAlchemyUserMemoryStore
+from app.llm.embeddings import AcademicEmbeddingGateway
 from app.llm.gateway import LLMGateway
 from app.llm.ollama_runtime import OllamaRuntime
 from app.queue import tasks as queue_tasks
@@ -33,6 +44,28 @@ class AcademicDiscordService:
 
     handler: NativeAcademicDiscordHandler
     database: Database
+    _turn_lock: asyncio.Lock = field(default_factory=asyncio.Lock, repr=False)
+
+    async def handle(
+        self,
+        message: object,
+        *,
+        abort_check: AbortCheck | None = None,
+        activity_sink: Callable[[Mapping[str, object]], Awaitable[None] | None] | None = None,
+    ) -> object:
+        """Run one wake with callbacks scoped to it while reusing the service graph."""
+
+        async with self._turn_lock:
+            mutable_handler = cast(Any, self.handler)
+            previous_abort = mutable_handler._abort_check
+            previous_activity = mutable_handler._activity_sink
+            mutable_handler._abort_check = abort_check
+            mutable_handler._activity_sink = activity_sink
+            try:
+                return await self.handler(message)  # type: ignore[arg-type]
+            finally:
+                mutable_handler._abort_check = previous_abort
+                mutable_handler._activity_sink = previous_activity
 
     def close(self) -> None:
         self.database.dispose()
@@ -40,6 +73,10 @@ class AcademicDiscordService:
 
 def create_academic_discord_service(
     settings: Settings | None = None,
+    *,
+    database: Database | None = None,
+    abort_check: AbortCheck | None = None,
+    activity_sink: Callable[[Mapping[str, object]], Awaitable[None] | None] | None = None,
 ) -> AcademicDiscordService:
     """Build the one canonical Discord academic handler for queue workers."""
 
@@ -59,15 +96,29 @@ def create_academic_discord_service(
     ):
         raise ValueError("Academic Discord worker configuration is incomplete")
 
-    database = Database(app_settings)
+    database = database or Database(app_settings)
     gateway = LLMGateway(app_settings)
+    compaction_gateway = LLMGateway(
+        app_settings.model_copy(
+            update={
+                "ollama_max_output_tokens": (app_settings.conversation_compaction_max_output_tokens)
+            }
+        )
+    )
+    embedding_gateway = AcademicEmbeddingGateway(app_settings)
     store = SQLAlchemyAcademicPlannerStore(
         database.engine,
         confirmation_ttl_hours=app_settings.academic_confirmation_ttl_hours,
+        embedding_gateway=embedding_gateway,
         default_practice_minutes=app_settings.academic_memory_default_practice_minutes,
     )
     artifact_store = ArtifactStore(
         app_settings.artifact_root,
+        retention_days_by_class={
+            "native_context_manifest": app_settings.conversation_context_manifest_retention_days,
+            "user_memory_content": None,
+            "user_memory_evidence": None,
+        },
         default_retention_days=app_settings.artifact_retention_days,
     )
     material_intake = AcademicMaterialIntakeService(
@@ -75,6 +126,30 @@ def create_academic_discord_service(
         artifact_store=artifact_store,
         max_bytes=app_settings.discord_academic_pdf_max_bytes,
         max_pages=app_settings.academic_material_pdf_max_pages,
+    )
+    conversation_service = NativeConversationService(
+        engine=database.engine,
+        artifact_store=artifact_store,
+        session_ttl_hours=app_settings.academic_confirmation_ttl_hours,
+    )
+    user_memory_service = (
+        UserMemoryService(
+            store=SQLAlchemyUserMemoryStore(
+                engine=database.engine,
+                artifact_store=artifact_store,
+            ),
+            embedding_gateway=embedding_gateway,
+            retrieval_limit=app_settings.user_memory_retrieval_limit,
+        )
+        if app_settings.user_memory_enabled
+        else None
+    )
+    context_assembler = ConversationContextAssembler(
+        settings=app_settings,
+        gateway=compaction_gateway,
+        conversation_service=conversation_service,
+        artifact_store=artifact_store,
+        user_memory_service=user_memory_service,
     )
     adapter = DiscordAcademicPlannerAdapter(
         token=token,
@@ -130,6 +205,21 @@ def create_academic_discord_service(
         if notion_connector is not None
         else None
     )
+    memory_service = (
+        AcademicMemoryService(
+            store=store,
+            model_gateway=gateway,
+            embedding_gateway=embedding_gateway,
+            timezone=app_settings.app_timezone,
+            default_practice_minutes=app_settings.academic_memory_default_practice_minutes,
+        )
+        if app_settings.academic_memory_enabled
+        else None
+    )
+    calendar_semantic_interpreter = CalendarEventSemanticInterpreter(
+        gateway,
+        max_prompt_chars=app_settings.calendar_semantic_prompt_max_chars,
+    )
     handler = NativeAcademicDiscordHandler(
         store=store,
         delivery=delivery,
@@ -168,6 +258,13 @@ def create_academic_discord_service(
         career_engine=database.engine,
         career_writer_provider=lambda: career_writer,
         material_intake=material_intake,
+        memory_service=memory_service,
+        user_memory_service=user_memory_service,
+        context_assembler=context_assembler,
+        calendar_semantic_interpreter=calendar_semantic_interpreter,
+        conversation_service=conversation_service,
+        abort_check=abort_check,
+        activity_sink=activity_sink,
     )
     return AcademicDiscordService(handler=handler, database=database)
 

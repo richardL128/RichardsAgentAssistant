@@ -55,6 +55,58 @@ def test_outbox_dedupes_acknowledges_replays_and_prunes(tmp_path: Path) -> None:
     assert outbox.prune_terminal(older_than=timedelta(microseconds=1)) == 1
 
 
+def test_outbox_marks_earlier_active_scope_rows_aborted(tmp_path: Path) -> None:
+    outbox = WakeOutbox(tmp_path / "wake.sqlite3")
+    first_at = datetime(2026, 9, 9, 0, 0, tzinfo=UTC)
+    abort_at = datetime(2026, 9, 9, 0, 1, tzinfo=UTC)
+    later_at = datetime(2026, 9, 9, 0, 2, tzinfo=UTC)
+    outbox.record_event(
+        message_id="111111111111111111",
+        channel_id="222222222222222222",
+        author_id="333333333333333333",
+        event_timestamp=first_at,
+    )
+    outbox.mark_acknowledged("111111111111111111", "444444444444444444")
+    outbox.record_event(
+        message_id="555555555555555555",
+        channel_id="222222222222222222",
+        author_id="333333333333333333",
+        event_timestamp=later_at,
+    )
+    outbox.record_event(
+        message_id="666666666666666666",
+        channel_id="222222222222222222",
+        author_id="777777777777777777",
+        event_timestamp=first_at,
+    )
+    outbox.record_event(
+        message_id="888888888888888888",
+        channel_id="222222222222222222",
+        author_id="333333333333333333",
+        event_timestamp=abort_at,
+        request_kind="abort",
+    )
+
+    aborted = outbox.mark_scope_aborted(
+        channel_id="222222222222222222",
+        author_id="333333333333333333",
+        before=abort_at,
+    )
+
+    assert [row.message_id for row in aborted] == ["111111111111111111"]
+    assert outbox.get("111111111111111111").state == "aborted"
+    assert outbox.get("111111111111111111").safe_error_code == "user_abort"
+    assert outbox.get("555555555555555555").state == "pending"
+    assert outbox.get("666666666666666666").state == "pending"
+    assert outbox.get("888888888888888888").request_kind == "abort"
+    assert [row.message_id for row in outbox.pending_rows()] == [
+        "555555555555555555",
+        "666666666666666666",
+        "888888888888888888",
+    ]
+    assert outbox.prune_terminal(older_than=timedelta(microseconds=1)) == 1
+
+
 def test_outbox_rejects_invalid_ids_and_error_codes(tmp_path: Path) -> None:
     outbox = WakeOutbox(tmp_path / "wake.sqlite3")
 

@@ -89,7 +89,7 @@ def _material_input(
         content_hash=hashlib.sha256(payload).hexdigest(),
         raw_artifact_key=artifact.key,
         captured_at=NOW,
-        expires_at=NOW + timedelta(days=2),
+        expires_at=NOW + timedelta(days=30),
     )
 
 
@@ -178,7 +178,6 @@ class _PlannerProposal:
     proposal_id: object
     confirmation_event: str
     changes: tuple[_PlannerChange, ...]
-    source_plan_id: object | None = None
     expires_at: datetime | None = None
 
 

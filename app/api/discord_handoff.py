@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 import math
 from datetime import UTC, datetime, timedelta
@@ -13,7 +14,10 @@ from fastapi.responses import JSONResponse
 from pydantic import SecretStr, ValidationError
 from sqlalchemy.orm import Session
 
-from app.agents.academic_planner.commands import parse_academic_command
+from app.agents.academic_planner.commands import (
+    is_discord_abort_command,
+    parse_academic_command,
+)
 from app.artifacts.store import ArtifactMetadata, ArtifactStore
 from app.connectors.discord import (
     DiscordAcademicPlannerAdapter,
@@ -26,14 +30,23 @@ from app.connectors.discord_gateway import (
     DiscordAcademicMessageCreate,
 )
 from app.core.errors import LifeAgentError
-from app.db.academic import AcademicInboundMaterialInput, AcademicInboundMaterialRepository
+from app.db.academic import (
+    AcademicInboundMaterialInput,
+    AcademicInboundMaterialRepository,
+    AcademicRepository,
+)
 from app.db.discord_wake import (
+    DiscordAbortRequestRecord,
+    DiscordWakeAbortRequestResult,
+    DiscordWakeAbortStatusSnapshot,
     DiscordWakeAction,
     DiscordWakeInboundInput,
     DiscordWakeNonceReplayError,
     DiscordWakeRepository,
 )
 from app.host.handoff import (
+    DiscordHostAbortEvent,
+    DiscordHostAbortReceipt,
     DiscordHostHandoff,
     DiscordHostHandoffEvent,
     DiscordHostInteractionHandoffEvent,
@@ -42,6 +55,142 @@ from app.host.handoff import (
 from app.queue import tasks as queue_tasks
 
 router = APIRouter(prefix="/internal/discord/academic", tags=["internal"])
+
+_SAFE_TOOL_ACTIVITY_LABELS = {
+    "archive_assessment": "proposal_drafting",
+    "attach_material_to_assessment": "proposal_drafting",
+    "create_assessment": "proposal_drafting",
+    "create_course_event": "proposal_drafting",
+    "create_misc_task": "proposal_drafting",
+    "find_course_event_slots": "availability_data",
+    "inspect_inbound_pdf": "assessment_data",
+    "manage_academic_memory": "memory_data",
+    "prepare_job_interview": "interview_preparation",
+    "propose_interview_date": "proposal_drafting",
+    "propose_interview_plan_save": "proposal_drafting",
+    "search_assessment_materials": "assessment_data",
+    "search_assessments": "assessment_data",
+    "search_courses": "course_data",
+    "search_job_interviews": "interview_data",
+    "search_jobs_context": "interview_data",
+    "search_pending_assessment_creates": "assessment_data",
+    "update_assessment": "proposal_drafting",
+}
+
+
+@router.post("/abort", include_in_schema=False)
+async def accept_discord_abort(request: Request) -> JSONResponse:
+    """Authenticate and interrupt earlier owner/channel Discord turns."""
+
+    settings = request.app.state.settings
+    secret = settings.discord_host_handoff_secret
+    if secret is None:
+        raise HTTPException(status_code=503, detail="Discord host handoff is not configured")
+    if request.url.hostname not in {"127.0.0.1", "localhost", "testserver"}:
+        raise HTTPException(status_code=404, detail="Not found")
+    body = await _bounded_body(request, settings.discord_handoff_max_body_bytes)
+    signature = request.headers.get("x-lifeagent-handoff-signature", "")
+    if not verify_handoff_signature(body, signature, secret):
+        raise HTTPException(status_code=401, detail="Invalid handoff authentication")
+    try:
+        payload: object = json.loads(body)
+        if not isinstance(payload, dict):
+            raise TypeError
+        event = DiscordHostAbortEvent.model_validate(payload)
+    except (json.JSONDecodeError, UnicodeDecodeError, ValidationError, TypeError):
+        raise HTTPException(status_code=422, detail="Invalid abort reference") from None
+    now = datetime.now(UTC)
+    if abs((now - event.handoff_timestamp).total_seconds()) > (
+        settings.discord_handoff_max_clock_skew_seconds
+    ):
+        raise HTTPException(status_code=408, detail="Stale abort reference")
+
+    await _refetch_and_validate_abort(request, event)
+    await _validate_acknowledgement(request, event)
+
+    with Session(request.app.state.database.engine) as session, session.begin():
+        abort_record = DiscordWakeRepository.record_abort_request(
+            session,
+            abort_event_id=event.abort_message_id,
+            handoff_nonce=event.nonce,
+            channel_id=event.channel_id,
+            user_id=event.author_id,
+            ack_message_id=event.acknowledgement_message_id,
+            received_at=event.event_timestamp,
+        )
+        if not abort_record.created and abort_record.status != "processing":
+            receipt = _recorded_abort_receipt(abort_record)
+            return JSONResponse(status_code=200, content=receipt.model_dump(mode="json"))
+        requested = DiscordWakeRepository.request_abort_for_scope(
+            session,
+            channel_id=event.channel_id,
+            user_id=event.author_id,
+            abort_event_id=event.abort_message_id,
+            abort_received_at=event.event_timestamp,
+        )
+        AcademicRepository.abort_owner_channel_continuations(
+            session,
+            discord_channel_id=event.channel_id,
+            discord_user_id=event.author_id,
+            abort_event_id=event.abort_message_id,
+            aborted_at=event.event_timestamp,
+        )
+        target_ids = tuple(target.wake_id for target in requested.targets)
+        terminally_aborted_ids: list[UUID] = []
+        for target in requested.targets:
+            if target.queue_job_id is None:
+                DiscordWakeRepository.mark_aborted(
+                    session,
+                    target.wake_id,
+                    abort_event_id=event.abort_message_id,
+                )
+                terminally_aborted_ids.append(target.wake_id)
+
+    infrastructure_aborted_ids: list[UUID] = []
+    for target in requested.targets:
+        if target.queue_job_id is None or target.state != "abort_requested":
+            continue
+        cancelled = await queue_tasks.procrastinate_app.job_manager.cancel_job_by_id_async(
+            target.queue_job_id,
+            abort=True,
+        )
+        infrastructure_status: str | None = None
+        if not cancelled:
+            job_status = await queue_tasks.procrastinate_app.job_manager.get_job_status_async(
+                target.queue_job_id
+            )
+            infrastructure_status = getattr(job_status, "value", str(job_status))
+        if (cancelled and target.prior_state == "queued") or infrastructure_status in {
+            "cancelled",
+            "aborted",
+        }:
+            infrastructure_aborted_ids.append(target.wake_id)
+
+    if infrastructure_aborted_ids:
+        with Session(request.app.state.database.engine) as session, session.begin():
+            for wake_id in infrastructure_aborted_ids:
+                DiscordWakeRepository.mark_queue_cancelled_aborted(
+                    session,
+                    wake_id,
+                    abort_event_id=event.abort_message_id,
+                )
+        terminally_aborted_ids.extend(infrastructure_aborted_ids)
+
+    snapshot = await _wait_for_abort_status(request, target_ids)
+    await _edit_cancelled_progress(request, tuple(dict.fromkeys(terminally_aborted_ids)))
+    receipt = _abort_receipt(requested, snapshot)
+    with Session(request.app.state.database.engine) as session, session.begin():
+        DiscordWakeRepository.finalize_abort_request(
+            session,
+            abort_event_id=event.abort_message_id,
+            status="accepted" if receipt.status == "duplicate" else receipt.status,
+            target_count=receipt.target_count,
+            running_count=receipt.running_count,
+            queued_count=receipt.queued_count,
+            safe_activity_label=receipt.safe_activity_label,
+            safe_tool_status=receipt.safe_tool_status,
+        )
+    return JSONResponse(status_code=200, content=receipt.model_dump(mode="json"))
 
 
 @router.post("/handoff", include_in_schema=False)
@@ -79,6 +228,8 @@ async def accept_discord_handoff(request: Request) -> JSONResponse:
         return await _accept_interaction(request, event)
 
     message = await _refetch_and_validate(request, event)
+    if is_discord_abort_command(message.content.get_secret_value()):
+        raise HTTPException(status_code=422, detail="ABORT requires the abort handoff")
     command = parse_academic_command(message.content.get_secret_value().strip())
     if event.acknowledgement_message_id is None:
         raise HTTPException(status_code=422, detail="Wake acknowledgement is required")
@@ -169,14 +320,33 @@ async def _persist_and_enqueue(
             accepted = DiscordWakeRepository.accept_verified_event(session, intake)
     except (DiscordWakeNonceReplayError, ValueError):
         raise HTTPException(status_code=409, detail="Handoff replay rejected") from None
-    if accepted.status == "replayed" and accepted.enqueued:
+    with Session(request.app.state.database.engine) as session, session.begin():
+        enqueue = DiscordWakeRepository.enqueue_decision(session, accepted.wake_id)
+    if not enqueue.should_enqueue:
+        if enqueue.state == "aborted":
+            await _edit_cancelled_progress(request, (accepted.wake_id,))
         return JSONResponse(status_code=200, content={"status": "duplicate"})
     try:
-        await queue_tasks.defer_discord_wake(str(accepted.wake_id))
+        queue_job_id = await queue_tasks.defer_discord_wake(str(accepted.wake_id))
     except Exception:
         raise HTTPException(status_code=503, detail="Discord request could not be queued") from None
     with Session(request.app.state.database.engine) as session, session.begin():
-        DiscordWakeRepository.mark_enqueued(session, accepted.wake_id)
+        bound = DiscordWakeRepository.bind_queue_job_id(
+            session,
+            accepted.wake_id,
+            queue_job_id,
+        )
+    if bound.should_cancel_queue_job and bound.queue_job_id is not None:
+        cancelled = await queue_tasks.procrastinate_app.job_manager.cancel_job_by_id_async(
+            bound.queue_job_id,
+            abort=True,
+        )
+        if cancelled:
+            with Session(request.app.state.database.engine) as session, session.begin():
+                DiscordWakeRepository.mark_queue_cancelled_aborted(
+                    session,
+                    accepted.wake_id,
+                )
     status_code = 202 if accepted.status == "created" else 200
     status = "accepted" if status_code == 202 else "duplicate"
     return JSONResponse(status_code=status_code, content={"status": status})
@@ -239,7 +409,7 @@ async def _refetch_and_validate(
 
 async def _validate_acknowledgement(
     request: Request,
-    event: DiscordHostHandoffEvent,
+    event: DiscordHostHandoffEvent | DiscordHostAbortEvent,
 ) -> None:
     settings = request.app.state.settings
     token = settings.discord_bot_token
@@ -267,6 +437,186 @@ async def _validate_acknowledgement(
         ) from None
     except ValueError:
         raise HTTPException(status_code=422, detail="Wake acknowledgement is invalid") from None
+
+
+async def _refetch_and_validate_abort(
+    request: Request,
+    event: DiscordHostAbortEvent,
+) -> DiscordAcademicMessageCreate:
+    settings = request.app.state.settings
+    token = settings.discord_bot_token
+    channel_id = settings.discord_academic_channel_id
+    authorized_users = {str(user_id) for user_id in settings.discord_academic_authorized_user_ids}
+    if token is None or channel_id is None or settings.discord_application_id is None:
+        raise HTTPException(status_code=503, detail="Discord backend is not configured")
+    if event.channel_id != channel_id or event.author_id not in authorized_users:
+        raise HTTPException(status_code=403, detail="Discord reference is not authorized")
+    adapter = DiscordAcademicPlannerAdapter(
+        token=token,
+        allowed_channel_ids={channel_id},
+        base_url=settings.discord_api_url,
+    )
+    try:
+        fetched = await adapter.fetch_message(
+            channel_id=event.channel_id,
+            message_id=event.abort_message_id,
+        )
+    except LifeAgentError as exc:
+        status_code = 503 if exc.record.retryable else 422
+        raise HTTPException(
+            status_code=status_code,
+            detail="Discord message is unavailable",
+        ) from None
+    except ValueError:
+        raise HTTPException(status_code=422, detail="Discord message is unavailable") from None
+    if (
+        fetched.id != event.abort_message_id
+        or fetched.channel_id != event.channel_id
+        or fetched.author.id != event.author_id
+        or fetched.author.bot
+        or fetched.timestamp != event.event_timestamp
+        or not is_discord_abort_command(fetched.content.get_secret_value())
+    ):
+        raise HTTPException(status_code=422, detail="Discord abort reference changed")
+    return _to_academic_message(fetched)
+
+
+async def _wait_for_abort_status(
+    request: Request,
+    wake_ids: tuple[UUID, ...],
+) -> DiscordWakeAbortStatusSnapshot:
+    timeout = request.app.state.settings.discord_abort_wait_timeout_seconds
+    deadline = asyncio.get_running_loop().time() + timeout
+    while True:
+        with Session(request.app.state.database.engine) as session:
+            snapshot = DiscordWakeRepository.abort_status_snapshot(session, wake_ids)
+        if snapshot.abort_requested_count == 0:
+            return snapshot
+        remaining = deadline - asyncio.get_running_loop().time()
+        if remaining <= 0:
+            return snapshot
+        await asyncio.sleep(min(0.05, remaining))
+
+
+def _abort_receipt(
+    requested: DiscordWakeAbortRequestResult,
+    snapshot: DiscordWakeAbortStatusSnapshot,
+) -> DiscordHostAbortReceipt:
+    running_count = sum(target.prior_state == "running" for target in requested.targets)
+    queued_count = sum(target.prior_state == "queued" for target in requested.targets)
+    if snapshot.total_count == 0:
+        status = "no_active"
+    elif snapshot.abort_requested_count:
+        status = "unconfirmed"
+    elif requested.newly_requested_count == 0:
+        status = "duplicate"
+    else:
+        status = "accepted"
+
+    activity = snapshot.activity
+    activity_label: str | None = None
+    if activity is not None:
+        if activity.activity_tool_name is not None:
+            safe_tool_activity = _SAFE_TOOL_ACTIVITY_LABELS.get(activity.activity_tool_name)
+            if safe_tool_activity is not None:
+                activity_label = f"tool activity: {safe_tool_activity}"
+        elif activity.activity_phase is not None:
+            activity_label = {
+                "accepted": "queue handoff",
+                "queued": "queue handoff",
+                "abort_requested": "turn shutdown",
+                "terminal": "queue handoff" if requested.running_count == 0 else "turn shutdown",
+            }.get(
+                activity.activity_phase,
+                activity.activity_phase.replace("_", " "),
+            )
+        if activity_label is not None:
+            activity_label = activity_label[:80]
+
+    if snapshot.completed_count:
+        tool_status = "completed_before_cancel"
+    elif snapshot.abort_requested_count:
+        if (
+            activity is not None
+            and activity.activity_side_effect_class in {"durable_local_write", "external_write"}
+            and activity.activity_tool_status in {"running", "cancellation_requested", "unknown"}
+        ):
+            tool_status = "unknown"
+        else:
+            tool_status = "cancellation_requested"
+    elif snapshot.aborted_count:
+        if (
+            activity is not None
+            and activity.activity_side_effect_class in {"durable_local_write", "external_write"}
+            and activity.activity_tool_status not in {"succeeded", "failed", "cancelled"}
+        ):
+            tool_status = "unknown"
+        else:
+            tool_status = "cancelled"
+    else:
+        tool_status = "none"
+
+    return DiscordHostAbortReceipt(
+        status=status,
+        target_count=min(snapshot.total_count, 100),
+        running_count=min(running_count, 100),
+        queued_count=min(queued_count, 100),
+        safe_activity_label=activity_label,
+        safe_tool_status=tool_status,
+    )
+
+
+def _recorded_abort_receipt(record: DiscordAbortRequestRecord) -> DiscordHostAbortReceipt:
+    if record.status == "processing":
+        raise ValueError("Discord abort receipt is still processing")
+    return DiscordHostAbortReceipt(
+        status="duplicate" if record.status == "accepted" else record.status,
+        target_count=record.target_count,
+        running_count=record.running_count,
+        queued_count=record.queued_count,
+        safe_activity_label=record.safe_activity_label,
+        safe_tool_status=record.safe_tool_status,
+    )
+
+
+async def _edit_cancelled_progress(request: Request, wake_ids: tuple[UUID, ...]) -> None:
+    if not wake_ids:
+        return
+    settings = request.app.state.settings
+    token = settings.discord_bot_token
+    channel_id = settings.discord_academic_channel_id
+    if token is None or channel_id is None:
+        return
+    with Session(request.app.state.database.engine) as session:
+        acknowledgement_ids = tuple(
+            row.ack_message_id
+            for wake_id in wake_ids
+            if (row := DiscordWakeRepository.get_by_id(session, wake_id)) is not None
+            and row.ack_message_id is not None
+        )
+    if not acknowledgement_ids:
+        return
+    adapter = DiscordAcademicPlannerAdapter(
+        token=token,
+        allowed_channel_ids={channel_id},
+        base_url=settings.discord_api_url,
+    )
+
+    async def edit(message_id: str) -> None:
+        try:
+            await adapter.edit_academic_message(
+                channel_id=channel_id,
+                message_id=message_id,
+                content="Aborted. I stopped this Discord turn before it could continue.",
+            )
+        except Exception:
+            return
+
+    try:
+        async with asyncio.timeout(min(1.0, settings.discord_abort_wait_timeout_seconds)):
+            await asyncio.gather(*(edit(message_id) for message_id in acknowledgement_ids))
+    except TimeoutError:
+        return
 
 
 def _to_academic_message(message: DiscordFetchedMessage) -> DiscordAcademicMessageCreate:
@@ -373,4 +723,4 @@ async def _capture_pdf_attachments(
     return tuple(material_ids)
 
 
-__all__ = ["accept_discord_handoff", "router"]
+__all__ = ["accept_discord_abort", "accept_discord_handoff", "router"]

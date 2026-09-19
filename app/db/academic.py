@@ -16,10 +16,14 @@ from datetime import UTC, date, datetime, timedelta
 from typing import Any, Literal, cast
 from zoneinfo import ZoneInfo
 
-from sqlalchemy import and_, delete, func, or_, select, update
+from sqlalchemy import delete, func, or_, select, update
 from sqlalchemy.exc import IntegrityError, NoResultFound
 from sqlalchemy.orm import Session
 
+from app.agents.academic_planner.calendar_roles import (
+    AcademicCalendarRole,
+    academic_calendar_role,
+)
 from app.db.models import (
     AcademicAssessmentMaterialProfile,
     AcademicCheckIn,
@@ -42,8 +46,6 @@ from app.db.models import (
     Course,
     FixedCommitment,
     PlanningPreference,
-    StudyBlock,
-    StudyPlan,
 )
 from app.db.repositories import AuditRepository
 
@@ -91,16 +93,27 @@ AcademicClarificationWriteAction = Literal[
     "assignment",
     "tutorial",
     "lab",
-    "studying_block",
+    "event",
 ]
 AcademicClarificationAction = Literal[
     "quiz",
     "assignment",
     "tutorial",
     "lab",
-    "studying_block",
+    "event",
     "ignore",
 ]
+
+
+class AcademicSemanticUnavailableError(RuntimeError):
+    """A semantic lookup could not run; an empty corpus is a different result."""
+
+    code = "embeddings_unavailable"
+
+    def __init__(self) -> None:
+        super().__init__("academic semantic embeddings are unavailable")
+
+
 CommitmentKind = Literal[
     "class",
     "test",
@@ -115,11 +128,12 @@ CommitmentKind = Literal[
 ]
 CHUNK_MAX_CHARS = 20_000
 BOUNDED_TEXT_CHARS = 255
+ACADEMIC_MATERIAL_EMBEDDING_DIMENSIONS = 1024
 AGENT_CLARIFICATION_SESSION_KIND = "agent_clarification"
 _SHA256 = re.compile(r"^[0-9a-f]{64}$")
 _TORONTO = ZoneInfo("America/Toronto")
 _ACADEMIC_CLARIFICATION_WRITE_ACTIONS = frozenset(
-    ("quiz", "assignment", "tutorial", "lab", "studying_block")
+    ("quiz", "assignment", "tutorial", "lab", "event")
 )
 _ACADEMIC_CLARIFICATION_ACTIONS = _ACADEMIC_CLARIFICATION_WRITE_ACTIONS | {"ignore"}
 _ACADEMIC_DOCUMENT_SOURCE_KINDS = frozenset(
@@ -173,6 +187,9 @@ _SIGNED_NOTION_URL_MARKERS = (
     "x-amz-credential=",
     "x-amz-security-token=",
 )
+_ABORTABLE_DISCOURSE_SESSION_KINDS = frozenset(
+    ("learning_focus", "memory_review", AGENT_CLARIFICATION_SESSION_KIND)
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -207,6 +224,25 @@ class DocumentChunkInput:
     content_hash: str | None = None
     embedding: Sequence[float] | None = None
     embedding_model: str | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class MaterialEmbeddingBackfillCandidate:
+    """One active material chunk that needs a current-model embedding."""
+
+    chunk_id: uuid.UUID
+    document_id: uuid.UUID
+    content: str
+    content_hash: str
+
+
+@dataclass(frozen=True, slots=True)
+class ReflectionEmbeddingBackfillCandidate:
+    """One reflection memory that needs a current-model embedding."""
+
+    memory_id: uuid.UUID
+    raw_text: str
+    raw_text_hash: str
 
 
 @dataclass(frozen=True, slots=True)
@@ -279,7 +315,7 @@ class ClarificationInput:
     idempotency_key: str
     tutorial_preview_title: str | None = None
     lab_preview_title: str | None = None
-    studying_block_preview_title: str | None = None
+    event_preview_title: str | None = None
     course_id: uuid.UUID | None = None
     assessment_id: uuid.UUID | None = None
     raw_label: str | None = None
@@ -373,6 +409,10 @@ class CalendarSemanticResultInput:
     analyzed_at: datetime
     overview: str | None = None
     description: str | None = None
+    intent_value: str | None = None
+    intent_status: CalendarSemanticStatus | None = None
+    intent_rationale: str | None = None
+    intent_evidence_ids: Sequence[str] = ()
     evidence_ids: Sequence[str] = ()
     description_evidence_ids: Sequence[str] = ()
 
@@ -756,6 +796,37 @@ class AcademicInboundMaterialRepository:
         row.error_code = "intake_expired"
         session.flush()
         return True
+
+    @staticmethod
+    def expire_unresolved_for_abort(
+        session: Session,
+        *,
+        owner_discord_user_id: str,
+        discord_channel_id: str,
+        now: datetime,
+    ) -> int:
+        current = _utc(now, "now")
+        rows = list(
+            session.scalars(
+                select(AcademicInboundMaterial)
+                .where(
+                    AcademicInboundMaterial.owner_discord_user_id
+                    == _discord_id(owner_discord_user_id, "owner_discord_user_id"),
+                    AcademicInboundMaterial.discord_channel_id
+                    == _discord_id(discord_channel_id, "discord_channel_id"),
+                    AcademicInboundMaterial.state.in_(("captured", "awaiting_target")),
+                    AcademicInboundMaterial.proposal_id.is_(None),
+                    AcademicInboundMaterial.created_at < current,
+                )
+                .with_for_update()
+            )
+        )
+        for row in rows:
+            row.state = "expired"
+            row.error_code = "user_abort"
+            row.expires_at = current
+        session.flush()
+        return len(rows)
 
     @staticmethod
     def find_pending_create_proposals(
@@ -1225,9 +1296,7 @@ class AcademicRepository:
             "assignment_preview_title": _bounded(request.assignment_preview_title, 1_024),
             "tutorial_preview_title": _bounded_optional(request.tutorial_preview_title, 1_024),
             "lab_preview_title": _bounded_optional(request.lab_preview_title, 1_024),
-            "studying_block_preview_title": _bounded_optional(
-                request.studying_block_preview_title, 1_024
-            ),
+            "event_preview_title": _bounded_optional(request.event_preview_title, 1_024),
             "expected_edited_at": expected,
             "title_property_id": _bounded_optional(request.title_property_id),
             "idempotency_key": request.idempotency_key,
@@ -1955,6 +2024,269 @@ class AcademicRepository:
         return [rows_by_id[chunk_id] for chunk_id in ids if chunk_id in rows_by_id]
 
     @staticmethod
+    def count_material_embedding_backfill_candidates(
+        session: Session,
+        *,
+        embedding_model: str,
+        access_classification: str = "private",
+    ) -> int:
+        """Count active material chunks missing the exact current-model embedding."""
+
+        model = _bounded(embedding_model, 255)
+        candidate_conditions = [
+            AcademicDocumentChunk.embedding.is_(None),
+            AcademicDocumentChunk.embedding_model != model,
+            AcademicDocumentChunk.embedding_model.is_(None),
+        ]
+        if session.get_bind().dialect.name == "postgresql":
+            candidate_conditions.append(
+                AcademicDocumentChunk.embedding_dimensions != ACADEMIC_MATERIAL_EMBEDDING_DIMENSIONS
+            )
+        return int(
+            session.scalar(
+                select(func.count())
+                .select_from(AcademicDocumentChunk)
+                .join(AcademicDocument, AcademicDocument.id == AcademicDocumentChunk.document_id)
+                .where(
+                    AcademicDocument.assessment_id.is_not(None),
+                    AcademicDocument.active.is_(True),
+                    AcademicDocument.extraction_status.in_(_ACADEMIC_DOCUMENT_USABLE_STATUSES),
+                    AcademicDocument.access_classification == access_classification,
+                    AcademicDocumentChunk.content != "",
+                    or_(*candidate_conditions),
+                )
+            )
+            or 0
+        )
+
+    @staticmethod
+    def count_active_assessment_material_chunks(
+        session: Session,
+        *,
+        access_classification: str = "private",
+    ) -> int:
+        """Count active usable private assessment-material chunks."""
+
+        return int(
+            session.scalar(
+                select(func.count())
+                .select_from(AcademicDocumentChunk)
+                .join(AcademicDocument, AcademicDocument.id == AcademicDocumentChunk.document_id)
+                .where(
+                    AcademicDocument.assessment_id.is_not(None),
+                    AcademicDocument.active.is_(True),
+                    AcademicDocument.extraction_status.in_(_ACADEMIC_DOCUMENT_USABLE_STATUSES),
+                    AcademicDocument.access_classification == access_classification,
+                    AcademicDocumentChunk.content != "",
+                )
+            )
+            or 0
+        )
+
+    @staticmethod
+    def list_material_embedding_backfill_candidates(
+        session: Session,
+        *,
+        embedding_model: str,
+        limit: int = 100,
+        after_chunk_id: uuid.UUID | None = None,
+        access_classification: str = "private",
+    ) -> list[MaterialEmbeddingBackfillCandidate]:
+        """Return bounded, id-ordered active material chunks needing current vectors."""
+
+        if limit < 1 or limit > 500:
+            raise ValueError("material embedding backfill limit must be between 1 and 500")
+        model = _bounded(embedding_model, 255)
+        candidate_conditions = [
+            AcademicDocumentChunk.embedding.is_(None),
+            AcademicDocumentChunk.embedding_model != model,
+            AcademicDocumentChunk.embedding_model.is_(None),
+        ]
+        if session.get_bind().dialect.name == "postgresql":
+            candidate_conditions.append(
+                AcademicDocumentChunk.embedding_dimensions != ACADEMIC_MATERIAL_EMBEDDING_DIMENSIONS
+            )
+        statement = (
+            select(
+                AcademicDocumentChunk.id,
+                AcademicDocumentChunk.document_id,
+                AcademicDocumentChunk.content,
+                AcademicDocumentChunk.content_hash,
+            )
+            .join(AcademicDocument, AcademicDocument.id == AcademicDocumentChunk.document_id)
+            .where(
+                AcademicDocument.assessment_id.is_not(None),
+                AcademicDocument.active.is_(True),
+                AcademicDocument.extraction_status.in_(_ACADEMIC_DOCUMENT_USABLE_STATUSES),
+                AcademicDocument.access_classification == access_classification,
+                AcademicDocumentChunk.content != "",
+                or_(*candidate_conditions),
+            )
+            .order_by(AcademicDocumentChunk.id)
+            .limit(limit)
+        )
+        if after_chunk_id is not None:
+            statement = statement.where(AcademicDocumentChunk.id > after_chunk_id)
+        return [
+            MaterialEmbeddingBackfillCandidate(
+                chunk_id=row_id,
+                document_id=document_id,
+                content=content,
+                content_hash=content_hash,
+            )
+            for row_id, document_id, content, content_hash in session.execute(statement)
+        ]
+
+    @staticmethod
+    def update_material_chunk_embedding(
+        session: Session,
+        *,
+        chunk_id: uuid.UUID,
+        content_hash: str,
+        embedding: Sequence[float],
+        embedding_model: str,
+    ) -> bool:
+        """Persist a derived embedding only if the chunk content is unchanged."""
+
+        if not _SHA256.fullmatch(content_hash):
+            raise ValueError("chunk content_hash must be SHA-256 hex")
+        vector = _embedding_vector(embedding)
+        if vector is None:
+            raise ValueError("embedding must not be empty")
+        if (
+            session.get_bind().dialect.name == "postgresql"
+            and len(vector) != ACADEMIC_MATERIAL_EMBEDDING_DIMENSIONS
+        ):
+            raise ValueError("material embeddings must be 1024-dimensional on PostgreSQL")
+        model = _bounded(embedding_model, 255)
+        chunk = session.get(AcademicDocumentChunk, chunk_id)
+        if chunk is None or chunk.content_hash != content_hash:
+            return False
+        chunk.embedding = vector
+        chunk.embedding_model = model
+        chunk.embedding_dimensions = len(vector)
+        session.flush()
+        return True
+
+    @staticmethod
+    def count_reflection_embedding_backfill_candidates(
+        session: Session,
+        *,
+        embedding_model: str,
+    ) -> int:
+        """Count reflection memories missing the exact current-model embedding."""
+
+        model = _bounded(embedding_model, 255)
+        candidate_conditions = [
+            AcademicReflectionMemory.embedding.is_(None),
+            AcademicReflectionMemory.embedding_model != model,
+            AcademicReflectionMemory.embedding_model.is_(None),
+        ]
+        if session.get_bind().dialect.name == "postgresql":
+            candidate_conditions.append(
+                AcademicReflectionMemory.embedding_dimensions
+                != ACADEMIC_MATERIAL_EMBEDDING_DIMENSIONS
+            )
+        return int(
+            session.scalar(
+                select(func.count())
+                .select_from(AcademicReflectionMemory)
+                .where(
+                    AcademicReflectionMemory.raw_text != "",
+                    or_(*candidate_conditions),
+                )
+            )
+            or 0
+        )
+
+    @staticmethod
+    def count_reflection_memories(session: Session) -> int:
+        """Count persisted reflection memories with raw text available for embedding."""
+
+        return int(
+            session.scalar(
+                select(func.count())
+                .select_from(AcademicReflectionMemory)
+                .where(AcademicReflectionMemory.raw_text != "")
+            )
+            or 0
+        )
+
+    @staticmethod
+    def list_reflection_embedding_backfill_candidates(
+        session: Session,
+        *,
+        embedding_model: str,
+        limit: int = 100,
+        after_memory_id: uuid.UUID | None = None,
+    ) -> list[ReflectionEmbeddingBackfillCandidate]:
+        """Return bounded, id-ordered reflection memories needing current vectors."""
+
+        if limit < 1 or limit > 500:
+            raise ValueError("reflection embedding backfill limit must be between 1 and 500")
+        model = _bounded(embedding_model, 255)
+        candidate_conditions = [
+            AcademicReflectionMemory.embedding.is_(None),
+            AcademicReflectionMemory.embedding_model != model,
+            AcademicReflectionMemory.embedding_model.is_(None),
+        ]
+        if session.get_bind().dialect.name == "postgresql":
+            candidate_conditions.append(
+                AcademicReflectionMemory.embedding_dimensions
+                != ACADEMIC_MATERIAL_EMBEDDING_DIMENSIONS
+            )
+        statement = (
+            select(AcademicReflectionMemory.id, AcademicReflectionMemory.raw_text)
+            .where(
+                AcademicReflectionMemory.raw_text != "",
+                or_(*candidate_conditions),
+            )
+            .order_by(AcademicReflectionMemory.id)
+            .limit(limit)
+        )
+        if after_memory_id is not None:
+            statement = statement.where(AcademicReflectionMemory.id > after_memory_id)
+        return [
+            ReflectionEmbeddingBackfillCandidate(
+                memory_id=memory_id,
+                raw_text=raw_text,
+                raw_text_hash=_sha256(raw_text),
+            )
+            for memory_id, raw_text in session.execute(statement)
+        ]
+
+    @staticmethod
+    def update_reflection_memory_embedding(
+        session: Session,
+        *,
+        memory_id: uuid.UUID,
+        raw_text_hash: str,
+        embedding: Sequence[float],
+        embedding_model: str,
+    ) -> bool:
+        """Persist a derived reflection embedding only if raw text is unchanged."""
+
+        if not _SHA256.fullmatch(raw_text_hash):
+            raise ValueError("raw_text_hash must be SHA-256 hex")
+        vector = _embedding_vector(embedding)
+        if vector is None:
+            raise ValueError("embedding must not be empty")
+        if (
+            session.get_bind().dialect.name == "postgresql"
+            and len(vector) != ACADEMIC_MATERIAL_EMBEDDING_DIMENSIONS
+        ):
+            raise ValueError("reflection embeddings must be 1024-dimensional on PostgreSQL")
+        model = _bounded(embedding_model, 255)
+        memory = session.get(AcademicReflectionMemory, memory_id)
+        if memory is None or _sha256(memory.raw_text) != raw_text_hash:
+            return False
+        memory.embedding = vector
+        memory.embedding_model = model
+        memory.embedding_dimensions = len(vector)
+        session.flush()
+        return True
+
+    @staticmethod
     def list_material_planning_chunks(
         session: Session,
         *,
@@ -2110,6 +2442,11 @@ class AcademicRepository:
             return []
         if limit < 1 or limit > 100:
             raise ValueError("semantic retrieval limit must be between 1 and 100")
+        if (
+            session.get_bind().dialect.name == "postgresql"
+            and len(vector) != ACADEMIC_MATERIAL_EMBEDDING_DIMENSIONS
+        ):
+            return []
         model = _bounded(embedding_model, 255)
         statement = (
             select(AcademicDocumentChunk)
@@ -2165,117 +2502,6 @@ class AcademicRepository:
             "error_code": error_code,
         }
         return _upsert(session, AcademicSyncCursor, [AcademicSyncCursor.scope == scope], values)
-
-    @staticmethod
-    def upsert_study_plan(
-        session: Session,
-        *,
-        plan_key: str,
-        starts_on: date,
-        ends_on: date,
-        timezone: str,
-        status: Literal["draft", "published", "superseded"] = "draft",
-        preference_version: str | None = None,
-    ) -> StudyPlan:
-        if ends_on < starts_on:
-            raise ValueError("study plan must end on or after its start")
-        values = {
-            "plan_key": plan_key,
-            "starts_on": starts_on,
-            "ends_on": ends_on,
-            "timezone": timezone,
-            "status": status,
-            "preference_version": preference_version,
-        }
-        return _upsert(session, StudyPlan, [StudyPlan.plan_key == plan_key], values)
-
-    @staticmethod
-    def upsert_study_block(
-        session: Session,
-        *,
-        plan_id: uuid.UUID,
-        block_key: str,
-        title: str,
-        starts_at: datetime,
-        ends_at: datetime,
-        allocated_minutes: int,
-        status: Literal[
-            "planned", "in_progress", "completed", "incomplete", "carried_forward"
-        ] = "planned",
-        assessment_id: uuid.UUID | None = None,
-        learning_focus_id: uuid.UUID | None = None,
-        block_kind: Literal["assessment", "practice"] = "assessment",
-        carry_forward_from_id: uuid.UUID | None = None,
-        notes: str | None = None,
-    ) -> StudyBlock:
-        starts_at = _utc(starts_at, "starts_at")
-        ends_at = _utc(ends_at, "ends_at")
-        if ends_at <= starts_at or allocated_minutes <= 0:
-            raise ValueError("study block must have positive duration and allocation")
-        values = {
-            "plan_id": plan_id,
-            "block_key": block_key,
-            "title": title,
-            "starts_at": starts_at,
-            "ends_at": ends_at,
-            "allocated_minutes": allocated_minutes,
-            "status": status,
-            "assessment_id": assessment_id,
-            "learning_focus_id": learning_focus_id,
-            "block_kind": block_kind,
-            "carry_forward_from_id": carry_forward_from_id,
-            "notes": notes,
-        }
-        return _upsert(
-            session,
-            StudyBlock,
-            [StudyBlock.plan_id == plan_id, StudyBlock.block_key == block_key],
-            values,
-        )
-
-    @staticmethod
-    def carry_forward_incomplete_blocks(
-        session: Session,
-        *,
-        source_plan_id: uuid.UUID,
-        target_plan_id: uuid.UUID,
-        starts_at: datetime,
-        gap_minutes: int = 0,
-    ) -> list[StudyBlock]:
-        if gap_minutes < 0:
-            raise ValueError("gap_minutes must not be negative")
-        cursor = _utc(starts_at, "starts_at")
-        source_blocks = list(
-            session.scalars(
-                select(StudyBlock)
-                .where(
-                    StudyBlock.plan_id == source_plan_id,
-                    StudyBlock.status.in_(["incomplete", "in_progress"]),
-                )
-                .order_by(StudyBlock.starts_at, StudyBlock.id)
-            )
-        )
-        result: list[StudyBlock] = []
-        for source in source_blocks:
-            duration = source.ends_at - source.starts_at
-            key = f"{source.block_key}:carry:{target_plan_id}"
-            carried = AcademicRepository.upsert_study_block(
-                session,
-                plan_id=target_plan_id,
-                block_key=key[:255],
-                assessment_id=source.assessment_id,
-                learning_focus_id=source.learning_focus_id,
-                title=source.title,
-                starts_at=cursor,
-                ends_at=cursor + duration,
-                allocated_minutes=source.allocated_minutes,
-                status="carried_forward",
-                carry_forward_from_id=source.id,
-                notes=source.notes,
-            )
-            result.append(carried)
-            cursor = carried.ends_at + timedelta(minutes=gap_minutes)
-        return result
 
     @staticmethod
     def create_discourse_session(
@@ -2578,6 +2804,54 @@ class AcademicRepository:
             row.partial_state = {}
         session.flush()
         return len(rows)
+
+    @staticmethod
+    def abort_owner_channel_continuations(
+        session: Session,
+        *,
+        discord_channel_id: str,
+        discord_user_id: str,
+        abort_event_id: str,
+        aborted_at: datetime,
+    ) -> dict[str, int]:
+        """Close owner/channel resumable state without deleting history."""
+
+        current = _utc(aborted_at, "aborted_at")
+        event_id = _bounded(abort_event_id, 255)
+        discourse_rows = list(
+            session.scalars(
+                select(AcademicDiscourseSession)
+                .where(
+                    AcademicDiscourseSession.state == "open",
+                    AcademicDiscourseSession.discord_channel_id == _bounded(discord_channel_id, 24),
+                    AcademicDiscourseSession.discord_user_id == _bounded(discord_user_id, 24),
+                    AcademicDiscourseSession.last_turn_at < current,
+                    AcademicDiscourseSession.session_kind.in_(_ABORTABLE_DISCOURSE_SESSION_KINDS),
+                )
+                .with_for_update()
+            )
+        )
+        final_state = {
+            "outcome": "aborted",
+            "abort_discord_event_id": event_id,
+            "aborted_at": current.isoformat(),
+        }
+        for row in discourse_rows:
+            row.state = "completed"
+            row.completed_at = current
+            row.last_turn_at = current
+            row.partial_state = dict(final_state)
+        material_count = AcademicInboundMaterialRepository.expire_unresolved_for_abort(
+            session,
+            owner_discord_user_id=discord_user_id,
+            discord_channel_id=discord_channel_id,
+            now=current,
+        )
+        session.flush()
+        return {
+            "discourse_sessions_closed": len(discourse_rows),
+            "inbound_materials_expired": material_count,
+        }
 
     @staticmethod
     def create_learning_focus(
@@ -2903,11 +3177,6 @@ class AcademicRepository:
                 AcademicLearningFocusEvent.focus_id == focus_id
             )
         )
-        session.execute(
-            update(StudyBlock)
-            .where(StudyBlock.learning_focus_id == focus_id)
-            .values(learning_focus_id=None, block_kind="practice")
-        )
         session.delete(focus)
         session.flush()
         return True
@@ -3119,7 +3388,6 @@ class AcademicRepository:
         status: Literal[
             "received", "questioned", "planned", "proposal_pending", "completed", "failed"
         ] = "received",
-        plan_id: uuid.UUID | None = None,
     ) -> AcademicCheckIn:
         values = {
             "idempotency_key": idempotency_key,
@@ -3129,7 +3397,6 @@ class AcademicRepository:
             "content_artifact_key": content_artifact_key,
             "redacted_summary": redacted_summary,
             "status": status,
-            "plan_id": plan_id,
         }
         existing = session.scalar(
             select(AcademicCheckIn).where(AcademicCheckIn.idempotency_key == idempotency_key)
@@ -3550,21 +3817,6 @@ def _material_planning_profile_from_row(
     )
 
 
-def _material_planning_signals(row: AcademicAssessmentMaterialProfile | None) -> Any | None:
-    if row is None or row.state != "active":
-        return None
-    from app.agents.academic_planner.contracts import ValidatedMaterialPlanningSignals
-
-    return ValidatedMaterialPlanningSignals(
-        effort_lower_minutes=row.effort_lower_minutes,
-        effort_upper_minutes=row.effort_upper_minutes,
-        scope_score=row.scope_score,
-        dependency_risk_score=row.dependency_risk_score,
-        evidence_chunk_ids=tuple(row.evidence_chunk_ids),
-        profile_version=row.profile_version,
-    )
-
-
 def _durable_source_url(value: str | None) -> str | None:
     """Drop temporary signed Notion attachment URLs before relational persistence."""
 
@@ -3593,20 +3845,6 @@ def _checkin_proposal_from_row(
     if "expires_at" in getattr(proposal_type, "model_fields", {}):
         values["expires_at"] = _aware_db(row.expires_at) if row.expires_at is not None else None
     return proposal_type(**values)
-
-
-def _resolve_study_plan_id(
-    session: Session,
-    source_plan_id: uuid.UUID | None,
-) -> uuid.UUID | None:
-    """Resolve a planner-facing plan key to the internal foreign-key ID."""
-
-    if source_plan_id is None:
-        return None
-    plan = session.get(StudyPlan, source_plan_id)
-    if plan is None:
-        plan = session.scalar(select(StudyPlan).where(StudyPlan.plan_key == str(source_plan_id)))
-    return plan.id if plan is not None else None
 
 
 def _lock_proposal_operation(
@@ -3934,10 +4172,41 @@ class SQLAlchemyAcademicPlannerStore:
                     course_id=str(course.id),
                     course_code=course.course_code,
                     title=course.title,
+                    calendar_role=academic_calendar_role(course.title),
                 )
                 for course, _calendar in rows
             ]
         return tuple(options)
+
+    def search_misc_courses(self) -> Sequence[Any]:
+        """Return at most two valid reserved misc targets for uniqueness checks."""
+
+        from app.agents.academic_planner.contracts import AcademicCourseOption
+
+        with Session(self.engine) as session:
+            rows = session.execute(
+                select(Course, AcademicCourseCalendar)
+                .join(AcademicCourseCalendar, AcademicCourseCalendar.course_id == Course.id)
+                .where(
+                    Course.active.is_(True),
+                    func.lower(func.trim(Course.title)) == AcademicCalendarRole.MISC.value,
+                    AcademicCourseCalendar.discovery_status == "valid",
+                    AcademicCourseCalendar.child_data_source_id.is_not(None),
+                    AcademicCourseCalendar.title_property_id.is_not(None),
+                    AcademicCourseCalendar.date_property_id.is_not(None),
+                )
+                .order_by(Course.id)
+                .limit(2)
+            )
+            return tuple(
+                AcademicCourseOption(
+                    course_id=str(course.id),
+                    course_code=course.course_code,
+                    title=course.title,
+                    calendar_role=AcademicCalendarRole.MISC,
+                )
+                for course, _calendar in rows
+            )
 
     def search_assessments(
         self,
@@ -4079,14 +4348,19 @@ class SQLAlchemyAcademicPlannerStore:
         from app.agents.academic_planner.contracts import AcademicSemanticCandidate
         from app.llm.embeddings import EmbeddingStatus
 
-        if self.embedding_gateway is None or limit < 1:
+        if limit < 1:
             return ()
+        if self.embedding_gateway is None:
+            raise AcademicSemanticUnavailableError
         result = await self.embedding_gateway.embed_reflection_text(query)
         if result.status is not EmbeddingStatus.VALID or result.embedding is None:
-            return ()
+            raise AcademicSemanticUnavailableError
         vector = result.embedding.vector
+        embedding_model = _bounded(result.model_identity, 255)
         with Session(self.engine) as session:
             if session.get_bind().dialect.name == "postgresql":
+                if len(vector) != ACADEMIC_MATERIAL_EMBEDDING_DIMENSIONS:
+                    raise AcademicSemanticUnavailableError
                 distance = AcademicReflectionMemory.embedding.cosine_distance(vector).label(
                     "distance"
                 )
@@ -4098,6 +4372,7 @@ class SQLAlchemyAcademicPlannerStore:
                     )
                     .where(
                         AcademicReflectionMemory.embedding.is_not(None),
+                        AcademicReflectionMemory.embedding_model == embedding_model,
                         AcademicReflectionMemory.embedding_dimensions == len(vector),
                         AcademicLearningFocus.status.in_(["active", "snoozed"]),
                     )
@@ -4134,6 +4409,7 @@ class SQLAlchemyAcademicPlannerStore:
                 )
                 .where(
                     AcademicReflectionMemory.embedding.is_not(None),
+                    AcademicReflectionMemory.embedding_model == embedding_model,
                     AcademicReflectionMemory.embedding_dimensions == len(vector),
                     AcademicLearningFocus.status.in_(["active", "snoozed"]),
                 )
@@ -4636,11 +4912,13 @@ class SQLAlchemyAcademicPlannerStore:
 
         from app.llm.embeddings import EmbeddingStatus
 
-        if self.embedding_gateway is None or limit < 1:
+        if limit < 1:
             return []
+        if self.embedding_gateway is None:
+            raise AcademicSemanticUnavailableError
         result = await self.embedding_gateway.embed_academic_text(query)
         if result.status is not EmbeddingStatus.VALID or result.embedding is None:
-            return []
+            raise AcademicSemanticUnavailableError
         with Session(self.engine) as session:
             scope = _resolve_assessment_scope(session, assessment_id)
             if scope is None:
@@ -4689,17 +4967,8 @@ class SQLAlchemyAcademicPlannerStore:
             limit=limit,
         )
 
-    def load_planner_facts(self, *, now: datetime, horizon_days: int) -> Any:
-        from app.agents.academic_planner.contracts import (
-            AmbiguousFact,
-            AssessmentType,
-            IncompleteBlock,
-            PlannerFacts,
-            PracticeNeed,
-        )
-        from app.agents.academic_planner.contracts import (
-            Assessment as PlannerAssessment,
-        )
+    def load_calendar_availability(self, *, now: datetime, horizon_days: int) -> Any:
+        from app.agents.academic_planner.contracts import CalendarAvailabilityFacts
         from app.agents.academic_planner.contracts import (
             FixedCommitment as PlannerCommitment,
         )
@@ -4707,75 +4976,6 @@ class SQLAlchemyAcademicPlannerStore:
         current = _utc(now, "now")
         horizon = current + timedelta(days=horizon_days)
         with Session(self.engine) as session:
-            courses = {
-                course.id: course
-                for course in session.scalars(select(Course).where(Course.active.is_(True)))
-            }
-            assessment_rows = list(
-                session.scalars(
-                    select(Assessment)
-                    .where(
-                        or_(
-                            Assessment.due_at.is_(None),
-                            and_(
-                                Assessment.due_at > current,
-                                Assessment.due_at <= horizon + timedelta(days=1),
-                            ),
-                        ),
-                        Assessment.course_id.in_(courses) if courses else Assessment.id.is_(None),
-                        Assessment.active.is_(True),
-                    )
-                    .order_by(Assessment.due_at, Assessment.notion_id)
-                )
-            )
-            active_profiles = {
-                row.assessment_id: row
-                for row in session.scalars(
-                    select(AcademicAssessmentMaterialProfile).where(
-                        AcademicAssessmentMaterialProfile.assessment_id.in_(
-                            {assessment.id for assessment in assessment_rows}
-                        ),
-                        AcademicAssessmentMaterialProfile.state == "active",
-                    )
-                )
-            }
-            assessments: list[Any] = []
-            ambiguous: list[Any] = []
-            for row in assessment_rows:
-                course = courses[row.course_id]
-                citation = _citation_text(row.source_page, row.source_block, row.source_url)
-                if row.fact_state == "ambiguous" or row.due_at is None:
-                    ambiguous.append(
-                        AmbiguousFact(
-                            id=row.notion_id,
-                            question=(
-                                row.ambiguity_reason or f"Confirm the deadline for {row.title}."
-                            ),
-                            source_citation=citation,
-                            candidate_value=row.due_at.isoformat() if row.due_at else None,
-                        )
-                    )
-                    continue
-                assessments.append(
-                    PlannerAssessment(
-                        id=row.notion_id,
-                        course=course.course_code,
-                        title=row.title,
-                        assessment_type=_planner_assessment_type(
-                            AssessmentType, row.assessment_type
-                        ),
-                        due_at=_aware_db(row.due_at),
-                        estimated_minutes=row.estimated_minutes,
-                        weight_percent=row.grade_weight_percent or 0,
-                        course_priority=course.priority,
-                        confidence_gap=row.confidence_gap,
-                        scope_size=row.scope_size,
-                        completed=row.completed,
-                        ambiguous=row.fact_state != "confirmed",
-                        citations=(citation,),
-                        material_signals=_material_planning_signals(active_profiles.get(row.id)),
-                    )
-                )
             commitments = [
                 PlannerCommitment(
                     id=row.notion_id,
@@ -4794,91 +4994,35 @@ class SQLAlchemyAcademicPlannerStore:
                     .order_by(FixedCommitment.starts_at)
                 )
             ]
-            incomplete_rows = list(
-                session.scalars(
-                    select(StudyBlock).where(StudyBlock.status.in_(["incomplete", "in_progress"]))
-                )
-            )
-            linked_assessments = {
-                assessment.id: assessment.notion_id
-                for assessment in session.scalars(
-                    select(Assessment).where(
-                        Assessment.id.in_(
-                            {
-                                row.assessment_id
-                                for row in incomplete_rows
-                                if row.assessment_id is not None
-                            }
-                        )
-                    )
-                )
-            }
-            incomplete = [
-                IncompleteBlock(
-                    id=str(row.id),
-                    assessment_id=linked_assessments.get(row.assessment_id, str(row.assessment_id)),
+            commitments.extend(
+                PlannerCommitment(
+                    id=row.notion_id,
                     title=row.title,
-                    remaining_minutes=row.allocated_minutes,
-                    original_due_at=None,
+                    start_at=_aware_db(cast(datetime, row.due_at)),
+                    end_at=_aware_db(cast(datetime, row.ends_at)),
+                    kind="event",
                 )
-                for row in incomplete_rows
-                if row.assessment_id is not None
-            ]
-            local_day = current.astimezone(_TORONTO).date()
-            practice_needs: list[Any] = []
-            focus_rows = session.scalars(
-                select(AcademicLearningFocus)
-                .where(
-                    AcademicLearningFocus.status == "active",
-                    AcademicLearningFocus.practice_due_on.is_not(None),
-                    AcademicLearningFocus.practice_due_on <= local_day,
-                )
-                .order_by(
-                    AcademicLearningFocus.next_review_at,
-                    AcademicLearningFocus.topic,
+                for row in session.scalars(
+                    select(Assessment)
+                    .where(
+                        Assessment.due_at < horizon,
+                        Assessment.ends_at > current,
+                        Assessment.fact_state == "confirmed",
+                        Assessment.active.is_(True),
+                        Assessment.archived.is_(False),
+                    )
+                    .order_by(Assessment.due_at)
                 )
             )
-            for row in focus_rows:
-                linked_assessment = (
-                    session.get(Assessment, row.assessment_id)
-                    if row.assessment_id is not None
-                    else None
-                )
-                practice_needs.append(
-                    PracticeNeed(
-                        focus_id=str(row.id),
-                        course_id=str(row.course_id) if row.course_id is not None else None,
-                        course_code=row.course_code,
-                        assessment_id=(
-                            str(row.assessment_id) if row.assessment_id is not None else None
-                        ),
-                        assessment_title=(linked_assessment.title if linked_assessment else None),
-                        topic=row.topic,
-                        target_minutes=row.practice_minutes or self.default_practice_minutes,
-                        next_review_at=(
-                            _aware_db(row.next_review_at)
-                            if row.next_review_at is not None
-                            else current + timedelta(days=1)
-                        ),
-                        source_action="reinforce_focus",
-                        rationale=(
-                            "Scheduled as a separate practice block because this academic topic "
-                            "is an active learning focus from the latest reflection."
-                        ),
-                    )
-                )
+            commitments.sort(key=lambda item: item.start_at)
             preference = session.scalar(
                 select(PlanningPreference).order_by(PlanningPreference.updated_at.desc())
             )
             availability = _availability_windows(preference.availability if preference else {})
             buffer_minutes = preference.buffer_minutes if preference else 15
-        return PlannerFacts(
-            assessments=tuple(assessments),
+        return CalendarAvailabilityFacts(
             commitments=tuple(commitments),
             availability=tuple(availability),
-            incomplete_blocks=tuple(incomplete),
-            practice_needs=tuple(practice_needs),
-            ambiguous_facts=tuple(ambiguous),
             buffer_minutes=buffer_minutes,
             horizon_days=horizon_days,
         )
@@ -4949,102 +5093,9 @@ class SQLAlchemyAcademicPlannerStore:
                 semantics=semantics,
             )
 
-    def save_daily_plan(self, plan: Any) -> None:
-        local_day = _aware_db(plan.created_at).astimezone(_TORONTO).date()
-        with Session(self.engine) as session, session.begin():
-            stored = AcademicRepository.upsert_study_plan(
-                session,
-                plan_key=str(plan.plan_id),
-                starts_on=local_day,
-                ends_on=local_day,
-                timezone="America/Toronto",
-                status="published",
-            )
-            for block in plan.blocks:
-                assessment = session.scalar(
-                    select(Assessment).where(Assessment.notion_id == block.assessment_id)
-                )
-                AcademicRepository.upsert_study_block(
-                    session,
-                    plan_id=stored.id,
-                    block_key=str(block.id),
-                    assessment_id=assessment.id if assessment else None,
-                    learning_focus_id=_parse_uuid(_field(block, "learning_focus_id")),
-                    block_kind=_field(block, "block_kind") or "assessment",
-                    title=block.title,
-                    starts_at=block.start_at,
-                    ends_at=block.end_at,
-                    allocated_minutes=max(
-                        1, int((block.end_at - block.start_at).total_seconds() // 60)
-                    ),
-                    status="carried_forward" if block.carried_over else "planned",
-                    notes=block.rationale,
-                )
-
-    def get_latest_daily_plan(self) -> Any | None:
-        from app.agents.academic_planner.contracts import DailyPlan
-        from app.agents.academic_planner.contracts import StudyBlock as PlannerBlock
-
-        with Session(self.engine) as session:
-            plan = session.scalar(
-                select(StudyPlan)
-                .order_by(StudyPlan.created_at.desc(), StudyPlan.starts_on.desc())
-                .limit(1)
-            )
-            if plan is None:
-                return None
-            rows = list(
-                session.scalars(
-                    select(StudyBlock)
-                    .where(StudyBlock.plan_id == plan.id)
-                    .order_by(StudyBlock.starts_at, StudyBlock.id)
-                )
-            )
-            blocks: list[Any] = []
-            assessment_ids = {row.assessment_id for row in rows if row.assessment_id is not None}
-            assessment_notion_ids = {
-                assessment.id: assessment.notion_id
-                for assessment in session.scalars(
-                    select(Assessment).where(Assessment.id.in_(assessment_ids))
-                )
-            }
-            for row in rows:
-                assessment_id = (
-                    assessment_notion_ids.get(row.assessment_id, str(row.assessment_id))
-                    if row.assessment_id
-                    else row.block_key
-                )
-                blocks.append(
-                    PlannerBlock(
-                        id=row.block_key,
-                        assessment_id=assessment_id,
-                        learning_focus_id=(
-                            str(row.learning_focus_id)
-                            if row.learning_focus_id is not None
-                            else None
-                        ),
-                        block_kind=cast(
-                            Literal["assessment", "practice"],
-                            row.block_kind,
-                        ),
-                        title=row.title,
-                        start_at=_aware_db(row.starts_at),
-                        end_at=_aware_db(row.ends_at),
-                        carried_over=row.status == "carried_forward",
-                        priority_score=0,
-                        rationale=row.notes or "Persisted deterministic study block.",
-                    )
-                )
-            return DailyPlan(
-                plan_id=uuid.UUID(plan.plan_key),
-                created_at=_aware_db(plan.created_at),
-                blocks=tuple(blocks),
-            )
-
     def save_checkin_proposal(self, proposal: Any) -> None:
         with Session(self.engine) as session, session.begin():
             now = datetime.now(UTC)
-            plan_id = _resolve_study_plan_id(session, proposal.source_plan_id)
             checkin = AcademicRepository.create_checkin(
                 session,
                 idempotency_key=f"academic-checkin:{proposal.proposal_id}",
@@ -5053,7 +5104,6 @@ class SQLAlchemyAcademicPlannerStore:
                 received_at=now,
                 redacted_summary="Academic check-in proposal pending confirmation.",
                 status="proposal_pending",
-                plan_id=plan_id,
             )
             AcademicRepository.create_proposed_change(
                 session,
@@ -5128,7 +5178,6 @@ class SQLAlchemyAcademicPlannerStore:
                         "superseded proposal is not the single compatible pending create"
                     )
                 superseded_row_id = pending_create.id
-            plan_id = _resolve_study_plan_id(session, proposal.source_plan_id)
             checkin_status: Literal["questioned", "proposal_pending"] = (
                 "proposal_pending" if changes else "questioned"
             )
@@ -5144,7 +5193,6 @@ class SQLAlchemyAcademicPlannerStore:
                     else "Academic check-in needs clarification."
                 ),
                 "status": checkin_status,
-                "plan_id": plan_id,
             }
             try:
                 checkin = AcademicCheckIn(**checkin_values)
@@ -5806,9 +5854,9 @@ class SQLAlchemyAcademicPlannerStore:
                     if kwargs.get("lab_preview_title") is not None
                     else None
                 ),
-                studying_block_preview_title=(
-                    str(kwargs["studying_block_preview_title"])
-                    if kwargs.get("studying_block_preview_title") is not None
+                event_preview_title=(
+                    str(kwargs["event_preview_title"])
+                    if kwargs.get("event_preview_title") is not None
                     else None
                 ),
                 expected_edited_at=_utc(kwargs["expected_edited_at"], "expected_edited_at"),
@@ -5848,6 +5896,23 @@ class SQLAlchemyAcademicPlannerStore:
             return AcademicRepository.expire_clarifications(
                 session,
                 now=now or datetime.now(UTC),
+            )
+
+    def abort_owner_channel_continuations(
+        self,
+        *,
+        discord_channel_id: str,
+        discord_user_id: str,
+        abort_event_id: str,
+        aborted_at: datetime | None = None,
+    ) -> dict[str, int]:
+        with Session(self.engine) as session, session.begin():
+            return AcademicRepository.abort_owner_channel_continuations(
+                session,
+                discord_channel_id=discord_channel_id,
+                discord_user_id=discord_user_id,
+                abort_event_id=abort_event_id,
+                aborted_at=aborted_at or datetime.now(UTC),
             )
 
     def mark_clarification_delivered(
@@ -5941,13 +6006,6 @@ class SQLAlchemyAcademicPlannerStore:
         with Session(self.engine) as session:
             return AcademicRepository.academic_notion_health(session)
 
-    # Short aliases are useful to host workers that use the generic store API.
-    def save(self, plan: Any) -> None:
-        self.save_daily_plan(plan)
-
-    def get(self) -> Any | None:
-        return self.get_latest_daily_plan()
-
     def mark_checkin(self, proposal_id: uuid.UUID) -> None:
         self.mark_checkin_applied(proposal_id)
 
@@ -5979,6 +6037,12 @@ def _apply_calendar_semantics(
         raise ValueError("invalid calendar semantic status")
     overview = _bounded_optional(semantics.overview, 700)
     description = _bounded_optional(semantics.description, 1_500)
+    intent_value = _bounded_optional(semantics.intent_value, 128)
+    if intent_value is not None and intent_value not in {"study", "regular"}:
+        raise ValueError("invalid calendar semantic intent value")
+    intent_status = semantics.intent_status
+    intent_rationale = _bounded_optional(semantics.intent_rationale, 500)
+    intent_evidence_ids = _bounded_semantic_ids(semantics.intent_evidence_ids)
     evidence_ids = _bounded_semantic_ids(semantics.evidence_ids)
     description_ids = _bounded_semantic_ids(semantics.description_evidence_ids)
     if semantics.status in {"unavailable", "invalid"}:
@@ -5989,9 +6053,19 @@ def _apply_calendar_semantics(
     elif semantics.status == "not_substantive":
         description = None
         description_ids = []
+    if intent_status is not None and intent_status not in {"valid", "unavailable", "invalid"}:
+        raise ValueError("invalid calendar semantic intent status")
+    if intent_status in {"unavailable", "invalid"}:
+        intent_value = None
+        intent_rationale = None
+        intent_evidence_ids = []
     row.calendar_semantic_overview = overview
     row.calendar_semantic_description = description
     row.calendar_semantic_status = semantics.status
+    row.calendar_semantic_intent_value = intent_value
+    row.calendar_semantic_intent_status = intent_status
+    row.calendar_semantic_intent_rationale = intent_rationale
+    row.calendar_semantic_intent_evidence_ids = intent_evidence_ids
     row.calendar_semantic_evidence_ids = evidence_ids
     row.calendar_semantic_description_evidence_ids = description_ids
     row.calendar_semantic_source_fingerprint = _bounded(semantics.source_fingerprint, 128)
@@ -6040,7 +6114,7 @@ def _assessment_calendar_item(
     description = row.calendar_semantic_description if semantic_status == "valid" else None
     return {
         "event_id": row.notion_id,
-        "source_area": "course",
+        "source_area": academic_calendar_role(course.title).value,
         "source_label": course.course_code,
         "title": row.title,
         "display_kind": _display_kind(row.assessment_type),
@@ -6052,6 +6126,12 @@ def _assessment_calendar_item(
         "is_all_day": row.is_all_day,
         "completed": row.completed,
         "semantic_status": semantic_status,
+        "semantic_intent_value": row.calendar_semantic_intent_value,
+        "semantic_intent_status": row.calendar_semantic_intent_status,
+        "semantic_intent_rationale": row.calendar_semantic_intent_rationale,
+        "semantic_intent_evidence_fragment_ids": tuple(
+            row.calendar_semantic_intent_evidence_ids or ()
+        ),
         "semantic_overview": overview,
         "semantic_description": description,
         "semantic_evidence_fragment_ids": tuple(row.calendar_semantic_evidence_ids or ()),
@@ -6073,6 +6153,10 @@ def _calendar_semantic_cache(row: Any) -> Mapping[str, Any]:
         "config_version": row.calendar_semantic_config_version,
         "prompt_version": row.calendar_semantic_prompt_version,
         "analyzed_at": row.calendar_semantic_analyzed_at,
+        "intent_value": row.calendar_semantic_intent_value,
+        "intent_status": row.calendar_semantic_intent_status,
+        "intent_rationale": row.calendar_semantic_intent_rationale,
+        "intent_evidence_ids": tuple(row.calendar_semantic_intent_evidence_ids or ()),
     }
 
 
@@ -6165,17 +6249,6 @@ def _aware_db(value: datetime) -> datetime:
     if value.tzinfo is None or value.utcoffset() is None:
         return value.replace(tzinfo=UTC)
     return value.astimezone(UTC)
-
-
-def _citation_text(page: int | None, block: str | None, url: str | None) -> str:
-    parts: list[str] = []
-    if page is not None:
-        parts.append(f"page {page}")
-    if block:
-        parts.append(f"block {block}")
-    if url:
-        parts.append(url)
-    return ", ".join(parts) or "source citation unavailable"
 
 
 def _planner_assessment_type(enum_type: Any, value: str) -> Any:
@@ -6416,7 +6489,7 @@ def _clarification_public(row: AcademicClarification) -> dict[str, Any]:
         "assignment": row.assignment_preview_title,
         "tutorial": row.tutorial_preview_title,
         "lab": row.lab_preview_title,
-        "studying_block": row.studying_block_preview_title,
+        "event": row.event_preview_title,
     }
     return {
         "id": str(row.id),
@@ -6428,7 +6501,7 @@ def _clarification_public(row: AcademicClarification) -> dict[str, Any]:
         "assignment_preview_title": row.assignment_preview_title,
         "tutorial_preview_title": row.tutorial_preview_title,
         "lab_preview_title": row.lab_preview_title,
-        "studying_block_preview_title": row.studying_block_preview_title,
+        "event_preview_title": row.event_preview_title,
         "preview_titles": {
             action: title for action, title in preview_titles.items() if title is not None
         },
@@ -6466,6 +6539,7 @@ def _add_clarification_audit(
 
 __all__ = [
     "AcademicRepository",
+    "AcademicSemanticUnavailableError",
     "AssessmentSourceTrace",
     "ClarificationInput",
     "CourseCalendarInput",

@@ -2,6 +2,9 @@
 
 DEFAULT_OLLAMA_MODEL="qwen3-32gb:latest"
 DEFAULT_OLLAMA_MODEL_DIGEST="d039cde69ac1f5a43d5134182adfefa65bdb533362a625b936e6171a53296eb3"
+DEFAULT_EMBEDDING_MODEL="qwen3-embedding:4b"
+DEFAULT_EMBEDDING_DIMENSIONS="1024"
+DEFAULT_EMBEDDING_MODEL_KEEP_ALIVE_SECONDS="300"
 DEFAULT_LOCAL_BASE_URL="http://127.0.0.1:11434"
 DEFAULT_OLLAMA_HOST="0.0.0.0:11434"
 DEFAULT_STARTUP_TIMEOUT_SECONDS="30"
@@ -113,6 +116,17 @@ PY
 
 fetch_json() {
   curl -fsS --max-time 2 "$1" > "$2" 2>/dev/null
+}
+
+post_json() {
+  post_url="$1"
+  post_body="$2"
+  post_output="$3"
+  post_timeout_seconds="${4:-10}"
+  curl -fsS --max-time "$post_timeout_seconds" \
+    -H 'Content-Type: application/json' \
+    -d "$post_body" \
+    "$post_url" > "$post_output" 2>/dev/null
 }
 
 launchd_domain() {

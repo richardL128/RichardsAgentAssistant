@@ -59,6 +59,8 @@ DiscordAcademicProgressPhase = Literal[
     "runtime_waking",
     "runtime_checking",
     "runtime_ready",
+    "context_preparing",
+    "context_compacting",
     "model_turn",
     "model_turn_started",
     "model_turn_pending",
@@ -80,15 +82,19 @@ DiscordAcademicProgressPhase = Literal[
     "partial_failure",
     "completed",
     "clarification_needed",
+    "aborted",
     "failed",
 ]
 DiscordAcademicToolActivity = Literal[
     "course_data",
     "assessment_data",
+    "availability_data",
     "interview_data",
     "interview_preparation",
+    "memory_data",
     "proposal_drafting",
     "proposal_validation",
+    "semantic_validation",
 ]
 _TERMINAL_PROGRESS_PHASES = frozenset(
     {
@@ -99,6 +105,7 @@ _TERMINAL_PROGRESS_PHASES = frozenset(
         "partial_failure",
         "completed",
         "clarification_needed",
+        "aborted",
         "failed",
     }
 )
@@ -107,6 +114,8 @@ _ACADEMIC_PROGRESS_PHASES = frozenset(
         "runtime_waking",
         "runtime_checking",
         "runtime_ready",
+        "context_preparing",
+        "context_compacting",
         "model_turn",
         "model_turn_started",
         "model_turn_pending",
@@ -128,6 +137,7 @@ _ACADEMIC_PROGRESS_PHASES = frozenset(
         "partial_failure",
         "completed",
         "clarification_needed",
+        "aborted",
         "failed",
     }
 )
@@ -741,7 +751,7 @@ class AcademicClarificationMessage(BaseModel):
     assignment_title_preview: str = Field(min_length=1, max_length=500)
     tutorial_title_preview: str = Field(min_length=1, max_length=500)
     lab_title_preview: str = Field(min_length=1, max_length=500)
-    studying_block_title_preview: str = Field(min_length=1, max_length=500)
+    event_title_preview: str = Field(min_length=1, max_length=500)
 
     def message_content(self) -> str:
         lines = [
@@ -751,7 +761,7 @@ class AcademicClarificationMessage(BaseModel):
             f"Assignment preview: {self.assignment_title_preview}",
             f"Tutorial preview: {self.tutorial_title_preview}",
             f"Lab preview: {self.lab_title_preview}",
-            f"Studying Block preview: {self.studying_block_title_preview}",
+            f"Event preview: {self.event_title_preview}",
         ]
         return _bounded_discord_content("\n".join(lines))
 
@@ -761,7 +771,7 @@ class AcademicClarificationMessage(BaseModel):
             ("Assignment", "assignment"),
             ("Tutorial", "tutorial"),
             ("Lab", "lab"),
-            ("Studying Block", "studying_block"),
+            ("Event", "event"),
         ]
         return [
             {
@@ -1413,7 +1423,7 @@ class DiscordAcademicPlannerDelivery:
             elif kind == "snoozed_and_remind":
                 lines.append(
                     f"- Reminder {count}/{delete_after}: {label} is snoozed, so no new "
-                    "practice block "
+                    "course event "
                     f"will be scheduled until you reply. (focus {focus_id})"
                 )
             elif kind == "deleted":
@@ -1759,6 +1769,16 @@ class DiscordAcademicProgressReporter:
             )
         )
 
+    async def finish_aborted(self) -> None:
+        await self.update(
+            DiscordAcademicProgressEvent(
+                phase="aborted",
+                attempt_number=self._attempt_number,
+                attempt_limit=self._attempt_limit,
+                terminal=True,
+            )
+        )
+
     async def flush(self) -> None:
         async with self._lock:
             await self._flush_locked()
@@ -1937,11 +1957,14 @@ def _progress_tool_activity(value: object) -> DiscordAcademicToolActivity | None
     if raw in {
         "course_data",
         "assessment_data",
+        "availability_data",
         "interview_data",
         "interview_preparation",
+        "memory_data",
         "proposal_draft",
         "proposal_drafting",
         "proposal_validation",
+        "semantic_validation",
     }:
         if raw == "proposal_draft":
             return "proposal_drafting"
@@ -2000,6 +2023,10 @@ def _progress_stage_text(event: DiscordAcademicProgressEvent) -> str:
         return "Checking the local Qwen runtime."
     if event.phase == "runtime_ready":
         return "The Qwen runtime is ready."
+    if event.phase == "context_preparing":
+        return "Preparing relevant conversation context."
+    if event.phase == "context_compacting":
+        return "Compacting the conversation safely; the full transcript is preserved."
     if event.phase == "model_turn":
         turn = event.model_turn_number or 1
         limit = event.model_turn_limit or 10
@@ -2048,6 +2075,8 @@ def _progress_stage_text(event: DiscordAcademicProgressEvent) -> str:
         return "Completed."
     if event.phase == "clarification_needed":
         return "Waiting for your clarification."
+    if event.phase == "aborted":
+        return "Aborted. I stopped this Discord turn."
     return "Academic request stopped safely."
 
 
@@ -2056,14 +2085,20 @@ def _tool_activity_stage(activity: DiscordAcademicToolActivity | None) -> str:
         return "Checking your course data."
     if activity == "assessment_data":
         return "Checking your assessment data."
+    if activity == "availability_data":
+        return "Checking your calendar availability."
     if activity == "interview_data":
         return "Syncing your Jobs and interview records."
     if activity == "interview_preparation":
         return "Matching the interview and checking its approved preparation sources."
+    if activity == "memory_data":
+        return "Updating your local academic memory."
     if activity == "proposal_drafting":
         return "Drafting a change for your review."
     if activity == "proposal_validation":
         return "Validating a safe proposal."
+    if activity == "semantic_validation":
+        return "Semantically validating the event title."
     return "Using an approved LifeAgent tool."
 
 
@@ -2139,7 +2174,7 @@ def _academic_proposal_preview(proposal: Any) -> str:
             kind = getattr(change.assessment_type, "value", change.assessment_type) or "event"
             course = change.course_code or change.course_id or "the selected course"
             ends_at = getattr(change, "ends_at", None)
-            if kind == "studying_block" and change.due_at is not None and ends_at is not None:
+            if change.due_at is not None and ends_at is not None:
                 lines.append(
                     f"- Create `{change.title}` in {course}, "
                     f"{_academic_date_range(change.due_at, ends_at)}."

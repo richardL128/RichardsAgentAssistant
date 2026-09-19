@@ -7,6 +7,8 @@ from datetime import UTC, datetime
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 from app.agents.calendar_briefing.contracts import (
+    CalendarActivityIntent,
+    CalendarActivityIntentStatus,
     CalendarEventSemanticInput,
     CalendarEventSemanticResult,
     CalendarEventSemanticStatus,
@@ -29,6 +31,10 @@ class CalendarSemanticCacheRecord(CalendarSemanticCacheModel):
     config_version: str = Field(min_length=1, max_length=128)
     prompt_version: str = Field(min_length=1, max_length=128)
     result: CalendarEventSemanticResult | None = None
+    activity_intent: CalendarActivityIntent | None = None
+    intent_status: CalendarActivityIntentStatus = CalendarActivityIntentStatus.UNAVAILABLE
+    intent_evidence_fragment_ids: tuple[str, ...] = Field(default=(), max_length=12)
+    intent_rationale: str | None = Field(default=None, min_length=1, max_length=500)
 
     @field_validator("source_last_edited_at")
     @classmethod
@@ -54,8 +60,22 @@ class CalendarSemanticCacheRecord(CalendarSemanticCacheModel):
                     raise ValueError("valid cache records require a description result")
             elif self.result.description_present:
                 raise ValueError("not_substantive cache records cannot carry a description result")
-        elif self.result is not None:
-            raise ValueError("failed calendar semantic cache records cannot carry a result")
+        elif self.result is not None and self.intent_status != CalendarActivityIntentStatus.VALID:
+            raise ValueError(
+                "failed calendar semantic cache records cannot carry only invalid data"
+            )
+        if self.intent_status == CalendarActivityIntentStatus.VALID:
+            if self.activity_intent is None:
+                raise ValueError("valid calendar intent cache records require intent")
+            if not self.intent_evidence_fragment_ids:
+                raise ValueError("valid calendar intent cache records require citations")
+            if self.intent_rationale is None:
+                raise ValueError("valid calendar intent cache records require rationale")
+        else:
+            if self.activity_intent is not None:
+                raise ValueError("failed calendar intent cache records cannot carry intent")
+            if self.intent_evidence_fragment_ids:
+                raise ValueError("failed calendar intent cache records cannot carry citations")
         return self
 
 
@@ -78,10 +98,12 @@ def decide_calendar_semantic_cache_reuse(
         return CalendarSemanticCacheDecision(reusable=False, reason="missing")
     if cached.event_id != event.event_id:
         return CalendarSemanticCacheDecision(reusable=False, reason="event_id_mismatch")
-    if cached.semantic_status not in {
+    reusable_prose = cached.semantic_status in {
         CalendarEventSemanticStatus.VALID,
         CalendarEventSemanticStatus.NOT_SUBSTANTIVE,
-    }:
+    }
+    reusable_intent = cached.intent_status == CalendarActivityIntentStatus.VALID
+    if not (reusable_prose or reusable_intent):
         return CalendarSemanticCacheDecision(reusable=False, reason="status_not_reusable")
     if cached.source_fingerprint != event.source_fingerprint:
         return CalendarSemanticCacheDecision(reusable=False, reason="source_fingerprint_mismatch")

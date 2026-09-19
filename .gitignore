@@ -33,6 +33,9 @@ htmlcov/
 
 # Historical implementation plans and agent-development prompts.
 /legacy/
+/prompts/implement-semantic-calendar-events-without-study-blocks.md
+/prompts/implement-context-memory-architecture.md
+/prompts/implement-qwen3-14b-semantic-model-migration.md
 
 /presentations/LifeAgent-Intern-Architecture.pptx
 

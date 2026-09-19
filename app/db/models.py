@@ -225,18 +225,36 @@ class DiscordWakeInbound(TimestampMixin, Base):
             name="action_valid",
         ),
         CheckConstraint(
-            "state IN ('queued','running','completed','failed')",
+            "state IN ('queued','running','abort_requested','aborted','completed','failed')",
             name="state_valid",
         ),
         CheckConstraint(
+            "abort_requested_prior_state IS NULL OR abort_requested_prior_state IN "
+            "('queued','running','abort_requested','aborted','completed','failed')",
+            name="abort_requested_prior_state_valid",
+        ),
+        CheckConstraint(
+            "activity_side_effect_class IS NULL OR activity_side_effect_class IN "
+            "('read_only','proposal_only','durable_local_write','external_write','unknown')",
+            name="activity_side_effect_class_valid",
+        ),
+        CheckConstraint(
+            "activity_tool_status IS NULL OR activity_tool_status IN "
+            "('not_started','running','succeeded','failed','unknown','completed_before_cancel',"
+            "'cancellation_requested','cancelled')",
+            name="activity_tool_status_valid",
+        ),
+        CheckConstraint(
             "interaction_action IS NULL OR interaction_action IN "
-            "('quiz','assignment','tutorial','lab','studying_block','ignore')",
+            "('quiz','assignment','tutorial','lab','event','ignore')",
             name="interaction_action_valid",
         ),
         CheckConstraint("retry_count >= 0", name="retry_count_nonnegative"),
         CheckConstraint("length(content_artifact_key) > 0", name="content_artifact_key_nonempty"),
         Index("ix_discord_wake_state_created", "state", "created_at"),
         Index("ix_discord_wake_received", "received_at"),
+        Index("ix_discord_wake_scope_active", "discord_channel_id", "discord_user_id", "state"),
+        Index("ix_discord_wake_queue_job", "queue_job_id"),
     )
 
     id: Mapped[uuid.UUID] = mapped_column(primary_key=True, default=uuid.uuid4)
@@ -254,6 +272,7 @@ class DiscordWakeInbound(TimestampMixin, Base):
     ack_message_id: Mapped[str | None] = mapped_column(String(32))
     content_artifact_key: Mapped[str] = mapped_column(String(512), nullable=False)
     state: Mapped[str] = mapped_column(String(32), nullable=False, default="queued")
+    queue_job_id: Mapped[int | None] = mapped_column(BigInteger)
     retry_count: Mapped[int] = mapped_column(nullable=False, default=0)
     last_error_code: Mapped[str | None] = mapped_column(String(128))
     received_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
@@ -261,6 +280,349 @@ class DiscordWakeInbound(TimestampMixin, Base):
     started_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     completed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     failed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    abort_requested_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    abort_requested_by_event_id: Mapped[str | None] = mapped_column(String(255))
+    abort_requested_prior_state: Mapped[str | None] = mapped_column(String(32))
+    abort_terminal_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    abort_reason_code: Mapped[str | None] = mapped_column(String(128))
+    activity_phase: Mapped[str | None] = mapped_column(String(64))
+    activity_model_turn: Mapped[int | None] = mapped_column()
+    activity_tool_name: Mapped[str | None] = mapped_column(String(128))
+    activity_tool_status: Mapped[str | None] = mapped_column(String(64))
+    activity_side_effect_class: Mapped[str | None] = mapped_column(String(64))
+    activity_updated_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+
+
+class DiscordAbortRequest(TimestampMixin, Base):
+    """Content-free owner/channel ABORT receipt covering late handoff races."""
+
+    __tablename__ = "discord_abort_requests"
+    __table_args__ = (
+        UniqueConstraint("handoff_nonce", name="uq_discord_abort_nonce"),
+        CheckConstraint("length(abort_event_id) > 0", name="abort_event_id_nonempty"),
+        CheckConstraint(
+            "status IN ('processing','accepted','no_active','unconfirmed')",
+            name="status_valid",
+        ),
+        CheckConstraint(
+            "safe_tool_status IN "
+            "('none','cancelled','cancellation_requested','unknown','completed_before_cancel')",
+            name="safe_tool_status_valid",
+        ),
+        CheckConstraint(
+            "target_count >= 0 AND running_count >= 0 AND queued_count >= 0",
+            name="abort_counts_nonnegative",
+        ),
+        Index(
+            "ix_discord_abort_scope_received",
+            "discord_channel_id",
+            "discord_user_id",
+            "received_at",
+        ),
+    )
+
+    abort_event_id: Mapped[str] = mapped_column(String(255), primary_key=True)
+    handoff_nonce: Mapped[str] = mapped_column(String(64), nullable=False)
+    discord_channel_id: Mapped[str] = mapped_column(String(32), nullable=False)
+    discord_user_id: Mapped[str] = mapped_column(String(32), nullable=False)
+    ack_message_id: Mapped[str] = mapped_column(String(32), nullable=False)
+    received_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    status: Mapped[str] = mapped_column(String(32), nullable=False, default="processing")
+    target_count: Mapped[int] = mapped_column(nullable=False, default=0)
+    running_count: Mapped[int] = mapped_column(nullable=False, default=0)
+    queued_count: Mapped[int] = mapped_column(nullable=False, default=0)
+    safe_activity_label: Mapped[str | None] = mapped_column(String(80))
+    safe_tool_status: Mapped[str] = mapped_column(String(32), nullable=False, default="none")
+    completed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+
+
+class NativeConversationSession(TimestampMixin, Base):
+    """Metadata for one durable native-model conversation.
+
+    Raw message content, tool output, and private reasoning stay in immutable
+    artifacts. This row only carries routing, lifecycle, and artifact pointers.
+    """
+
+    __tablename__ = "native_conversation_sessions"
+    __table_args__ = (
+        UniqueConstraint("root_event_id", name="uq_native_conversations_root_event"),
+        CheckConstraint("length(root_event_id) > 0", name="root_event_id_nonempty"),
+        CheckConstraint("channel = 'discord'", name="channel_discord_only"),
+        CheckConstraint(
+            "state IN ('processing','awaiting_user','completed','failed','expired','cancelled')",
+            name="state_valid",
+        ),
+        CheckConstraint("revision >= 1", name="revision_positive"),
+        CheckConstraint("next_event_sequence >= 1", name="next_event_sequence_positive"),
+        CheckConstraint(
+            "length(transcript_artifact_key) = 64",
+            name="transcript_artifact_key_valid",
+        ),
+        CheckConstraint(
+            "tool_checkpoint_artifact_key IS NULL OR length(tool_checkpoint_artifact_key) = 64",
+            name="tool_checkpoint_artifact_key_valid",
+        ),
+        CheckConstraint(
+            "last_disposition IS NULL OR last_disposition IN "
+            "('awaiting_user','completed','failed','expired','cancelled')",
+            name="last_disposition_valid",
+        ),
+        Index(
+            "uq_native_conversations_open_owner_channel",
+            "owner_discord_user_id",
+            "discord_channel_id",
+            unique=True,
+            sqlite_where=text("state IN ('processing','awaiting_user')"),
+            postgresql_where=text("state IN ('processing','awaiting_user')"),
+        ),
+        Index("ix_native_conversations_state_expiry", "state", "expires_at"),
+        Index(
+            "ix_native_conversations_owner_state",
+            "owner_discord_user_id",
+            "discord_channel_id",
+            "state",
+        ),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(primary_key=True, default=uuid.uuid4)
+    root_event_id: Mapped[str] = mapped_column(String(255), nullable=False)
+    channel: Mapped[str] = mapped_column(String(64), nullable=False, default="discord")
+    discord_channel_id: Mapped[str] = mapped_column(String(32), nullable=False)
+    owner_discord_user_id: Mapped[str] = mapped_column(String(32), nullable=False)
+    state: Mapped[str] = mapped_column(String(32), nullable=False, default="processing")
+    revision: Mapped[int] = mapped_column(nullable=False, default=1)
+    next_event_sequence: Mapped[int] = mapped_column(nullable=False, default=1)
+    transcript_artifact_key: Mapped[str] = mapped_column(String(64), nullable=False)
+    tool_checkpoint_artifact_key: Mapped[str | None] = mapped_column(String(64))
+    model_identity: Mapped[str | None] = mapped_column(String(255))
+    prompt_config_version: Mapped[str | None] = mapped_column(String(255))
+    started_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    last_turn_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    completed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    expires_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    last_disposition: Mapped[str | None] = mapped_column(String(32))
+    error_code: Mapped[str | None] = mapped_column(String(128))
+
+
+class NativeConversationInboundEvent(TimestampMixin, Base):
+    """Idempotency metadata for one inbound owner event in a native conversation."""
+
+    __tablename__ = "native_conversation_inbound_events"
+    __table_args__ = (
+        UniqueConstraint("external_event_id", name="uq_native_conversation_event"),
+        UniqueConstraint(
+            "conversation_id",
+            "event_sequence",
+            name="uq_native_conversation_event_sequence",
+        ),
+        CheckConstraint("length(external_event_id) > 0", name="external_event_id_nonempty"),
+        CheckConstraint("event_sequence >= 1", name="event_sequence_positive"),
+        Index(
+            "ix_native_conversation_events_session",
+            "conversation_id",
+            "event_sequence",
+        ),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(primary_key=True, default=uuid.uuid4)
+    conversation_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey("native_conversation_sessions.id", ondelete="CASCADE"),
+        nullable=False,
+    )
+    external_event_id: Mapped[str] = mapped_column(String(255), nullable=False)
+    event_sequence: Mapped[int] = mapped_column(nullable=False)
+    received_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+
+
+class NativeConversationCompaction(TimestampMixin, Base):
+    """Validated, artifact-backed summary metadata for a native conversation prefix."""
+
+    __tablename__ = "native_conversation_compactions"
+    __table_args__ = (
+        UniqueConstraint(
+            "conversation_id",
+            "covered_from_message_index",
+            "covered_through_message_index",
+            "source_fingerprint",
+            "summary_prompt_version",
+            name="uq_native_compaction_source_range",
+        ),
+        CheckConstraint("covered_from_message_index >= 0", name="covered_from_nonnegative"),
+        CheckConstraint(
+            "covered_through_message_index >= covered_from_message_index",
+            name="covered_range_valid",
+        ),
+        CheckConstraint(
+            "length(source_transcript_artifact_key) = 64",
+            name="source_transcript_artifact_key_valid",
+        ),
+        CheckConstraint("length(source_fingerprint) > 0", name="source_fingerprint_nonempty"),
+        CheckConstraint("length(summary_artifact_key) = 64", name="summary_artifact_key_valid"),
+        CheckConstraint("length(summary_model_identity) > 0", name="summary_model_nonempty"),
+        CheckConstraint("length(summary_prompt_version) > 0", name="summary_prompt_nonempty"),
+        CheckConstraint("estimated_input_tokens >= 0", name="estimated_input_tokens_nonnegative"),
+        CheckConstraint(
+            "reported_input_tokens IS NULL OR reported_input_tokens >= 0",
+            name="reported_input_tokens_nonnegative",
+        ),
+        CheckConstraint(
+            "reported_output_tokens IS NULL OR reported_output_tokens >= 0",
+            name="reported_output_tokens_nonnegative",
+        ),
+        CheckConstraint("status IN ('valid','superseded','failed')", name="status_valid"),
+        CheckConstraint(
+            "error_code IS NULL OR length(error_code) > 0",
+            name="error_code_nonempty",
+        ),
+        Index(
+            "ix_native_compactions_conversation_status_range",
+            "conversation_id",
+            "status",
+            "covered_through_message_index",
+        ),
+        Index("ix_native_compactions_parent", "parent_compaction_id"),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(primary_key=True, default=uuid.uuid4)
+    conversation_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey("native_conversation_sessions.id", ondelete="CASCADE"),
+        nullable=False,
+    )
+    parent_compaction_id: Mapped[uuid.UUID | None] = mapped_column(
+        ForeignKey("native_conversation_compactions.id", ondelete="SET NULL")
+    )
+    covered_from_message_index: Mapped[int] = mapped_column(nullable=False)
+    covered_through_message_index: Mapped[int] = mapped_column(nullable=False)
+    source_transcript_artifact_key: Mapped[str] = mapped_column(String(64), nullable=False)
+    source_fingerprint: Mapped[str] = mapped_column(String(128), nullable=False)
+    summary_artifact_key: Mapped[str] = mapped_column(String(64), nullable=False)
+    summary_model_identity: Mapped[str] = mapped_column(String(255), nullable=False)
+    summary_prompt_version: Mapped[str] = mapped_column(String(128), nullable=False)
+    estimated_input_tokens: Mapped[int] = mapped_column(nullable=False)
+    reported_input_tokens: Mapped[int | None] = mapped_column()
+    reported_output_tokens: Mapped[int | None] = mapped_column()
+    status: Mapped[str] = mapped_column(String(32), nullable=False, default="valid")
+    error_code: Mapped[str | None] = mapped_column(String(128))
+
+
+class UserMemoryFact(TimestampMixin, Base):
+    """Owner-scoped generic memory metadata; private text remains artifact-backed."""
+
+    __tablename__ = "user_memory_facts"
+    __table_args__ = (
+        CheckConstraint("length(owner_user_id) > 0", name="owner_user_id_nonempty"),
+        CheckConstraint("length(owner_channel_id) > 0", name="owner_channel_id_nonempty"),
+        CheckConstraint(
+            "kind IN ('preference','profile','standing_instruction','constraint','personal_fact')",
+            name="kind_valid",
+        ),
+        CheckConstraint(
+            "status IN ('active','pending_confirmation','superseded','deleted')",
+            name="status_valid",
+        ),
+        CheckConstraint("length(content_artifact_key) = 64", name="content_artifact_key_valid"),
+        CheckConstraint("length(redacted_preview) > 0", name="redacted_preview_nonempty"),
+        CheckConstraint("length(normalized_subject) > 0", name="normalized_subject_nonempty"),
+        CheckConstraint(
+            "confidence IS NULL OR (confidence >= 0.0 AND confidence <= 1.0)",
+            name="confidence_probability",
+        ),
+        CheckConstraint(
+            "sensitivity IN ('low','medium','high')",
+            name="sensitivity_valid",
+        ),
+        CheckConstraint(
+            "evidence_artifact_key IS NULL OR length(evidence_artifact_key) = 64",
+            name="evidence_artifact_key_valid",
+        ),
+        CheckConstraint(
+            "embedding_dimensions IS NULL OR embedding_dimensions > 0",
+            name="embedding_dimensions_positive",
+        ),
+        CheckConstraint("revision >= 1", name="revision_positive"),
+        Index(
+            "ix_user_memory_owner_status_kind",
+            "owner_user_id",
+            "owner_channel_id",
+            "status",
+            "kind",
+        ),
+        Index(
+            "ix_user_memory_owner_subject",
+            "owner_user_id",
+            "owner_channel_id",
+            "normalized_subject",
+        ),
+        Index(
+            "ix_user_memory_embedding_hnsw",
+            "embedding",
+            postgresql_using="hnsw",
+            postgresql_ops={"embedding": "vector_cosine_ops"},
+            postgresql_where=text("embedding IS NOT NULL"),
+        ),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(primary_key=True, default=uuid.uuid4)
+    owner_user_id: Mapped[str] = mapped_column(String(32), nullable=False)
+    owner_channel_id: Mapped[str] = mapped_column(String(32), nullable=False)
+    kind: Mapped[str] = mapped_column(String(32), nullable=False)
+    status: Mapped[str] = mapped_column(String(32), nullable=False, default="pending_confirmation")
+    content_artifact_key: Mapped[str] = mapped_column(String(64), nullable=False)
+    redacted_preview: Mapped[str] = mapped_column(String(2_000), nullable=False)
+    normalized_subject: Mapped[str] = mapped_column(String(255), nullable=False)
+    confidence: Mapped[float | None] = mapped_column(Float)
+    sensitivity: Mapped[str] = mapped_column(String(32), nullable=False, default="medium")
+    source_conversation_id: Mapped[uuid.UUID | None] = mapped_column(
+        ForeignKey("native_conversation_sessions.id", ondelete="SET NULL")
+    )
+    source_external_event_id: Mapped[str | None] = mapped_column(String(255))
+    evidence_artifact_key: Mapped[str | None] = mapped_column(String(64))
+    embedding: Mapped[list[float] | None] = mapped_column(Vector(1024).with_variant(JSON, "sqlite"))
+    embedding_model: Mapped[str | None] = mapped_column(String(255))
+    embedding_dimensions: Mapped[int | None] = mapped_column()
+    revision: Mapped[int] = mapped_column(nullable=False, default=1)
+
+
+class UserMemoryEvent(TimestampMixin, Base):
+    """Append-only audit event for generic user memory lifecycle changes."""
+
+    __tablename__ = "user_memory_events"
+    __table_args__ = (
+        UniqueConstraint(
+            "owner_user_id",
+            "owner_channel_id",
+            "external_event_id",
+            name="uq_user_memory_events_owner_external",
+        ),
+        CheckConstraint("length(owner_user_id) > 0", name="owner_user_id_nonempty"),
+        CheckConstraint("length(owner_channel_id) > 0", name="owner_channel_id_nonempty"),
+        CheckConstraint("length(external_event_id) > 0", name="external_event_id_nonempty"),
+        CheckConstraint(
+            "event_type IN "
+            "('create','confirm','correct','supersede','delete','retrieval_feedback')",
+            name="event_type_valid",
+        ),
+        CheckConstraint("actor IS NULL OR length(actor) > 0", name="actor_nonempty"),
+        Index("ix_user_memory_events_memory_time", "memory_id", "occurred_at"),
+        Index(
+            "ix_user_memory_events_owner_time",
+            "owner_user_id",
+            "owner_channel_id",
+            "occurred_at",
+        ),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(primary_key=True, default=uuid.uuid4)
+    memory_id: Mapped[uuid.UUID | None] = mapped_column(
+        ForeignKey("user_memory_facts.id", ondelete="SET NULL")
+    )
+    owner_user_id: Mapped[str] = mapped_column(String(32), nullable=False)
+    owner_channel_id: Mapped[str] = mapped_column(String(32), nullable=False)
+    external_event_id: Mapped[str] = mapped_column(String(255), nullable=False)
+    event_type: Mapped[str] = mapped_column(String(64), nullable=False)
+    actor: Mapped[str | None] = mapped_column(String(255))
+    occurred_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    payload: Mapped[dict[str, Any]] = mapped_column(JSON, nullable=False, default=dict)
 
 
 class EvidenceRef(TimestampMixin, Base):
@@ -663,6 +1025,26 @@ class Assessment(TimestampMixin, Base):
             "ends_at IS NULL OR due_at IS NULL OR ends_at > due_at",
             name="assessment_date_range_valid",
         ),
+        CheckConstraint(
+            "calendar_semantic_status IS NULL OR calendar_semantic_status IN "
+            "('valid','not_substantive','unavailable','invalid')",
+            name="calendar_semantic_status_valid",
+        ),
+        CheckConstraint(
+            "calendar_semantic_intent_status IS NULL OR calendar_semantic_intent_status IN "
+            "('valid','unavailable','invalid')",
+            name="calendar_semantic_intent_status_valid",
+        ),
+        CheckConstraint(
+            "calendar_semantic_intent_value IS NULL OR "
+            "calendar_semantic_intent_value IN ('study','regular')",
+            name="calendar_semantic_intent_value_valid",
+        ),
+        CheckConstraint(
+            "calendar_semantic_intent_rationale IS NULL OR "
+            "length(calendar_semantic_intent_rationale) > 0",
+            name="calendar_semantic_intent_rationale_nonempty",
+        ),
         Index("ix_assessments_course_due", "course_id", "due_at"),
         Index("ix_assessments_fact_state", "fact_state", "due_at"),
         Index("ix_assessments_source_active", "source_id", "active"),
@@ -700,6 +1082,10 @@ class Assessment(TimestampMixin, Base):
     calendar_semantic_overview: Mapped[str | None] = mapped_column(String(700))
     calendar_semantic_description: Mapped[str | None] = mapped_column(String(1500))
     calendar_semantic_status: Mapped[str | None] = mapped_column(String(32))
+    calendar_semantic_intent_value: Mapped[str | None] = mapped_column(String(128))
+    calendar_semantic_intent_status: Mapped[str | None] = mapped_column(String(32))
+    calendar_semantic_intent_rationale: Mapped[str | None] = mapped_column(String(500))
+    calendar_semantic_intent_evidence_ids: Mapped[list[str] | None] = mapped_column(JSON)
     calendar_semantic_evidence_ids: Mapped[list[str] | None] = mapped_column(JSON)
     calendar_semantic_description_evidence_ids: Mapped[list[str] | None] = mapped_column(JSON)
     calendar_semantic_source_fingerprint: Mapped[str | None] = mapped_column(String(128))
@@ -891,6 +1277,26 @@ class CareerInterviewEvent(TimestampMixin, Base):
         UniqueConstraint("interview_page_id", name="uq_career_interview_events_page"),
         CheckConstraint("length(interview_page_id) > 0", name="interview_page_id_nonempty"),
         CheckConstraint("length(title) > 0", name="title_nonempty"),
+        CheckConstraint(
+            "calendar_semantic_status IS NULL OR calendar_semantic_status IN "
+            "('valid','not_substantive','unavailable','invalid')",
+            name="calendar_semantic_status_valid",
+        ),
+        CheckConstraint(
+            "calendar_semantic_intent_status IS NULL OR calendar_semantic_intent_status IN "
+            "('valid','unavailable','invalid')",
+            name="calendar_semantic_intent_status_valid",
+        ),
+        CheckConstraint(
+            "calendar_semantic_intent_value IS NULL OR "
+            "calendar_semantic_intent_value IN ('study','regular')",
+            name="calendar_semantic_intent_value_valid",
+        ),
+        CheckConstraint(
+            "calendar_semantic_intent_rationale IS NULL OR "
+            "length(calendar_semantic_intent_rationale) > 0",
+            name="calendar_semantic_intent_rationale_nonempty",
+        ),
         Index("ix_career_interview_events_date_active", "active", "local_date"),
         Index("ix_career_interview_events_workspace", "workspace_id", "active"),
     )
@@ -919,6 +1325,10 @@ class CareerInterviewEvent(TimestampMixin, Base):
     calendar_semantic_overview: Mapped[str | None] = mapped_column(String(700))
     calendar_semantic_description: Mapped[str | None] = mapped_column(String(1500))
     calendar_semantic_status: Mapped[str | None] = mapped_column(String(32))
+    calendar_semantic_intent_value: Mapped[str | None] = mapped_column(String(128))
+    calendar_semantic_intent_status: Mapped[str | None] = mapped_column(String(32))
+    calendar_semantic_intent_rationale: Mapped[str | None] = mapped_column(String(500))
+    calendar_semantic_intent_evidence_ids: Mapped[list[str] | None] = mapped_column(JSON)
     calendar_semantic_evidence_ids: Mapped[list[str] | None] = mapped_column(JSON)
     calendar_semantic_description_evidence_ids: Mapped[list[str] | None] = mapped_column(JSON)
     calendar_semantic_source_fingerprint: Mapped[str | None] = mapped_column(String(128))
@@ -1209,7 +1619,7 @@ class AcademicClarification(TimestampMixin, Base):
         ),
         CheckConstraint(
             "decision IS NULL OR decision IN "
-            "('quiz','assignment','tutorial','lab','studying_block','ignore')",
+            "('quiz','assignment','tutorial','lab','event','ignore')",
             name="decision_valid",
         ),
         CheckConstraint(
@@ -1234,7 +1644,7 @@ class AcademicClarification(TimestampMixin, Base):
     assignment_preview_title: Mapped[str] = mapped_column(String(1_024), nullable=False)
     tutorial_preview_title: Mapped[str | None] = mapped_column(String(1_024))
     lab_preview_title: Mapped[str | None] = mapped_column(String(1_024))
-    studying_block_preview_title: Mapped[str | None] = mapped_column(String(1_024))
+    event_preview_title: Mapped[str | None] = mapped_column(String(1_024))
     expected_edited_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
     title_property_id: Mapped[str | None] = mapped_column(String(255))
     idempotency_key: Mapped[str] = mapped_column(String(512), nullable=False)
@@ -1460,6 +1870,13 @@ class AcademicReflectionMemory(TimestampMixin, Base):
         ),
         Index("ix_academic_reflections_focus_time", "focus_id", "recorded_at"),
         Index("ix_academic_reflections_session", "session_id", "recorded_at"),
+        Index(
+            "ix_academic_reflections_embedding_hnsw",
+            "embedding",
+            postgresql_using="hnsw",
+            postgresql_ops={"embedding": "vector_cosine_ops"},
+            postgresql_where=text("embedding IS NOT NULL"),
+        ),
     )
 
     id: Mapped[uuid.UUID] = mapped_column(primary_key=True, default=uuid.uuid4)
@@ -1472,7 +1889,7 @@ class AcademicReflectionMemory(TimestampMixin, Base):
     external_event_id: Mapped[str | None] = mapped_column(String(255))
     raw_text: Mapped[str] = mapped_column(Text, nullable=False)
     redacted_summary: Mapped[str | None] = mapped_column(String(2_000))
-    embedding: Mapped[list[float] | None] = mapped_column(Vector().with_variant(JSON, "sqlite"))
+    embedding: Mapped[list[float] | None] = mapped_column(Vector(1024).with_variant(JSON, "sqlite"))
     embedding_model: Mapped[str | None] = mapped_column(String(255))
     embedding_dimensions: Mapped[int | None] = mapped_column()
     embedding_metadata: Mapped[dict[str, Any]] = mapped_column(JSON, nullable=False, default=dict)
@@ -1530,70 +1947,6 @@ class PlanningPreference(TimestampMixin, Base):
     buffer_minutes: Mapped[int] = mapped_column(nullable=False, default=15)
     sleep_schedule: Mapped[dict[str, Any]] = mapped_column(JSON, nullable=False, default=dict)
     version: Mapped[str] = mapped_column(String(128), nullable=False, default="v1")
-
-
-class StudyPlan(TimestampMixin, Base):
-    """A deterministic plan window whose blocks are safely replayable."""
-
-    __tablename__ = "study_plans"
-    __table_args__ = (
-        UniqueConstraint("plan_key", name="uq_study_plans_plan_key"),
-        CheckConstraint("ends_on >= starts_on", name="study_plan_dates_valid"),
-        CheckConstraint("status IN ('draft','published','superseded')", name="status_valid"),
-        Index("ix_study_plans_window", "starts_on", "ends_on"),
-    )
-
-    id: Mapped[uuid.UUID] = mapped_column(primary_key=True, default=uuid.uuid4)
-    plan_key: Mapped[str] = mapped_column(String(255), nullable=False)
-    starts_on: Mapped[date] = mapped_column(Date, nullable=False)
-    ends_on: Mapped[date] = mapped_column(Date, nullable=False)
-    timezone: Mapped[str] = mapped_column(String(64), nullable=False)
-    status: Mapped[str] = mapped_column(String(32), nullable=False, default="draft")
-    preference_version: Mapped[str | None] = mapped_column(String(128))
-
-
-class StudyBlock(TimestampMixin, Base):
-    """One allocated work block, including visible carry-forward lineage."""
-
-    __tablename__ = "study_blocks"
-    __table_args__ = (
-        UniqueConstraint("plan_id", "block_key", name="uq_study_blocks_plan_key"),
-        CheckConstraint("allocated_minutes > 0", name="allocated_minutes_positive"),
-        CheckConstraint("ends_at > starts_at", name="study_block_times_valid"),
-        CheckConstraint(
-            "status IN ('planned','in_progress','completed','incomplete','carried_forward')",
-            name="status_valid",
-        ),
-        CheckConstraint(
-            "block_kind IN ('assessment','practice')",
-            name="block_kind_valid",
-        ),
-        Index("ix_study_blocks_plan_start", "plan_id", "starts_at"),
-        Index("ix_study_blocks_assessment", "assessment_id", "status"),
-        Index("ix_study_blocks_learning_focus", "learning_focus_id", "status"),
-    )
-
-    id: Mapped[uuid.UUID] = mapped_column(primary_key=True, default=uuid.uuid4)
-    plan_id: Mapped[uuid.UUID] = mapped_column(
-        ForeignKey("study_plans.id", ondelete="CASCADE"), nullable=False
-    )
-    block_key: Mapped[str] = mapped_column(String(255), nullable=False)
-    assessment_id: Mapped[uuid.UUID | None] = mapped_column(
-        ForeignKey("assessments.id", ondelete="SET NULL")
-    )
-    learning_focus_id: Mapped[uuid.UUID | None] = mapped_column(
-        ForeignKey("academic_learning_focuses.id", ondelete="SET NULL")
-    )
-    block_kind: Mapped[str] = mapped_column(String(32), nullable=False, default="assessment")
-    title: Mapped[str] = mapped_column(String(255), nullable=False)
-    starts_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
-    ends_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
-    allocated_minutes: Mapped[int] = mapped_column(nullable=False)
-    status: Mapped[str] = mapped_column(String(32), nullable=False, default="planned")
-    carry_forward_from_id: Mapped[uuid.UUID | None] = mapped_column(
-        ForeignKey("study_blocks.id", ondelete="SET NULL")
-    )
-    notes: Mapped[str | None] = mapped_column(String(2_000))
 
 
 class AcademicDocument(TimestampMixin, Base):
@@ -1680,6 +2033,13 @@ class AcademicDocumentChunk(TimestampMixin, Base):
             "embedding_model",
             "embedding_dimensions",
         ),
+        Index(
+            "ix_academic_chunks_embedding_hnsw",
+            "embedding",
+            postgresql_using="hnsw",
+            postgresql_ops={"embedding": "vector_cosine_ops"},
+            postgresql_where=text("embedding IS NOT NULL"),
+        ),
     )
 
     id: Mapped[uuid.UUID] = mapped_column(primary_key=True, default=uuid.uuid4)
@@ -1697,7 +2057,7 @@ class AcademicDocumentChunk(TimestampMixin, Base):
     search_vector: Mapped[str | None] = mapped_column(
         TSVECTOR().with_variant(Text, "sqlite"), server_default=FetchedValue()
     )
-    embedding: Mapped[list[float] | None] = mapped_column(Vector().with_variant(JSON, "sqlite"))
+    embedding: Mapped[list[float] | None] = mapped_column(Vector(1024).with_variant(JSON, "sqlite"))
     embedding_model: Mapped[str | None] = mapped_column(String(255))
     embedding_dimensions: Mapped[int | None] = mapped_column()
 
@@ -1800,9 +2160,6 @@ class AcademicCheckIn(TimestampMixin, Base):
     content_artifact_key: Mapped[str | None] = mapped_column(String(64))
     redacted_summary: Mapped[str | None] = mapped_column(String(2_000))
     status: Mapped[str] = mapped_column(String(32), nullable=False, default="received")
-    plan_id: Mapped[uuid.UUID | None] = mapped_column(
-        ForeignKey("study_plans.id", ondelete="SET NULL")
-    )
 
 
 class AcademicProposedChange(TimestampMixin, Base):
@@ -1991,6 +2348,7 @@ __all__ = [
     "DailyReviewReport",
     "Delivery",
     "DeliveryStatus",
+    "DiscordAbortRequest",
     "DiscordWakeInbound",
     "Document",
     "DocumentChunk",
@@ -1999,6 +2357,9 @@ __all__ = [
     "FixedCommitment",
     "HealthCheck",
     "HealthState",
+    "NativeConversationCompaction",
+    "NativeConversationInboundEvent",
+    "NativeConversationSession",
     "PlanningPreference",
     "ProposedChange",
     "RepositoryDiscoveryState",
@@ -2009,8 +2370,8 @@ __all__ = [
     "RunStatus",
     "RunStep",
     "StepStatus",
-    "StudyBlock",
-    "StudyPlan",
     "SyncCursor",
     "UIAcknowledgement",
+    "UserMemoryEvent",
+    "UserMemoryFact",
 ]

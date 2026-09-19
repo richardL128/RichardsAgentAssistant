@@ -6,10 +6,11 @@ from collections.abc import Mapping, Sequence
 from datetime import datetime, timedelta
 from uuid import UUID
 
-from app.agents.academic_planner.classification import (
-    AssessmentKind,
-    canonical_assessment_title,
+from app.agents.academic_planner.calendar_roles import (
+    AcademicCalendarRole,
+    canonical_misc_task_title,
 )
+from app.agents.academic_planner.classification import canonical_assessment_title
 from app.agents.academic_planner.contracts import (
     AcademicAssessmentOption,
     AcademicCourseOption,
@@ -17,7 +18,8 @@ from app.agents.academic_planner.contracts import (
     AssessmentType,
     AttachAssessmentMaterialCall,
     CreateAssessmentCall,
-    CreateStudySessionCall,
+    CreateCourseEventCall,
+    CreateMiscTaskCall,
     InboundMaterialProposalPreview,
     ProposedChange,
     UpdateAssessmentCall,
@@ -28,15 +30,16 @@ MAX_PROPOSED_MUTATIONS = 20
 _TOO_MANY_CHANGES = "That request includes too many changes; please split it up."
 _CREATE_COURSE_UNVERIFIED = "I could not verify the course for a requested new assessment."
 _CREATE_DUE_FUTURE_REQUIRED = "New assessments must be due in the future."
+_MISC_TARGET_UNVERIFIED = "I could not verify the reserved misc calendar for this task."
+_MISC_DUE_FUTURE_REQUIRED = "New miscellaneous tasks must be due in the future."
 _ASSESSMENT_UNVERIFIED = "I could not verify the assessment id for a requested change."
 _ASSESSMENT_METADATA_MISSING = "That assessment is missing the metadata required for a safe change."
 _NO_SUPPORTED_CHANGE = "I need at least one supported academic change before creating a proposal."
-_STUDY_COURSE_UNVERIFIED = "I could not verify the course for a requested study session."
-_STUDY_ONE_COURSE_REQUIRED = "A study-session request must resolve to exactly one course."
-_STUDY_START_FUTURE_REQUIRED = "Study sessions must start in the future."
-_STUDY_DURATION_INVALID = "Study sessions must be between 5 and 240 minutes."
-_STUDY_DUPLICATE = "Duplicate study-session blocks were not accepted."
-_STUDY_ORDER_INVALID = "Study-session blocks must be ordered and must not overlap."
+_EVENT_COURSE_UNVERIFIED = "I could not verify the course for a requested calendar event."
+_EVENT_START_FUTURE_REQUIRED = "Course events must start in the future."
+_EVENT_DURATION_INVALID = "Course events must be between 5 and 240 minutes."
+_EVENT_DUPLICATE = "Duplicate course events were not accepted."
+_EVENT_ORDER_INVALID = "Course events must be ordered and must not overlap."
 _MATERIAL_UNVERIFIED = "I could not verify every captured PDF for this proposal."
 _MATERIAL_DUPLICATE = "Duplicate PDFs were not accepted in one proposal."
 
@@ -45,14 +48,15 @@ HOST_VALIDATION_ERRORS = frozenset(
         _TOO_MANY_CHANGES,
         _CREATE_COURSE_UNVERIFIED,
         _CREATE_DUE_FUTURE_REQUIRED,
+        _MISC_TARGET_UNVERIFIED,
+        _MISC_DUE_FUTURE_REQUIRED,
         _ASSESSMENT_UNVERIFIED,
         _ASSESSMENT_METADATA_MISSING,
-        _STUDY_COURSE_UNVERIFIED,
-        _STUDY_ONE_COURSE_REQUIRED,
-        _STUDY_START_FUTURE_REQUIRED,
-        _STUDY_DURATION_INVALID,
-        _STUDY_DUPLICATE,
-        _STUDY_ORDER_INVALID,
+        _EVENT_COURSE_UNVERIFIED,
+        _EVENT_START_FUTURE_REQUIRED,
+        _EVENT_DURATION_INVALID,
+        _EVENT_DUPLICATE,
+        _EVENT_ORDER_INVALID,
         _MATERIAL_UNVERIFIED,
         _MATERIAL_DUPLICATE,
     }
@@ -60,7 +64,8 @@ HOST_VALIDATION_ERRORS = frozenset(
 
 MutationCall = (
     CreateAssessmentCall
-    | CreateStudySessionCall
+    | CreateMiscTaskCall
+    | CreateCourseEventCall
     | UpdateAssessmentCall
     | ArchiveAssessmentCall
     | AttachAssessmentMaterialCall
@@ -81,10 +86,10 @@ def proposed_changes_from_calls(
     if len(calls) > MAX_PROPOSED_MUTATIONS:
         return (), _TOO_MANY_CHANGES
 
-    study_calls = tuple(call for call in calls if isinstance(call, CreateStudySessionCall))
-    if study_calls:
-        failed = _validate_study_session_calls(
-            study_calls,
+    event_calls = tuple(call for call in calls if isinstance(call, CreateCourseEventCall))
+    if event_calls:
+        failed = _validate_course_event_calls(
+            event_calls,
             known_courses=known_courses,
             now=now,
         )
@@ -109,13 +114,13 @@ def proposed_changes_from_calls(
         if material_ids and len(previews) != len(material_ids):
             return (), _MATERIAL_UNVERIFIED
 
-        if isinstance(call, CreateStudySessionCall):
+        if isinstance(call, CreateCourseEventCall):
             course = known_courses[call.course_id]
             if call.assessment_id is not None:
                 assessment = known_assessments.get(call.assessment_id)
                 if assessment is None or assessment.course_id != call.course_id:
                     return (), _ASSESSMENT_UNVERIFIED
-            title = canonical_assessment_title(AssessmentKind.STUDYING_BLOCK, call.topic)
+            title = " ".join(call.title.split())
             starts_at = call.starts_at
             changes.append(
                 ProposedChange(
@@ -127,7 +132,27 @@ def proposed_changes_from_calls(
                     title=title,
                     due_at=starts_at,
                     ends_at=starts_at + timedelta(minutes=call.duration_minutes),
-                    assessment_type=AssessmentType.STUDYING_BLOCK,
+                    assessment_type=AssessmentType.EVENT,
+                )
+            )
+            continue
+
+        if isinstance(call, CreateMiscTaskCall):
+            course = known_courses.get(call.course_id)
+            if course is None or course.calendar_role is not AcademicCalendarRole.MISC:
+                return (), _MISC_TARGET_UNVERIFIED
+            if call.due_at <= now:
+                return (), _MISC_DUE_FUTURE_REQUIRED
+            title = canonical_misc_task_title(call.title)
+            changes.append(
+                ProposedChange(
+                    field="create_assessment",
+                    value=title,
+                    course_id=call.course_id,
+                    course_code=course.course_code,
+                    title=title,
+                    due_at=call.due_at,
+                    assessment_type=AssessmentType.TASK,
                 )
             )
             continue
@@ -209,32 +234,30 @@ def proposed_changes_from_calls(
     return tuple(changes), None
 
 
-def _validate_study_session_calls(
-    calls: Sequence[CreateStudySessionCall],
+def _validate_course_event_calls(
+    calls: Sequence[CreateCourseEventCall],
     *,
     known_courses: Mapping[str, AcademicCourseOption],
     now: datetime,
 ) -> str | None:
     if any(call.course_id not in known_courses for call in calls):
-        return _STUDY_COURSE_UNVERIFIED
-    if len({call.course_id for call in calls}) != 1:
-        return _STUDY_ONE_COURSE_REQUIRED
+        return _EVENT_COURSE_UNVERIFIED
 
-    seen: set[tuple[str, datetime]] = set()
+    seen: set[tuple[str, str, datetime]] = set()
     for call in calls:
         if call.starts_at <= now:
-            return _STUDY_START_FUTURE_REQUIRED
+            return _EVENT_START_FUTURE_REQUIRED
         if call.duration_minutes < 5 or call.duration_minutes > 240:
-            return _STUDY_DURATION_INVALID
-        key = (" ".join(call.topic.casefold().split()), call.starts_at)
+            return _EVENT_DURATION_INVALID
+        key = (call.course_id, " ".join(call.title.casefold().split()), call.starts_at)
         if key in seen:
-            return _STUDY_DUPLICATE
+            return _EVENT_DUPLICATE
         seen.add(key)
 
     previous_end: datetime | None = None
     for call in calls:
         if previous_end is not None and call.starts_at < previous_end:
-            return _STUDY_ORDER_INVALID
+            return _EVENT_ORDER_INVALID
         previous_end = call.starts_at + timedelta(minutes=call.duration_minutes)
     return None
 

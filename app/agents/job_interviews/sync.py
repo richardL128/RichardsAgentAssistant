@@ -289,7 +289,7 @@ def _interview_record(
             interviews_data_source_id=interview.interviews_source_id,
             source_url=interview.source_url,
             tags=_tags(interview.properties),
-            property_snapshot=interview.properties,
+            property_snapshot=_jsonable_mapping(interview.properties),
             url_candidates=_url_candidates(interview),
             evidence_fragments=tuple(
                 fragment.model_dump(mode="json") for fragment in interview.evidence_fragments
@@ -364,6 +364,28 @@ def _url_candidates(interview: NotionInterviewEvent) -> tuple[Mapping[str, Any],
         }
         for candidate in interview.url_candidates[:25]
     )
+
+
+def _jsonable_mapping(value: Mapping[str, Any]) -> dict[str, Any]:
+    converted = _jsonable(value)
+    return cast(dict[str, Any], converted) if isinstance(converted, dict) else {}
+
+
+def _jsonable(value: Any) -> Any:
+    model_dump = getattr(value, "model_dump", None)
+    if callable(model_dump):
+        return model_dump(mode="json")
+    if isinstance(value, Mapping):
+        mapping = cast(Mapping[object, object], value)
+        return {str(key): _jsonable(item) for key, item in mapping.items()}
+    if isinstance(value, Sequence) and not isinstance(value, str | bytes | bytearray):
+        sequence = cast(Sequence[object], value)
+        return [_jsonable(item) for item in sequence]
+    if isinstance(value, datetime | date):
+        return value.isoformat()
+    if value is None or isinstance(value, str | int | float | bool):
+        return value
+    return str(value)
 
 
 def _interview_fingerprint(interview: NotionInterviewEvent) -> str:

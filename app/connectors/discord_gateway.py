@@ -22,7 +22,7 @@ DiscordClarificationAction = Literal[
     "assignment",
     "tutorial",
     "lab",
-    "studying_block",
+    "event",
     "ignore",
 ]
 DiscordInteractionStatus = Literal[
@@ -39,7 +39,7 @@ _CUSTOM_ID_PATTERN = re.compile(
     r"^academic_clarify:"
     r"(?P<clarification_id>[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-"
     r"[0-9a-fA-F]{4}-[0-9a-fA-F]{12}):"
-    r"(?P<action>quiz|assignment|tutorial|lab|studying_block|ignore)$"
+    r"(?P<action>quiz|assignment|tutorial|lab|event|ignore)$"
 )
 _DISCORD_ID_PATTERN = re.compile(r"^[0-9]{5,24}$")
 _DISCORD_MESSAGE_COMPONENT_TYPE = 3
@@ -691,7 +691,7 @@ def _clarification_action_label(action: DiscordClarificationAction) -> str:
         "assignment": "Assignment",
         "tutorial": "Tutorial",
         "lab": "Lab",
-        "studying_block": "Studying Block",
+        "event": "Event",
         "ignore": "Ignore",
     }[action]
 

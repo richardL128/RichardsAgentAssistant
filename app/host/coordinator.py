@@ -8,6 +8,7 @@ import re
 import time
 from collections.abc import Awaitable, Callable
 from contextlib import suppress
+from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from typing import Literal, Protocol, cast
 from uuid import UUID
@@ -19,14 +20,19 @@ from app.connectors.discord_gateway import (
     DiscordClarificationInteraction,
     DiscordMessageCallbackResult,
 )
+from app.discord_commands import is_discord_abort_command
 from app.host.commands import HostWakeError
 from app.host.discord import (
+    HOST_ABORT_ACKNOWLEDGEMENT,
+    HOST_ABORTED_TURN_CONTENT,
     HOST_COMMAND_ACKNOWLEDGEMENT,
     HOST_WAKE_ACKNOWLEDGEMENT,
     DiscordWakeFailure,
     safe_failure_content,
 )
 from app.host.handoff import (
+    DiscordHostAbortEvent,
+    DiscordHostAbortReceipt,
     DiscordHostHandoff,
     DiscordHostHandoffAccepted,
     DiscordHostHandoffEvent,
@@ -73,7 +79,7 @@ class HostOutbox(Protocol):
         channel_id: str,
         author_id: str,
         event_timestamp: datetime,
-        request_kind: Literal["mention", "command", "continuation"] = "mention",
+        request_kind: Literal["mention", "command", "continuation", "abort"] = "mention",
     ) -> WakeOutboxRow: ...
 
     def mark_acknowledged(
@@ -85,6 +91,17 @@ class HostOutbox(Protocol):
     def mark_accepted(self, message_id: str) -> WakeOutboxRow: ...
 
     def mark_failed(self, message_id: str, safe_error_code: str) -> WakeOutboxRow: ...
+
+    def get(self, message_id: str) -> WakeOutboxRow: ...
+
+    def mark_scope_aborted(
+        self,
+        *,
+        channel_id: str,
+        author_id: str,
+        before: datetime,
+        safe_error_code: str = "user_abort",
+    ) -> tuple[WakeOutboxRow, ...]: ...
 
     def pending_rows(self, *, limit: int = 100) -> tuple[WakeOutboxRow, ...]: ...
 
@@ -113,8 +130,18 @@ class HostOutbox(Protocol):
 class BackendHandoff(Protocol):
     async def submit(self, event: DiscordHostHandoff) -> DiscordHostHandoffAccepted: ...
 
+    async def submit_abort(self, event: DiscordHostAbortEvent) -> DiscordHostAbortReceipt: ...
+
 
 WakeResult = Literal["handled", "ignored", "duplicate", "failed"]
+
+
+@dataclass(frozen=True, slots=True)
+class _ActiveWakeTask:
+    task: asyncio.Task[object]
+    channel_id: str
+    author_id: str
+    event_timestamp: datetime
 
 
 class HostWakeCoordinator:
@@ -149,6 +176,8 @@ class HostWakeCoordinator:
         self._wake_lock = asyncio.Lock()
         self._wake_task: asyncio.Task[None] | None = None
         self._interaction_tasks: dict[str, asyncio.Task[None]] = {}
+        self._scope_locks: dict[tuple[str, str], asyncio.Lock] = {}
+        self._active_wake_tasks: dict[str, _ActiveWakeTask] = {}
 
     async def handle_message(
         self,
@@ -158,33 +187,55 @@ class HostWakeCoordinator:
         return DiscordMessageCallbackResult(status="handled" if result == "handled" else result)
 
     async def process_message(self, message: DiscordAcademicMessageCreate) -> WakeResult:
+        if self._is_authorized_boundary(message) and is_discord_abort_command(
+            message.content.get_secret_value()
+        ):
+            return await self._process_abort_message(message)
+
         request_kind = self._request_kind(message)
         if request_kind is None:
             return "ignored"
-        row = self._outbox.record_event(
-            message_id=message.message_id,
-            channel_id=message.channel_id,
-            author_id=message.author_id,
-            event_timestamp=message.timestamp,
-            request_kind=request_kind,
-        )
-        if row.state == "accepted":
-            return "duplicate"
+        scope_key = (message.channel_id, message.author_id)
+        scope_lock = self._scope_lock(scope_key)
+        current_task = cast(asyncio.Task[object], asyncio.current_task())
+        async with scope_lock:
+            row = self._outbox.record_event(
+                message_id=message.message_id,
+                channel_id=message.channel_id,
+                author_id=message.author_id,
+                event_timestamp=message.timestamp,
+                request_kind=request_kind,
+            )
+            if row.state == "accepted":
+                return "duplicate"
+            if row.state == "aborted":
+                return "duplicate"
+            self._active_wake_tasks[message.message_id] = _ActiveWakeTask(
+                task=current_task,
+                channel_id=message.channel_id,
+                author_id=message.author_id,
+                event_timestamp=message.timestamp,
+            )
         acknowledgement_message_id = row.acknowledgement_message_id
-        if acknowledgement_message_id is None:
-            if request_kind == "command":
-                acknowledgement_message_id = await self._discord.send_acknowledgement(
-                    channel_id=message.channel_id,
-                    root_message_id=message.message_id,
-                    content=HOST_COMMAND_ACKNOWLEDGEMENT,
-                )
-            else:
-                acknowledgement_message_id = await self._discord.send_acknowledgement(
-                    channel_id=message.channel_id,
-                    root_message_id=message.message_id,
-                )
-            row = self._outbox.mark_acknowledged(message.message_id, acknowledgement_message_id)
         try:
+            if acknowledgement_message_id is None:
+                if request_kind == "command":
+                    acknowledgement_message_id = await self._discord.send_acknowledgement(
+                        channel_id=message.channel_id,
+                        root_message_id=message.message_id,
+                        content=HOST_COMMAND_ACKNOWLEDGEMENT,
+                    )
+                else:
+                    acknowledgement_message_id = await self._discord.send_acknowledgement(
+                        channel_id=message.channel_id,
+                        root_message_id=message.message_id,
+                    )
+                row = self._outbox.mark_acknowledged(
+                    message.message_id,
+                    acknowledgement_message_id,
+                )
+                if row.state == "aborted":
+                    return "duplicate"
             await self._ensure_wake_ready_with_progress(
                 channel_id=message.channel_id,
                 acknowledgement_message_id=acknowledgement_message_id,
@@ -199,6 +250,10 @@ class HostWakeCoordinator:
                 failure=failure,
             )
             return "failed"
+        finally:
+            active = self._active_wake_tasks.get(message.message_id)
+            if active is not None and active.task is current_task:
+                self._active_wake_tasks.pop(message.message_id, None)
         self._outbox.mark_accepted(message.message_id)
         return "handled"
 
@@ -233,7 +288,16 @@ class HostWakeCoordinator:
 
     async def replay_pending(self, *, limit: int = 100) -> int:
         accepted = 0
-        for row in self._outbox.pending_rows(limit=limit):
+        rows = self._outbox.pending_rows(limit=limit)
+        rows = tuple(sorted(rows, key=lambda item: item.request_kind != "abort"))
+        for row in rows:
+            row = self._outbox.get(row.message_id)
+            if row.state == "aborted":
+                continue
+            if row.request_kind == "abort":
+                if await self._process_abort_row(row):
+                    accepted += 1
+                continue
             acknowledgement_message_id = row.acknowledgement_message_id
             if acknowledgement_message_id is None:
                 if row.request_kind == "command":
@@ -374,6 +438,93 @@ class HostWakeCoordinator:
         )
         await self._handoff.submit(event)
 
+    async def _process_abort_message(self, message: DiscordAcademicMessageCreate) -> WakeResult:
+        row = self._outbox.record_event(
+            message_id=message.message_id,
+            channel_id=message.channel_id,
+            author_id=message.author_id,
+            event_timestamp=message.timestamp,
+            request_kind="abort",
+        )
+        if row.state == "accepted":
+            return "duplicate"
+        acknowledgement_message_id = row.acknowledgement_message_id
+        if acknowledgement_message_id is None:
+            acknowledgement_message_id = await self._discord.send_acknowledgement(
+                channel_id=message.channel_id,
+                root_message_id=message.message_id,
+                content=HOST_ABORT_ACKNOWLEDGEMENT,
+            )
+            row = self._outbox.mark_acknowledged(message.message_id, acknowledgement_message_id)
+        await self._process_abort_row(row)
+        return "handled"
+
+    async def _process_abort_row(self, row: WakeOutboxRow) -> bool:
+        acknowledgement_message_id = row.acknowledgement_message_id
+        if acknowledgement_message_id is None:
+            acknowledgement_message_id = await self._discord.send_acknowledgement(
+                channel_id=row.channel_id,
+                root_message_id=row.message_id,
+                content=HOST_ABORT_ACKNOWLEDGEMENT,
+            )
+            row = self._outbox.mark_acknowledged(row.message_id, acknowledgement_message_id)
+
+        scope_key = (row.channel_id, row.author_id)
+        scope_lock = self._scope_lock(scope_key)
+        async with scope_lock:
+            aborted_rows = self._outbox.mark_scope_aborted(
+                channel_id=row.channel_id,
+                author_id=row.author_id,
+                before=row.event_timestamp,
+            )
+            aborted_ids = {target.message_id for target in aborted_rows}
+            for message_id, active in tuple(self._active_wake_tasks.items()):
+                if (
+                    active.channel_id == row.channel_id
+                    and active.author_id == row.author_id
+                    and active.event_timestamp < row.event_timestamp
+                    and not active.task.done()
+                ):
+                    aborted_ids.add(message_id)
+                    active.task.cancel()
+
+        for aborted in aborted_rows:
+            if aborted.acknowledgement_message_id is not None:
+                await self._edit_progress(
+                    channel_id=aborted.channel_id,
+                    acknowledgement_message_id=aborted.acknowledgement_message_id,
+                    content=HOST_ABORTED_TURN_CONTENT,
+                )
+
+        try:
+            receipt = await self._handoff.submit_abort(
+                DiscordHostAbortEvent(
+                    abort_message_id=row.message_id,
+                    channel_id=row.channel_id,
+                    author_id=row.author_id,
+                    event_timestamp=row.event_timestamp,
+                    acknowledgement_message_id=acknowledgement_message_id,
+                    handoff_timestamp=datetime.now(UTC),
+                    nonce=handoff_nonce(row.message_id),
+                )
+            )
+            final_content = _abort_receipt_content(
+                receipt,
+                local_cancelled_count=len(aborted_ids),
+            )
+            confirmed = True
+        except Exception:
+            final_content = _abort_unconfirmed_content(len(aborted_ids))
+            confirmed = False
+        await self._edit_progress(
+            channel_id=row.channel_id,
+            acknowledgement_message_id=acknowledgement_message_id,
+            content=final_content,
+        )
+        if confirmed:
+            self._outbox.mark_accepted(row.message_id)
+        return confirmed
+
     async def _process_interaction(self, row: InteractionOutboxRow) -> None:
         try:
             await self._ensure_wake_ready()
@@ -429,9 +580,7 @@ class HostWakeCoordinator:
         self,
         message: DiscordAcademicMessageCreate,
     ) -> Literal["mention", "command", "continuation"] | None:
-        if message.channel_id != self._settings.discord_academic_channel_id:
-            return None
-        if message.author_id not in self._settings.discord_academic_authorized_user_ids:
+        if not self._is_authorized_boundary(message):
             return None
         if _EXACT_COMMAND.fullmatch(message.content.get_secret_value().strip()) is not None:
             return "command"
@@ -440,6 +589,19 @@ class HostWakeCoordinator:
         # must see it intact instead of a deterministic pre-router deciding what
         # kind of conversation it is.
         return "mention"
+
+    def _is_authorized_boundary(self, message: DiscordAcademicMessageCreate) -> bool:
+        return (
+            message.channel_id == self._settings.discord_academic_channel_id
+            and message.author_id in self._settings.discord_academic_authorized_user_ids
+        )
+
+    def _scope_lock(self, scope_key: tuple[str, str]) -> asyncio.Lock:
+        lock = self._scope_locks.get(scope_key)
+        if lock is None:
+            lock = asyncio.Lock()
+            self._scope_locks[scope_key] = lock
+        return lock
 
 
 def _failure_code(exc: Exception) -> DiscordWakeFailure:
@@ -453,6 +615,81 @@ def _failure_code(exc: Exception) -> DiscordWakeFailure:
         if exc.code == "ollama_unavailable":
             return "ollama_unavailable"
     return "handoff_failed"
+
+
+def _abort_receipt_content(
+    receipt: DiscordHostAbortReceipt,
+    *,
+    local_cancelled_count: int,
+) -> str:
+    target_count = max(receipt.target_count, local_cancelled_count)
+    if target_count == 0:
+        return "Abort received, but there was no active Discord turn for you in this channel."
+    count_summary = _abort_count_summary(receipt)
+    if receipt.safe_tool_status == "completed_before_cancel":
+        activity = (
+            f" I was working on: {receipt.safe_activity_label}."
+            if receipt.safe_activity_label
+            else ""
+        )
+        return f"Abort received, but the active turn completed before cancellation.{activity}"
+    if receipt.status == "unconfirmed":
+        activity = (
+            f" I was working on: {receipt.safe_activity_label}."
+            if receipt.safe_activity_label
+            else ""
+        )
+        external_state = (
+            " Its final external state is unknown."
+            if receipt.safe_tool_status == "unknown"
+            else " Cancellation remains unconfirmed."
+        )
+        return f"Abort received.{activity}{external_state}{count_summary}"
+    if receipt.safe_activity_label:
+        status = _safe_tool_status_label(receipt.safe_tool_status)
+        return f"Aborted. I was working on: {receipt.safe_activity_label}; {status}.{count_summary}"
+    return (
+        f"Aborted. {target_count} active Discord turn(s) stopped for you in this channel."
+        f"{count_summary}"
+    )
+
+
+def _abort_count_summary(receipt: DiscordHostAbortReceipt) -> str:
+    parts: list[str] = []
+    if receipt.running_count:
+        parts.append(f"{receipt.running_count} running turn(s)")
+    if receipt.queued_count:
+        parts.append(f"{receipt.queued_count} queued turn(s)")
+    return f" Affected: {'; '.join(parts)}." if parts else ""
+
+
+def _abort_unconfirmed_content(local_cancelled_count: int) -> str:
+    if local_cancelled_count > 0:
+        return (
+            "Abort received. I stopped local Discord handoff, but backend cancellation is "
+            "unconfirmed."
+        )
+    return "Abort received, but backend cancellation is unconfirmed."
+
+
+def _safe_tool_status_label(
+    status: Literal[
+        "none",
+        "cancelled",
+        "cancellation_requested",
+        "unknown",
+        "completed_before_cancel",
+    ],
+) -> str:
+    if status == "cancelled":
+        return "cancellation was confirmed"
+    if status == "cancellation_requested":
+        return "cancellation was requested"
+    if status == "unknown":
+        return "the final external state is unknown"
+    if status == "completed_before_cancel":
+        return "it completed before cancellation"
+    return "no tool was active"
 
 
 _EXACT_COMMAND = re.compile(

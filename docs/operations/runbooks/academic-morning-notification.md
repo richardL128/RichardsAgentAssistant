@@ -12,10 +12,11 @@ a rule such as `run_overdue`, `required_delivery_failed`, or
 ## Current architecture
 
 The combined planner morning notification is the only executable automatic
-planner schedule. Host code owns source refresh, study allocation, the exact
-Toronto-local calendar window, dates, ordering, citation checks, rendering, and
-delivery. Qwen receives only bounded text from each selected calendar event and
-may produce a cited overview plus an optional substantive description.
+agenda schedule. Host code owns source refresh, the exact Toronto-local calendar
+window, dates, ordering, citation checks, rendering, and delivery. Qwen receives
+only bounded text from each selected calendar event and may produce an
+independently validated activity intent, cited overview, and optional
+substantive description.
 
 The schedule is configured by:
 
@@ -43,9 +44,9 @@ Each occurrence uses stable identities:
 
 The event window starts at midnight on the intended scheduled Toronto-local
 date and ends inclusively 10 days and 12 hours later. It applies equally to
-active, non-archived course and Jobs/Interviews rows. Completed course rows are
-included and marked; date-less rows remain outside the inventory and continue
-through existing diagnostics.
+active, non-archived course, misc, and Jobs/Interviews rows. Completed course
+rows are included and marked; date-less rows remain outside the inventory and
+continue through existing diagnostics.
 
 ## Diagnosis
 
@@ -83,9 +84,11 @@ WHERE run_id = (
 ORDER BY created_at;"'
 ```
 
-Expected safe phase names include `source_refresh`, `evidence_collection`,
-`semantic_interpretation`, `semantic_validation`, `manifest_creation`, and
-`delivery`. Diagnostics contain phase/count state only, never event source text,
+Expected safe phase names include `source_refresh`,
+`event_001.evidence_collection`, `event_001.semantic_interpretation`,
+`event_001.semantic_validation`, `manifest_creation`, and `delivery`, with the
+event ordinal increasing per selected event. Diagnostics contain phase/count
+state, semantic status, and safe error codes only, never event source text,
 model prompts, or responses.
 
 ```bash
@@ -115,19 +118,20 @@ LIMIT 20;"'
 ## Source freshness requirement
 
 The normal morning message requires a fresh complete academic Notion sync
-immediately before planning, followed by a Jobs/Interviews sync. Missing Courses
+immediately before rendering, followed by a Jobs/Interviews sync. Missing Courses
 sharing, missing nested Assessments calendars, missing required title/date
 properties, partial academic source failure, or stale academic sync must be
 reported as an operational condition. A career sync failure is disclosed in the
-same message without hiding a valid academic plan.
+same message without hiding a valid academic agenda.
 
 ## Semantic availability and cache
 
 Qwen analyzes one selected event at a time from bounded, event-local textual
 properties and supported Notion page-body blocks. It does not receive files,
 relations, attachment/OCR content, external posting research, credentials, or
-raw vendor envelopes. A separate critic must accept the cited result before an
-overview or description is rendered.
+raw vendor envelopes. The normalized title is always a citable evidence fragment.
+The critic validates activity intent independently from overview/description, so
+one rejected component does not erase another supported component.
 
 A cached result is reusable only when the event fingerprint, Notion edit time,
 model identity, model configuration version, and prompt version all match. If

@@ -613,7 +613,6 @@ def test_connector_liveness_aggregates_all_three_checks() -> None:
         notion_token="notion-secret",
         notion_courses_database_id="courses",
         notion_assessments_database_id="assessments",
-        notion_study_blocks_database_id="study-blocks",
     )
 
     async def fetcher() -> InstallationToken:

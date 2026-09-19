@@ -1,4 +1,4 @@
-"""Typed facts and proposals for the deterministic academic planner."""
+"""Typed academic calendar, memory, and proposal contracts."""
 
 from __future__ import annotations
 
@@ -9,6 +9,7 @@ from uuid import UUID
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
+from app.agents.academic_planner.calendar_roles import AcademicCalendarRole
 from app.agents.job_interviews.contracts import InterviewReminderFact
 
 
@@ -23,11 +24,11 @@ def _aware(value: datetime) -> datetime:
 
 
 class AssessmentType(StrEnum):
+    TASK = "task"
     ASSIGNMENT = "assignment"
     QUIZ = "quiz"
     TUTORIAL = "tutorial"
     LAB = "lab"
-    STUDYING_BLOCK = "studying_block"
     MIDTERM = "midterm"
     FINAL = "final"
     EVENT = "event"
@@ -38,7 +39,6 @@ class UserCreatableAssessmentType(StrEnum):
     QUIZ = "quiz"
     TUTORIAL = "tutorial"
     LAB = "lab"
-    STUDYING_BLOCK = "studying_block"
 
 
 class ValidatedMaterialPlanningSignals(PlannerModel):
@@ -55,28 +55,6 @@ class ValidatedMaterialPlanningSignals(PlannerModel):
     def model_post_init(self, __context: object) -> None:
         if self.effort_upper_minutes < self.effort_lower_minutes:
             raise ValueError("material effort upper bound must not be below its lower bound")
-
-
-class Assessment(PlannerModel):
-    id: str = Field(min_length=1, max_length=255)
-    course: str = Field(min_length=1, max_length=255)
-    title: str = Field(min_length=1, max_length=500)
-    assessment_type: AssessmentType
-    due_at: datetime
-    estimated_minutes: int = Field(gt=0, le=10_080)
-    weight_percent: float = Field(ge=0, le=100)
-    course_priority: int = Field(ge=0, le=100, default=50)
-    confidence_gap: float = Field(ge=0, le=1, default=0.5)
-    scope_size: float = Field(ge=0, le=100, default=0)
-    completed: bool = False
-    ambiguous: bool = False
-    citations: tuple[str, ...] = ()
-    material_signals: ValidatedMaterialPlanningSignals | None = None
-
-    @field_validator("due_at")
-    @classmethod
-    def due_at_aware(cls, value: datetime) -> datetime:
-        return _aware(value)
 
 
 class FixedCommitment(PlannerModel):
@@ -121,48 +99,11 @@ class AvailabilityWindow(PlannerModel):
             raise ValueError("availability window must end after it starts")
 
 
-class IncompleteBlock(PlannerModel):
-    id: str = Field(min_length=1, max_length=255)
-    assessment_id: str = Field(min_length=1, max_length=255)
-    title: str = Field(min_length=1, max_length=500)
-    remaining_minutes: int = Field(gt=0, le=10_080)
-    original_due_at: datetime | None = None
-
-    @field_validator("original_due_at")
-    @classmethod
-    def due_at_aware(cls, value: datetime | None) -> datetime | None:
-        return _aware(value) if value is not None else None
-
-
-class AmbiguousFact(PlannerModel):
-    id: str = Field(min_length=1, max_length=255)
-    question: str = Field(min_length=1, max_length=1_000)
-    source_citation: str = Field(min_length=1, max_length=500)
-    candidate_value: str | None = Field(default=None, max_length=500)
-
-
-class PlannerFacts(PlannerModel):
-    assessments: tuple[Assessment, ...] = ()
+class CalendarAvailabilityFacts(PlannerModel):
     commitments: tuple[FixedCommitment, ...] = ()
     availability: tuple[AvailabilityWindow, ...] = ()
-    incomplete_blocks: tuple[IncompleteBlock, ...] = ()
-    practice_needs: tuple[PracticeNeed, ...] = ()
-    performance_signals: tuple[AcademicPerformanceSignal, ...] = Field(default=(), max_length=20)
-    ambiguous_facts: tuple[AmbiguousFact, ...] = ()
     buffer_minutes: int = Field(ge=0, le=240, default=15)
     horizon_days: int = Field(ge=7, le=14, default=7)
-
-
-class WorkBreakdown(PlannerModel):
-    assessment_id: str = Field(min_length=1, max_length=255)
-    steps: tuple[str, ...] = Field(max_length=20)
-    estimated_minutes: int = Field(gt=0, le=10_080)
-    rationale: str = Field(min_length=1, max_length=2_000)
-
-
-class PlanCritique(PlannerModel):
-    acceptable: bool
-    concerns: tuple[str, ...] = Field(max_length=20)
 
 
 class AssessmentMaterialSourceKind(StrEnum):
@@ -253,17 +194,6 @@ class MorningBriefingAssessmentFact(PlannerModel):
     priority_rank: int = Field(ge=1, le=50)
 
 
-class MorningBriefingBlockFact(PlannerModel):
-    block_id: str = Field(min_length=1, max_length=255)
-    assessment_id: str = Field(min_length=1, max_length=255)
-    learning_focus_id: str | None = Field(default=None, min_length=1, max_length=255)
-    block_kind: Literal["assessment", "practice"]
-    title: str = Field(min_length=1, max_length=500)
-    start_at_local: str = Field(min_length=1, max_length=64)
-    duration_minutes: int = Field(gt=0, le=10_080)
-    carried_over: bool
-
-
 class MorningBriefingLearningFocusFact(PlannerModel):
     focus_id: str = Field(min_length=1, max_length=255)
     course_code: str | None = Field(default=None, min_length=1, max_length=80)
@@ -300,7 +230,6 @@ class MorningBriefingContext(PlannerModel):
     timezone: Literal["America/Toronto"] = "America/Toronto"
     student_display_name: Literal["Richard"] = "Richard"
     assessments: tuple[MorningBriefingAssessmentFact, ...] = Field(default=(), max_length=50)
-    scheduled_blocks: tuple[MorningBriefingBlockFact, ...] = Field(default=(), max_length=100)
     learning_focuses: tuple[MorningBriefingLearningFocusFact, ...] = Field(
         default=(), max_length=20
     )
@@ -312,7 +241,6 @@ class MorningBriefingContext(PlannerModel):
     )
     work_breakdowns: tuple[MorningBriefingWorkBreakdownFact, ...] = Field(default=(), max_length=30)
     deferred_assessment_ids: tuple[str, ...] = Field(default=(), max_length=50)
-    deferred_practice_focus_ids: tuple[str, ...] = Field(default=(), max_length=20)
 
 
 class MorningBriefing(PlannerModel):
@@ -320,14 +248,12 @@ class MorningBriefing(PlannerModel):
 
     message_text: str = Field(min_length=1, max_length=2_000)
     referenced_assessment_ids: tuple[str, ...] = Field(default=(), max_length=50)
-    referenced_block_ids: tuple[str, ...] = Field(default=(), max_length=100)
     referenced_focus_ids: tuple[str, ...] = Field(default=(), max_length=20)
     referenced_performance_signal_ids: tuple[str, ...] = Field(default=(), max_length=20)
     referenced_insight_ids: tuple[str, ...] = Field(default=(), max_length=30)
 
     @field_validator(
         "referenced_assessment_ids",
-        "referenced_block_ids",
         "referenced_focus_ids",
         "referenced_performance_signal_ids",
         "referenced_insight_ids",
@@ -339,69 +265,15 @@ class MorningBriefing(PlannerModel):
         return value
 
 
-class StudyBlock(PlannerModel):
-    id: str = Field(min_length=1, max_length=255)
-    assessment_id: str = Field(min_length=1, max_length=255)
-    learning_focus_id: str | None = Field(default=None, min_length=1, max_length=255)
-    block_kind: Literal["assessment", "practice"] = "assessment"
-    title: str = Field(min_length=1, max_length=500)
-    start_at: datetime
-    end_at: datetime
-    carried_over: bool = False
-    priority_score: float = Field(ge=0)
-    rationale: str = Field(min_length=1, max_length=1_000)
-
-    @field_validator("start_at", "end_at")
-    @classmethod
-    def times_aware(cls, value: datetime) -> datetime:
-        return _aware(value)
-
-    def model_post_init(self, __context: object) -> None:
-        if self.end_at <= self.start_at:
-            raise ValueError("study block must end after it starts")
-
-
-class DailyPlan(PlannerModel):
-    plan_id: UUID
-    created_at: datetime
-    blocks: tuple[StudyBlock, ...]
-    deferred_assessment_ids: tuple[str, ...] = ()
-    deferred_practice_focus_ids: tuple[str, ...] = ()
-    ambiguous_questions: tuple[AmbiguousFact, ...] = ()
-    critique: PlanCritique | None = None
-
-    @field_validator("created_at")
-    @classmethod
-    def created_at_aware(cls, value: datetime) -> datetime:
-        return _aware(value)
-
-
-class ScheduledMorningBlock(PlannerModel):
-    """One allocator-authored block rendered by the scheduled notifier."""
-
-    block_id: str = Field(min_length=1, max_length=255)
-    title: str = Field(min_length=1, max_length=500)
-    local_start: datetime
-    duration_minutes: int = Field(gt=0, le=10_080)
-    block_kind: Literal["assessment", "practice"]
-    carried_over: bool = False
-
-    @field_validator("local_start")
-    @classmethod
-    def local_start_aware(cls, value: datetime) -> datetime:
-        if value.tzinfo is None or value.utcoffset() is None:
-            raise ValueError("local_start must be timezone-aware")
-        return value
-
-
 class ScheduledMorningNotification(PlannerModel):
     """Logical scheduled briefing and its deterministic Discord-sized parts."""
+
+    model_config = ConfigDict(extra="ignore", str_strip_whitespace=True)
 
     period_key: str = Field(min_length=1, max_length=512)
     intended_local_date: date
     scheduled_at: datetime
     source_synced_at: datetime
-    blocks: tuple[ScheduledMorningBlock, ...] = Field(max_length=100)
     interview_items: tuple[InterviewReminderFact, ...] = Field(default=(), max_length=100)
     message_text: str = Field(min_length=1)
     message_parts: tuple[str, ...] = Field(min_length=1)
@@ -468,10 +340,6 @@ class ProposedChange(PlannerModel):
         duration = self.ends_at - self.due_at
         if duration <= timedelta(0):
             raise ValueError("proposal end timestamp must be after the start timestamp")
-        if self.assessment_type is AssessmentType.STUDYING_BLOCK and duration > timedelta(
-            minutes=240
-        ):
-            raise ValueError("studying block duration must be at most 240 minutes")
 
 
 class AcademicCourseOption(PlannerModel):
@@ -480,6 +348,7 @@ class AcademicCourseOption(PlannerModel):
     course_id: str = Field(min_length=1, max_length=255)
     course_code: str = Field(min_length=1, max_length=80)
     title: str = Field(min_length=1, max_length=255)
+    calendar_role: AcademicCalendarRole = AcademicCalendarRole.COURSE
 
 
 class AcademicAssessmentOption(PlannerModel):
@@ -533,28 +402,43 @@ class CreateAssessmentCall(PlannerModel):
         return _aware(value)
 
 
+class CreateMiscTaskCall(PlannerModel):
+    """Host-bound creation call for the unique reserved misc calendar."""
+
+    tool: Literal["create_misc_task"]
+    course_id: str = Field(min_length=1, max_length=255)
+    title: str = Field(min_length=1, max_length=500)
+    due_at: datetime
+
+    @field_validator("due_at")
+    @classmethod
+    def due_at_aware(cls, value: datetime) -> datetime:
+        return _aware(value)
+
+
+class CreateCourseEventCall(PlannerModel):
+    """Propose one ordinary course calendar event with a natural title."""
+
+    tool: Literal["create_course_event"]
+    course_id: str = Field(min_length=1, max_length=255)
+    title: str = Field(min_length=1, max_length=500)
+    starts_at: datetime
+    duration_minutes: int = Field(ge=5, le=240)
+    assessment_id: str | None = Field(default=None, min_length=1, max_length=255)
+    requires_study_intent: bool = False
+
+    @field_validator("starts_at")
+    @classmethod
+    def starts_at_aware(cls, value: datetime) -> datetime:
+        return _aware(value)
+
+
 class AttachAssessmentMaterialCall(PlannerModel):
     """Propose attaching captured owner-scoped PDFs to one searched assessment."""
 
     tool: Literal["attach_material_to_assessment"]
     assessment_id: str = Field(min_length=1, max_length=255)
     inbound_material_ids: tuple[UUID, ...] = Field(min_length=1, max_length=5)
-
-
-class CreateStudySessionCall(PlannerModel):
-    """Create one confirmed studying block with a host-derived end timestamp."""
-
-    tool: Literal["create_study_session"]
-    course_id: str = Field(min_length=1, max_length=255)
-    assessment_id: str | None = Field(default=None, min_length=1, max_length=255)
-    topic: str = Field(min_length=1, max_length=300)
-    starts_at: datetime
-    duration_minutes: int = Field(ge=5, le=240)
-
-    @field_validator("starts_at")
-    @classmethod
-    def starts_at_aware(cls, value: datetime) -> datetime:
-        return _aware(value)
 
 
 class UpdateAssessmentCall(PlannerModel):
@@ -790,217 +674,20 @@ class AcademicDiscourseContinuationState(PlannerModel):
     prior_user_messages: tuple[str, ...] = Field(default=(), max_length=5)
 
 
-class PracticeNeed(PlannerModel):
-    """One separate daily practice block for an active focus before next_review_at."""
-
-    topic: str = Field(min_length=1, max_length=300)
-    target_minutes: int = Field(ge=5, le=240)
-    next_review_at: datetime
-    review_cadence: Literal["daily"] = "daily"
-    source_action: Literal["create_focus", "reinforce_focus"]
-    focus_id: str | None = Field(default=None, min_length=1, max_length=255)
-    course_id: str | None = Field(default=None, min_length=1, max_length=255)
-    course_code: str | None = Field(default=None, min_length=1, max_length=80)
-    assessment_id: str | None = Field(default=None, min_length=1, max_length=255)
-    assessment_title: str | None = Field(default=None, min_length=1, max_length=500)
-    rationale: str = Field(min_length=1, max_length=1_000)
-
-    @field_validator("next_review_at")
-    @classmethod
-    def practice_next_review_aware(cls, value: datetime) -> datetime:
-        return _aware(value)
-
-
 class AcademicDiscourseLoopResult(PlannerModel):
     """Result of a semantic discourse loop without external writes."""
 
     actions: tuple[AcademicDiscourseAction, ...] = Field(max_length=20)
-    practice_needs: tuple[PracticeNeed, ...] = Field(default=(), max_length=20)
     clarification: DiscourseClarification | None = None
     continuation_state: AcademicDiscourseContinuationState | None = None
     applicable: bool = True
     turns: int = Field(ge=1, le=4)
 
 
-type AcademicAgentToolCall = Annotated[
-    SearchCoursesCall
-    | SearchAssessmentsCall
-    | CreateAssessmentCall
-    | CreateStudySessionCall
-    | UpdateAssessmentCall
-    | ArchiveAssessmentCall,
-    Field(discriminator="tool"),
-]
-
-
-class AcademicRequestRouteDecision(PlannerModel):
-    """Semantic split of one unsanitized academic message into independent domains."""
-
-    calendar_request: str | None = Field(default=None, min_length=1, max_length=2_000)
-    memory_request: str | None = Field(default=None, min_length=1, max_length=1_000)
-    unrelated: bool = False
-
-    def model_post_init(self, __context: object) -> None:
-        has_request = self.calendar_request is not None or self.memory_request is not None
-        if self.unrelated == has_request:
-            raise ValueError("route must contain requests or be unrelated, but not both")
-
-
-class AcademicAgentDecision(PlannerModel):
-    """One bounded model turn for academic tool selection."""
-
-    tool_calls: tuple[AcademicAgentToolCall, ...] = Field(default=(), max_length=20)
-    question: str | None = Field(default=None, min_length=1, max_length=1_000)
-    answer: str | None = Field(default=None, min_length=1, max_length=1_800)
-    not_applicable: bool = False
-
-    def model_post_init(self, __context: object) -> None:
-        if self.not_applicable and (
-            self.tool_calls or self.question is not None or self.answer is not None
-        ):
-            raise ValueError(
-                "not_applicable cannot include event tools, an answer, or clarification"
-            )
-        selected_modes = (
-            int(bool(self.tool_calls))
-            + int(self.question is not None)
-            + int(self.answer is not None)
-            + int(self.not_applicable)
-        )
-        if selected_modes != 1:
-            raise ValueError(
-                "exactly one of tool_calls, question, answer, or not_applicable must be selected"
-            )
-
-
-class AcademicAgentWireDecision(PlannerModel):
-    """Required-mode wire contract used for structured model decoding."""
-
-    mode: Literal["tools", "answer", "clarification", "not_applicable"] = Field(
-        description=(
-            "Choose tools for a supported action or required lookup, answer for a read-only "
-            "request grounded in prior tool results, clarification only when facts remain "
-            "ambiguous after required lookups, or not_applicable for a different domain."
-        )
-    )
-    tool_calls: tuple[AcademicAgentToolCall, ...] = Field(default=(), max_length=20)
-    question: str | None = Field(default=None, min_length=1, max_length=1_000)
-    answer: str | None = Field(default=None, min_length=1, max_length=1_800)
-
-    def model_post_init(self, __context: object) -> None:
-        if self.mode == "tools" and (
-            not self.tool_calls or self.question is not None or self.answer is not None
-        ):
-            raise ValueError("tools mode requires tool calls and no answer or clarification")
-        if self.mode == "answer" and (
-            self.tool_calls or self.question is not None or self.answer is None
-        ):
-            raise ValueError("answer mode requires one answer and no tools or clarification")
-        if self.mode == "clarification" and (
-            self.tool_calls or self.question is None or self.answer is not None
-        ):
-            raise ValueError("clarification mode requires one question and no tools or answer")
-        if self.mode == "not_applicable" and (
-            self.tool_calls or self.question is not None or self.answer is not None
-        ):
-            raise ValueError(
-                "not_applicable mode cannot include tools, an answer, or clarification"
-            )
-
-    def to_decision(self) -> AcademicAgentDecision:
-        return AcademicAgentDecision(
-            tool_calls=self.tool_calls,
-            question=self.question,
-            answer=self.answer,
-            not_applicable=self.mode == "not_applicable",
-        )
-
-
-class AcademicAgentProgressPhase(StrEnum):
-    RUNTIME_WAKING = "runtime_waking"
-    MODEL_TURN = "model_turn"
-    COURSE_LOOKUP = "course_lookup"
-    ASSESSMENT_LOOKUP = "assessment_lookup"
-    PROPOSAL_VALIDATION = "proposal_validation"
-    PROPOSAL_READY = "proposal_ready"
-    COMPLETED = "completed"
-    CLARIFICATION_NEEDED = "clarification_needed"
-    FAILED = "failed"
-
-
-class AcademicAgentLookupKind(StrEnum):
-    COURSE = "course"
-    ASSESSMENT = "assessment"
-
-
-class AcademicAgentLoopOutcome(StrEnum):
-    PROPOSAL_READY = "proposal_ready"
-    ANSWER_READY = "answer_ready"
-    CLARIFICATION_REQUIRED = "clarification_required"
-    NOT_APPLICABLE = "not_applicable"
-    MODEL_INVALID_OUTPUT = "model_invalid_output"
-    MODEL_FAILED = "model_failed"
-    MODEL_TIMEOUT = "model_timeout"
-    AGENT_TURN_LIMIT_EXHAUSTED = "agent_turn_limit_exhausted"
-    HOST_VALIDATION_FAILED = "host_validation_failed"
-
-
-class AcademicAgentProgressEvent(PlannerModel):
-    """Host-observed progress metadata safe for user-visible rendering."""
-
-    model_config = ConfigDict(extra="forbid", frozen=True)
-
-    phase: AcademicAgentProgressPhase
-    attempt_number: int = Field(ge=1, le=3)
-    attempt_limit: int = Field(ge=1, le=3)
-    model_turn: int | None = Field(default=None, ge=1, le=10)
-    model_turn_limit: int | None = Field(default=None, ge=1, le=10)
-    lookup_kind: AcademicAgentLookupKind | None = None
-    result_count: int | None = Field(default=None, ge=0, le=20)
-    terminal: bool = False
-
-    def model_post_init(self, __context: object) -> None:
-        if self.attempt_number > self.attempt_limit:
-            raise ValueError("attempt_number must be less than or equal to attempt_limit")
-        if (self.model_turn is None) != (self.model_turn_limit is None):
-            raise ValueError("model turn metadata must be provided together")
-        if (
-            self.model_turn is not None
-            and self.model_turn_limit is not None
-            and self.model_turn > self.model_turn_limit
-        ):
-            raise ValueError("model_turn must be less than or equal to model_turn_limit")
-        if self.result_count is not None and self.lookup_kind is None:
-            raise ValueError("result_count requires lookup_kind")
-
-
-class AcademicAgentContinuationInput(PlannerModel):
-    """Structured untrusted user context for clarification reruns."""
-
-    original_user_request: str = Field(min_length=1, max_length=4_000)
-    prior_clarification_questions: tuple[str, ...] = Field(default=(), max_length=2)
-    clarification_answers: tuple[str, ...] = Field(default=(), max_length=2)
-
-    def model_post_init(self, __context: object) -> None:
-        if len(self.clarification_answers) > len(self.prior_clarification_questions):
-            raise ValueError("answers cannot outnumber clarification questions")
-
-
-class AcademicAgentLoopResult(PlannerModel):
-    """Result of a Discord academic agent loop without external writes."""
-
-    changes: tuple[ProposedChange, ...] = Field(max_length=20)
-    question: str | None = Field(default=None, min_length=1, max_length=1_000)
-    response: str | None = Field(default=None, min_length=1, max_length=1_800)
-    turns: int = Field(ge=1, le=10)
-    outcome: AcademicAgentLoopOutcome = AcademicAgentLoopOutcome.CLARIFICATION_REQUIRED
-
-
 class CheckinProposal(PlannerModel):
     proposal_id: UUID
     confirmation_event: str = Field(min_length=1, max_length=255)
     changes: tuple[ProposedChange, ...] = Field(max_length=20)
-    source_plan_id: UUID | None = None
     expires_at: datetime | None = None
     question: str | None = Field(default=None, max_length=2_000)
 
@@ -1017,15 +704,6 @@ class CheckinExtraction(PlannerModel):
 
 
 __all__ = [
-    "AcademicAgentContinuationInput",
-    "AcademicAgentDecision",
-    "AcademicAgentLookupKind",
-    "AcademicAgentLoopOutcome",
-    "AcademicAgentLoopResult",
-    "AcademicAgentProgressEvent",
-    "AcademicAgentProgressPhase",
-    "AcademicAgentToolCall",
-    "AcademicAgentWireDecision",
     "AcademicAssessmentOption",
     "AcademicAssessmentSearchResult",
     "AcademicCourseOption",
@@ -1040,12 +718,9 @@ __all__ = [
     "AcademicMemoryReviewDecision",
     "AcademicMemorySummary",
     "AcademicPerformanceSignal",
-    "AcademicRequestRouteDecision",
     "AcademicSemanticCandidate",
     "AcademicSemanticSearchResult",
-    "AmbiguousFact",
     "ArchiveAssessmentCall",
-    "Assessment",
     "AssessmentMaterialDiagnostic",
     "AssessmentMaterialExtractionStatus",
     "AssessmentMaterialSource",
@@ -1053,45 +728,38 @@ __all__ = [
     "AssessmentType",
     "AttachAssessmentMaterialCall",
     "AvailabilityWindow",
+    "CalendarAvailabilityFacts",
     "CheckinExtraction",
     "CheckinProposal",
     "CreateAssessmentCall",
+    "CreateCourseEventCall",
     "CreateLearningFocusAction",
-    "CreateStudySessionCall",
-    "DailyPlan",
+    "CreateMiscTaskCall",
     "DiscourseClarification",
     "DiscourseIntent",
     "DiscoursePartialFacts",
     "FixedCommitment",
     "GroundedAssessmentInsight",
     "InboundMaterialProposalPreview",
-    "IncompleteBlock",
     "LearningFocusStatus",
     "MemoryManagementOutcome",
     "MorningBriefing",
     "MorningBriefingAssessmentFact",
-    "MorningBriefingBlockFact",
     "MorningBriefingContext",
     "MorningBriefingLearningFocusFact",
     "MorningBriefingMaterialInsightFact",
     "MorningBriefingPerformanceFact",
     "MorningBriefingWorkBreakdownFact",
-    "PlanCritique",
-    "PlannerFacts",
-    "PracticeNeed",
     "ProposedChange",
     "ReinforceLearningFocusAction",
     "ResolveLearningFocusAction",
-    "ScheduledMorningBlock",
     "ScheduledMorningNotification",
     "SearchAssessmentsCall",
     "SearchCoursesCall",
     "SearchLearningFocusesCall",
     "SearchSemanticFocusesCall",
     "SnoozeLearningFocusAction",
-    "StudyBlock",
     "UpdateAssessmentCall",
     "UserCreatableAssessmentType",
     "ValidatedMaterialPlanningSignals",
-    "WorkBreakdown",
 ]

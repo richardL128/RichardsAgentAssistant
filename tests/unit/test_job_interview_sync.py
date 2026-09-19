@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import uuid
 from datetime import UTC, datetime
 from types import SimpleNamespace
@@ -111,7 +112,10 @@ def _interview(page_id: str, date_start: str | None) -> NotionInterviewEvent:
         date_property_name="Date",
         date=NotionDateValue(start=date_start) if date_start is not None else None,
         last_edited_at=NOW,
-        properties={"Tags": ("technical",)},
+        properties={
+            "Date": NotionDateValue(start=date_start) if date_start is not None else None,
+            "Tags": ("technical",),
+        },
         url_candidates=(
             NotionInterviewUrlCandidate(
                 url="https://jobs.example.com/posting",
@@ -182,6 +186,12 @@ async def test_sync_batches_application_rows_and_persists_only_schedulable_inter
     assert len(store.interviews) == 1
     assert store.interviews[0][1].interview_page_id == "valid-interview"
     assert store.interviews[0][1].local_date.isoformat() == "2026-10-02"
+    assert store.interviews[0][1].property_snapshot["Date"] == {
+        "start": "2026-10-02T17:30:00.000Z",
+        "end": None,
+        "time_zone": None,
+    }
+    json.dumps(store.interviews[0][1].property_snapshot)
     assert store.deactivated_seen == {"valid-interview"}
     assert {item[0].code for item in store.diagnostics} == {"interview_date_invalid"}
 

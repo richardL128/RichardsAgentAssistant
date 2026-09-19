@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import re
+import subprocess
 import tempfile
 from collections.abc import Awaitable, Callable
 from datetime import UTC, datetime, timedelta
@@ -18,6 +19,7 @@ from app.connectors.notion import NOTION_API_BASE_URL, NOTION_API_VERSION
 from app.core.config import Settings
 from app.core.errors import ErrorCategory, LifeAgentError
 from app.db.session import Database
+from app.llm.embeddings import AcademicEmbeddingGateway, EmbeddingReadinessError
 
 GITHUB_TOKEN_REFRESH_WINDOW = timedelta(minutes=1)
 _NOTION_ID_PATTERN = re.compile(r"^[A-Za-z0-9_-]{1,128}$")
@@ -62,6 +64,26 @@ class OllamaTagsResponse(BaseModel):
     model_config = ConfigDict(extra="ignore")
 
     models: list[OllamaModelRecord] = Field(default_factory=lambda: list[OllamaModelRecord]())
+
+
+class OllamaResidentModelRecord(BaseModel):
+    """Safe resident-model fields from Ollama's process endpoint."""
+
+    model_config = ConfigDict(extra="ignore")
+
+    name: str
+    context_length: int | None = None
+    size_vram: int | None = None
+
+
+class OllamaPsResponse(BaseModel):
+    """Minimal allowlisted shape from Ollama's non-secret process endpoint."""
+
+    model_config = ConfigDict(extra="ignore")
+
+    models: list[OllamaResidentModelRecord] = Field(
+        default_factory=lambda: list[OllamaResidentModelRecord]()
+    )
 
 
 def check_artifact_root(settings: Settings) -> HealthCheck:
@@ -110,6 +132,7 @@ def check_database(database: Database) -> tuple[HealthCheck, ...]:
                     "procrastinate",
                     "shared_schema",
                     "checkpoints",
+                    "native_conversations",
                     "code_review_schema",
                 )
             ),
@@ -117,6 +140,7 @@ def check_database(database: Database) -> tuple[HealthCheck, ...]:
     schema_ok, schema_detail = database.check_procrastinate_schema()
     shared_ok, shared_detail = database.check_shared_schema()
     checkpoint_ok, checkpoint_detail = database.check_checkpoint_schema()
+    conversation_ok, conversation_detail = database.check_native_conversation_schema()
     code_review_ok, code_review_detail = database.check_code_review_schema()
     return (
         connection_check,
@@ -134,6 +158,11 @@ def check_database(database: Database) -> tuple[HealthCheck, ...]:
             name="checkpoints",
             state=HealthState.HEALTHY if checkpoint_ok else HealthState.FAILED,
             diagnostic=checkpoint_detail,
+        ),
+        HealthCheck(
+            name="native_conversations",
+            state=HealthState.HEALTHY if conversation_ok else HealthState.FAILED,
+            diagnostic=conversation_detail,
         ),
         HealthCheck(
             name="code_review_schema",
@@ -406,17 +435,19 @@ async def check_ollama(settings: Settings, client: httpx.AsyncClient | None = No
                         "configured Ollama model digest does not match; model features are degraded"
                     ),
                 )
+        runtime_state, runtime_diagnostic = await _ollama_runtime_diagnostic(settings, client)
+        identity_diagnostic = (
+            f"Ollama /api/tags responded ({model_count} model(s) advertised); "
+            "configured model identity verified"
+            if settings.ollama_model_digest
+            else f"Ollama /api/tags responded ({model_count} model(s) advertised)"
+        )
         return HealthCheck(
             name="ollama",
-            state=HealthState.HEALTHY,
-            diagnostic=(
-                f"Ollama /api/tags responded ({model_count} model(s) advertised); "
-                "configured model identity verified"
-                if settings.ollama_model_digest
-                else f"Ollama /api/tags responded ({model_count} model(s) advertised)"
-            ),
+            state=runtime_state,
+            diagnostic=f"{identity_diagnostic}; {runtime_diagnostic}",
         )
-    except (httpx.HTTPError, ValidationError, ValueError, TypeError) as exc:
+    except (httpx.HTTPError, SQLAlchemyError, ValidationError, ValueError, TypeError) as exc:
         return HealthCheck(
             name="ollama",
             state=HealthState.ATTENTION,
@@ -427,6 +458,173 @@ async def check_ollama(settings: Settings, client: httpx.AsyncClient | None = No
     finally:
         if owns_client:
             await client.aclose()
+
+
+async def _ollama_runtime_diagnostic(
+    settings: Settings,
+    client: httpx.AsyncClient,
+) -> tuple[HealthState, str]:
+    try:
+        response = await client.get(f"{settings.ollama_url}/api/ps")
+        response.raise_for_status()
+        payload = OllamaPsResponse.model_validate(response.json())
+    except (httpx.HTTPError, ValidationError, ValueError, TypeError) as exc:
+        return (
+            HealthState.HEALTHY,
+            f"resident allocation not verified (/api/ps unavailable: {exc.__class__.__name__})",
+        )
+    resident = next(
+        (model for model in payload.models if model.name == settings.ollama_model),
+        None,
+    )
+    host = await asyncio.to_thread(_host_memory_diagnostic)
+    if resident is None:
+        return (
+            HealthState.HEALTHY,
+            f"resident allocation not observed; {host}",
+        )
+    context = resident.context_length
+    size_vram = resident.size_vram
+    context_value = context or "unknown"
+    size_vram_value = size_vram or "unknown"
+    allocation = f"resident context_length={context_value}; size_vram={size_vram_value}"
+    if context is not None and context != settings.ollama_num_ctx:
+        return (
+            HealthState.ATTENTION,
+            f"{allocation}; expected context_length={settings.ollama_num_ctx}; {host}",
+        )
+    return (HealthState.HEALTHY, f"{allocation}; {host}")
+
+
+def _host_memory_diagnostic() -> str:
+    free_percent = "unknown"
+    swapouts = "unknown"
+    swapout_bytes = "unknown"
+    try:
+        pressure = subprocess.run(
+            ["/usr/bin/memory_pressure", "-Q"],
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=10,
+        ).stdout
+        free_match = re.search(r"memory free percentage: (\d+)%", pressure)
+        if free_match:
+            free_percent = free_match.group(1)
+    except (OSError, subprocess.SubprocessError):
+        pass
+    try:
+        vm_stat = subprocess.run(
+            ["/usr/bin/vm_stat"],
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=10,
+        ).stdout
+        swapout_match = re.search(r"Swapouts:\s+(\d+)\.", vm_stat)
+        page_size_match = re.search(r"page size of (\d+) bytes", vm_stat)
+        if swapout_match:
+            swapouts = swapout_match.group(1)
+        if swapout_match and page_size_match:
+            swapout_bytes = str(int(swapout_match.group(1)) * int(page_size_match.group(1)))
+    except (OSError, subprocess.SubprocessError):
+        pass
+    return (
+        f"host_memory_free_percent={free_percent}; "
+        f"host_swapouts={swapouts}; host_swapout_bytes={swapout_bytes}"
+    )
+
+
+async def check_academic_embeddings(
+    settings: Settings,
+    client: httpx.AsyncClient | None = None,
+    *,
+    embedding_gateway: AcademicEmbeddingGateway | None = None,
+    database: Database | None = None,
+) -> HealthCheck:
+    """Verify semantic academic memory/material embeddings are truly available."""
+
+    gateway = embedding_gateway or AcademicEmbeddingGateway(settings)
+    try:
+        ready = await gateway.ensure_ready(http_client=client)
+        active_chunks = 0
+        pending_chunks = 0
+        reflection_count = 0
+        pending_reflections = 0
+        if database is not None:
+            (
+                active_chunks,
+                pending_chunks,
+                reflection_count,
+                pending_reflections,
+            ) = await asyncio.to_thread(
+                _academic_embedding_counts,
+                database,
+                gateway.model_identity,
+            )
+            if pending_chunks or pending_reflections:
+                return HealthCheck(
+                    name="academic_embeddings",
+                    state=HealthState.FAILED,
+                    diagnostic=(
+                        "academic embeddings stale; "
+                        f"active material chunks {active_chunks}; "
+                        f"pending material embeddings {pending_chunks}; "
+                        f"reflection memories {reflection_count}; "
+                        f"pending reflection embeddings {pending_reflections}; "
+                        f"dimension {ready.dimension}"
+                    ),
+                )
+        digest_state = "digest pinned" if settings.embedding_model_digest else "digest unpinned"
+        return HealthCheck(
+            name="academic_embeddings",
+            state=HealthState.HEALTHY,
+            diagnostic=(
+                "academic embeddings ready; "
+                f"model={ready.model}; dimension={ready.dimension}; "
+                f"active material chunks {active_chunks}; "
+                f"pending material embeddings {pending_chunks}; "
+                f"reflection memories {reflection_count}; "
+                f"pending reflection embeddings {pending_reflections}; "
+                f"{digest_state}"
+            ),
+        )
+    except EmbeddingReadinessError as exc:
+        return HealthCheck(
+            name="academic_embeddings",
+            state=HealthState.FAILED,
+            diagnostic=f"academic embeddings unavailable ({exc.code.value})",
+        )
+    except (httpx.HTTPError, SQLAlchemyError, ValidationError, ValueError, TypeError) as exc:
+        return HealthCheck(
+            name="academic_embeddings",
+            state=HealthState.FAILED,
+            diagnostic=f"academic embeddings unavailable ({exc.__class__.__name__})",
+        )
+
+
+def _academic_embedding_counts(
+    database: Database,
+    embedding_model: str,
+) -> tuple[int, int, int, int]:
+    from sqlalchemy.orm import Session
+
+    from app.db.academic import AcademicRepository
+
+    with Session(database.engine) as session:
+        active_count = AcademicRepository.count_active_assessment_material_chunks(session)
+        pending_count = AcademicRepository.count_material_embedding_backfill_candidates(
+            session,
+            embedding_model=embedding_model,
+        )
+        reflection_count = AcademicRepository.count_reflection_memories(session)
+        pending_reflection_count = (
+            AcademicRepository.count_reflection_embedding_backfill_candidates(
+                session,
+                embedding_model=embedding_model,
+            )
+        )
+    return active_count, pending_count, reflection_count, pending_reflection_count
 
 
 async def check_github_installation_token(
@@ -673,6 +871,7 @@ async def readiness(
     checks = [*db_checks, check_artifact_root(settings)]
     checks.append(check_academic_notion_status(settings, database))
     checks.append(await check_ollama(settings, ollama_client))
+    checks.append(await check_academic_embeddings(settings, ollama_client, database=database))
     states = {check.state for check in checks}
     if HealthState.FAILED in states:
         status = HealthState.FAILED

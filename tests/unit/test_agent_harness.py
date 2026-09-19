@@ -4,12 +4,21 @@ import asyncio
 from collections.abc import Mapping, Sequence
 
 import pytest
-from langchain_core.messages import AIMessage, BaseMessage, HumanMessage, ToolMessage
+from langchain_core.messages import (
+    AIMessage,
+    BaseMessage,
+    HumanMessage,
+    SystemMessage,
+    ToolMessage,
+)
 
 from app.agents.harness import (
     AgentHarnessEvent,
+    AgentTranscriptCheckpoint,
+    ConversationLifecycle,
     NativeTool,
     ToolExecutionResult,
+    UserAbortRequested,
     _pending_elapsed_schedule,
     run_native_tool_loop,
 )
@@ -43,6 +52,19 @@ def tool_schema(name: str) -> Mapping[str, object]:
             "description": "test tool",
             "parameters": {"type": "object", "properties": {}},
         },
+    }
+
+
+def terminal_call(
+    *,
+    disposition: str = "completed",
+    content: str = "Done.",
+    call_id: str = "terminal-1",
+) -> dict[str, object]:
+    return {
+        "id": call_id,
+        "name": "emit_conversation_response",
+        "args": {"disposition": disposition, "content": content},
     }
 
 
@@ -197,6 +219,476 @@ async def test_tool_call_result_and_answer_events_are_ordered() -> None:
     assert isinstance(result.messages[3], ToolMessage)
     assert result.messages[3].content == '{"content":{"echo":"calendar"},"status":"succeeded"}'
     assert gateway.calls[1][-1].content == result.messages[3].content
+
+
+@pytest.mark.asyncio
+async def test_restored_messages_are_replayed_between_current_system_and_new_user() -> None:
+    prior = (
+        HumanMessage(content="Add a quiz."),
+        AIMessage(content="Which course?"),
+    )
+    gateway = Gateway([AIMessage(content="ECE 202 quiz added to the proposal.")])
+
+    result = await run_native_tool_loop(
+        gateway=gateway,
+        user_input="ECE 202",
+        restored_messages=prior,
+        system_message="Current policy.",
+    )
+
+    assert result.status == "completed"
+    assert [message.type for message in gateway.calls[0]] == [
+        "system",
+        "human",
+        "ai",
+        "human",
+    ]
+    assert gateway.calls[0][0].content == "Current policy."
+    assert gateway.calls[0][1:3] == prior
+    assert gateway.calls[0][-1].content == "ECE 202"
+
+
+@pytest.mark.asyncio
+async def test_resume_with_current_human_already_restored_does_not_append_duplicate() -> None:
+    restored = (HumanMessage(content="Continue the open request."),)
+    gateway = Gateway([AIMessage(content="Continuing now.")])
+
+    result = await run_native_tool_loop(
+        gateway=gateway,
+        user_input=None,
+        restored_messages=restored,
+    )
+
+    assert result.status == "completed"
+    assert [message.type for message in gateway.calls[0]] == ["system", "human"]
+    assert gateway.calls[0][-1].content == "Continue the open request."
+
+
+@pytest.mark.asyncio
+async def test_resume_checkpointed_terminal_lifecycle_returns_without_model_call() -> None:
+    events: list[AgentHarnessEvent] = []
+    restored = (
+        HumanMessage(content="Add the quiz to ECE 202."),
+        AIMessage(
+            content="",
+            tool_calls=[
+                terminal_call(
+                    disposition="completed",
+                    content="I prepared that for review.",
+                )
+            ],
+        ),
+    )
+    gateway = Gateway([AIMessage(content="Should not be called.")])
+
+    result = await run_native_tool_loop(
+        gateway=gateway,
+        user_input=None,
+        restored_messages=restored,
+        require_terminal_response=True,
+        event_sink=lambda event: collect(events, event),
+    )
+
+    assert result.status == "completed"
+    assert result.lifecycle_disposition == "completed"
+    assert result.final_response == "I prepared that for review."
+    assert gateway.calls == []
+    assert [(event.kind, event.content, event.lifecycle_disposition) for event in events] == [
+        ("final_response", "I prepared that for review.", "completed")
+    ]
+
+
+@pytest.mark.asyncio
+async def test_resume_executes_only_missing_tool_results_then_continues() -> None:
+    checkpoints: list[AgentTranscriptCheckpoint] = []
+    executed: list[str] = []
+
+    async def lookup(arguments: Mapping[str, object]) -> object:
+        value = str(arguments["value"])
+        executed.append(value)
+        return {"value": value}
+
+    restored_assistant = AIMessage(
+        content="I will look up both values.",
+        tool_calls=[
+            {"id": "call-1", "name": "lookup", "args": {"value": "already-done"}},
+            {"id": "call-2", "name": "lookup", "args": {"value": "missing"}},
+        ],
+    )
+    restored = (
+        HumanMessage(content="Look up two values."),
+        restored_assistant,
+        ToolMessage(
+            content='{"content":{"value":"already-done"},"status":"succeeded"}',
+            tool_call_id="call-1",
+            name="lookup",
+            status="success",
+        ),
+    )
+    gateway = Gateway([AIMessage(content="Both values are ready.")])
+
+    result = await run_native_tool_loop(
+        gateway=gateway,
+        user_input=None,
+        restored_messages=restored,
+        tools=(NativeTool(schema=tool_schema("lookup"), handler=lookup),),
+        checkpoint_sink=lambda checkpoint: collect(checkpoints, checkpoint),
+    )
+
+    assert result.status == "completed"
+    assert executed == ["missing"]
+    assert [item.kind for item in checkpoints] == ["tool_result", "assistant_message"]
+    assert checkpoints[0].tool_call_id == "call-2"
+    assert [message.type for message in gateway.calls[0]] == [
+        "system",
+        "human",
+        "ai",
+        "tool",
+        "tool",
+    ]
+    assert gateway.calls[0][-1].tool_call_id == "call-2"
+
+
+@pytest.mark.asyncio
+async def test_resume_with_all_tool_results_does_not_reexecute_tools() -> None:
+    executed = False
+
+    async def lookup(_: Mapping[str, object]) -> object:
+        nonlocal executed
+        executed = True
+        return {"ok": True}
+
+    restored = (
+        HumanMessage(content="Look up one value."),
+        AIMessage(
+            content="I will look that up.",
+            tool_calls=[{"id": "call-1", "name": "lookup", "args": {}}],
+        ),
+        ToolMessage(
+            content='{"content":{"ok":true},"status":"succeeded"}',
+            tool_call_id="call-1",
+            name="lookup",
+            status="success",
+        ),
+    )
+    gateway = Gateway([AIMessage(content="Already have it.")])
+
+    result = await run_native_tool_loop(
+        gateway=gateway,
+        user_input=None,
+        restored_messages=restored,
+        tools=(NativeTool(schema=tool_schema("lookup"), handler=lookup),),
+    )
+
+    assert result.status == "completed"
+    assert executed is False
+    assert len(gateway.calls) == 1
+
+
+@pytest.mark.asyncio
+async def test_resume_invalid_lifecycle_checkpoint_uses_bounded_correction() -> None:
+    restored = (
+        HumanMessage(content="Answer in lifecycle mode."),
+        AIMessage(content="Plain text cannot finish lifecycle mode."),
+    )
+    gateway = Gateway(
+        [
+            AIMessage(
+                content="",
+                tool_calls=[
+                    terminal_call(
+                        disposition="completed",
+                        content="Corrected after resume.",
+                    )
+                ],
+            )
+        ]
+    )
+
+    result = await run_native_tool_loop(
+        gateway=gateway,
+        user_input=None,
+        restored_messages=restored,
+        require_terminal_response=True,
+    )
+
+    assert result.status == "completed"
+    assert result.final_response == "Corrected after resume."
+    assert len(gateway.calls) == 1
+    assert isinstance(gateway.calls[0][-1], SystemMessage)
+    assert "emit_conversation_response was not called" in str(gateway.calls[0][-1].content)
+
+
+@pytest.mark.asyncio
+async def test_checkpoint_sink_receives_full_transcript_after_assistant_and_tool_result() -> None:
+    checkpoints: list[AgentTranscriptCheckpoint] = []
+
+    async def checkpoint(item: AgentTranscriptCheckpoint) -> None:
+        checkpoints.append(item)
+
+    async def lookup(_: Mapping[str, object]) -> object:
+        return {"ok": True}
+
+    reasoning_message = AIMessage(
+        content="I will check.",
+        additional_kwargs={"reasoning_content": "private native thinking"},
+        tool_calls=[{"id": "call-1", "name": "lookup", "args": {}}],
+    )
+    gateway = Gateway([reasoning_message, AIMessage(content="Done.")])
+
+    result = await run_native_tool_loop(
+        gateway=gateway,
+        user_input="look up",
+        tools=(NativeTool(schema=tool_schema("lookup"), handler=lookup),),
+        checkpoint_sink=checkpoint,
+    )
+
+    assert result.status == "completed"
+    assert [item.kind for item in checkpoints] == [
+        "assistant_message",
+        "tool_result",
+        "assistant_message",
+    ]
+    assert checkpoints[0].messages[-1].additional_kwargs["reasoning_content"] == (
+        "private native thinking"
+    )
+    assert isinstance(checkpoints[1].messages[-1], ToolMessage)
+    assert checkpoints[1].tool_call_id == "call-1"
+    assert checkpoints[1].tool_name == "lookup"
+
+
+@pytest.mark.asyncio
+async def test_terminal_response_tool_returns_completed_lifecycle_without_tool_result() -> None:
+    events: list[AgentHarnessEvent] = []
+    gateway = Gateway(
+        [
+            AIMessage(
+                content="",
+                tool_calls=[terminal_call(disposition="completed", content="All set.")],
+            )
+        ]
+    )
+
+    result = await run_native_tool_loop(
+        gateway=gateway,
+        user_input="finish this",
+        require_terminal_response=True,
+        event_sink=lambda event: collect(events, event),
+    )
+
+    assert result.status == "completed"
+    assert result.lifecycle_disposition == "completed"
+    assert result.final_response == "All set."
+    assert [event.kind for event in events] == ["model_turn_started", "final_response"]
+    assert events[-1].lifecycle_disposition == "completed"
+    assert len(result.messages) == 3
+    assert isinstance(result.messages[-1], AIMessage)
+
+
+@pytest.mark.asyncio
+async def test_terminal_response_tool_can_leave_conversation_awaiting_user() -> None:
+    gateway = Gateway(
+        [
+            AIMessage(
+                content="",
+                tool_calls=[
+                    terminal_call(
+                        disposition="awaiting_user",
+                        content="Which course should I use?",
+                    )
+                ],
+            )
+        ]
+    )
+
+    result = await run_native_tool_loop(
+        gateway=gateway,
+        user_input="Add a quiz tomorrow.",
+        require_terminal_response=True,
+    )
+
+    assert result.status == "awaiting_user"
+    assert result.lifecycle_disposition == "awaiting_user"
+    assert result.final_response == "Which course should I use?"
+
+
+@pytest.mark.asyncio
+async def test_missing_terminal_response_gets_one_correction_turn() -> None:
+    gateway = Gateway(
+        [
+            AIMessage(content="Plain text is not terminal in lifecycle mode."),
+            AIMessage(
+                content="",
+                tool_calls=[terminal_call(disposition="completed", content="Corrected.")],
+            ),
+        ]
+    )
+
+    result = await run_native_tool_loop(
+        gateway=gateway,
+        user_input="answer",
+        require_terminal_response=True,
+    )
+
+    assert result.status == "completed"
+    assert result.final_response == "Corrected."
+    assert len(gateway.calls) == 2
+    assert isinstance(gateway.calls[1][-1], SystemMessage)
+    assert "emit_conversation_response was not called" in str(gateway.calls[1][-1].content)
+
+
+@pytest.mark.asyncio
+async def test_repeated_invalid_terminal_response_fails_closed() -> None:
+    gateway = Gateway(
+        [
+            AIMessage(
+                content="",
+                tool_calls=[
+                    terminal_call(
+                        disposition="completed",
+                        content="Mixed.",
+                        call_id="terminal-1",
+                    ),
+                    {"id": "call-1", "name": "lookup", "args": {}},
+                ],
+            ),
+            AIMessage(content="Still plain text."),
+        ]
+    )
+
+    async def lookup(_: Mapping[str, object]) -> object:
+        return {"ok": True}
+
+    result = await run_native_tool_loop(
+        gateway=gateway,
+        user_input="answer",
+        tools=(NativeTool(schema=tool_schema("lookup"), handler=lookup),),
+        require_terminal_response=True,
+    )
+
+    assert result.status == "failed"
+    assert result.final_response == (
+        "The model did not produce a valid terminal conversation response. Please try again."
+    )
+    assert len(gateway.calls) == 2
+
+
+@pytest.mark.asyncio
+async def test_lifecycle_validator_can_reject_and_correct_terminal_response() -> None:
+    seen: list[ConversationLifecycle] = []
+
+    def validator(
+        lifecycle: ConversationLifecycle,
+        _messages: Sequence[BaseMessage],
+    ) -> str | None:
+        seen.append(lifecycle)
+        if lifecycle.content == "Which course?":
+            return "duplicate clarification"
+        return None
+
+    gateway = Gateway(
+        [
+            AIMessage(
+                content="",
+                tool_calls=[
+                    terminal_call(
+                        disposition="awaiting_user",
+                        content="Which course?",
+                        call_id="terminal-1",
+                    )
+                ],
+            ),
+            AIMessage(
+                content="",
+                tool_calls=[
+                    terminal_call(
+                        disposition="completed",
+                        content="I used the course you already gave me.",
+                        call_id="terminal-2",
+                    )
+                ],
+            ),
+        ]
+    )
+
+    result = await run_native_tool_loop(
+        gateway=gateway,
+        user_input="ECE 202",
+        require_terminal_response=True,
+        lifecycle_validator=validator,
+    )
+
+    assert result.status == "completed"
+    assert result.final_response == "I used the course you already gave me."
+    assert [item.content for item in seen] == [
+        "Which course?",
+        "I used the course you already gave me.",
+    ]
+
+
+@pytest.mark.asyncio
+async def test_abort_check_stops_before_model_turn() -> None:
+    gateway = Gateway([AIMessage(content="Should not be reached.")])
+
+    def abort() -> None:
+        raise UserAbortRequested()
+
+    with pytest.raises(UserAbortRequested):
+        await run_native_tool_loop(
+            gateway=gateway,
+            user_input="stop first",
+            abort_check=abort,
+        )
+
+    assert gateway.calls == []
+
+
+@pytest.mark.asyncio
+async def test_abort_check_stops_before_next_tool_handler() -> None:
+    events: list[AgentHarnessEvent] = []
+    checks = 0
+    handler_called = False
+
+    def abort_after_model() -> None:
+        nonlocal checks
+        checks += 1
+        if checks >= 3:
+            raise UserAbortRequested()
+
+    async def lookup(_: Mapping[str, object]) -> object:
+        nonlocal handler_called
+        handler_called = True
+        return {"ok": True}
+
+    gateway = Gateway(
+        [
+            AIMessage(
+                content="I will check safely.",
+                tool_calls=[{"id": "call-1", "name": "lookup", "args": {"secret": "redacted"}}],
+            )
+        ]
+    )
+
+    with pytest.raises(UserAbortRequested):
+        await run_native_tool_loop(
+            gateway=gateway,
+            user_input="look up",
+            tools=(
+                NativeTool(
+                    schema=tool_schema("lookup"),
+                    handler=lookup,
+                    side_effect_class="proposal_only",
+                    activity="proposal_drafting",
+                ),
+            ),
+            event_sink=lambda event: collect(events, event),
+            abort_check=abort_after_model,
+        )
+
+    assert handler_called is False
+    assert [event.kind for event in events] == ["model_turn_started", "tool_call"]
+    assert events[1].tool_side_effect_class == "proposal_only"
+    assert events[1].tool_activity == "proposal_drafting"
 
 
 @pytest.mark.asyncio

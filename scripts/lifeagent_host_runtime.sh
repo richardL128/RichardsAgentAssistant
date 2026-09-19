@@ -133,19 +133,38 @@ run_test_preflight() {
     sh -c "$LIFEAGENT_TEST_COMMAND"
     return
   fi
-  if [ ! -x "$REPO_DIR/.venv/bin/pytest" ]; then
-    echo ".venv/bin/pytest is required for deploy preflight" >&2
-    exit 127
+
+  test_venv="$CHECKOUT_REPO_DIR/.venv"
+  test_python="$test_venv/bin/python"
+  tool_root="$CHECKOUT_REPO_DIR/.tools"
+  python_install_dir="$tool_root/python"
+  uv_cache_dir="$tool_root/uv-cache"
+  uv_bin="$(resolve_uv)"
+  ensure_private_dir "$tool_root"
+  ensure_private_dir "$python_install_dir"
+  ensure_private_dir "$uv_cache_dir"
+
+  if ! [ -x "$test_python" ] || ! "$test_python" -c 'import encodings' >/dev/null 2>&1; then
+    echo "repairing checkout test virtualenv with persistent managed Python"
+    UV_CACHE_DIR="$uv_cache_dir" \
+      UV_PYTHON_INSTALL_DIR="$python_install_dir" \
+      "$uv_bin" venv --clear --managed-python --python 3.12 "$test_venv"
   fi
-  "$REPO_DIR/.venv/bin/pytest" -q \
+
+  UV_CACHE_DIR="$uv_cache_dir" \
+    UV_PYTHON_INSTALL_DIR="$python_install_dir" \
+    UV_PROJECT_ENVIRONMENT="$test_venv" \
+    "$uv_bin" sync --locked --project "$CHECKOUT_REPO_DIR" --managed-python --python 3.12
+
+  "$test_python" -m pytest -q \
     tests/unit/test_host_*.py \
     tests/unit/test_discord_handoff.py \
     tests/unit/test_discord_wake_store.py \
     tests/unit/test_ollama_runtime.py \
     tests/unit/test_ollama_qwen_scripts.py \
     tests/unit/test_academic_delivery.py \
-    tests/unit/test_academic_discord_checkin.py \
-    tests/unit/test_discord_gateway_checkin.py \
+    tests/unit/test_academic_discord_service.py \
+    tests/unit/test_academic_native_discord_harness.py \
     tests/unit/test_academic_main.py \
     tests/unit/test_phase0_core.py \
     tests/unit/test_queue.py

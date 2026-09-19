@@ -16,12 +16,14 @@ from app.connectors.discord import (
     DiscordAcademicPlannerAdapter,
 )
 from app.connectors.discord_gateway import (
+    DiscordAcademicMessageCreate,
     DiscordClarificationAction,
     DiscordClarificationCallbackResult,
     DiscordClarificationInteraction,
     DiscordGatewayListener,
     DiscordGatewayReconnect,
     DiscordInteractionStatus,
+    DiscordMessageCallbackResult,
     parse_clarification_custom_id,
 )
 from app.core.errors import ErrorCode, LifeAgentError
@@ -63,7 +65,7 @@ async def test_clarification_message_has_six_opaque_buttons_and_previews() -> No
                 assignment_title_preview="Assignment — Chapter 4",
                 tutorial_title_preview="Tutorial — Chapter 4",
                 lab_title_preview="Lab — Chapter 4",
-                studying_block_title_preview="Studying Block — Chapter 4",
+                event_title_preview="Chapter 4 review",
             )
         )
 
@@ -80,7 +82,7 @@ async def test_clarification_message_has_six_opaque_buttons_and_previews() -> No
         "Assignment preview: Assignment — Chapter 4\n"
         "Tutorial preview: Tutorial — Chapter 4\n"
         "Lab preview: Lab — Chapter 4\n"
-        "Studying Block preview: Studying Block — Chapter 4"
+        "Event preview: Chapter 4 review"
     )
     assert len(body["components"]) == 2
     buttons = body["components"][0]["components"] + body["components"][1]["components"]
@@ -89,7 +91,7 @@ async def test_clarification_message_has_six_opaque_buttons_and_previews() -> No
         "Assignment",
         "Tutorial",
         "Lab",
-        "Studying Block",
+        "Event",
         "Ignore",
     ]
     assert [button["custom_id"] for button in buttons] == [
@@ -97,7 +99,7 @@ async def test_clarification_message_has_six_opaque_buttons_and_previews() -> No
         f"academic_clarify:{clarification_id}:assignment",
         f"academic_clarify:{clarification_id}:tutorial",
         f"academic_clarify:{clarification_id}:lab",
-        f"academic_clarify:{clarification_id}:studying_block",
+        f"academic_clarify:{clarification_id}:event",
         f"academic_clarify:{clarification_id}:ignore",
     ]
     assert [len(row["components"]) for row in body["components"]] == [5, 1]
@@ -174,7 +176,7 @@ async def test_clarification_rejects_non_allowlisted_channel_before_http() -> No
                     assignment_title_preview="Assignment — Chapter 4",
                     tutorial_title_preview="Tutorial — Chapter 4",
                     lab_title_preview="Lab — Chapter 4",
-                    studying_block_title_preview="Studying Block — Chapter 4",
+                    event_title_preview="Chapter 4 review",
                 )
             )
 
@@ -278,6 +280,28 @@ def _interaction_payload(
             "data": {
                 "custom_id": f"academic_clarify:{clarification_id}:{action}",
             },
+        },
+    }
+
+
+def _message_payload(
+    *,
+    message_id: str,
+    content: str,
+    channel_id: str = CHANNEL,
+    user_id: str = USER,
+) -> dict[str, object]:
+    return {
+        "op": 0,
+        "s": 2,
+        "t": "MESSAGE_CREATE",
+        "d": {
+            "id": message_id,
+            "channel_id": channel_id,
+            "author": {"id": user_id},
+            "timestamp": "2026-09-09T00:00:00+00:00",
+            "content": content,
+            "mentions": [],
         },
     }
 
@@ -416,9 +440,9 @@ async def test_gateway_authorizes_user_and_makes_replays_harmless() -> None:
         clarification_id,
         "lab",
     )
-    assert parse_clarification_custom_id(f"academic_clarify:{clarification_id}:studying_block") == (
+    assert parse_clarification_custom_id(f"academic_clarify:{clarification_id}:event") == (
         clarification_id,
-        "studying_block",
+        "event",
     )
     assert parse_clarification_custom_id(f"academic_clarify:{clarification_id}:paper") is None
     assert parse_clarification_custom_id(f"academic_clarify:{clarification_id}:Quiz") is None
@@ -449,9 +473,9 @@ async def test_gateway_authorizes_user_and_makes_replays_harmless() -> None:
             "Choice queued: Lab. I will update this message when Notion finishes.",
         ),
         (
-            "studying_block",
+            "event",
             "queued",
-            "Choice queued: Studying Block. I will update this message when Notion finishes.",
+            "Choice queued: Event. I will update this message when Notion finishes.",
         ),
         ("ignore", "ignored", "Confirmed choice: Ignore. No Notion change was made."),
         (
@@ -563,6 +587,67 @@ async def test_gateway_queue_boundary_does_not_wait_for_slow_clarification_work(
     assert "private-interaction-token" not in repr(enqueuer.interactions)
     worker_release.set()
     await asyncio.gather(*enqueuer.worker_tasks)
+
+
+@pytest.mark.asyncio
+async def test_gateway_schedules_abort_message_while_prior_message_handler_runs() -> None:
+    release = asyncio.Event()
+
+    class MessageHandler:
+        def __init__(self) -> None:
+            self.messages: list[DiscordAcademicMessageCreate] = []
+
+        async def __call__(
+            self,
+            message: DiscordAcademicMessageCreate,
+        ) -> DiscordMessageCallbackResult:
+            self.messages.append(message)
+            if len(self.messages) == 1:
+                await release.wait()
+            return DiscordMessageCallbackResult(status="handled")
+
+    handler = MessageHandler()
+    listener = DiscordGatewayListener(
+        token=SecretStr(TOKEN),
+        api_base_url="https://discord.com/api/v10",
+        allowed_channel_ids={CHANNEL},
+        authorized_user_ids={USER},
+        clarification_enqueuer=_Handler(),
+        message_content_enabled=True,
+        message_handler=handler,
+        http_client=_GatewayHttp(),
+        websocket_connect=lambda _: _never_connect(),
+    )
+
+    assert (
+        await listener.handle_gateway_payload(
+            _message_payload(message_id="123456789012345678", content="start a plan")
+        )
+        == "handled"
+    )
+    for _ in range(20):
+        if len(handler.messages) == 1:
+            break
+        await asyncio.sleep(0)
+    assert len(handler.messages) == 1
+
+    assert (
+        await listener.handle_gateway_payload(
+            _message_payload(message_id="223456789012345678", content="ABORT")
+        )
+        == "handled"
+    )
+    for _ in range(20):
+        if len(handler.messages) == 2:
+            break
+        await asyncio.sleep(0)
+
+    release.set()
+    await listener.drain_message_tasks()
+    assert [item.content.get_secret_value() for item in handler.messages] == [
+        "start a plan",
+        "ABORT",
+    ]
 
 
 @pytest.mark.asyncio

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+import inspect
 import json
 import shutil
 import subprocess
@@ -12,7 +13,8 @@ from collections.abc import Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Any, Protocol
+from types import SimpleNamespace
+from typing import Any, Protocol, cast
 
 import fitz
 from sqlalchemy import select
@@ -373,9 +375,11 @@ class AssessmentMaterialIngestionService:
         return existing is not None
 
     async def _embed_chunks(self, chunks: Sequence[DocumentChunk]) -> tuple[DocumentChunk, ...]:
+        embeddings = await self._embed_chunk_texts([chunk.content for chunk in chunks])
+        if len(embeddings) != len(chunks):
+            raise RuntimeError("assessment material batch embedding returned the wrong count")
         result: list[DocumentChunk] = []
-        for chunk in chunks:
-            embedding = await self._embeddings.embed_academic_text(chunk.content)
+        for chunk, embedding in zip(chunks, embeddings, strict=True):
             vector = getattr(getattr(embedding, "embedding", None), "vector", None)
             status = str(getattr(embedding, "status", ""))
             if vector is None or status not in {"valid", "EmbeddingStatus.VALID"}:
@@ -400,6 +404,21 @@ class AssessmentMaterialIngestionService:
                 )
             )
         return tuple(result)
+
+    async def _embed_chunk_texts(self, texts: Sequence[str]) -> tuple[Any, ...]:
+        embed_academic_texts = getattr(self._embeddings, "embed_academic_texts", None)
+        if callable(embed_academic_texts):
+            batched = embed_academic_texts(list(texts))
+            if inspect.isawaitable(batched):
+                batched = await batched
+            return _embedding_results_from_batch(batched)
+        embed_documents = getattr(self._embeddings, "embed_documents", None)
+        if callable(embed_documents):
+            legacy_batch = embed_documents(list(texts))
+            if inspect.isawaitable(legacy_batch):
+                legacy_batch = await legacy_batch
+            return tuple(_embedding_result_sequence(legacy_batch))
+        return tuple([await self._embeddings.embed_academic_text(text) for text in texts])
 
     def _persist_failure(
         self,
@@ -637,6 +656,32 @@ def _failure_code(exc: Exception) -> str:
     if "ocr" in message:
         return "material_ocr_failed"
     return "material_ingestion_failed"
+
+
+def _embedding_result_sequence(value: object) -> Sequence[Any]:
+    if isinstance(value, Sequence) and not isinstance(value, (str, bytes, bytearray)):
+        return cast(Sequence[Any], value)
+    results = getattr(value, "results", None)
+    if isinstance(results, Sequence) and not isinstance(results, (str, bytes, bytearray)):
+        return cast(Sequence[Any], results)
+    embeddings = getattr(value, "embeddings", None)
+    if isinstance(embeddings, Sequence) and not isinstance(embeddings, (str, bytes, bytearray)):
+        return cast(Sequence[Any], embeddings)
+    raise RuntimeError("assessment material batch embedding returned an invalid payload")
+
+
+def _embedding_results_from_batch(value: object) -> tuple[Any, ...]:
+    status = str(getattr(value, "status", ""))
+    if status not in {"valid", "EmbeddingStatus.VALID"}:
+        raise RuntimeError("assessment material batch embedding failed")
+    model_identity = str(getattr(value, "model_identity", ""))
+    embeddings = getattr(value, "embeddings", None)
+    if not isinstance(embeddings, Sequence) or isinstance(embeddings, (str, bytes, bytearray)):
+        raise RuntimeError("assessment material batch embedding returned an invalid payload")
+    return tuple(
+        SimpleNamespace(status="valid", model_identity=model_identity, embedding=embedding)
+        for embedding in cast(Sequence[Any], embeddings)
+    )
 
 
 def _safe_error(exc: Exception) -> str:

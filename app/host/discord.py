@@ -16,6 +16,8 @@ HOST_WAKE_ACKNOWLEDGEMENT = (
     "I’m waking up LifeAgent and Qwen. Please give me a little time to respond."  # noqa: RUF001
 )
 HOST_COMMAND_ACKNOWLEDGEMENT = "I’m waking up LifeAgent to handle that command."  # noqa: RUF001
+HOST_ABORT_ACKNOWLEDGEMENT = "Abort received. I’m stopping the active Discord turn now."  # noqa: RUF001
+HOST_ABORTED_TURN_CONTENT = "Aborted. I stopped this Discord turn before it could continue."
 
 DiscordWakeFailure = Literal[
     "docker_timeout",
@@ -193,6 +195,8 @@ def _raise_safe_edit_failure() -> NoReturn:
 
 
 __all__ = [
+    "HOST_ABORTED_TURN_CONTENT",
+    "HOST_ABORT_ACKNOWLEDGEMENT",
     "HOST_COMMAND_ACKNOWLEDGEMENT",
     "HOST_WAKE_ACKNOWLEDGEMENT",
     "DiscordWakeAckAdapter",

@@ -16,15 +16,43 @@ in the private academic Discord channel, and event-local semantic analysis for
 the automatic morning calendar briefing. A native macOS LaunchAgent owns the
 sole Discord Gateway connection, acknowledges interactive messages, wakes the
 fixed Compose services and Ollama API, and submits an HMAC-signed reference to
-the loopback backend. Scheduled Qwen workflows for study-plan allocation, code
-review, and finance remain non-executable. Exact `confirm <proposal-id>` and
-`reject <proposal-id>` commands and clarification buttons remain model-free
-exceptions.
+the loopback backend. There is no scheduled study-plan allocation workflow;
+scheduled Qwen workflows for code review and finance remain non-executable.
+Exact `confirm <proposal-id>` and `reject <proposal-id>` commands and
+clarification buttons remain model-free exceptions.
 
 The API may remain cold between conversations, but the academic worker stays
 resident with PostgreSQL. That worker owns the minute-level periodic deferrer;
 keeping it resident is what makes the configured morning occurrence executable
 without loading Qwen or waiting for an inbound Discord message.
+
+Ordinary authorized Discord requests use one generic durable native conversation
+session per owner/channel. Relational rows contain only lookup, revision,
+idempotency, lifecycle, expiry, and content-addressed artifact keys; immutable
+private artifacts contain the ordered user, assistant, native tool-call,
+tool-result, provider-reasoning, lifecycle, and trusted host-tool checkpoints.
+Every model boundary receives a host-budgeted working set: current policy and
+owner input, an adjacency-safe recent tail, a validated cumulative session
+summary, relevant active generic owner memories, and current tool-loop state.
+The full append-only transcript remains the recovery and audit source and is
+never replaced by summary or memory prompt blocks. The model terminates each
+turn with the typed `emit_conversation_response` control tool, selecting
+`awaiting_user` or `completed`; host code does not infer continuity from prose.
+Exact cancel, confirmation, and rejection commands remain model-free controls.
+
+The worker lazily reuses one Discord service and model gateway across wakes, but
+durability never depends on that process or on Ollama residency. No inference or
+database transaction remains open while a person replies. A worker restart,
+Ollama unload, or container restart reloads the transcript and trusted tool
+capabilities from PostgreSQL plus the artifact store. Open sessions are compacted
+only into separately validated derived summaries; canonical transcripts are
+never truncated. Summary corruption fails closed, expiry asks the owner to
+resend, and context-capacity exhaustion preserves the session for recovery.
+Generic owner memory uses separate owner/channel-scoped tables and private
+artifacts; explicit remember/correct/forget actions are required for active
+writes, and academic learning-focus memory remains a separate domain.
+The native default is a 16,384-token context with 13,824 input tokens, 1,024
+output tokens, and a 1,536-token reserve; startup rejects incoherent budgets.
 
 The sole automatic planner schedule is the host-rendered combined morning
 notification. It runs from `ACADEMIC_MORNING_SCHEDULE` in `APP_TIMEZONE`, uses
@@ -310,17 +338,35 @@ confirmation event, rechecks Notion page/property/owned-target preconditions,
 and updates only the Date property or the LifeAgent-owned preparation child
 page.
 
+The reserved active `misc` row in the configured Courses database is a third
+planner calendar role for personal/general timed to-dos. The role is assigned
+only when the top-level Courses row title normalizes exactly to `misc`; no
+hardcoded Notion page, database, data-source, or calendar-view ID is accepted.
+The row uses the same seeded child Assessments/Assessment Calendar structure as
+course rows, with exactly one `Name` title property and one `Date` date
+property. Missing, duplicate, inaccessible, or malformed misc setup fails
+closed and produces an actionable setup condition rather than routing the item
+to a course or Jobs.
+
+General timed requests such as `scrub toilets @6 pm tdy` are selected
+semantically by Qwen through the dedicated `create_misc_task` mutation, not by
+course or career tools. Host validation rechecks that the selected target is
+the unique reserved `misc` calendar and that the due time is future-dated, then
+renders the canonical `Task — <title>` proposal. The write path is identical to
+academic proposals: no Notion change occurs before the exact owner
+confirmation, and confirmation writes only the discovered `Name` and `Date`
+properties on the misc row's Assessments data source.
+
 ---
 
 ## 4. University personal-assistant and academic planner
 
 ### Goal
 
-Use Notion as the source of truth for assignments, tests, quizzes, events,
-rubrics, instructions, and course outlines. Convert those inputs into a
-realistic day-by-day work and study plan, send the host-rendered automatic
-morning calendar briefing through Discord, and run an end-of-day progress
-check-in through Discord.
+Use Notion as the source of truth for assignments, tests, quizzes, ordinary
+calendar events, rubrics, instructions, and course outlines. Send a
+host-rendered automatic morning calendar briefing through Discord and retain
+learning-focus memory for personalized academic help.
 
 ```text
 Notion assessment calendar + attached PDFs/pages
@@ -329,12 +375,12 @@ Typed calendar facts + lossless private material ingestion/OCR
                     ↓
 Assessment-scoped chunks + local embeddings + semantic evidence critic
                     ↓
-Deterministic scheduler + bounded Qwen semantic conversation reasoning
+Bounded Qwen semantic event and conversation reasoning
                     ↓
-Proposed Discord response, study blocks, carry-forward queue, model-free confirmations
+Neutral agenda, ordinary event proposals, and confirmation-gated writes
 ```
 
-The automatic morning path keeps scheduling and delivery deterministic while
+The automatic morning path keeps source truth and delivery host-owned while
 using Qwen for bounded event semantics:
 
 ```text
@@ -342,9 +388,7 @@ ACADEMIC_MORNING_SCHEDULE in APP_TIMEZONE
                     ↓
 fresh complete Notion sync
                     ↓
-deterministic allocator for the intended local day
-                    ↓
-inclusive 10-day-12-hour course and Jobs event inventory
+inclusive 10-day-12-hour course, misc, and Jobs event inventory
                     ↓
 bounded event evidence → Qwen interpreter + critic → exact semantic cache
                     ↓
@@ -353,14 +397,16 @@ host-rendered, retry-safe multipart Discord briefing
 
 ### Suggested Notion structure
 
-Use one top-level Courses database. Each course row/page owns one seeded inline
-Assessments database; its calendar is only a view over those assessment pages.
+Use one top-level Courses database. Each ordinary course row/page owns one
+seeded inline Assessments database; its calendar is only a view over those
+assessment pages. The reserved `Jobs` and `misc` rows are semantic roles in
+that same top-level database, not separately configured Notion IDs.
 
 | Source | Essential fields |
 | --- | --- |
 | Courses | Course Code title, priority ranking, course-outline PDF/page, term, assessment policy |
-| Per-course Assessments | Name title, Date, optional typed metadata, arbitrary body text, and supported PDF attachments |
-| PostgreSQL study/work blocks | Linked assessment, planned duration, actual duration, completion state, notes |
+| Per-course and misc Assessments | Name title, Date, optional typed metadata, arbitrary body text, and supported PDF attachments |
+| PostgreSQL semantic event cache | Independent activity intent, cited overview/description, model/config/prompt versions |
 
 The configured Discord runtime is one native, role-separated model harness. It
 receives authorized free-form input intact, can answer unrelated questions, and
@@ -369,23 +415,27 @@ tool call, the model's own action description is passed through the durable
 response path. The editable progress message also uses bounded, host-authored
 activity labels without request details. Structured tool results remain
 internal, failures are summarized safely, and hidden reasoning is never exposed.
-The deterministic application boundary validates only tool schemas,
+The host application boundary validates only tool schemas,
 allowlisted/owner-scoped IDs, time and size bounds, stale-write preconditions,
 idempotency, and exact confirmation. The Notion calendar displays the underlying
-assessment pages; a studying-block assessment remains distinct from the
-generated study blocks that LifeAgent stores in PostgreSQL rather than exporting
-to Notion automatically.
+assessment pages. Study and review activity uses the same ordinary event records
+as other timed academic work; model-supported activity intent is stored
+independently from the event title and generated prose.
 
-Conversation-triggered study sessions use this same per-course Assessments
-calendar as their sole current Notion write path. Every message from an
+Conversation-triggered course events use this same per-course Assessments
+calendar as their sole academic Notion write path. Personal/general timed
+to-dos use the unique reserved `misc` row's Assessments calendar through the
+dedicated semantic `create_misc_task` mutation. These task deadlines are
+calendar reminders. Every message from an
 allowlisted owner in the private academic Discord channel is acknowledged,
 durably queued, and passed intact to the same harness. A mention is optional and
 is removed only as Discord transport syntax. The model may ask a natural
 follow-up without a separate deterministic clarification state machine.
-A resolved study session creates an ordered proposal, not a
-write. Its Discord preview is rendered by host code in Toronto local time and
-shows every course, canonical `Studying Block — <topic>` title, start, end, and
-duration before the exact `confirm <proposal-id>` command can apply it.
+A resolved course event or misc task creates an ordered proposal, not a write.
+Its Discord preview is rendered by host code in Toronto local time and shows
+every target, the exact natural course-event title or canonical
+`Task — <title>`, start or due time, and duration when applicable before the
+exact `confirm <proposal-id>` command can apply it.
 
 Authorized PDF attachments use the same conversation and confirmation boundary.
 The Gateway captures only bounded attachment metadata before the acknowledgement;
@@ -418,13 +468,15 @@ apply. Upload uncertainty or partial failure is terminal for automatic replay;
 the old architecture is not retained as a fallback write path.
 
 No external calendar is involved: not Google Calendar, Apple Calendar, Microsoft
-Calendar, or a separate Notion Calendar API. LifeAgent also does not publish
-planner-generated PostgreSQL `StudyBlock` allocations to Notion automatically.
-Confirmed study-session writes create assessment pages under the discovered
+Calendar, or a separate Notion Calendar API. Confirmed course-event writes create
+ordinary assessment pages under the discovered
 course-owned Assessments data source, using only the discovered title and date
-property IDs. For these pages, the Notion Date value must include both `start`
-and `end`; historical start-only studying-block records remain readable legacy
-assessment facts.
+property IDs. Confirmed misc-task writes use the discovered title and date
+property IDs from the unique reserved `misc` row's Assessments data source.
+For timed course-event pages, the Notion Date value includes both `start` and
+`end`. Historical externally owned titles are left unchanged. Misc tasks are
+due-at items and use the single selected
+future Date value.
 
 ### Ingestion flow
 
@@ -433,8 +485,8 @@ assessment facts.
 3. Extract up to 15 PDF pages with block/page citations and bounded local OCR;
    mark incomplete visual coverage `partial`.
 4. Chunk and embed material locally, with every read hard-scoped to its assessment.
-5. Let the semantic material agent select free-form, useful insights for today's
-   scheduled block and require exact evidence chunk IDs plus a separate critic.
+5. Let the semantic material agent select free-form, useful assessment insights
+   and require exact evidence chunk IDs plus a separate critic.
 6. Build a bounded, versioned material profile from cited evidence; a separate
    critic must accept it before activation, and the previous accepted profile
    remains active if refresh fails.
@@ -442,73 +494,29 @@ assessment facts.
    Qwen has semantically interpreted free-form conversation. Ambiguous weights
    or other typed facts never become hard constraints without reconciliation.
 
-### Assignment prioritization
+### Prioritization and scheduling status
 
-For each assignment, Qwen produces a work breakdown:
+The former deterministic study-block allocator, daily-plan persistence, and
+carry-forward scheduler are removed and are not an alternate runtime path.
+Material profiles may retain cited scope, effort, and dependency-risk evidence
+for interactive assistance, but they do not create PostgreSQL study blocks or
+move Notion dates. New calendar time is proposed through the native Discord
+harness and requires exact owner confirmation before a scoped Notion write.
 
-- Deliverables and grading criteria.
-- Likely research, build, write, test, and submission steps.
-- Dependencies.
-- Estimated effort range.
-- Risk of leaving work late.
-- Remaining available work sessions before the deadline.
+### Automatic agenda and interactive updates
 
-The priority is explainable:
-
-```text
-assignment priority =
-deadline pressure
-+ grade weight
-+ effort remaining ÷ available time
-+ dependency/risk
-+ course priority
-```
-
-Time estimates improve from actual time logged against previous assignment types and courses.
-Material-derived effort signals may scale a typed estimate only from `0.5x` to
-`2x`. Scope and dependency-risk adjustments are each capped at 20 priority
-points. They never change a deadline, fixed commitment, grade weight, or course
-priority.
-
-### Test and quiz prioritization
-
-The course outline plus the Notion test scope provides the ground truth.
-
-```text
-test-study priority =
-deadline pressure
-+ test/quiz weight
-+ course-priority ranking
-+ scope size
-+ current confidence gap
-```
-
-A low-weight quiz tomorrow covering two topics receives a short review block. A heavily weighted midterm in a high-priority course with broad scope receives spaced blocks across multiple days. Qwen can create topic-level study tasks but must not claim mastery because it generated study materials.
-
-### Scheduling and carry-forward rules
-
-- Fixed classes, events, sleep, commute, and personal commitments are non-negotiable.
-- Reserve buffer time; a 100% full calendar is not realistic.
-- Plan the next 7–14 days in detail.
-- Give high-priority tasks protected deep-work blocks with realistic durations.
-- Never move a test, deadline, or required event.
-- Automatically roll incomplete work blocks forward, label them as carried over, and re-evaluate their priority.
-- Ask before changing a deadline or creating a major new calendar commitment.
-
-### Daily interaction and end-of-day Discord check-in
-
-The deterministic allocator remains authoritative for deadlines, planned start
-times, study durations, carry-forward, and deferred work. The automatic morning
-notification is the sole executable academic schedule. It performs a fresh
-complete Notion sync, builds the intended Toronto-local day, inventories every
-active dated course and Jobs event through the exact inclusive 10-day-12-hour
-endpoint, and asks Qwen only for cited event-local semantics. Model failure
-removes only unverified overview/description prose; trusted calendar metadata
-still renders with one honest availability condition. The full multipart
-manifest is persisted before sending so retries resume missing parts without
-duplicating delivered content. If academic Notion data is inaccessible,
-incomplete, stale, or misconfigured, the job reports an actionable setup/source
-condition instead of sending a false light-day message.
+The automatic morning notification is the sole executable academic schedule.
+It performs a fresh complete Notion sync and inventories every
+active dated course, misc, and Jobs event through the exact inclusive
+10-day-12-hour endpoint, and asks Qwen only for cited event-local semantics.
+Model failure removes only unverified overview/description prose; trusted
+calendar metadata still renders with one honest availability condition. The
+full multipart manifest is persisted before sending so retries resume missing
+parts without duplicating delivered content. The rendered briefing separates
+course dates, misc tasks, and job events so a personal to-do is never presented
+as coursework or interview preparation. If academic Notion data is
+inaccessible, incomplete, stale, or misconfigured, the job reports an
+actionable setup/source condition instead of sending a false light-day message.
 
 Operational health persists this schedule as `health_checks.check_name =
 'academic_morning'`. Before the configured occurrence and throughout the grace
@@ -517,18 +525,11 @@ reports attention for a missing run, failed/attention run, missing delivery,
 failed delivery, or uncertain delivery. A successful run advances the next
 expected time to the following occurrence plus grace.
 
-A model-free end-of-day reminder may ask in Discord:
-
-1. What progress was made on each of today’s planned to-dos?
-2. How did each test or quiz taken today go?
-3. Are there any new tasks, deadlines, tests, or events that should be added to Notion?
-
 Every message from an allowlisted owner in the authorized private channel may
 reach Qwen. Exact confirmation and rejection commands remain deterministic,
-model-free HITL hooks and are intercepted before the harness. The
-planner should update time estimates and the next-day plan only from confirmed
-progress; it must not infer that planned work was completed merely because it
-appeared on the calendar.
+model-free HITL hooks and are intercepted before the harness. The assistant may
+record explicit progress or propose new calendar events, but it must not infer
+completion merely because an item appeared in the morning agenda.
 
 Confirmed Notion batches are not treated as atomic because Notion does not
 provide multi-page transactions. The proposal enters a durable `applying` state
@@ -553,13 +554,13 @@ The frontend's complete architecture and implementation guidance lives in [front
 
 ## Recommended implementation order
 
-1. Build the Discord-mentioned academic assistant as the only configured
-   conversation-triggered study-session path.
-2. Treat historical/planned scheduled study-plan Qwen, code-review Qwen, and
-   finance Qwen workflows as non-executable in the current runtime; restoring
-   them requires a future architecture change. The host-controlled morning
-   briefing, including its bounded event-semantic calls, remains the only
-   automatic academic schedule.
+1. Maintain the Discord-mentioned academic assistant as the only configured
+   conversation-triggered path for proposing ordinary course calendar events.
+2. Keep the removed historical study-plan allocator non-executable. Scheduled
+   code-review and finance Qwen workflows also remain non-executable in the
+   current runtime; restoring them requires a future architecture change. The
+   host-controlled morning briefing, including its bounded event-semantic
+   calls, remains the only automatic academic schedule.
 3. Consider any future scheduled finance briefing only after selecting and
    authorizing the exact eight-source allowlist, subscriptions/data access, and a
    new runtime design.

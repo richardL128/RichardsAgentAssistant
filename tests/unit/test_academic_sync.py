@@ -306,7 +306,7 @@ def _course(
 
 
 @pytest.mark.asyncio
-async def test_sync_continues_valid_courses_and_deduplicates_requests() -> None:
+async def test_sync_continues_valid_courses_and_accepts_untyped_generic_events() -> None:
     valid = _course(
         "course-1",
         "BIO 101",
@@ -346,16 +346,13 @@ async def test_sync_continues_valid_courses_and_deduplicates_requests() -> None:
     assert first.status == "partial"
     assert first.valid_course_count == 1
     assert first.assessment_count == 2
-    assert first.clarification_count == 1
+    assert first.clarification_count == 0
     assert first.archived_count == 1
     assert [item[1] for item in store.assessments[:2]] == ["quiz", "event"]
-    assert store.assessments[1][0].fact_state == "ambiguous"
+    assert store.assessments[1][0].fact_state == "confirmed"
     assert store.reconciled[0] == ("assessment-source", ("event-quiz", "event-unknown"))
     assert set(store.cursors) == {"courses-source", "assessment-source"}
-    assert len(discord.clarifications) == 1
-    assert discord.clarifications[0].tutorial_title_preview == "Tutorial — Chapter 4"
-    assert discord.clarifications[0].lab_title_preview == "Lab — Chapter 4"
-    assert discord.clarifications[0].studying_block_title_preview == ("Studying Block — Chapter 4")
+    assert discord.clarifications == []
     assert len(discord.reminders) == 1
     assert second.clarification_count == 0
 
@@ -373,7 +370,7 @@ async def test_sync_persists_valid_notion_date_end() -> None:
                 assessments=(
                     _assessment(
                         "event-study",
-                        "Studying Block - Race conditions",
+                        "Review race conditions",
                         due=NotionDateValue(
                             start="2026-09-10T23:00:00.000Z",
                             end="2026-09-10T23:45:00.000Z",
@@ -413,7 +410,7 @@ async def test_sync_rejects_invalid_notion_date_end_without_persisting_end() -> 
                 assessments=(
                     _assessment(
                         "event-study",
-                        "Studying Block - Race conditions",
+                        "Review race conditions",
                         due=NotionDateValue(
                             start="2026-09-10T23:00:00.000Z",
                             end="2026-09-10T22:45:00.000Z",
@@ -549,6 +546,74 @@ async def test_sync_persists_recognized_expanded_type_without_event_downgrade(
 
 
 @pytest.mark.asyncio
+async def test_sync_reserved_misc_row_persists_tasks_without_clarification() -> None:
+    misc = _course(
+        "misc-calendar",
+        "  MiSc  ",
+        assessments=(_assessment("event-toilets", "scrub the toilets"),),
+    )
+    discovery = NotionDiscoveryResult(
+        courses_database_id="courses-db",
+        courses_source_id="courses-source",
+        courses_source_type="data_source",
+        courses=(misc,),
+        synced_at=NOW,
+    )
+    store = _Store()
+    discord = _Discord()
+    syncer = AcademicNotionSync(
+        connector=cast(NotionConnector, _Connector(discovery)),
+        store=store,
+        discord=discord,
+        discord_channel_id=CHANNEL,
+    )
+
+    result = await syncer.sync(now=NOW)
+
+    assert result.status == "succeeded"
+    assert result.assessment_count == 1
+    assert result.clarification_count == 0
+    assessment, kind, label_source = store.assessments[0]
+    assert assessment.title == "Task — scrub the toilets"
+    assert assessment.current_title == "Task — scrub the toilets"
+    assert kind == "task"
+    assert label_source == "reserved_misc_calendar"
+    assert assessment.fact_state == "confirmed"
+    assert discord.clarifications == []
+
+
+@pytest.mark.asyncio
+async def test_sync_duplicate_reserved_misc_rows_fail_closed() -> None:
+    discovery = NotionDiscoveryResult(
+        courses_database_id="courses-db",
+        courses_source_id="courses-source",
+        courses_source_type="data_source",
+        courses=(
+            _course("misc-calendar-1", "misc"),
+            _course("misc-calendar-2", " MISC "),
+        ),
+        synced_at=NOW,
+    )
+    store = _Store()
+    syncer = AcademicNotionSync(
+        connector=cast(NotionConnector, _Connector(discovery)),
+        store=store,
+    )
+
+    result = await syncer.sync(now=NOW)
+
+    assert result.status == "partial"
+    assert result.valid_course_count == 0
+    assert result.invalid_calendar_count == 2
+    assert result.diagnostic_codes == ("misc_calendar_duplicate",)
+    assert [(status, code) for _course_row, status, code in store.calendars] == [
+        ("duplicate", "misc_calendar_duplicate"),
+        ("duplicate", "misc_calendar_duplicate"),
+    ]
+    assert store.assessments == []
+
+
+@pytest.mark.asyncio
 async def test_missing_configuration_persists_setup_without_model_or_write() -> None:
     store = _Store()
     syncer = AcademicNotionSync(connector=None, store=store)
@@ -612,7 +677,7 @@ async def test_authorized_choice_is_exact_guarded_write_and_replay_is_harmless()
         ("assignment", "Assignment — Chapter 4"),
         ("tutorial", "Tutorial — Chapter 4"),
         ("lab", "Lab — Chapter 4"),
-        ("studying_block", "Studying Block — Chapter 4"),
+        ("event", "Chapter 4"),
     ],
 )
 @pytest.mark.asyncio

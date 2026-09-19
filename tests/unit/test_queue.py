@@ -396,6 +396,37 @@ async def test_discord_wake_deferral_uses_global_model_lock_and_per_wake_queuein
 
 
 @pytest.mark.asyncio
+async def test_discord_wake_deferral_recovers_job_id_after_queue_acceptance_race(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class DuplicateTask:
+        def configure(self, **_kwargs: str) -> DuplicateTask:
+            return self
+
+        async def defer_async(self, **_kwargs: str) -> int:
+            raise AlreadyEnqueued("duplicate queueing lock")
+
+    wake_id = "77777777-7777-4777-8777-777777777777"
+    queueing_lock = f"discord-wake:{wake_id}"
+
+    async def list_jobs_async(**kwargs: str):
+        assert kwargs == {
+            "task": "lifeagent.discord_academic",
+            "queueing_lock": queueing_lock,
+        }
+        return [SimpleNamespace(id=41), SimpleNamespace(id=42)]
+
+    monkeypatch.setattr(tasks, "discord_wake_task", DuplicateTask())
+    monkeypatch.setattr(
+        tasks.procrastinate_app.job_manager,
+        "list_jobs_async",
+        list_jobs_async,
+    )
+
+    assert await tasks.defer_discord_wake(wake_id) == 42
+
+
+@pytest.mark.asyncio
 async def test_academic_clarification_deferral_uses_per_clarification_lock_without_model_lock(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -418,7 +449,7 @@ async def test_academic_clarification_deferral_uses_per_clarification_lock_witho
 
     result = await tasks.defer_academic_clarification(
         clarification_id=clarification_id,
-        action="studying_block",
+        action="event",
         user_id="123456789012345678",
     )
 
@@ -429,7 +460,7 @@ async def test_academic_clarification_deferral_uses_per_clarification_lock_witho
     }
     assert task.arguments == {
         "clarification_id": clarification_id,
-        "action": "studying_block",
+        "action": "event",
         "user_id": "123456789012345678",
     }
 

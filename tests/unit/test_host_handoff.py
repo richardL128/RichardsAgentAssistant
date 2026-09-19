@@ -5,6 +5,7 @@ import pytest
 from pydantic import SecretStr
 
 from app.host.handoff import (
+    DiscordHostAbortEvent,
     DiscordHostHandoffClient,
     DiscordHostHandoffEvent,
     HandoffRejectedError,
@@ -27,6 +28,18 @@ def _event() -> DiscordHostHandoffEvent:
     )
 
 
+def _abort_event() -> DiscordHostAbortEvent:
+    return DiscordHostAbortEvent(
+        abort_message_id="555555555555555555",
+        channel_id="222222222222222222",
+        author_id="333333333333333333",
+        event_timestamp=datetime(2026, 9, 9, tzinfo=UTC),
+        acknowledgement_message_id="666666666666666666",
+        handoff_timestamp=datetime(2026, 9, 9, 1, tzinfo=UTC),
+        nonce=handoff_nonce("555555555555555555"),
+    )
+
+
 def test_handoff_body_is_canonical_reference_only_and_signed() -> None:
     secret = SecretStr("handoff-secret")
     body = canonical_handoff_body(_event())
@@ -37,6 +50,12 @@ def test_handoff_body_is_canonical_reference_only_and_signed() -> None:
     assert signature.startswith("sha256=")
     assert verify_handoff_signature(body, signature, secret)
     assert not verify_handoff_signature(body, signature, SecretStr("wrong"))
+
+    abort_body = canonical_handoff_body(_abort_event())
+    assert b"ABORT" not in abort_body
+    assert b"content" not in abort_body
+    assert b"token" not in abort_body
+    assert b"acknowledgement_message_id" in abort_body
 
 
 @pytest.mark.asyncio
@@ -57,6 +76,38 @@ async def test_handoff_client_posts_signed_body_and_accepts_202() -> None:
     assert result.status == "accepted"
     assert requests[0].headers["x-lifeagent-handoff-signature"].startswith("sha256=")
     assert requests[0].content == canonical_handoff_body(_event())
+
+
+@pytest.mark.asyncio
+async def test_handoff_client_posts_abort_to_sibling_endpoint_and_validates_receipt() -> None:
+    requests: list[httpx.Request] = []
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        return httpx.Response(
+            202,
+            json={
+                "status": "accepted",
+                "target_count": 2,
+                "running_count": 1,
+                "queued_count": 1,
+                "safe_activity_label": "model wait",
+                "safe_tool_status": "cancelled",
+            },
+        )
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+        result = await DiscordHostHandoffClient(
+            endpoint_url="http://127.0.0.1:8000/internal/discord/academic/handoff",
+            secret=SecretStr("handoff-secret"),
+            client=client,
+        ).submit_abort(_abort_event())
+
+    assert result.status == "accepted"
+    assert result.target_count == 2
+    assert requests[0].url.path == "/internal/discord/academic/abort"
+    assert requests[0].headers["x-lifeagent-handoff-signature"].startswith("sha256=")
+    assert requests[0].content == canonical_handoff_body(_abort_event())
 
 
 @pytest.mark.asyncio
