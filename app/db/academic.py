@@ -16,7 +16,7 @@ from datetime import UTC, date, datetime, timedelta
 from typing import Any, Literal, cast
 from zoneinfo import ZoneInfo
 
-from sqlalchemy import delete, func, or_, select, update
+from sqlalchemy import and_, delete, func, or_, select, update
 from sqlalchemy.exc import IntegrityError, NoResultFound
 from sqlalchemy.orm import Session
 
@@ -257,6 +257,8 @@ class CourseCalendarInput:
     title_property_name: str | None = None
     date_property_id: str | None = None
     date_property_name: str | None = None
+    learn_context_property_id: str | None = None
+    learn_context_property_name: str | None = None
     discovery_status: str = "valid"
     diagnostic_code: str | None = None
     diagnostic_fingerprint: str | None = None
@@ -287,6 +289,7 @@ class AcademicCourseMutationTarget:
     data_source_id: str
     title_property_id: str
     date_property_id: str
+    learn_context_property_id: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -300,6 +303,10 @@ class AcademicAssessmentMutationTarget:
     last_edited_at: datetime
     title_property_id: str
     date_property_id: str
+    due_at: datetime | None = None
+    ends_at: datetime | None = None
+    learn_context_property_id: str | None = None
+    is_all_day: bool = False
 
 
 @dataclass(frozen=True, slots=True)
@@ -1044,6 +1051,8 @@ class AcademicRepository:
             "title_property_name": _bounded_optional(calendar.title_property_name),
             "date_property_id": _bounded_optional(calendar.date_property_id),
             "date_property_name": _bounded_optional(calendar.date_property_name),
+            "learn_context_property_id": _bounded_optional(calendar.learn_context_property_id),
+            "learn_context_property_name": _bounded_optional(calendar.learn_context_property_name),
             "discovery_status": calendar.discovery_status,
             "diagnostic_code": _bounded_optional(calendar.diagnostic_code, 128),
             "diagnostic_fingerprint": _bounded_optional(calendar.diagnostic_fingerprint, 128),
@@ -4175,8 +4184,35 @@ class SQLAlchemyAcademicPlannerStore:
                     calendar_role=academic_calendar_role(course.title),
                 )
                 for course, _calendar in rows
+                if academic_calendar_role(course.title) is AcademicCalendarRole.COURSE
             ]
         return tuple(options)
+
+    def load_active_morning_courses(self) -> tuple[Mapping[str, str], ...]:
+        """Return every active, valid, non-reserved course in stable display order."""
+
+        with Session(self.engine) as session:
+            rows = session.execute(
+                select(Course, AcademicCourseCalendar)
+                .join(AcademicCourseCalendar, AcademicCourseCalendar.course_id == Course.id)
+                .where(
+                    Course.active.is_(True),
+                    AcademicCourseCalendar.discovery_status == "valid",
+                    AcademicCourseCalendar.child_data_source_id.is_not(None),
+                    AcademicCourseCalendar.title_property_id.is_not(None),
+                    AcademicCourseCalendar.date_property_id.is_not(None),
+                )
+                .order_by(Course.course_code, Course.term, Course.id)
+            )
+            return tuple(
+                {
+                    "course_id": course.notion_id,
+                    "course_code": course.course_code,
+                    "title": course.title,
+                }
+                for course, _calendar in rows
+                if academic_calendar_role(course.title) is AcademicCalendarRole.COURSE
+            )
 
     def search_misc_courses(self) -> Sequence[Any]:
         """Return at most two valid reserved misc targets for uniqueness checks."""
@@ -4207,6 +4243,101 @@ class SQLAlchemyAcademicPlannerStore:
                 )
                 for course, _calendar in rows
             )
+
+    def resolve_learn_calendar_targets(self) -> tuple[AcademicCourseMutationTarget, ...]:
+        """Resolve zero, one, or multiple exact reserved LEARN calendars fail-closed."""
+
+        with Session(self.engine) as session:
+            rows = session.execute(
+                select(Course, AcademicCourseCalendar)
+                .join(AcademicCourseCalendar, AcademicCourseCalendar.course_id == Course.id)
+                .where(
+                    Course.active.is_(True),
+                    AcademicCourseCalendar.discovery_status == "valid",
+                    AcademicCourseCalendar.child_data_source_id.is_not(None),
+                    AcademicCourseCalendar.title_property_id.is_not(None),
+                    AcademicCourseCalendar.date_property_id.is_not(None),
+                    AcademicCourseCalendar.learn_context_property_id.is_not(None),
+                )
+                .order_by(Course.id)
+            )
+            targets = [
+                AcademicCourseMutationTarget(
+                    course_id=str(course.id),
+                    course_code=course.course_code,
+                    data_source_id=cast(str, calendar.child_data_source_id),
+                    title_property_id=cast(str, calendar.title_property_id),
+                    date_property_id=cast(str, calendar.date_property_id),
+                    learn_context_property_id=cast(str, calendar.learn_context_property_id),
+                )
+                for course, calendar in rows
+                if academic_calendar_role(course.title) is AcademicCalendarRole.LEARN
+            ]
+            return tuple(targets[:2])
+
+    def load_learn_calendar_candidates(
+        self,
+        *,
+        relevant_dates: Sequence[date],
+        timezone: str = "America/Toronto",
+        limit: int = 20,
+    ) -> tuple[Mapping[str, Any], ...]:
+        """Return bounded candidates only from the exact reserved LEARN calendar."""
+
+        if limit < 1 or limit > 20:
+            raise ValueError("LEARN candidate limit must be between 1 and 20")
+        wanted = frozenset(relevant_dates)
+        if not wanted:
+            return ()
+        zone = ZoneInfo(timezone)
+        with Session(self.engine) as session:
+            rows = session.execute(
+                select(Assessment, Course, AcademicCourseCalendar)
+                .join(Course, Course.id == Assessment.course_id)
+                .join(
+                    AcademicCourseCalendar,
+                    AcademicCourseCalendar.course_id == Course.id,
+                )
+                .where(
+                    Course.active.is_(True),
+                    Assessment.active.is_(True),
+                    Assessment.archived.is_(False),
+                    Assessment.due_at.is_not(None),
+                    Assessment.notion_last_edited_at.is_not(None),
+                    AcademicCourseCalendar.discovery_status == "valid",
+                    AcademicCourseCalendar.learn_context_property_id.is_not(None),
+                )
+                .order_by(Assessment.due_at, Assessment.id)
+                .limit(200)
+            )
+            candidates: list[Mapping[str, Any]] = []
+            for assessment, course, calendar in rows:
+                if academic_calendar_role(course.title) is not AcademicCalendarRole.LEARN:
+                    continue
+                due_at = _aware_db(cast(datetime, assessment.due_at))
+                candidate_date = (
+                    due_at.date() if assessment.is_all_day else due_at.astimezone(zone).date()
+                )
+                if candidate_date not in wanted:
+                    continue
+                candidates.append(
+                    {
+                        "assessment_id": str(assessment.id),
+                        "course_id": str(course.id),
+                        "page_id": assessment.notion_id,
+                        "title": assessment.title,
+                        "due_at": due_at,
+                        "ends_at": assessment.ends_at,
+                        "is_all_day": assessment.is_all_day,
+                        "last_edited_at": _aware_db(
+                            cast(datetime, assessment.notion_last_edited_at)
+                        ),
+                        "learn_context_property_id": calendar.learn_context_property_id,
+                    }
+                )
+                if len(candidates) >= limit:
+                    break
+            return tuple(candidates)
 
     def search_assessments(
         self,
@@ -4548,6 +4679,7 @@ class SQLAlchemyAcademicPlannerStore:
                 data_source_id=cast(str, calendar.child_data_source_id),
                 title_property_id=cast(str, calendar.title_property_id),
                 date_property_id=cast(str, calendar.date_property_id),
+                learn_context_property_id=calendar.learn_context_property_id,
             )
 
     def resolve_assessment_mutation_target(
@@ -4592,6 +4724,10 @@ class SQLAlchemyAcademicPlannerStore:
                 last_edited_at=_aware_db(cast(datetime, assessment.notion_last_edited_at)),
                 title_property_id=cast(str, assessment.title_property_id),
                 date_property_id=cast(str, calendar.date_property_id),
+                due_at=assessment.due_at,
+                ends_at=assessment.ends_at,
+                learn_context_property_id=calendar.learn_context_property_id,
+                is_all_day=assessment.is_all_day,
             )
 
     def get_sync_cursor(self, database: str) -> str | None:
@@ -5081,6 +5217,87 @@ class SQLAlchemyAcademicPlannerStore:
             items.sort(key=lambda item: (item[0], item[1], item[2], item[3], item[4]["event_id"]))
             return tuple(item[-1] for item in items)
 
+    def load_morning_calendar_items(
+        self,
+        *,
+        occurrence: date | datetime,
+        timezone: str = "America/Toronto",
+    ) -> tuple[Mapping[str, Any], ...]:
+        """Select course-week and today-overlap facts using Toronto local-day boundaries."""
+
+        tz = ZoneInfo(timezone)
+        day_start, day_end = _local_day_window(occurrence, tz)
+        course_end = day_start + timedelta(days=8)
+        query_start = day_start.astimezone(UTC) - timedelta(days=1)
+        query_end = course_end.astimezone(UTC) + timedelta(days=1)
+        with Session(self.engine) as session:
+            rows = list(
+                session.execute(
+                    select(Assessment, Course)
+                    .join(Course, Assessment.course_id == Course.id)
+                    .where(
+                        Course.active.is_(True),
+                        Assessment.active.is_(True),
+                        Assessment.archived.is_(False),
+                        Assessment.completed.is_(False),
+                        Assessment.due_at.is_not(None),
+                        Assessment.due_at < query_end,
+                        or_(
+                            Assessment.due_at >= query_start,
+                            and_(
+                                Assessment.ends_at.is_not(None),
+                                Assessment.ends_at > query_start,
+                            ),
+                        ),
+                    )
+                )
+            )
+        items: list[tuple[datetime, str, str, str, Mapping[str, Any]]] = []
+        for row, course in rows:
+            role = academic_calendar_role(course.title)
+            due_at = _aware_db(cast(datetime, row.due_at))
+            local_start = _calendar_local_start(due_at, is_all_day=row.is_all_day, timezone=tz)
+            local_end = (
+                _calendar_local_start(
+                    _aware_db(row.ends_at),
+                    is_all_day=row.is_all_day,
+                    timezone=tz,
+                )
+                if row.ends_at is not None
+                else None
+            )
+            if role is AcademicCalendarRole.COURSE:
+                selected = day_start <= local_start < course_end
+            else:
+                effective_end = local_end or (
+                    local_start + timedelta(days=1) if row.is_all_day else local_start
+                )
+                selected = (
+                    local_start < day_end and effective_end > day_start
+                    if local_end is not None or row.is_all_day
+                    else day_start <= local_start < day_end
+                )
+            if not selected:
+                continue
+            item = _assessment_calendar_item(
+                row,
+                course,
+                local_start=local_start,
+                window_start=day_start,
+                timezone=tz,
+            )
+            items.append(
+                (
+                    local_start,
+                    role.value,
+                    course.course_code.casefold(),
+                    row.title.casefold(),
+                    item,
+                )
+            )
+        items.sort(key=lambda item: (item[0], item[1], item[2], item[3], item[4]["event_id"]))
+        return tuple(item[-1] for item in items)
+
     def save_assessment_calendar_semantics(
         self,
         notion_id: str,
@@ -5420,6 +5637,8 @@ class SQLAlchemyAcademicPlannerStore:
                     title_property_name=_field(course, "title_property_name"),
                     date_property_id=_field(course, "date_property_id"),
                     date_property_name=_field(course, "date_property_name"),
+                    learn_context_property_id=_field(course, "learn_context_property_id"),
+                    learn_context_property_name=_field(course, "learn_context_property_name"),
                     discovery_status=status,
                     diagnostic_code=diagnostic_code,
                     diagnostic_fingerprint=schema_fingerprint,
@@ -6089,6 +6308,16 @@ def _calendar_window(occurrence: date | datetime, timezone: ZoneInfo) -> tuple[d
     return window_start, window_start + timedelta(days=10, hours=12)
 
 
+def _local_day_window(occurrence: date | datetime, timezone: ZoneInfo) -> tuple[datetime, datetime]:
+    if isinstance(occurrence, datetime):
+        local_day = _aware_db(occurrence).astimezone(timezone).date()
+    else:
+        local_day = occurrence
+    start = datetime.combine(local_day, datetime.min.time(), tzinfo=timezone)
+    end = datetime.combine(local_day + timedelta(days=1), datetime.min.time(), tzinfo=timezone)
+    return start, end
+
+
 def _calendar_local_start(value: datetime, *, is_all_day: bool, timezone: ZoneInfo) -> datetime:
     local = _aware_db(value).astimezone(timezone)
     if is_all_day:
@@ -6114,6 +6343,7 @@ def _assessment_calendar_item(
     description = row.calendar_semantic_description if semantic_status == "valid" else None
     return {
         "event_id": row.notion_id,
+        "source_id": course.notion_id,
         "source_area": academic_calendar_role(course.title).value,
         "source_label": course.course_code,
         "title": row.title,
@@ -6140,6 +6370,8 @@ def _assessment_calendar_item(
         ),
         "semantic_cache": _calendar_semantic_cache(row),
         "source_url": row.source_url,
+        "starts_at": due_at,
+        "ends_at": _aware_db(row.ends_at) if row.ends_at is not None else None,
         "source_last_edited_at": row.notion_last_edited_at,
         "source_fingerprint": row.calendar_semantic_source_fingerprint,
     }

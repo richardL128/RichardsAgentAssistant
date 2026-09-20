@@ -19,6 +19,7 @@ from pydantic import BaseModel, ConfigDict, Field, SecretStr, field_validator, m
 from sqlalchemy import Engine
 from sqlalchemy.orm import Session
 
+from app.agents.calendar_briefing.morning_manifest import MorningEmbedPayload
 from app.agents.finance.contracts import BriefingPayload
 from app.agents.finance.delivery import render_discord_briefing
 from app.core.config import DISCORD_API_BASE_URL, Settings
@@ -738,6 +739,16 @@ class AcademicDiscordMessage(BaseModel):
     content: str = Field(min_length=1, max_length=2_000)
 
 
+class AcademicDiscordEmbedMessage(BaseModel):
+    """One bounded host-rendered scheduled embed with no message content."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    delivery_id: UUID
+    channel_id: str = Field(pattern=r"^[0-9]{5,24}$")
+    embed: MorningEmbedPayload
+
+
 class AcademicClarificationMessage(BaseModel):
     """Bounded assessment-type clarification with opaque button identifiers."""
 
@@ -1014,7 +1025,9 @@ class DiscordAcademicPlannerAdapter:
             raise ValueError("Discord wake acknowledgement identity is invalid")
         return message
 
-    async def send(self, message: AcademicDiscordMessage) -> DiscordDeliveryReceipt:
+    async def send(
+        self, message: AcademicDiscordMessage | AcademicDiscordEmbedMessage
+    ) -> DiscordDeliveryReceipt:
         if message.channel_id not in self._allowed_channel_ids:
             raise ValueError("Discord academic target is not allowlisted")
         owns_client = self._client is None
@@ -1023,11 +1036,14 @@ class DiscordAcademicPlannerAdapter:
             timeout=httpx.Timeout(10.0),
         )
         request_json: dict[str, object] = {
-            "content": message.content,
             "nonce": _discord_nonce(message.delivery_id),
             "enforce_nonce": True,
             "allowed_mentions": {"parse": []},
         }
+        if isinstance(message, AcademicDiscordEmbedMessage):
+            request_json["embeds"] = [message.embed.model_dump(mode="json")]
+        else:
+            request_json["content"] = message.content
         slept_seconds = 0.0
         try:
             for attempt in range(1, _DISCORD_SEND_RATE_LIMIT_MAX_ATTEMPTS + 1):
@@ -1385,6 +1401,23 @@ class DiscordAcademicPlannerDelivery:
         """Deliver one deterministic scheduled academic notification."""
 
         return await self._send(_bounded_discord_content(content), idempotency_key)
+
+    async def send_scheduled_embed(
+        self,
+        embed: MorningEmbedPayload,
+        *,
+        idempotency_key: str,
+    ) -> Delivery:
+        """Deliver one host-rendered morning category embed."""
+
+        return await deliver_academic_embed(
+            engine=self._engine,
+            run_id=self._run_id,
+            channel_id=self._channel_id,
+            embed=embed,
+            idempotency_key=idempotency_key,
+            adapter=self._adapter,
+        )
 
     async def send_checkin(self, *, plan: Any | None, idempotency_key: str) -> Delivery:
         content = (
@@ -2170,6 +2203,32 @@ def _academic_proposal_preview(proposal: Any) -> str:
         )
     lines = [f"Proposed academic updates (proposal {proposal_id}):"]
     for change in changes:
+        if change.field in {
+            "create_learn_calendar_event",
+            "enrich_learn_calendar_event",
+        }:
+            operation = (
+                "Create a new event in `Classes + Tutorials + Labs`"
+                if change.field == "create_learn_calendar_event"
+                else f"Enrich existing `{change.expected_title}`"
+            )
+            date_value = getattr(change, "learn_date", None)
+            date_label = date_value.isoformat() if date_value is not None else "unset"
+            precision = getattr(change, "learn_date_precision", None) or "unknown"
+            course = getattr(change, "learn_course_code", None) or "unknown course"
+            summary = getattr(change, "learn_summary", None) or "summary unavailable"
+            lines.extend(
+                (
+                    f"- {operation}.",
+                    f"  - Source course: {course}",
+                    f"  - Grounded summary: {summary}",
+                    f"  - Date: {date_label} ({precision})",
+                    "  - Exact property changed: `LEARN Context` only."
+                    if change.field == "enrich_learn_calendar_event"
+                    else "  - New page properties: `Name`, `Date`, and `LEARN Context`.",
+                )
+            )
+            continue
         if change.field == "create_assessment":
             kind = getattr(change.assessment_type, "value", change.assessment_type) or "event"
             course = change.course_code or change.course_id or "the selected course"
@@ -2410,6 +2469,63 @@ async def deliver_academic_message(
         delivery_id=intent.delivery.id,
         channel_id=channel_id,
         content=content,
+    )
+    try:
+        receipt = await adapter.send(message)
+    except LifeAgentError as exc:
+        status = (
+            DeliveryStatus.UNCERTAIN
+            if exc.record.category is ErrorCategory.TRANSIENT
+            else DeliveryStatus.FAILED
+        )
+        code = (
+            ErrorCode.DELIVERY_UNCERTAIN.value
+            if status is DeliveryStatus.UNCERTAIN
+            else exc.record.code.value
+        )
+        await asyncio.to_thread(
+            _record_review_attempt,
+            engine,
+            delivery_id=intent.delivery.id,
+            status=status,
+            external_url=None,
+            error_code=code,
+        )
+        raise
+    return await asyncio.to_thread(
+        _record_review_attempt,
+        engine,
+        delivery_id=intent.delivery.id,
+        status=DeliveryStatus.SENT,
+        external_url=receipt.permalink,
+        error_code=None,
+    )
+
+
+async def deliver_academic_embed(
+    *,
+    engine: Engine,
+    run_id: UUID,
+    channel_id: str,
+    embed: MorningEmbedPayload,
+    idempotency_key: str,
+    adapter: DiscordAcademicPlannerAdapter,
+) -> Delivery:
+    """Open one category delivery intent, POST its embed, and persist the receipt."""
+
+    intent = await asyncio.to_thread(
+        _open_review_intent,
+        engine,
+        run_id=run_id,
+        target=channel_id,
+        key=idempotency_key,
+    )
+    if intent.already_delivered:
+        return intent.delivery
+    message = AcademicDiscordEmbedMessage(
+        delivery_id=intent.delivery.id,
+        channel_id=channel_id,
+        embed=embed,
     )
     try:
         receipt = await adapter.send(message)
@@ -2938,6 +3054,7 @@ async def deliver_daily_review_report(
 
 __all__ = [
     "AcademicClarificationMessage",
+    "AcademicDiscordEmbedMessage",
     "AcademicDiscordMessage",
     "AcademicSetupReminderMessage",
     "DailyReviewSummary",
@@ -2962,6 +3079,7 @@ __all__ = [
     "FailureAlert",
     "FinanceDiscordBriefingMessage",
     "ReviewSummary",
+    "deliver_academic_embed",
     "deliver_academic_message",
     "deliver_daily_review_report",
     "deliver_failure_alert",

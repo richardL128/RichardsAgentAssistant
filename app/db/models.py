@@ -1132,11 +1132,323 @@ class AcademicCourseCalendar(TimestampMixin, Base):
     title_property_name: Mapped[str | None] = mapped_column(String(255))
     date_property_id: Mapped[str | None] = mapped_column(String(255))
     date_property_name: Mapped[str | None] = mapped_column(String(255))
+    learn_context_property_id: Mapped[str | None] = mapped_column(String(255))
+    learn_context_property_name: Mapped[str | None] = mapped_column(String(255))
     discovery_status: Mapped[str] = mapped_column(String(32), nullable=False, default="valid")
     diagnostic_code: Mapped[str | None] = mapped_column(String(128))
     diagnostic_fingerprint: Mapped[str | None] = mapped_column(String(128))
     last_discovered_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     last_synced_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+
+
+class LearnCourse(TimestampMixin, Base):
+    """Bounded LEARN course metadata from visible Brightspace pages."""
+
+    __tablename__ = "learn_courses"
+    __table_args__ = (
+        UniqueConstraint("org_unit_id", name="uq_learn_courses_org_unit"),
+        CheckConstraint("length(org_unit_id) > 0", name="org_unit_id_nonempty"),
+        CheckConstraint("length(code) > 0", name="code_nonempty"),
+        CheckConstraint("length(name) > 0", name="name_nonempty"),
+        CheckConstraint("url IS NULL OR length(url) > 0", name="url_nonempty"),
+        Index("ix_learn_courses_active_code", "active", "code"),
+        Index("ix_learn_courses_term_code", "term", "code"),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(primary_key=True, default=uuid.uuid4)
+    org_unit_id: Mapped[str] = mapped_column(String(128), nullable=False)
+    code: Mapped[str] = mapped_column(String(64), nullable=False)
+    name: Mapped[str] = mapped_column(String(255), nullable=False)
+    term: Mapped[str | None] = mapped_column(String(128))
+    active: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
+    url: Mapped[str | None] = mapped_column(String(2048))
+    first_seen_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    last_seen_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    disappeared_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+
+
+class LearnScheduledItem(TimestampMixin, Base):
+    """Normalized LEARN calendar/schedule item metadata."""
+
+    __tablename__ = "learn_scheduled_items"
+    __table_args__ = (
+        UniqueConstraint("source_id", name="uq_learn_scheduled_items_source"),
+        UniqueConstraint("source_id", "fingerprint", name="uq_learn_scheduled_items_fingerprint"),
+        CheckConstraint("length(source_id) > 0", name="source_id_nonempty"),
+        CheckConstraint("length(title) > 0", name="title_nonempty"),
+        CheckConstraint("length(fingerprint) > 0", name="fingerprint_nonempty"),
+        CheckConstraint(
+            "date_precision IN ('date','datetime')",
+            name="date_precision_valid",
+        ),
+        CheckConstraint(
+            "completion_state IN ('unknown','incomplete','complete','cancelled')",
+            name="completion_state_valid",
+        ),
+        CheckConstraint(
+            "end_at IS NULL OR start_at IS NULL OR end_at >= start_at",
+            name="range_valid",
+        ),
+        Index("ix_learn_scheduled_items_course_start", "course_id", "start_date", "start_at"),
+        Index("ix_learn_scheduled_items_active", "active", "start_date"),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(primary_key=True, default=uuid.uuid4)
+    source_id: Mapped[str] = mapped_column(String(255), nullable=False)
+    course_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey("learn_courses.id", ondelete="CASCADE"), nullable=False
+    )
+    title: Mapped[str] = mapped_column(String(500), nullable=False)
+    start_date: Mapped[date] = mapped_column(Date, nullable=False)
+    start_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    due_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    end_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    date_precision: Mapped[str] = mapped_column(String(32), nullable=False, default="datetime")
+    completion_state: Mapped[str] = mapped_column(String(32), nullable=False, default="unknown")
+    url: Mapped[str | None] = mapped_column(String(2048))
+    fingerprint: Mapped[str] = mapped_column(String(128), nullable=False)
+    active: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
+    first_seen_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    last_seen_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    disappeared_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+
+
+class LearnAnnouncementSource(TimestampMixin, Base):
+    """Announcement source metadata without raw title or body storage."""
+
+    __tablename__ = "learn_announcement_sources"
+    __table_args__ = (
+        UniqueConstraint("source_id", name="uq_learn_announcements_source"),
+        UniqueConstraint("source_id", "fingerprint", name="uq_learn_announcements_fingerprint"),
+        CheckConstraint("length(source_id) > 0", name="source_id_nonempty"),
+        CheckConstraint("length(fingerprint) > 0", name="fingerprint_nonempty"),
+        CheckConstraint("url IS NULL OR length(url) > 0", name="url_nonempty"),
+        Index("ix_learn_announcements_course_effective", "course_id", "effective_at"),
+        Index("ix_learn_announcements_visible_effective", "visible", "effective_at"),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(primary_key=True, default=uuid.uuid4)
+    source_id: Mapped[str] = mapped_column(String(255), nullable=False)
+    course_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey("learn_courses.id", ondelete="CASCADE"), nullable=False
+    )
+    published_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    content_updated_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    effective_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    url: Mapped[str | None] = mapped_column(String(2048))
+    fingerprint: Mapped[str] = mapped_column(String(128), nullable=False)
+    visible: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
+    has_attachments: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+    first_seen_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    last_seen_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    disappeared_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+
+
+class LearnAnnouncementSemanticResult(TimestampMixin, Base):
+    """Validated semantic interpretation of one announcement fingerprint."""
+
+    __tablename__ = "learn_announcement_semantic_results"
+    __table_args__ = (
+        UniqueConstraint(
+            "announcement_id",
+            "source_fingerprint",
+            "prompt_version",
+            name="uq_learn_semantic_announcement_fingerprint_prompt",
+        ),
+        CheckConstraint("length(source_fingerprint) > 0", name="source_fingerprint_nonempty"),
+        CheckConstraint("length(summary) > 0", name="summary_nonempty"),
+        CheckConstraint("length(why_it_matters) > 0", name="why_it_matters_nonempty"),
+        CheckConstraint("length(model_identity) > 0", name="model_identity_nonempty"),
+        CheckConstraint("length(prompt_version) > 0", name="prompt_version_nonempty"),
+        CheckConstraint(
+            "status IN ('valid','summary_unavailable','invalid','superseded','source_removed')",
+            name="status_valid",
+        ),
+        Index("ix_learn_semantic_status", "status", "interpreted_at"),
+        Index("ix_learn_semantic_announcement_status", "announcement_id", "status"),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(primary_key=True, default=uuid.uuid4)
+    announcement_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey("learn_announcement_sources.id", ondelete="CASCADE"), nullable=False
+    )
+    course_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey("learn_courses.id", ondelete="CASCADE"), nullable=False
+    )
+    source_fingerprint: Mapped[str] = mapped_column(String(128), nullable=False)
+    summary: Mapped[str] = mapped_column(String(1600), nullable=False)
+    why_it_matters: Mapped[str] = mapped_column(String(1600), nullable=False)
+    action_items: Mapped[list[dict[str, Any]]] = mapped_column(JSON, nullable=False, default=list)
+    evidence_fragments: Mapped[list[dict[str, Any]]] = mapped_column(
+        JSON, nullable=False, default=list
+    )
+    source_url: Mapped[str | None] = mapped_column(String(2048))
+    model_identity: Mapped[str] = mapped_column(String(255), nullable=False)
+    prompt_version: Mapped[str] = mapped_column(String(128), nullable=False)
+    critic_model_identity: Mapped[str | None] = mapped_column(String(255))
+    critic_prompt_version: Mapped[str | None] = mapped_column(String(128))
+    repair_attempted: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+    anti_copy_passed: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
+    status: Mapped[str] = mapped_column(String(32), nullable=False, default="valid")
+    error_code: Mapped[str | None] = mapped_column(String(128))
+    interpreted_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+
+
+class LearnDatedImplication(TimestampMixin, Base):
+    """Grounded academic date extracted semantically from an announcement."""
+
+    __tablename__ = "learn_dated_implications"
+    __table_args__ = (
+        UniqueConstraint(
+            "semantic_result_id",
+            "implication_key",
+            name="uq_learn_dated_implications_result_key",
+        ),
+        CheckConstraint("length(implication_key) > 0", name="implication_key_nonempty"),
+        CheckConstraint("length(activity_type) > 0", name="activity_type_nonempty"),
+        CheckConstraint(
+            "date_precision IN ('date','datetime')",
+            name="date_precision_valid",
+        ),
+        CheckConstraint(
+            "end_at IS NULL OR start_at IS NULL OR end_at >= start_at",
+            name="range_valid",
+        ),
+        CheckConstraint(
+            "status IN ('active','superseded','source_removed')",
+            name="status_valid",
+        ),
+        Index("ix_learn_dated_implications_reminder", "status", "reminder_date"),
+        Index("ix_learn_dated_implications_course_date", "course_id", "academic_date"),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(primary_key=True, default=uuid.uuid4)
+    semantic_result_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey("learn_announcement_semantic_results.id", ondelete="CASCADE"),
+        nullable=False,
+    )
+    announcement_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey("learn_announcement_sources.id", ondelete="CASCADE"), nullable=False
+    )
+    course_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey("learn_courses.id", ondelete="CASCADE"), nullable=False
+    )
+    source_fingerprint: Mapped[str] = mapped_column(String(128), nullable=False)
+    implication_key: Mapped[str] = mapped_column(String(128), nullable=False)
+    activity_type: Mapped[str] = mapped_column(String(128), nullable=False)
+    academic_date: Mapped[date] = mapped_column(Date, nullable=False)
+    start_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    end_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    date_precision: Mapped[str] = mapped_column(String(32), nullable=False)
+    reminder_date: Mapped[date] = mapped_column(Date, nullable=False)
+    evidence_fragments: Mapped[list[dict[str, Any]]] = mapped_column(
+        JSON, nullable=False, default=list
+    )
+    status: Mapped[str] = mapped_column(String(32), nullable=False, default="active")
+
+
+class LearnNotificationDelivery(TimestampMixin, Base):
+    """Idempotency records for LEARN briefing selections and reconnect alerts."""
+
+    __tablename__ = "learn_notification_deliveries"
+    __table_args__ = (
+        UniqueConstraint("message_key", name="uq_learn_notification_deliveries_message"),
+        CheckConstraint("length(message_key) > 0", name="message_key_nonempty"),
+        CheckConstraint(
+            "delivery_kind IN ('announcement_window','day_before','reconnect_alert')",
+            name="delivery_kind_valid",
+        ),
+        CheckConstraint(
+            "status IN ('pending','sent','failed','superseded')",
+            name="status_valid",
+        ),
+        Index(
+            "ix_learn_notification_delivery_occurrence",
+            "delivery_kind",
+            "occurrence_date",
+            "status",
+        ),
+        Index("ix_learn_notification_delivery_source", "announcement_id", "source_fingerprint"),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(primary_key=True, default=uuid.uuid4)
+    message_key: Mapped[str] = mapped_column(String(512), nullable=False)
+    delivery_kind: Mapped[str] = mapped_column(String(64), nullable=False)
+    occurrence_date: Mapped[date] = mapped_column(Date, nullable=False)
+    scheduled_for: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    channel: Mapped[str] = mapped_column(String(64), nullable=False, default="discord")
+    target: Mapped[str | None] = mapped_column(String(255))
+    announcement_id: Mapped[uuid.UUID | None] = mapped_column(
+        ForeignKey("learn_announcement_sources.id", ondelete="CASCADE")
+    )
+    dated_implication_id: Mapped[uuid.UUID | None] = mapped_column(
+        ForeignKey("learn_dated_implications.id", ondelete="CASCADE")
+    )
+    source_fingerprint: Mapped[str | None] = mapped_column(String(128))
+    status: Mapped[str] = mapped_column(String(32), nullable=False, default="pending")
+    sent_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    external_message_id: Mapped[str | None] = mapped_column(String(255))
+    error_code: Mapped[str | None] = mapped_column(String(128))
+
+
+class LearnNotionProposalLink(TimestampMixin, Base):
+    """LEARN source to confirmation-gated academic proposal/idempotency link."""
+
+    __tablename__ = "learn_notion_proposal_links"
+    __table_args__ = (
+        UniqueConstraint("idempotency_key", name="uq_learn_proposal_links_idempotency"),
+        CheckConstraint("length(source_id) > 0", name="source_id_nonempty"),
+        CheckConstraint("length(source_fingerprint) > 0", name="source_fingerprint_nonempty"),
+        CheckConstraint(
+            "source_kind IN ('scheduled_item','announcement_implication')",
+            name="source_kind_valid",
+        ),
+        CheckConstraint(
+            "operation IN ('create_learn_calendar_event','enrich_learn_calendar_event')",
+            name="operation_valid",
+        ),
+        CheckConstraint(
+            "state IN "
+            "('pending','confirmed','rejected','expired','applied','superseded','skipped')",
+            name="state_valid",
+        ),
+        Index(
+            "ix_learn_proposal_links_source",
+            "source_kind",
+            "source_id",
+            "source_fingerprint",
+            "operation",
+            "state",
+        ),
+        Index("ix_learn_proposal_links_proposal", "proposal_id"),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(primary_key=True, default=uuid.uuid4)
+    source_kind: Mapped[str] = mapped_column(String(64), nullable=False)
+    source_id: Mapped[str] = mapped_column(String(255), nullable=False)
+    source_fingerprint: Mapped[str] = mapped_column(String(128), nullable=False)
+    scheduled_item_id: Mapped[uuid.UUID | None] = mapped_column(
+        ForeignKey("learn_scheduled_items.id", ondelete="CASCADE")
+    )
+    dated_implication_id: Mapped[uuid.UUID | None] = mapped_column(
+        ForeignKey("learn_dated_implications.id", ondelete="CASCADE")
+    )
+    operation: Mapped[str] = mapped_column(String(64), nullable=False)
+    state: Mapped[str] = mapped_column(String(32), nullable=False, default="pending")
+    idempotency_key: Mapped[str] = mapped_column(String(512), nullable=False)
+    proposal_id: Mapped[uuid.UUID | None] = mapped_column(
+        ForeignKey("academic_proposed_changes.id", ondelete="SET NULL")
+    )
+    reserved_calendar_notion_id: Mapped[str] = mapped_column(String(255), nullable=False)
+    target_notion_page_id: Mapped[str | None] = mapped_column(String(255))
+    target_expected_title: Mapped[str | None] = mapped_column(String(500))
+    target_expected_date: Mapped[date | None] = mapped_column(Date)
+    target_expected_start_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    target_expected_last_edited_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    learn_context_property_id: Mapped[str] = mapped_column(String(255), nullable=False)
+    learn_context_property_name: Mapped[str] = mapped_column(String(255), nullable=False)
+    explicit_request_key: Mapped[str | None] = mapped_column(String(255))
+    conflict_code: Mapped[str | None] = mapped_column(String(128))
 
 
 class CareerJobsWorkspace(TimestampMixin, Base):
@@ -2357,6 +2669,13 @@ __all__ = [
     "FixedCommitment",
     "HealthCheck",
     "HealthState",
+    "LearnAnnouncementSemanticResult",
+    "LearnAnnouncementSource",
+    "LearnCourse",
+    "LearnDatedImplication",
+    "LearnNotificationDelivery",
+    "LearnNotionProposalLink",
+    "LearnScheduledItem",
     "NativeConversationCompaction",
     "NativeConversationInboundEvent",
     "NativeConversationSession",

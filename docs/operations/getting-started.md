@@ -12,7 +12,8 @@ Ollama runs on the host. Keep all credentials in `.env` or a secret manager;
 never commit them or paste them into logs, tickets, or chat.
 
 Qwen is configured for authorized private Discord conversations and bounded
-event-local semantic analysis in the automatic morning briefing. The native
+event interpretation plus category composition in the automatic morning
+briefing. The native
 macOS Discord wake LaunchAgent remains connected while the API is cold,
 acknowledges an allowlisted owner's message, starts the fixed local services as
 needed, and submits a signed reference to the backend. PostgreSQL and the
@@ -20,11 +21,18 @@ planner worker stay resident so scheduled work does not depend on an inbound
 Discord message. Health checks, startup, and messages outside the channel or
 owner allowlist must not load Qwen.
 
-The one executable automatic planner schedule is the combined morning
-notification. Host code refreshes Notion, builds the intended local day's
-calendar agenda, selects course, misc, and Jobs events in the exact
-10-day-12-hour local window, validates Qwen-produced event semantics, and sends
-a persisted, idempotent multipart Discord briefing.
+The morning agenda refreshes Notion, selects course work due today and over the
+following seven days plus Jobs, misc, and reserved schedule events that overlap
+today, validates Qwen-produced semantics, and sends exactly four persisted,
+idempotent Discord embeds. A separate nightly schedule sends one reflection
+prompt to the configured proactive owner and opens a durable conversation; it
+does not load Qwen until the owner replies through the authorized channel.
+
+Waterloo LEARN support is optional and disabled by default. It uses a separate
+host-only browser profile and LaunchAgent; follow the
+[LEARN bridge runbook](runbooks/learn-bridge.md) before enabling it. A LEARN
+failure never changes the morning source of truth: the scheduled briefing reads
+only the freshly synchronized reserved Notion calendar, not LEARN directly.
 
 ## 1. Start the platform
 
@@ -86,8 +94,9 @@ need to keep.
 
 The API container runs migrations automatically. It does not own a Discord
 Gateway listener. `worker-academic-planner` owns durable planner-channel jobs,
-assessment-material ingestion, and the combined morning notification. The
-morning path may call the configured Qwen model only for event-local semantics;
+assessment-material ingestion, the combined morning notification, and the
+nightly reflection prompt. The morning path may call the configured Qwen model
+for event-local semantics and the bounded four-category composer/critic;
 no legacy model worker or other scheduled model workflow is a runtime option.
 
 ## 2. Connect host Ollama to Docker
@@ -110,12 +119,26 @@ environment overrides, and never evaluate `.env` as shell code.
 scripts/ollama_qwen_status.sh
 ```
 
-Configure the reasoning and embedding roles separately. Pin each digest after
-verifying the installed model:
+Configure the semantic/reasoning and embedding roles separately. The accepted
+semantic model is `qwen3:14b` at the measured 32K profile; the embedder remains
+`qwen3-embedding:4b` at 1,024 dimensions:
 
 ```dotenv
-OLLAMA_MODEL=qwen3-32gb:latest
-OLLAMA_MODEL_DIGEST=
+OLLAMA_MODEL=qwen3:14b
+OLLAMA_MODEL_DIGEST=bdbd181c33f2ed1b31c972991882db3cf4d192569092138a7d29e973cd9debe8
+OLLAMA_MAX_CONCURRENCY=1
+OLLAMA_NUM_CTX=32768
+OLLAMA_NUM_BATCH=32
+OLLAMA_MAX_INPUT_TOKENS=26624
+OLLAMA_MAX_OUTPUT_TOKENS=2048
+OLLAMA_CONTEXT_RESERVE_TOKENS=4096
+OLLAMA_TIMEOUT_SECONDS=300
+OLLAMA_REASONING=false
+OLLAMA_STRUCTURED_OUTPUT_TRANSPORT=json_schema
+CONVERSATION_COMPACTION_TRIGGER_TOKENS=19968
+CONVERSATION_COMPACTION_TARGET_TOKENS=14336
+CONVERSATION_RECENT_TAIL_MAX_TOKENS=8192
+CONVERSATION_COMPACTION_MAX_OUTPUT_TOKENS=2048
 EMBEDDING_MODEL=qwen3-embedding:4b
 EMBEDDING_MODEL_DIGEST=
 EMBEDDING_DIMENSIONS=1024
@@ -130,20 +153,61 @@ private Discord channel. Study-plan, code-review, and finance Qwen schedules are
 not configured. The separate academic morning schedule is host-controlled and
 uses the same configured model only for bounded event semantics.
 
-Clearing either digest skips that role's digest pin during first setup. Pin the
-actual digests later after verifying both models in `/api/tags`. The 32B model
-is used for reasoning; the 4B model produces normalized 1,024-dimensional
-vectors for assessment materials, durable academic memory, and generic
-owner-scoped preference/fact retrieval. Generic user memory remains separate
-from academic learning-focus memory and is activated only by explicit owner
-management requests.
+Install the exact model tag and verify the digest before treating the setup as
+ready:
 
-The checked-in default remains the measured-safe 16K profile. A 32K rollout is
-allowed only after `scripts/phase1_benchmark.py` passes the target-Mac combined
-generation and embedding residency gate and its artifact is retained under
-`docs/benchmarks/`. Context assembly itself is always enabled: full transcripts
-remain durable, while model calls use validated summaries, a bounded recent
-tail, relevant active owner memory, and current tool-loop state.
+```bash
+ollama pull qwen3:14b
+curl --fail http://127.0.0.1:11434/api/tags \
+  | jq -r '.models[] | select(.name == "qwen3:14b") | "\(.name) \(.digest)"'
+```
+
+The printed digest for `qwen3:14b` must be
+`bdbd181c33f2ed1b31c972991882db3cf4d192569092138a7d29e973cd9debe8` before it
+is pinned in `.env`. Clearing a digest skips that role's digest pin during
+first setup only; pin it after verifying the installed model in `/api/tags`.
+Do not configure a former semantic model as a fallback, alternate runtime path,
+or rollback model. A digest mismatch should stop readiness until the installed
+tag or `.env` is corrected.
+
+The 14B model performs semantic decisions, structured responses, native tool
+selection, and event-local morning semantics. The 4B embedding model produces
+normalized 1,024-dimensional vectors for assessment materials, durable academic
+memory, and generic owner-scoped preference/fact retrieval. Generic user memory
+remains separate from academic learning-focus memory and is activated only by
+explicit owner management requests.
+
+The accepted context invariant is
+`26624 + 2048 + 4096 = 32768`. Context assembly itself is always enabled: full
+transcripts remain durable, while model calls use validated summaries, a
+bounded recent tail, relevant active owner memory, and current tool-loop state.
+The compaction profile is `19968` trigger tokens, `14336` target tokens,
+`8192` recent-tail tokens, and `2048` compaction-output tokens.
+
+Retain the accepted hardware benchmark artifact under `docs/benchmarks/` and
+rerun the benchmark after changing model, digest, context, timeout, reasoning,
+transport, concurrency, or host memory assumptions:
+
+```bash
+PYTHONPATH=. .venv/bin/python scripts/phase1_benchmark.py \
+  --model qwen3:14b \
+  --expected-digest bdbd181c33f2ed1b31c972991882db3cf4d192569092138a7d29e973cd9debe8 \
+  --num-ctx 32768 \
+  --num-batch 32 \
+  --max-output-tokens 2048 \
+  --timeout-seconds 300 \
+  --structured-output-transport json_schema \
+  --output docs/benchmarks/phase1-32k-qwen3-14b-m2max.candidate.json
+```
+
+Never overwrite the accepted artifact with a rerun. Inspect every candidate
+evaluation and replace the accepted artifact only after all gates and the
+native-tool soak pass again.
+
+If the benchmark or live run shows timeouts, less than 10% host free memory,
+more than 1 GiB steady swap growth, or model concurrency above one, stop and
+reduce competing host load before retrying. Do not lower the documented profile
+or re-enable a former semantic model to mask memory pressure.
 
 Install or verify the supervised Ollama LaunchAgent with the fixed script:
 
@@ -153,9 +217,11 @@ scripts/ollama_qwen_start.sh
 
 The script loads or kickstarts `com.lifeagent.ollama`, checks both configured
 model roles and optional digests, verifies the embedding capability and vector
-dimension, and exits nonzero with a bounded diagnostic if readiness fails. It
-does not use `nohup` or a PID file and never pulls a model unless the operator
-explicitly opts in:
+dimension, and exits nonzero with a bounded diagnostic if readiness fails. Run
+`scripts/ollama_qwen_status.sh` after startup to confirm the configured tag,
+digest, embedding dimension, and residency state. The start script does not use
+`nohup` or a PID file and never pulls a model unless the operator explicitly
+opts in:
 
 ```bash
 scripts/ollama_qwen_start.sh --pull
@@ -180,6 +246,9 @@ Apply the bounded, resumable backfill only after that dry run is correct:
 The command prints counts only. It does not print material text, reflection
 text, vectors, URLs, or owner identifiers. Repeat it until `remaining_count` is
 zero, then deploy through `scripts/lifeagent_host_runtime.sh deploy`.
+Use that deploy command as the canonical rollout after model configuration
+changes; an ad hoc `docker compose up` is useful for local diagnosis but is not
+deployment completion for the native runtime.
 
 Do not forward port 11434 through your router or expose it to the public
 internet. Docker Compose maps `host.docker.internal` to the local host; the
@@ -412,6 +481,8 @@ ACADEMIC_MORNING_CATCHUP_GRACE_MINUTES=30
 CALENDAR_SEMANTIC_EVENT_TIMEOUT_SECONDS=180
 CALENDAR_SEMANTIC_TOTAL_TIMEOUT_SECONDS=600
 CALENDAR_SEMANTIC_PROMPT_MAX_CHARS=16000
+ACADEMIC_END_OF_DAY_SCHEDULE=21:00
+ACADEMIC_END_OF_DAY_CATCHUP_GRACE_MINUTES=30
 ```
 
 `ACADEMIC_MORNING_SCHEDULE` is interpreted in `APP_TIMEZONE`. The default
@@ -419,22 +490,47 @@ CALENDAR_SEMANTIC_PROMPT_MAX_CHARS=16000
 must not send a stale morning notification after that deadline. Each scheduled
 period records one run with agent `academic_morning_notification`, schedule
 `academic-morning`, and idempotency key
-`academic-morning:YYYY-MM-DD:HHMM:v1`. The combined academic/interview Discord
-manifest derives ordered delivery keys as
-`planner-morning-delivery-v2:YYYY-MM-DD:HHMM:v1:NNN`. Each part is at most
-2,000 characters, and the persisted manifest lets retries skip parts already
-delivered.
+`academic-morning:YYYY-MM-DD:HHMM:v1`. The four-embed manifest uses category
+keys `planner-morning-four-v3:YYYY-MM-DD:HHMM:v1:<category>:v1`, where category
+is `courses`, `jobs`, `misc`, or `schedule`. Embed titles are at most 256
+characters and descriptions at most 4,096 characters. The persisted manifest
+lets retries skip categories already delivered.
 
 Before sending a normal morning agenda, the job completes the academic sync and
-then the Jobs/Interviews sync. The combined message renders course dates, misc
-tasks, and job events as separate sections so general to-dos are not blended
-with coursework or interview preparation. A career failure is disclosed in the
-combined message but does not hide a valid academic agenda; one invalid interview
-does not hide other valid interview reminders. Missing academic sharing, stale
-academic sync, malformed/duplicate misc setup, or Discord delivery uncertainty
-remains fail-closed. Semantic model or critic failure does not suppress trusted
-event titles and dates; the message omits unverified prose and includes one
-bounded availability condition.
+then the Jobs/Interviews sync. Discord receives four embeds in the fixed order
+Courses, Jobs, Misc, and Classes + Tutorials + Labs. A category failure is
+disclosed in that category's embed and does not hide independently fresh
+categories. Missing sharing, stale data, malformed reserved calendars, or
+Discord delivery uncertainty remains fail-closed. Semantic model or critic
+failure produces a visible facts-only category using trusted Notion metadata.
+
+### Nightly academic check-in
+
+Set one authorized Discord owner as the proactive recipient:
+
+```dotenv
+DISCORD_ACADEMIC_PROACTIVE_USER_ID=123456789012345678
+ACADEMIC_END_OF_DAY_SCHEDULE=21:00
+ACADEMIC_END_OF_DAY_CATCHUP_GRACE_MINUTES=30
+```
+
+The proactive user ID must also appear in
+`DISCORD_ACADEMIC_AUTHORIZED_USER_IDS`. At the configured Toronto-local time,
+the academic worker records one `academic_nightly_checkin` run, sends an
+idempotent reflection prompt, and opens an artifact-backed conversation for at
+most the configured session TTL. If another conversation is already open, the
+job retries only inside the catch-up window. A late occurrence does not send a
+stale prompt.
+
+The owner's reply follows the normal private-channel model path. Study-related
+reflections may update academic learning-focus memory, and the assistant may
+prepare calendar proposals, but every Notion write still requires the displayed
+exact confirmation command. `skip`, `skip tonight`, `skip this check-in`, or
+`skip this checkin` closes that night's conversation without a write. Generic
+personal memory still requires an explicit remember, correct, or forget request.
+
+Operational health is persisted as `academic_end_of_day`. Use the
+[nightly check-in runbook](runbooks/academic-nightly-checkin.md) for diagnosis.
 
 For setup recovery or an immediate refresh after fixing a template/share
 problem, run the same idempotent boundary manually:
@@ -476,6 +572,7 @@ user-visible progress message uses Discord's REST API.
 DISCORD_BOT_TOKEN=...
 DISCORD_ACADEMIC_CHANNEL_ID=...
 DISCORD_ACADEMIC_AUTHORIZED_USER_IDS=[123456789012345678]
+DISCORD_ACADEMIC_PROACTIVE_USER_ID=123456789012345678
 DISCORD_ACADEMIC_MESSAGE_CONTENT_ENABLED=true
 DISCORD_APPLICATION_ID=...
 MODEL_TRIGGER_MODE=authorized_discord_channel
@@ -534,8 +631,9 @@ copies configuration privately. Neither LaunchAgent depends on the Desktop
 checkout or its temporary Python installation.
 
 After both native agents pass the startup check, deploy keeps PostgreSQL and the
-academic worker running for the morning schedule, and stops only the API so the
-next authorized message exercises the cold API wake path. A Discord-triggered wake uses `--no-build
+academic worker running for the morning and nightly schedules, and stops only
+the API so the next authorized message exercises the cold API wake path. A
+Discord-triggered wake uses `--no-build
 --pull never`; a missing or stale image marker fails safely and tells the
 operator to rerun `deploy`. Use `install` only to reinstall LaunchAgents for an
 already deployed image, and `uninstall` to stop and remove both plists without

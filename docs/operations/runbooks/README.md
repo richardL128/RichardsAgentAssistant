@@ -9,10 +9,12 @@ The current configured runtime includes two native macOS LaunchAgents plus the
 Compose API, PostgreSQL, and academic worker. Qwen-powered conversation work is
 triggered only by messages from authorized owners in the configured private
 Discord channel. The automatic academic morning notification is scheduled and
-executable; its only model boundary is bounded event-local semantic
-interpretation for selected calendar rows. Scheduled academic conversation
-Qwen, code-review Qwen, and finance Qwen workflows are not executable runtime
-paths.
+executable; it uses bounded event interpretation and critic-checked category
+composition. A second schedule sends a model-free nightly reflection prompt and
+opens a durable conversation for the configured proactive owner; Qwen runs only
+after that owner replies through the authorized channel. Scheduled code-review
+Qwen and finance Qwen workflows are not executable runtime paths. The optional
+LEARN bridge adds a separate host LaunchAgent only after explicit enablement.
 
 For first-time setup, see [Getting started](../getting-started.md).
 
@@ -26,6 +28,8 @@ database, but they do not imply standalone services can be started.
 
 - [Model unavailable or slow](model-unavailable-slow.md)
 - [Academic morning notification](academic-morning-notification.md)
+- [Academic nightly check-in](academic-nightly-checkin.md)
+- [LEARN bridge](learn-bridge.md)
 - [Job interviews and research](job-interviews.md)
 - [Discord cold wake](discord-cold-wake.md)
 - [Queue backlog](queue-backlog.md)

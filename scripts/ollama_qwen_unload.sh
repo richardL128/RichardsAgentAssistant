@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -eu
 
-DEFAULT_OLLAMA_MODEL="qwen3-32gb:latest"
+DEFAULT_OLLAMA_MODEL="qwen3:14b"
 
 SCRIPT_DIR="$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)"
 REPO_DIR="$(dirname -- "$SCRIPT_DIR")"

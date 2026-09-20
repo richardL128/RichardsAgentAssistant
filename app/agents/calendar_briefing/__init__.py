@@ -6,6 +6,7 @@ from app.agents.calendar_briefing.cache import (
     decide_calendar_semantic_cache_reuse,
 )
 from app.agents.calendar_briefing.contracts import (
+    ActiveMorningCourse,
     CalendarActivityIntent,
     CalendarActivityIntentStatus,
     CalendarEventEvidenceFragment,
@@ -18,6 +19,19 @@ from app.agents.calendar_briefing.contracts import (
     calendar_title_evidence_fragment,
     fingerprint_event_evidence,
     with_title_evidence_fragment,
+)
+from app.agents.calendar_briefing.morning_composer import (
+    CourseComposition,
+    EventDigestComposition,
+    MorningBriefingComposer,
+    MorningCategory,
+    ScheduleComposition,
+)
+from app.agents.calendar_briefing.morning_manifest import (
+    MorningBriefingDeliveryManifest,
+    MorningEmbedPayload,
+    MorningManifestEntry,
+    build_morning_briefing_manifest,
 )
 from app.agents.calendar_briefing.multipart import (
     DISCORD_CONTENT_LIMIT,
@@ -33,6 +47,7 @@ from app.agents.calendar_briefing.semantic_interpreter import (
 
 __all__ = [
     "DISCORD_CONTENT_LIMIT",
+    "ActiveMorningCourse",
     "CalendarActivityIntent",
     "CalendarActivityIntentStatus",
     "CalendarBriefingDeliveryManifest",
@@ -48,8 +63,17 @@ __all__ = [
     "CalendarEventSourceKind",
     "CalendarSemanticCacheDecision",
     "CalendarSemanticCacheRecord",
+    "CourseComposition",
+    "EventDigestComposition",
+    "MorningBriefingComposer",
+    "MorningBriefingDeliveryManifest",
+    "MorningCategory",
+    "MorningEmbedPayload",
+    "MorningManifestEntry",
+    "ScheduleComposition",
     "ScheduledMorningCalendarItem",
     "build_calendar_briefing_manifest",
+    "build_morning_briefing_manifest",
     "calendar_title_evidence_fragment",
     "decide_calendar_semantic_cache_reuse",
     "fingerprint_event_evidence",

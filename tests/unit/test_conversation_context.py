@@ -1,12 +1,16 @@
 from __future__ import annotations
 
+import json
 import uuid
 from types import SimpleNamespace
 
 import pytest
 from langchain_core.messages import AIMessage, HumanMessage, SystemMessage, ToolMessage
 
-from app.agents.conversation.context import ConversationContextAssembler
+from app.agents.conversation.context import (
+    ConversationContextAssembler,
+    estimate_native_input_tokens,
+)
 from app.agents.harness import PreModelContext
 from app.artifacts.store import ArtifactStore
 from app.llm.contracts import InvocationStatus
@@ -67,6 +71,42 @@ class _Gateway:
                 user_statements=(),
             ),
         )
+
+
+class _CapturingArtifactStore(ArtifactStore):
+    def __init__(self, *args, **kwargs) -> None:
+        super().__init__(*args, **kwargs)
+        self.writes = []
+
+    def put(self, *args, **kwargs):
+        metadata = super().put(*args, **kwargs)
+        self.writes.append(metadata)
+        return metadata
+
+
+def _canonical_context_near_budget(*, minimum_tokens: int, maximum_tokens: int):
+    messages = [SystemMessage(content="Policy")]
+    index = 0
+    while True:
+        candidate = (
+            *messages,
+            HumanMessage(
+                content="CURRENT_OWNER_MARKER continue from the recent context.",
+            ),
+        )
+        estimate = estimate_native_input_tokens(candidate, ())
+        if estimate >= minimum_tokens:
+            assert estimate <= maximum_tokens
+            return candidate, estimate
+        messages.extend(
+            (
+                HumanMessage(
+                    content=(f"Historic request {index} OLD_REPLAY_MARKER_{index} " + "x" * 320),
+                ),
+                AIMessage(content=f"Historic answer {index} " + "y" * 160),
+            )
+        )
+        index += 1
 
 
 @pytest.mark.asyncio
@@ -175,3 +215,70 @@ async def test_compaction_excludes_reasoning_and_keeps_full_canonical_input(tmp_
             and any(call.get("id") == item.tool_call_id for call in prior.tool_calls)
             for prior in assembled[:index]
         )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("minimum_tokens", "maximum_tokens"),
+    [
+        pytest.param(19_968, 26_624, id="near-trigger"),
+        pytest.param(26_200, 26_624, id="near-max"),
+    ],
+)
+async def test_promoted_32k_profile_compacts_large_context_without_replay(
+    tmp_path,
+    minimum_tokens: int,
+    maximum_tokens: int,
+) -> None:
+    conversations = _Conversations()
+    gateway = _Gateway()
+    artifacts = _CapturingArtifactStore(tmp_path)
+    assembler = ConversationContextAssembler(
+        settings=_settings(
+            conversation_compaction_trigger_tokens=19_968,
+            conversation_compaction_target_tokens=14_336,
+            conversation_recent_tail_max_tokens=8_192,
+            conversation_compaction_max_output_tokens=2_048,
+            ollama_max_input_tokens=26_624,
+            user_memory_enabled=False,
+        ),
+        gateway=gateway,
+        conversation_service=conversations,
+        artifact_store=artifacts,
+    )
+    canonical, original_estimate = _canonical_context_near_budget(
+        minimum_tokens=minimum_tokens,
+        maximum_tokens=maximum_tokens,
+    )
+
+    assembled = await assembler.assemble(
+        PreModelContext(
+            canonical_messages=canonical,
+            tools=(),
+            turn=10,
+            turn_limit=20,
+        ),
+        conversation_id=uuid.uuid4(),
+        event_id=f"profile-{minimum_tokens}",
+    )
+
+    assembled_text = "\n".join(str(message.content) for message in assembled)
+    assembled_estimate = estimate_native_input_tokens(assembled, ())
+    manifest_metadata = [
+        metadata
+        for metadata in artifacts.writes
+        if metadata.data_class == "native_context_manifest"
+    ][-1]
+    manifest = json.loads(artifacts.get(manifest_metadata.key))
+
+    assert original_estimate >= minimum_tokens
+    assert conversations.published
+    assert len(gateway.prompts) == 1
+    assert len(assembled) < len(canonical)
+    assert "OLD_REPLAY_MARKER_0" not in assembled_text
+    assert "CURRENT_OWNER_MARKER" in assembled_text
+    assert assembled_estimate <= 14_336
+    assert manifest["compacted"] is True
+    assert manifest["omitted_message_count"] > 0
+    assert manifest["estimated_input_tokens"] == assembled_estimate
+    assert manifest["estimated_input_tokens"] <= 14_336

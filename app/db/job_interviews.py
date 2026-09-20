@@ -674,6 +674,52 @@ class JobInterviewRepository:
         return [item[-1] for item in items]
 
     @staticmethod
+    def load_morning_calendar_items(
+        session: Session,
+        *,
+        occurrence: date | datetime,
+        timezone: str = "America/Toronto",
+    ) -> list[dict[str, Any]]:
+        """Return incomplete Jobs events that occur on the requested local day."""
+
+        tz = ZoneInfo(timezone)
+        day_start, day_end = _local_day_window(occurrence, tz)
+        rows = list(
+            session.scalars(
+                select(CareerInterviewEvent)
+                .where(
+                    CareerInterviewEvent.active.is_(True),
+                    CareerInterviewEvent.archived.is_(False),
+                    CareerInterviewEvent.local_date.is_not(None),
+                    CareerInterviewEvent.local_date <= day_start.date(),
+                )
+                .order_by(CareerInterviewEvent.date_start, CareerInterviewEvent.title)
+            )
+        )
+        items: list[tuple[datetime, str, dict[str, Any]]] = []
+        for row in rows:
+            if _job_event_completed(row.property_snapshot):
+                continue
+            local_start = _interview_local_start(row, timezone=tz)
+            local_end = _interview_local_end(row, timezone=tz)
+            if local_start is None:
+                continue
+            if local_end is None:
+                if not day_start <= local_start < day_end:
+                    continue
+            elif not (local_start < day_end and local_end > day_start):
+                continue
+            item = _interview_calendar_item(
+                row,
+                local_start=local_start,
+                window_start=day_start,
+                timezone=tz,
+            )
+            items.append((local_start, row.title.casefold(), item))
+        items.sort(key=lambda item: (item[0], item[1], item[2]["event_id"]))
+        return [item[-1] for item in items]
+
+    @staticmethod
     def save_interview_calendar_semantics(
         session: Session,
         *,
@@ -1466,6 +1512,21 @@ class SQLAlchemyJobInterviewStore:
                 )
             )
 
+    def load_morning_calendar_items(
+        self,
+        *,
+        occurrence: date | datetime,
+        timezone: str = "America/Toronto",
+    ) -> tuple[Mapping[str, Any], ...]:
+        with Session(self.engine) as session:
+            return tuple(
+                JobInterviewRepository.load_morning_calendar_items(
+                    session,
+                    occurrence=occurrence,
+                    timezone=timezone,
+                )
+            )
+
     def save_interview_calendar_semantics(
         self,
         interview_page_id: str,
@@ -1794,6 +1855,16 @@ def _calendar_window(occurrence: date | datetime, timezone: ZoneInfo) -> tuple[d
     return window_start, window_start + timedelta(days=10, hours=12)
 
 
+def _local_day_window(occurrence: date | datetime, timezone: ZoneInfo) -> tuple[datetime, datetime]:
+    if isinstance(occurrence, datetime):
+        local_day = _aware_db(occurrence).astimezone(timezone).date()
+    else:
+        local_day = occurrence
+    start = datetime.combine(local_day, datetime.min.time(), tzinfo=timezone)
+    end = datetime.combine(local_day + timedelta(days=1), datetime.min.time(), tzinfo=timezone)
+    return start, end
+
+
 def _interview_local_start(
     row: CareerInterviewEvent,
     *,
@@ -1806,6 +1877,29 @@ def _interview_local_start(
     return _aware_db(row.date_start).astimezone(timezone)
 
 
+def _interview_local_end(
+    row: CareerInterviewEvent,
+    *,
+    timezone: ZoneInfo,
+) -> datetime | None:
+    for value in row.property_snapshot.values():
+        if not isinstance(value, Mapping):
+            continue
+        raw_end: object = cast(Mapping[str, object], value).get("end")
+        if not isinstance(raw_end, str) or not raw_end:
+            continue
+        try:
+            if "T" not in raw_end:
+                return datetime.combine(date.fromisoformat(raw_end), datetime.min.time(), timezone)
+            parsed = datetime.fromisoformat(raw_end.replace("Z", "+00:00"))
+            if parsed.tzinfo is None or parsed.utcoffset() is None:
+                parsed = parsed.replace(tzinfo=timezone)
+            return parsed.astimezone(timezone)
+        except ValueError:
+            return None
+    return None
+
+
 def _interview_calendar_item(
     row: CareerInterviewEvent,
     *,
@@ -1813,7 +1907,7 @@ def _interview_calendar_item(
     window_start: datetime,
     timezone: ZoneInfo,
 ) -> dict[str, Any]:
-    local_end = None
+    local_end = _interview_local_end(row, timezone=timezone)
     semantic_status = row.calendar_semantic_status or CalendarEventSemanticStatus.UNAVAILABLE.value
     overview = (
         row.calendar_semantic_overview if semantic_status in {"valid", "not_substantive"} else None
@@ -1821,6 +1915,7 @@ def _interview_calendar_item(
     description = row.calendar_semantic_description if semantic_status == "valid" else None
     return {
         "event_id": row.interview_page_id,
+        "source_id": "jobs/interviews",
         "source_area": "jobs",
         "source_label": "Jobs/Interviews",
         "title": row.title,
@@ -1847,10 +1942,22 @@ def _interview_calendar_item(
         ),
         "semantic_cache": _calendar_semantic_cache(row),
         "source_url": row.source_url,
+        "starts_at": row.date_start or local_start.astimezone(UTC),
+        "ends_at": local_end.astimezone(UTC) if local_end is not None else None,
         "source_last_edited_at": row.notion_last_edited_at,
         "source_fingerprint": row.calendar_semantic_source_fingerprint,
         "url_candidates": row.url_candidates,
     }
+
+
+def _job_event_completed(snapshot: Mapping[str, Any]) -> bool:
+    for key, value in snapshot.items():
+        if str(key).casefold().strip() not in {"status", "completed", "complete"}:
+            continue
+        normalized = str(value).casefold().strip()
+        if normalized in {"true", "yes", "done", "complete", "completed", "cancelled"}:
+            return True
+    return False
 
 
 def _calendar_semantic_cache(row: Any) -> Mapping[str, Any]:

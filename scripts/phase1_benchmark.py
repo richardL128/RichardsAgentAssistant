@@ -29,6 +29,14 @@ LATENCY_P95_LIMIT_MS = 300_000
 MODEL_ALLOCATION_LIMIT_BYTES = 28 * GIB
 MINIMUM_FREE_MEMORY_PERCENT = 10.0
 STEADY_SWAPOUT_LIMIT_BYTES = GIB
+ACCEPTED_MODEL = "qwen3:14b"
+ACCEPTED_NUM_CTX = 32_768
+ACCEPTED_MAX_INPUT_TOKENS = 26_624
+ACCEPTED_MAX_OUTPUT_TOKENS = 2_048
+ACCEPTED_CONTEXT_RESERVE_TOKENS = 4_096
+ACCEPTED_COMPACTION_TRIGGER_TOKENS = 19_968
+ACCEPTED_COMPACTION_TARGET_TOKENS = 14_336
+ACCEPTED_RECENT_TAIL_MAX_TOKENS = 8_192
 
 
 def _sha256(path: Path) -> str:
@@ -241,6 +249,39 @@ def _benchmark_gate_passed(checks: Mapping[str, bool], advisories: Mapping[str, 
     return all(checks.values()) and all(advisories.values())
 
 
+def _benchmark_context_profile(num_ctx: int, max_output_tokens: int) -> dict[str, int]:
+    accepted_default_profile = (
+        num_ctx == ACCEPTED_NUM_CTX and max_output_tokens == ACCEPTED_MAX_OUTPUT_TOKENS
+    )
+    reserve = (
+        ACCEPTED_CONTEXT_RESERVE_TOKENS
+        if accepted_default_profile
+        else min(4096, max(0, num_ctx // 8))
+    )
+    max_input = num_ctx - max_output_tokens - reserve
+    if max_input <= 2:
+        raise RuntimeError("benchmark context window is too small for the requested output")
+    return {
+        "max_input_tokens": max_input,
+        "context_reserve_tokens": reserve,
+        "compaction_trigger_tokens": (
+            ACCEPTED_COMPACTION_TRIGGER_TOKENS
+            if accepted_default_profile
+            else max(2, int(max_input * 0.75))
+        ),
+        "compaction_target_tokens": (
+            ACCEPTED_COMPACTION_TARGET_TOKENS
+            if accepted_default_profile
+            else max(1, int(max_input * 0.5))
+        ),
+        "recent_tail_max_tokens": (
+            ACCEPTED_RECENT_TAIL_MAX_TOKENS
+            if accepted_default_profile
+            else max(1, min(8192, max(1, int(max_input * 0.5))))
+        ),
+    }
+
+
 async def _run(args: argparse.Namespace) -> dict[str, object]:
     fixture_dir = args.fixture_dir.resolve()
     fixtures = load_fixtures(fixture_dir)
@@ -285,12 +326,7 @@ async def _run(args: argparse.Namespace) -> dict[str, object]:
         if resident_models:
             await asyncio.sleep(5)
 
-        benchmark_reserve = min(4096, max(0, args.num_ctx // 8))
-        benchmark_max_input = args.num_ctx - args.max_output_tokens - benchmark_reserve
-        if benchmark_max_input <= 2:
-            raise RuntimeError("benchmark context window is too small for the requested output")
-        compaction_trigger = max(2, int(benchmark_max_input * 0.75))
-        compaction_target = max(1, int(benchmark_max_input * 0.5))
+        context_profile = _benchmark_context_profile(args.num_ctx, args.max_output_tokens)
         settings = Settings(
             ollama_base_url=base_url,
             ollama_model=args.model,
@@ -298,16 +334,16 @@ async def _run(args: argparse.Namespace) -> dict[str, object]:
             ollama_num_ctx=args.num_ctx,
             ollama_num_batch=args.num_batch,
             ollama_max_concurrency=1,
-            ollama_max_input_tokens=benchmark_max_input,
+            ollama_max_input_tokens=context_profile["max_input_tokens"],
             ollama_max_output_tokens=args.max_output_tokens,
-            ollama_context_reserve_tokens=benchmark_reserve,
+            ollama_context_reserve_tokens=context_profile["context_reserve_tokens"],
             ollama_timeout_seconds=args.timeout_seconds,
             ollama_seed=args.seed,
             ollama_reasoning=args.reasoning,
             ollama_structured_output_transport=args.structured_output_transport,
-            conversation_compaction_trigger_tokens=compaction_trigger,
-            conversation_compaction_target_tokens=compaction_target,
-            conversation_recent_tail_max_tokens=max(1, min(8192, compaction_target)),
+            conversation_compaction_trigger_tokens=context_profile["compaction_trigger_tokens"],
+            conversation_compaction_target_tokens=context_profile["compaction_target_tokens"],
+            conversation_recent_tail_max_tokens=context_profile["recent_tail_max_tokens"],
             conversation_compaction_max_output_tokens=args.max_output_tokens,
         )
         gateway = LLMGateway(settings)
@@ -462,8 +498,8 @@ async def _run(args: argparse.Namespace) -> dict[str, object]:
             "num_ctx": args.num_ctx,
             "num_batch": args.num_batch,
             "max_output_tokens": args.max_output_tokens,
-            "max_input_tokens": benchmark_max_input,
-            "context_reserve_tokens": benchmark_reserve,
+            "max_input_tokens": context_profile["max_input_tokens"],
+            "context_reserve_tokens": context_profile["context_reserve_tokens"],
             "max_concurrency": 1,
             "embedding_model": args.embedding_model,
             "embedding_dimensions": args.embedding_dimensions,
@@ -495,15 +531,15 @@ async def _run(args: argparse.Namespace) -> dict[str, object]:
 
 def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--model", default="qwen3-32gb:latest")
+    parser.add_argument("--model", default=ACCEPTED_MODEL)
     parser.add_argument("--expected-digest", required=True)
     parser.add_argument("--base-url", default="http://127.0.0.1:11434")
     parser.add_argument("--fixture-dir", type=Path, default=Path("tests/fixtures/evaluation"))
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--warm-repetitions", type=int, default=10)
-    parser.add_argument("--num-ctx", type=int, default=2048)
+    parser.add_argument("--num-ctx", type=int, default=ACCEPTED_NUM_CTX)
     parser.add_argument("--num-batch", type=int, default=32)
-    parser.add_argument("--max-output-tokens", type=int, default=384)
+    parser.add_argument("--max-output-tokens", type=int, default=ACCEPTED_MAX_OUTPUT_TOKENS)
     parser.add_argument(
         "--reasoning",
         action=argparse.BooleanOptionalAction,

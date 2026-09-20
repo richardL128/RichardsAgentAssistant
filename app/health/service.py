@@ -27,6 +27,8 @@ _COMPONENT_ALIASES = {
     "code_review_ingest": "code_review",
     "academic_planner": "academic_planner",
     "academic_morning_notification": "academic_morning",
+    "academic_end_of_day_notification": "academic_end_of_day",
+    "academic_nightly_checkin": "academic_end_of_day",
     "finance": "finance",
 }
 
@@ -34,6 +36,11 @@ _ACADEMIC_MORNING_AGENT = "academic_morning_notification"
 _ACADEMIC_MORNING_COMPONENT = "academic_morning"
 _ACADEMIC_MORNING_NAMESPACE = "academic-morning"
 _DEFAULT_ACADEMIC_MORNING_GRACE_MINUTES = 30
+_ACADEMIC_END_OF_DAY_AGENT = "academic_end_of_day_notification"
+_ACADEMIC_END_OF_DAY_AGENTS = ("academic_end_of_day_notification", "academic_nightly_checkin")
+_ACADEMIC_END_OF_DAY_COMPONENT = "academic_end_of_day"
+_ACADEMIC_END_OF_DAY_NAMESPACE = "academic-end-of-day"
+_DEFAULT_ACADEMIC_END_OF_DAY_GRACE_MINUTES = 30
 
 
 def evaluate_and_persist(session: Session, facts: OperationalFacts) -> OperationalHealth:
@@ -113,34 +120,94 @@ def evaluate_academic_morning_health(
 ) -> OperationalHealth:
     """Persist schedule-specific health for the host-controlled morning notifier."""
 
+    return _evaluate_scheduled_delivery_health(
+        session,
+        settings=settings,
+        evaluated_at=evaluated_at,
+        agent_name=_ACADEMIC_MORNING_AGENT,
+        component=_ACADEMIC_MORNING_COMPONENT,
+        namespace=_ACADEMIC_MORNING_NAMESPACE,
+        schedule_time=settings.academic_morning_schedule,
+        grace_minutes=_academic_morning_grace_minutes(settings),
+        waiting_code="academic_morning_waiting",
+        missing_code="academic_morning_missing",
+    )
+
+
+def evaluate_academic_end_of_day_health(
+    session: Session,
+    *,
+    settings: Settings,
+    evaluated_at: datetime,
+) -> OperationalHealth:
+    """Persist schedule-specific health for the host-controlled nightly check-in."""
+
+    return _evaluate_scheduled_delivery_health(
+        session,
+        settings=settings,
+        evaluated_at=evaluated_at,
+        agent_name=_ACADEMIC_END_OF_DAY_AGENT,
+        component=_ACADEMIC_END_OF_DAY_COMPONENT,
+        namespace=_ACADEMIC_END_OF_DAY_NAMESPACE,
+        schedule_time=settings.academic_end_of_day_schedule,
+        grace_minutes=_academic_end_of_day_grace_minutes(settings),
+        waiting_code="academic_end_of_day_waiting",
+        missing_code="academic_end_of_day_missing",
+        accepted_agent_names=_ACADEMIC_END_OF_DAY_AGENTS,
+        setup_diagnostic_code=_academic_end_of_day_setup_diagnostic(settings),
+    )
+
+
+def _evaluate_scheduled_delivery_health(
+    session: Session,
+    *,
+    settings: Settings,
+    evaluated_at: datetime,
+    agent_name: str,
+    component: str,
+    namespace: str,
+    schedule_time: time,
+    grace_minutes: int,
+    waiting_code: str,
+    missing_code: str,
+    accepted_agent_names: tuple[str, ...] | None = None,
+    setup_diagnostic_code: str | None = None,
+) -> OperationalHealth:
+    """Persist schedule-specific health for one host-controlled Discord delivery."""
+
     if evaluated_at.tzinfo is None or evaluated_at.utcoffset() is None:
         raise ValueError("evaluated_at must be timezone-aware")
     current = evaluated_at.astimezone(UTC)
-    schedule, occurrence = _academic_morning_occurrence(settings, current)
-    grace = timedelta(minutes=_academic_morning_grace_minutes(settings))
+    schedule, occurrence = _scheduled_occurrence(settings, current, schedule_time)
+    grace = timedelta(minutes=grace_minutes)
     current_deadline = occurrence.scheduled_at + grace
-    period_key = _academic_morning_period_key(occurrence)
+    period_key = _period_key(namespace, occurrence)
     run = session.scalar(
         select(AgentRun)
         .where(
-            AgentRun.agent_name == _ACADEMIC_MORNING_AGENT,
+            AgentRun.agent_name.in_(accepted_agent_names or (agent_name,)),
             AgentRun.idempotency_key == period_key,
         )
         .order_by(AgentRun.created_at.desc())
         .limit(1)
     )
-    last_success_at = _latest_academic_morning_success(session)
+    last_success_at = _latest_scheduled_success(session, accepted_agent_names or (agent_name,))
     next_expected_at = current_deadline
-    if run is None:
+    if setup_diagnostic_code is not None:
+        processing = ProcessingStatus.ATTENTION
+        delivery = DeliveryStatus.NOT_REQUIRED
+        connector_authenticated = True
+        diagnostic_code = setup_diagnostic_code
+    elif run is None:
         processing = (
             ProcessingStatus.SUCCEEDED if current <= current_deadline else ProcessingStatus.QUEUED
         )
         delivery = DeliveryStatus.NOT_REQUIRED
         connector_authenticated = True
         diagnostic_code = (
-            f"academic_morning_waiting:{period_key}"
+            f"{waiting_code}:{period_key}"
             if current <= current_deadline
-            else f"academic_morning_missing:{period_key}"
+            else f"{missing_code}:{period_key}"
         )
     else:
         processing = (
@@ -154,7 +221,7 @@ def evaluate_academic_morning_health(
             receipt.error_code != "authorization_invalid" for receipt in deliveries
         )
         if processing is ProcessingStatus.SUCCEEDED and delivery is DeliveryStatus.SUCCEEDED:
-            next_expected_at = _next_academic_morning_deadline(
+            next_expected_at = _next_scheduled_deadline(
                 schedule,
                 current=current,
                 current_scheduled_at=occurrence.scheduled_at,
@@ -164,7 +231,7 @@ def evaluate_academic_morning_health(
     return evaluate_and_persist(
         session,
         OperationalFacts(
-            component=_ACADEMIC_MORNING_COMPONENT,
+            component=component,
             processing=processing,
             delivery=delivery,
             connector_authenticated=connector_authenticated,
@@ -231,12 +298,60 @@ def _academic_morning_grace_minutes(settings: Settings) -> int:
     return value
 
 
-def _academic_morning_occurrence(settings: Settings, current: datetime) -> tuple[Any, Any]:
+def _academic_end_of_day_grace_minutes(settings: Settings) -> int:
+    value = getattr(
+        settings,
+        "academic_end_of_day_catchup_grace_minutes",
+        _DEFAULT_ACADEMIC_END_OF_DAY_GRACE_MINUTES,
+    )
+    if not isinstance(value, int):
+        value = int(value)
+    if value < 0:
+        raise ValueError("academic end-of-day catch-up grace must not be negative")
+    return value
+
+
+def _academic_end_of_day_setup_diagnostic(settings: Settings) -> str | None:
+    bot = settings.discord_bot_token is not None
+    channel = settings.discord_academic_channel_id is not None
+    owner = settings.discord_academic_proactive_user_id is not None
+    owner_auth = (
+        settings.discord_academic_proactive_user_id is not None
+        and settings.discord_academic_proactive_user_id
+        in settings.discord_academic_authorized_user_ids
+    )
+    content = settings.discord_academic_message_content_enabled
+    handoff = (
+        settings.discord_application_id is not None
+        and settings.discord_host_handoff_secret is not None
+    )
+    if bot and channel and owner and owner_auth and content and handoff:
+        return None
+    return (
+        "setup_attention:"
+        f"bot={_bool_code(bot)};"
+        f"channel={_bool_code(channel)};"
+        f"owner={_bool_code(owner)};"
+        f"owner_auth={_bool_code(owner_auth)};"
+        f"content={_bool_code(content)};"
+        f"handoff={_bool_code(handoff)}"
+    )
+
+
+def _bool_code(value: bool) -> str:
+    return "true" if value else "false"
+
+
+def _scheduled_occurrence(
+    settings: Settings,
+    current: datetime,
+    schedule_time: time,
+) -> tuple[Any, Any]:
     # Import lazily to avoid initializing the queue task registry while loading health services.
     from app.queue.periodic import TorontoPeriodicSchedule
 
     schedule = TorontoPeriodicSchedule.from_time(
-        settings.academic_morning_schedule,
+        schedule_time,
         timezone_name=settings.app_timezone,
     )
     local_day = current.astimezone(schedule.zone).date()
@@ -247,13 +362,13 @@ def _academic_morning_occurrence(settings: Settings, current: datetime) -> tuple
     return schedule, schedule.next_occurrence(current)
 
 
-def _academic_morning_period_key(occurrence: Any) -> str:
+def _period_key(namespace: str, occurrence: Any) -> str:
     from app.queue.periodic import stable_period_key
 
-    return stable_period_key(_ACADEMIC_MORNING_NAMESPACE, occurrence)
+    return stable_period_key(namespace, occurrence)
 
 
-def _next_academic_morning_deadline(
+def _next_scheduled_deadline(
     schedule: Any,
     *,
     current: datetime,
@@ -264,12 +379,12 @@ def _next_academic_morning_deadline(
     return schedule.next_occurrence(next_after).scheduled_at + grace
 
 
-def _latest_academic_morning_success(session: Session) -> datetime | None:
+def _latest_scheduled_success(session: Session, agent_names: tuple[str, ...]) -> datetime | None:
     finished_at = session.scalar(
         select(AgentRun.finished_at)
         .join(Delivery, Delivery.run_id == AgentRun.id)
         .where(
-            AgentRun.agent_name == _ACADEMIC_MORNING_AGENT,
+            AgentRun.agent_name.in_(agent_names),
             AgentRun.status == RunStatus.SUCCEEDED,
             AgentRun.finished_at.is_not(None),
             Delivery.status.in_(
@@ -290,22 +405,27 @@ def _latest_academic_morning_success(session: Session) -> datetime | None:
 
 
 def _next_expected(settings: Settings, component: str, current: datetime) -> datetime | None:
-    """Return a due time only for the scheduled morning component."""
+    """Return a due time only for known scheduled components."""
 
-    if component != _ACADEMIC_MORNING_COMPONENT:
+    if component == _ACADEMIC_MORNING_COMPONENT:
+        schedule_time = settings.academic_morning_schedule
+        grace_minutes = _academic_morning_grace_minutes(settings)
+    elif component == _ACADEMIC_END_OF_DAY_COMPONENT:
+        schedule_time = settings.academic_end_of_day_schedule
+        grace_minutes = _academic_end_of_day_grace_minutes(settings)
+    else:
         return None
     from app.queue.periodic import TorontoPeriodicSchedule
 
     schedule = TorontoPeriodicSchedule.from_time(
-        settings.academic_morning_schedule,
+        schedule_time,
         timezone_name=settings.app_timezone,
     )
-    return schedule.next_occurrence(current).scheduled_at + timedelta(
-        minutes=_academic_morning_grace_minutes(settings)
-    )
+    return schedule.next_occurrence(current).scheduled_at + timedelta(minutes=grace_minutes)
 
 
 __all__ = [
+    "evaluate_academic_end_of_day_health",
     "evaluate_academic_morning_health",
     "evaluate_and_persist",
     "evaluate_run_and_persist",

@@ -29,7 +29,7 @@ from app.health.checks import (
     check_notion_authentication,
     check_queue,
 )
-from app.health.service import evaluate_academic_morning_health
+from app.health.service import evaluate_academic_end_of_day_health, evaluate_academic_morning_health
 from app.queue import visibility
 from app.queue.periodic import TorontoPeriodicSchedule, stable_period_key
 from app.queue.visibility import QueueJobMetadata
@@ -88,6 +88,24 @@ def _academic_morning_settings(**overrides: object) -> Settings:
     return Settings(**defaults)
 
 
+def _academic_end_of_day_settings(**overrides: object) -> Settings:
+    defaults: dict[str, object] = {
+        "_env_file": None,
+        "app_timezone": "America/Toronto",
+        "academic_end_of_day_schedule": time(21),
+        "academic_end_of_day_catchup_grace_minutes": 30,
+        "discord_bot_token": "discord-secret",
+        "discord_application_id": "111111111111111111",
+        "discord_academic_channel_id": ACADEMIC_CHANNEL_ID,
+        "discord_academic_authorized_user_ids": [123456789],
+        "discord_academic_proactive_user_id": 123456789,
+        "discord_academic_message_content_enabled": True,
+        "discord_host_handoff_secret": "handoff-secret",
+    }
+    defaults.update(overrides)
+    return Settings(**defaults)
+
+
 def _academic_morning_key(settings: Settings, local_day: datetime) -> str:
     schedule = TorontoPeriodicSchedule.from_time(
         settings.academic_morning_schedule,
@@ -95,6 +113,15 @@ def _academic_morning_key(settings: Settings, local_day: datetime) -> str:
     )
     occurrence = schedule.next_occurrence(local_day.astimezone(UTC) - timedelta(microseconds=1))
     return stable_period_key("academic-morning", occurrence)
+
+
+def _academic_end_of_day_key(settings: Settings, local_day: datetime) -> str:
+    schedule = TorontoPeriodicSchedule.from_time(
+        settings.academic_end_of_day_schedule,
+        timezone_name=settings.app_timezone,
+    )
+    occurrence = schedule.next_occurrence(local_day.astimezone(UTC) - timedelta(microseconds=1))
+    return stable_period_key("academic-end-of-day", occurrence)
 
 
 def _seed_academic_morning_run(
@@ -156,6 +183,62 @@ def _seed_academic_morning_run(
                         if delivery_status is DatabaseDeliveryStatus.FAILED
                         else None
                     )
+                ),
+            )
+        )
+    return run
+
+
+def _seed_academic_end_of_day_run(
+    session: Session,
+    *,
+    settings: Settings,
+    status: RunStatus,
+    local_day: datetime = datetime(2026, 9, 10, tzinfo=TORONTO),
+    error_code: str | None = None,
+    delivery_status: DatabaseDeliveryStatus | None = None,
+) -> AgentRun:
+    run = AgentRun(
+        idempotency_key=_academic_end_of_day_key(settings, local_day),
+        agent_name="academic_nightly_checkin",
+        trigger="schedule",
+        schedule="academic-end-of-day",
+        input_version="academic-end-of-day:v1",
+        status=status,
+        error_code=error_code,
+        started_at=datetime(2026, 9, 11, 1, 0, tzinfo=UTC),
+        finished_at=(
+            datetime(2026, 9, 11, 1, 5, tzinfo=UTC)
+            if status
+            in {
+                RunStatus.SUCCEEDED,
+                RunStatus.ATTENTION,
+                RunStatus.FAILED,
+                RunStatus.CANCELLED,
+            }
+            else None
+        ),
+    )
+    session.add(run)
+    session.flush()
+    if delivery_status is not None:
+        session.add(
+            Delivery(
+                run_id=run.id,
+                channel="discord",
+                target=ACADEMIC_CHANNEL_ID,
+                idempotency_key=f"{run.idempotency_key}:delivery",
+                status=delivery_status,
+                attempt_count=1,
+                last_attempt_at=datetime(2026, 9, 11, 1, 6, tzinfo=UTC),
+                external_url=(
+                    f"https://discord.com/channels/@me/{ACADEMIC_CHANNEL_ID}/123456789012345680"
+                    if delivery_status
+                    in {
+                        DatabaseDeliveryStatus.SENT,
+                        DatabaseDeliveryStatus.ACKNOWLEDGED,
+                    }
+                    else None
                 ),
             )
         )
@@ -331,6 +414,120 @@ def test_academic_morning_health_advances_after_successful_delivery(
     assert health.last_success_at == datetime(2026, 9, 10, 12, 5, tzinfo=UTC)
     assert health.next_expected_at == datetime(2026, 9, 11, 12, 30, tzinfo=UTC)
     assert persisted_next_due_at == datetime(2026, 9, 11, 12, 30, tzinfo=UTC)
+
+
+def test_academic_end_of_day_health_waits_before_deadline(
+    health_engine: Engine,
+) -> None:
+    settings = _academic_end_of_day_settings()
+
+    with Session(health_engine) as session, session.begin():
+        health = evaluate_academic_end_of_day_health(
+            session,
+            settings=settings,
+            evaluated_at=datetime(2026, 9, 11, 1, 15, tzinfo=UTC),
+        )
+        persisted = session.scalar(
+            select(PersistedHealthCheck).where(
+                PersistedHealthCheck.check_name == "academic_end_of_day"
+            )
+        )
+        persisted_state = persisted.state if persisted is not None else None
+
+    assert health.state is HealthState.HEALTHY
+    assert health.rule == "processing_and_delivery_succeeded"
+    assert health.next_expected_at == datetime(2026, 9, 11, 1, 30, tzinfo=UTC)
+    assert "academic_end_of_day_waiting:academic-end-of-day:2026-09-10:2100:v1" in (
+        health.diagnostic
+    )
+    assert persisted_state == "healthy"
+
+
+def test_academic_end_of_day_health_reports_absent_run_after_grace(
+    health_engine: Engine,
+) -> None:
+    settings = _academic_end_of_day_settings()
+
+    with Session(health_engine) as session, session.begin():
+        health = evaluate_academic_end_of_day_health(
+            session,
+            settings=settings,
+            evaluated_at=datetime(2026, 9, 11, 1, 31, tzinfo=UTC),
+        )
+
+    assert health.state is HealthState.ATTENTION
+    assert health.rule == "run_overdue"
+    assert health.next_expected_at == datetime(2026, 9, 11, 1, 30, tzinfo=UTC)
+    assert "academic_end_of_day_missing:academic-end-of-day:2026-09-10:2100:v1" in (
+        health.diagnostic
+    )
+
+
+def test_academic_end_of_day_health_reports_missing_proactive_owner_setup(
+    health_engine: Engine,
+) -> None:
+    settings = _academic_end_of_day_settings(discord_academic_proactive_user_id=None)
+
+    with Session(health_engine) as session, session.begin():
+        health = evaluate_academic_end_of_day_health(
+            session,
+            settings=settings,
+            evaluated_at=datetime(2026, 9, 11, 1, 15, tzinfo=UTC),
+        )
+
+    assert health.state is HealthState.ATTENTION
+    assert health.rule == "processing_completed_with_attention"
+    assert "setup_attention:" in health.diagnostic
+    assert "owner=false" in health.diagnostic
+    assert "owner_auth=false" in health.diagnostic
+    assert "discord-secret" not in health.diagnostic
+
+
+def test_academic_end_of_day_health_reports_unauthorized_proactive_owner(
+    health_engine: Engine,
+) -> None:
+    settings = _academic_end_of_day_settings(
+        discord_academic_authorized_user_ids=[111111111],
+        discord_academic_proactive_user_id=222222222,
+    )
+
+    with Session(health_engine) as session, session.begin():
+        health = evaluate_academic_end_of_day_health(
+            session,
+            settings=settings,
+            evaluated_at=datetime(2026, 9, 11, 1, 15, tzinfo=UTC),
+        )
+
+    assert health.state is HealthState.ATTENTION
+    assert health.rule == "processing_completed_with_attention"
+    assert "setup_attention:" in health.diagnostic
+    assert "owner=true" in health.diagnostic
+    assert "owner_auth=false" in health.diagnostic
+    assert "222222222" not in health.diagnostic
+
+
+def test_academic_end_of_day_health_advances_after_successful_delivery(
+    health_engine: Engine,
+) -> None:
+    settings = _academic_end_of_day_settings()
+
+    with Session(health_engine) as session, session.begin():
+        _seed_academic_end_of_day_run(
+            session,
+            settings=settings,
+            status=RunStatus.SUCCEEDED,
+            delivery_status=DatabaseDeliveryStatus.SENT,
+        )
+        health = evaluate_academic_end_of_day_health(
+            session,
+            settings=settings,
+            evaluated_at=datetime(2026, 9, 11, 1, 10, tzinfo=UTC),
+        )
+
+    assert health.state is HealthState.HEALTHY
+    assert health.rule == "processing_and_delivery_succeeded"
+    assert health.last_success_at == datetime(2026, 9, 11, 1, 5, tzinfo=UTC)
+    assert health.next_expected_at == datetime(2026, 9, 12, 1, 30, tzinfo=UTC)
 
 
 def test_github_token_check_name_is_not_an_agent_check_name() -> None:

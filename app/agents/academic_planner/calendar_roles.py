@@ -11,15 +11,19 @@ class AcademicCalendarRole(StrEnum):
 
     COURSE = "course"
     MISC = "misc"
+    LEARN = "learn"
 
 
 _TASK_PREFIX = re.compile(r"^\s*task\b\s*(?:[—:-]\s*)?", re.IGNORECASE)
+LEARN_CALENDAR_TITLE = "Classes + Tutorials + Labs"
 
 
 def academic_calendar_role(title: str) -> AcademicCalendarRole:
     """Reserve only an exact, normalized ``misc`` title for general to-dos."""
 
     normalized = " ".join(title.casefold().split())
+    if normalized == " ".join(LEARN_CALENDAR_TITLE.casefold().split()):
+        return AcademicCalendarRole.LEARN
     if normalized == AcademicCalendarRole.MISC.value:
         return AcademicCalendarRole.MISC
     return AcademicCalendarRole.COURSE
@@ -33,6 +37,7 @@ def canonical_misc_task_title(title: str) -> str:
 
 
 __all__ = [
+    "LEARN_CALENDAR_TITLE",
     "AcademicCalendarRole",
     "academic_calendar_role",
     "canonical_misc_task_title",

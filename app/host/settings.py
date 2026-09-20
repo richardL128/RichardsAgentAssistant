@@ -44,8 +44,10 @@ class HostWakeSettings:
     backend_live_url: str = "http://127.0.0.1:8000/health/live"
     discord_api_base_url: str = "https://discord.com/api/v10"
     ollama_local_base_url: str = "http://127.0.0.1:11434"
-    ollama_model: str = "qwen3-32gb:latest"
-    ollama_model_digest: str | None = None
+    ollama_model: str = "qwen3:14b"
+    ollama_model_digest: str | None = (
+        "bdbd181c33f2ed1b31c972991882db3cf4d192569092138a7d29e973cd9debe8"
+    )
     embedding_model: str = "qwen3-embedding:4b"
     embedding_model_digest: str | None = None
     embedding_dimensions: int = 1024
@@ -151,6 +153,15 @@ class HostWakeSettings:
             "LIFEAGENT_BACKEND_HANDOFF_URL",
             f"http://127.0.0.1:{api_port}/internal/discord/academic/handoff",
         )
+        ollama_model = env.get("OLLAMA_MODEL", "qwen3:14b")
+        if "OLLAMA_MODEL_DIGEST" in env:
+            ollama_model_digest = env.get("OLLAMA_MODEL_DIGEST") or None
+        else:
+            ollama_model_digest = (
+                "bdbd181c33f2ed1b31c972991882db3cf4d192569092138a7d29e973cd9debe8"
+                if ollama_model == "qwen3:14b"
+                else None
+            )
         return cls(
             repository_root=root,
             discord_bot_token=SecretStr(_required(env, "DISCORD_BOT_TOKEN")),
@@ -169,8 +180,8 @@ class HostWakeSettings:
             backend_live_url=backend_live,
             discord_api_base_url=env.get("DISCORD_API_BASE_URL", "https://discord.com/api/v10"),
             ollama_local_base_url=env.get("OLLAMA_LOCAL_BASE_URL", "http://127.0.0.1:11434"),
-            ollama_model=env.get("OLLAMA_MODEL", "qwen3-32gb:latest"),
-            ollama_model_digest=env.get("OLLAMA_MODEL_DIGEST") or None,
+            ollama_model=ollama_model,
+            ollama_model_digest=ollama_model_digest,
             embedding_model=env.get("EMBEDDING_MODEL", "qwen3-embedding:4b"),
             embedding_model_digest=env.get("EMBEDDING_MODEL_DIGEST") or None,
             embedding_dimensions=_env_int(env, "EMBEDDING_DIMENSIONS", 1024),

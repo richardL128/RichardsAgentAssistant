@@ -125,6 +125,17 @@ def test_structured_response_transport_changes_config_version() -> None:
     assert schema_gateway.native_config_version == json_gateway.native_config_version
 
 
+def test_reasoning_setting_changes_structured_and_native_config_versions() -> None:
+    reasoning_disabled = LLMGateway(Settings(), chat_model=FakeChatModel([]))
+    reasoning_enabled = LLMGateway(
+        Settings(ollama_reasoning=True),
+        chat_model=FakeChatModel([]),
+    )
+
+    assert reasoning_disabled.config_version != reasoning_enabled.config_version
+    assert reasoning_disabled.native_config_version != reasoning_enabled.native_config_version
+
+
 def test_structured_response_transport_setting_is_strict_and_diagnosed() -> None:
     settings = Settings()
 

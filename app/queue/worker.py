@@ -11,18 +11,21 @@ from app.agents.academic_planner.material_ingestion import run_assessment_materi
 from app.agents.academic_planner.morning_notification import (
     run_scheduled_morning_notification,
 )
+from app.agents.academic_planner.nightly_checkin import run_scheduled_nightly_checkin
 from app.queue.app import procrastinate_app
 from app.queue.tasks import (
     register_academic_clarification_handler,
     register_academic_clarification_status_handler,
     register_academic_material_ingestion_handler,
     register_academic_morning_notification_handler,
+    register_academic_nightly_checkin_handler,
     register_discord_wake_handler,
 )
 
 register_academic_clarification_handler(run_academic_clarification)
 register_academic_clarification_status_handler(run_academic_clarification_status)
 register_academic_morning_notification_handler(run_scheduled_morning_notification)
+register_academic_nightly_checkin_handler(run_scheduled_nightly_checkin)
 register_academic_material_ingestion_handler(run_assessment_material_ingestion)
 register_discord_wake_handler(run_discord_wake)
 

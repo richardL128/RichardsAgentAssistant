@@ -35,6 +35,8 @@ class AcademicMutationTargetStore(Protocol):
         self, assessment_id: str
     ) -> AcademicAssessmentMutationTarget | None: ...
 
+    def resolve_learn_calendar_targets(self) -> tuple[AcademicCourseMutationTarget, ...]: ...
+
     def begin_proposal_operation(
         self,
         *,
@@ -241,6 +243,10 @@ class DiscoveredAcademicNotionWriter:
                     receipt = await self._update(change, operation_id)
                 elif change.field == "archive_assessment":
                     receipt = await self._archive(change, operation_id)
+                elif change.field == "create_learn_calendar_event":
+                    receipt = await self._create_learn_event(change, operation_id)
+                elif change.field == "enrich_learn_calendar_event":
+                    receipt = await self._enrich_learn_event(change, operation_id)
                 else:
                     raise permanent_error(
                         ErrorCode.INPUT_INVALID,
@@ -352,6 +358,99 @@ class DiscoveredAcademicNotionWriter:
             receipt=receipt,
         )
         return receipt
+
+    def _learn_calendar_target(self) -> AcademicCourseMutationTarget:
+        targets = self._target_store.resolve_learn_calendar_targets()
+        if len(targets) != 1:
+            raise permanent_error(
+                ErrorCode.SOURCE_SETUP_REQUIRED,
+                "exactly one Classes + Tutorials + Labs calendar with LEARN Context is required",
+            )
+        target = targets[0]
+        if target.learn_context_property_id is None:
+            raise permanent_error(
+                ErrorCode.SOURCE_SETUP_REQUIRED,
+                "the reserved LEARN Context property is unavailable",
+            )
+        return target
+
+    async def _create_learn_event(
+        self,
+        change: ProposedChange,
+        operation_id: str,
+    ) -> NotionWriteReceipt:
+        target = self._learn_calendar_target()
+        if (
+            change.title is None
+            or change.learn_date is None
+            or change.learn_context is None
+            or target.learn_context_property_id is None
+        ):
+            raise permanent_error(ErrorCode.INPUT_INVALID, "LEARN event create is incomplete")
+        due_value = _notion_learn_value(change.learn_date)
+        if due_value is None:
+            raise permanent_error(ErrorCode.INPUT_INVALID, "LEARN event date is missing")
+        return await self._connector.create_assessment_page(
+            proposal_id=operation_id,
+            data_source_id=target.data_source_id,
+            title_property_id=target.title_property_id,
+            date_property_id=target.date_property_id,
+            title=change.title,
+            due=due_value,
+            ends_at=_notion_learn_value(change.learn_ends_at),
+            rich_text_property_id=target.learn_context_property_id,
+            rich_text_value=change.learn_context,
+        )
+
+    async def _enrich_learn_event(
+        self,
+        change: ProposedChange,
+        operation_id: str,
+    ) -> NotionWriteReceipt:
+        reserved = self._learn_calendar_target()
+        if change.assessment_id is None:
+            raise permanent_error(ErrorCode.INPUT_INVALID, "LEARN enrichment target is missing")
+        target = self._assessment_target(change)
+        if (
+            target.course_id != reserved.course_id
+            or target.page_id != change.target_page_id
+            or target.learn_context_property_id is None
+            or target.learn_context_property_id != reserved.learn_context_property_id
+            or target.due_at is None
+            or change.expected_due_value is None
+            or change.learn_context is None
+        ):
+            raise permanent_error(
+                ErrorCode.INPUT_INVALID,
+                "LEARN enrichment target is outside the reserved calendar",
+            )
+        if not _learn_expected_date_matches(change.expected_due_value, target):
+            raise permanent_error(
+                ErrorCode.INPUT_INVALID,
+                "LEARN enrichment target date changed after preview",
+            )
+        expected_due = (
+            target.due_at.date().isoformat()
+            if target.is_all_day
+            else target.due_at
+        )
+        expected_end = (
+            target.ends_at.date().isoformat()
+            if target.is_all_day and target.ends_at is not None
+            else target.ends_at
+        )
+        return await self._connector.guarded_update_learn_context(
+            proposal_id=operation_id,
+            page_id=target.page_id,
+            title_property_id=target.title_property_id,
+            date_property_id=target.date_property_id,
+            learn_context_property_id=target.learn_context_property_id,
+            expected_title=target.title,
+            expected_due=expected_due,
+            expected_ends_at=expected_end,
+            expected_last_edited_at=target.last_edited_at,
+            learn_context=change.learn_context,
+        )
 
     async def _send_material_uploads(
         self,
@@ -569,9 +668,38 @@ def _proposal_uuid_from_operation(operation_id: str) -> UUID:
 def _requires_hitl_review(changes: Sequence[ProposedChange]) -> bool:
     return any(
         getattr(change, "field", None)
-        in {"create_assessment", "attach_assessment_material", "archive_assessment"}
+        in {
+            "create_assessment",
+            "attach_assessment_material",
+            "archive_assessment",
+            "create_learn_calendar_event",
+            "enrich_learn_calendar_event",
+        }
         for change in changes
     )
+
+
+def _notion_learn_value(value: object) -> datetime | str | None:
+    if value is None:
+        return None
+    if isinstance(value, datetime):
+        return value
+    if hasattr(value, "isoformat"):
+        return cast(Any, value).isoformat()
+    raise permanent_error(ErrorCode.INPUT_INVALID, "LEARN date value is invalid")
+
+
+def _learn_expected_date_matches(
+    expected: object,
+    target: AcademicAssessmentMutationTarget,
+) -> bool:
+    if target.due_at is None:
+        return False
+    if isinstance(expected, datetime):
+        return expected == target.due_at
+    if hasattr(expected, "isoformat"):
+        return cast(Any, expected).isoformat() == target.due_at.date().isoformat()
+    return False
 
 
 def _validate_review(

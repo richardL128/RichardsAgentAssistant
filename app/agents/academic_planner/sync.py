@@ -75,6 +75,7 @@ _SETUP_LABELS: dict[str, str] = {
     "assessment_schema_malformed": "malformed Assessments calendar schema",
     "assessment_name_property_invalid": "missing or invalid Name property",
     "assessment_date_property_invalid": "missing or invalid Date property",
+    "learn_context_property_invalid": "missing or invalid LEARN Context property",
     "course_persistence_failed": "course calendar persistence failed",
     "course_discovery_failed": "course calendar discovery failed",
     "notion_sync_failed": "Courses database synchronization failed",
@@ -189,6 +190,7 @@ class AcademicNotionSyncResult:
     material_job_count: int = 0
     invalid_calendar_count: int = 0
     diagnostic_codes: tuple[str, ...] = ()
+    unavailable_roles: tuple[AcademicCalendarRole, ...] = ()
     synced_at: datetime | None = None
     error_code: str | None = None
     retryable: bool = False
@@ -229,6 +231,8 @@ class _CourseRecord:
     title_property_name: str | None
     date_property_id: str | None
     date_property_name: str | None
+    learn_context_property_id: str | None
+    learn_context_property_name: str | None
 
 
 @dataclass(frozen=True, slots=True)
@@ -370,8 +374,12 @@ class AcademicNotionSync:
         clarification_count = 0
         material_job_count = 0
         invalid_calendars = 0
+        unavailable_roles: set[AcademicCalendarRole] = set()
+        if len(active_misc_courses) > 1:
+            unavailable_roles.add(AcademicCalendarRole.MISC)
         for course in result.courses:
             course_record = _course_record(course)
+            course_role = academic_calendar_role(course.course_title)
             invalid = _course_setup_diagnostic(
                 course,
                 course_diagnostics.get(course.course_page_id, ()),
@@ -379,6 +387,7 @@ class AcademicNotionSync:
             try:
                 if invalid is not None:
                     invalid_calendars += 1
+                    unavailable_roles.add(course_role)
                     self._store.upsert_course_calendar(
                         course_record,
                         status=_calendar_status(invalid.code),
@@ -450,6 +459,7 @@ class AcademicNotionSync:
                     self._store.save_sync_cursor(source_id, result.synced_at.isoformat())
             except Exception:
                 invalid_calendars += 1
+                unavailable_roles.add(course_role)
                 diagnostics.append(
                     NotionDiscoveryDiagnostic(
                         code="course_persistence_failed",
@@ -488,6 +498,7 @@ class AcademicNotionSync:
             material_job_count=material_job_count,
             invalid_calendar_count=invalid_calendars,
             diagnostic_codes=codes,
+            unavailable_roles=tuple(sorted(unavailable_roles, key=lambda role: role.value)),
             synced_at=result.synced_at,
             error_code=(ErrorCode.SOURCE_SYNC_PARTIAL.value if status == "partial" else None),
         )
@@ -778,6 +789,8 @@ def _course_record(course: NotionCourse) -> _CourseRecord:
         title_property_name=getattr(course, "title_property_name", None),
         date_property_id=getattr(course, "date_property_id", None),
         date_property_name=getattr(course, "date_property_name", None),
+        learn_context_property_id=getattr(course, "learn_context_property_id", None),
+        learn_context_property_name=getattr(course, "learn_context_property_name", None),
     )
 
 
@@ -794,6 +807,11 @@ def _assessment_record(
         classification: Any = _ResolvedClassification(
             kind="task",
             source="reserved_misc_calendar",
+        )
+    elif calendar_role is AcademicCalendarRole.LEARN:
+        classification = _ResolvedClassification(
+            kind="event",
+            source="reserved_learn_calendar",
         )
     else:
         classification = classify_assessment_label(

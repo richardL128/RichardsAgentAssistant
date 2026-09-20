@@ -1,0 +1,388 @@
+{
+  "acceptance_checks": {
+    "cold_fixture_passed": true,
+    "concurrent_results_not_mixed": true,
+    "context_length_matches": true,
+    "embedding_residency_probe_passed": true,
+    "model_allocation_within_limit": true,
+    "model_identity_stable": true,
+    "model_intervals_non_overlapping": true,
+    "single_active_model_call": true,
+    "two_tasks_completed": true,
+    "warm_fixtures_passed": true,
+    "warm_p95_within_timeout": true
+  },
+  "acceptance_thresholds": {
+    "minimum_steady_host_free_percent": 10.0,
+    "model_allocation_limit_bytes": 30064771072,
+    "steady_swapout_limit_bytes": 1073741824,
+    "warm_p95_limit_ms": 300000
+  },
+  "advisory_checks": {
+    "steady_host_headroom_observed": true,
+    "steady_swapout_within_limit": true
+  },
+  "benchmark_version": "phase1-live-v1",
+  "cold": {
+    "benchmark_version": "phase1-live-v1",
+    "config_versions": [
+      "b2b36d63c4937eb4545c744426dd588f34cae249688b7ba938876ccaf695c70e"
+    ],
+    "evaluations": [
+      {
+        "assertion_failures": [],
+        "assertions_passed": true,
+        "domain": "code_review",
+        "error_code": null,
+        "error_diagnostic": null,
+        "expected_status": "valid",
+        "fixture_id": "code-finding-triage-v1",
+        "latency_ms": 13174.618749995716,
+        "passed": true,
+        "status": "valid",
+        "telemetry": [
+          {
+            "attempt": 1,
+            "config_version": "b2b36d63c4937eb4545c744426dd588f34cae249688b7ba938876ccaf695c70e",
+            "error_code": null,
+            "estimated_input_tokens": 433,
+            "estimated_output_tokens": 138,
+            "finished_at": "2026-09-19T21:32:24.385290Z",
+            "input_characters": 1730,
+            "latency_ms": 13174.618749995716,
+            "model_finished_at": "2026-09-19T21:32:24.384059Z",
+            "model_identity": "qwen3:14b@bdbd181c33f2ed1b31c972991882db3cf4d192569092138a7d29e973cd9debe8",
+            "model_latency_ms": 13173.342082998715,
+            "model_started_at": "2026-09-19T21:32:11.210664Z",
+            "output_characters": 551,
+            "output_valid": true,
+            "queue_wait_ms": 0.005207955837249756,
+            "reported_input_tokens": 410,
+            "reported_output_tokens": 101,
+            "request_id": "bdbdc925-244c-4b4e-ba75-65e06ea302bb",
+            "started_at": "2026-09-19T21:32:11.210656Z"
+          }
+        ],
+        "valid": true
+      }
+    ],
+    "metrics": {
+      "p50_latency_ms": 13174.618749995716,
+      "p95_latency_ms": 13174.618749995716,
+      "pass_rate": 1.0,
+      "passed_evaluations": 1,
+      "total_evaluations": 1,
+      "valid_evaluations": 1,
+      "validity_rate": 1.0
+    },
+    "model_identities": [
+      "qwen3:14b@bdbd181c33f2ed1b31c972991882db3cf4d192569092138a7d29e973cd9debe8"
+    ]
+  },
+  "cold_start_memory": {
+    "after": {
+      "free_percent": 22.0,
+      "page_size_bytes": 16384,
+      "swapouts": 100525991,
+      "total_bytes": 34359738368
+    },
+    "before": {
+      "free_percent": 81.0,
+      "page_size_bytes": 16384,
+      "swapouts": 100507835,
+      "total_bytes": 34359738368
+    },
+    "minimum_host_free_percent": 20.0,
+    "observed_context_lengths": [
+      32768
+    ],
+    "observed_reasoning_context_lengths": [
+      32768
+    ],
+    "peak_combined_model_size_bytes": 14363058502,
+    "peak_combined_model_vram_bytes": 14363058502,
+    "peak_model_size_bytes": 14363058502,
+    "peak_model_vram_bytes": 14363058502,
+    "sample_count": 18,
+    "sample_errors": 0,
+    "swapout_delta_bytes": 297467904,
+    "swapout_delta_pages": 18156
+  },
+  "concurrency": {
+    "gateway_metrics": {
+      "active": 0,
+      "limit": 1,
+      "peak": 1
+    },
+    "model_intervals_non_overlapping": true,
+    "outputs_match_markers": true,
+    "request_ids": [
+      "b6dd2c6f-0904-447d-8867-83615a30d837",
+      "a1ed0bb2-d2b9-4d55-a0b1-75000d8c85f1"
+    ],
+    "statuses": [
+      "valid",
+      "valid"
+    ]
+  },
+  "embedding_probe": {
+    "expected_dimensions": 1024,
+    "finished_at": "2026-09-19T21:33:07.084534+00:00",
+    "model": "qwen3-embedding:4b",
+    "observed_dimensions": 1024,
+    "started_at": "2026-09-19T21:33:04.802656+00:00",
+    "status": "valid"
+  },
+  "gate_passed": true,
+  "generated_at": "2026-09-19T21:33:18.951401+00:00",
+  "memory": {
+    "after": {
+      "free_percent": 19.0,
+      "page_size_bytes": 16384,
+      "swapouts": 100540792,
+      "total_bytes": 34359738368
+    },
+    "before": {
+      "free_percent": 22.0,
+      "page_size_bytes": 16384,
+      "swapouts": 100526235,
+      "total_bytes": 34359738368
+    },
+    "minimum_host_free_percent": 19.0,
+    "observed_context_lengths": [
+      32768
+    ],
+    "observed_reasoning_context_lengths": [
+      32768
+    ],
+    "peak_combined_model_size_bytes": 14363058502,
+    "peak_combined_model_vram_bytes": 14363058502,
+    "peak_model_size_bytes": 14363058502,
+    "peak_model_vram_bytes": 14363058502,
+    "sample_count": 49,
+    "sample_errors": 0,
+    "swapout_delta_bytes": 238501888,
+    "swapout_delta_pages": 14557
+  },
+  "ollama": {
+    "digest": "bdbd181c33f2ed1b31c972991882db3cf4d192569092138a7d29e973cd9debe8",
+    "identity_stable_at_finish": true,
+    "model": "qwen3:14b",
+    "tag_record": {
+      "capabilities": [
+        "completion",
+        "tools",
+        "thinking"
+      ],
+      "details": {
+        "context_length": 40960,
+        "embedding_length": 5120,
+        "families": [
+          "qwen3"
+        ],
+        "family": "qwen3",
+        "format": "gguf",
+        "parameter_size": "14.8B",
+        "parent_model": "",
+        "quantization_level": "Q4_K_M"
+      },
+      "digest": "bdbd181c33f2ed1b31c972991882db3cf4d192569092138a7d29e973cd9debe8",
+      "model": "qwen3:14b",
+      "modified_at": "2026-09-19T17:31:47.646183521-04:00",
+      "name": "qwen3:14b",
+      "size": 9276198565
+    },
+    "version": "0.34.2"
+  },
+  "platform": {
+    "machine": "arm64",
+    "python": "3.12.14",
+    "release": "25.6.0",
+    "system": "Darwin"
+  },
+  "provenance": {
+    "fixture_manifest_sha256": "f67703adbd9fba4f4ef362d0850d2b53ee41e51897cae5d1f753035af0ba6396",
+    "uv_lock_sha256": "99c79b5c79aa6c484938f1050b09da2aa9d2d453d3b05e09eae1f644070ec01f"
+  },
+  "settings": {
+    "config_version": "b2b36d63c4937eb4545c744426dd588f34cae249688b7ba938876ccaf695c70e",
+    "context_reserve_tokens": 4096,
+    "embedding_dimensions": 1024,
+    "embedding_model": "qwen3-embedding:4b",
+    "max_concurrency": 1,
+    "max_input_tokens": 26624,
+    "max_output_tokens": 2048,
+    "num_batch": 32,
+    "num_ctx": 32768,
+    "reasoning": false,
+    "repair_attempts": 1,
+    "seed": 1729,
+    "structured_output_transport": "json_schema",
+    "temperature": 0,
+    "timeout_seconds": 300.0
+  },
+  "warm": {
+    "benchmark_version": "phase1-live-v1",
+    "config_versions": [
+      "b2b36d63c4937eb4545c744426dd588f34cae249688b7ba938876ccaf695c70e"
+    ],
+    "evaluations": [
+      {
+        "assertion_failures": [],
+        "assertions_passed": true,
+        "domain": "code_review",
+        "error_code": null,
+        "error_diagnostic": null,
+        "expected_status": "valid",
+        "fixture_id": "code-finding-triage-v1",
+        "latency_ms": 4766.271583037451,
+        "passed": true,
+        "status": "valid",
+        "telemetry": [
+          {
+            "attempt": 1,
+            "config_version": "b2b36d63c4937eb4545c744426dd588f34cae249688b7ba938876ccaf695c70e",
+            "error_code": null,
+            "estimated_input_tokens": 433,
+            "estimated_output_tokens": 138,
+            "finished_at": "2026-09-19T21:32:34.192923Z",
+            "input_characters": 1730,
+            "latency_ms": 4766.271583037451,
+            "model_finished_at": "2026-09-19T21:32:34.192852Z",
+            "model_identity": "qwen3:14b@bdbd181c33f2ed1b31c972991882db3cf4d192569092138a7d29e973cd9debe8",
+            "model_latency_ms": 4766.189959016629,
+            "model_started_at": "2026-09-19T21:32:29.426646Z",
+            "output_characters": 551,
+            "output_valid": true,
+            "queue_wait_ms": 0.010082963854074478,
+            "reported_input_tokens": 410,
+            "reported_output_tokens": 101,
+            "request_id": "ed2f59d6-58a4-4097-81ee-f3064e90afd2",
+            "started_at": "2026-09-19T21:32:29.426634Z"
+          }
+        ],
+        "valid": true
+      },
+      {
+        "assertion_failures": [],
+        "assertions_passed": true,
+        "domain": "finance",
+        "error_code": null,
+        "error_diagnostic": null,
+        "expected_status": "valid",
+        "fixture_id": "finance-fact-inference-v1",
+        "latency_ms": 16548.65366697777,
+        "passed": true,
+        "status": "valid",
+        "telemetry": [
+          {
+            "attempt": 1,
+            "config_version": "b2b36d63c4937eb4545c744426dd588f34cae249688b7ba938876ccaf695c70e",
+            "error_code": null,
+            "estimated_input_tokens": 654,
+            "estimated_output_tokens": 227,
+            "finished_at": "2026-09-19T21:32:50.749674Z",
+            "input_characters": 2613,
+            "latency_ms": 16548.65366697777,
+            "model_finished_at": "2026-09-19T21:32:50.749620Z",
+            "model_identity": "qwen3:14b@bdbd181c33f2ed1b31c972991882db3cf4d192569092138a7d29e973cd9debe8",
+            "model_latency_ms": 16548.589542042464,
+            "model_started_at": "2026-09-19T21:32:34.200954Z",
+            "output_characters": 907,
+            "output_valid": true,
+            "queue_wait_ms": 0.008750008419156075,
+            "reported_input_tokens": 634,
+            "reported_output_tokens": 221,
+            "request_id": "07041de5-d7eb-4493-a2a4-c2c1b10db1cb",
+            "started_at": "2026-09-19T21:32:34.200941Z"
+          }
+        ],
+        "valid": true
+      },
+      {
+        "assertion_failures": [],
+        "assertions_passed": true,
+        "domain": "academic",
+        "error_code": null,
+        "error_diagnostic": null,
+        "expected_status": "valid",
+        "fixture_id": "academic-ambiguous-extraction-v1",
+        "latency_ms": 12388.593249954283,
+        "passed": true,
+        "status": "valid",
+        "telemetry": [
+          {
+            "attempt": 1,
+            "config_version": "b2b36d63c4937eb4545c744426dd588f34cae249688b7ba938876ccaf695c70e",
+            "error_code": null,
+            "estimated_input_tokens": 637,
+            "estimated_output_tokens": 128,
+            "finished_at": "2026-09-19T21:33:03.146608Z",
+            "input_characters": 2547,
+            "latency_ms": 12388.593249954283,
+            "model_finished_at": "2026-09-19T21:33:03.146550Z",
+            "model_identity": "qwen3:14b@bdbd181c33f2ed1b31c972991882db3cf4d192569092138a7d29e973cd9debe8",
+            "model_latency_ms": 12388.526584021747,
+            "model_started_at": "2026-09-19T21:32:50.757967Z",
+            "output_characters": 511,
+            "output_valid": true,
+            "queue_wait_ms": 0.007207971066236496,
+            "reported_input_tokens": 628,
+            "reported_output_tokens": 161,
+            "request_id": "2f05c574-781b-434b-ae8f-aafa65753ebc",
+            "started_at": "2026-09-19T21:32:50.757957Z"
+          }
+        ],
+        "valid": true
+      },
+      {
+        "assertion_failures": [],
+        "assertions_passed": true,
+        "domain": "structured_output",
+        "error_code": null,
+        "error_diagnostic": null,
+        "expected_status": "valid",
+        "fixture_id": "valid-json-v1",
+        "latency_ms": 1647.905791993253,
+        "passed": true,
+        "status": "valid",
+        "telemetry": [
+          {
+            "attempt": 1,
+            "config_version": "b2b36d63c4937eb4545c744426dd588f34cae249688b7ba938876ccaf695c70e",
+            "error_code": null,
+            "estimated_input_tokens": 168,
+            "estimated_output_tokens": 15,
+            "finished_at": "2026-09-19T21:33:04.798326Z",
+            "input_characters": 670,
+            "latency_ms": 1647.905791993253,
+            "model_finished_at": "2026-09-19T21:33:04.798219Z",
+            "model_identity": "qwen3:14b@bdbd181c33f2ed1b31c972991882db3cf4d192569092138a7d29e973cd9debe8",
+            "model_latency_ms": 1647.789541981183,
+            "model_started_at": "2026-09-19T21:33:03.150430Z",
+            "output_characters": 57,
+            "output_valid": true,
+            "queue_wait_ms": 0.007375027053058147,
+            "reported_input_tokens": 156,
+            "reported_output_tokens": 17,
+            "request_id": "3e8e1f25-5cf2-4d9f-bc9c-76c29b57ad84",
+            "started_at": "2026-09-19T21:33:03.150421Z"
+          }
+        ],
+        "valid": true
+      }
+    ],
+    "metrics": {
+      "p50_latency_ms": 4766.271583037451,
+      "p95_latency_ms": 16548.65366697777,
+      "pass_rate": 1.0,
+      "passed_evaluations": 4,
+      "total_evaluations": 4,
+      "valid_evaluations": 4,
+      "validity_rate": 1.0
+    },
+    "model_identities": [
+      "qwen3:14b@bdbd181c33f2ed1b31c972991882db3cf4d192569092138a7d29e973cd9debe8"
+    ]
+  }
+}

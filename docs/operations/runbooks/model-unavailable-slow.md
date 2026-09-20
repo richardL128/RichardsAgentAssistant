@@ -41,16 +41,23 @@ scripts/ollama_qwen_status.sh
 ```
 
 The status script reports, with meaningful exit codes, whether the local Ollama
-API is reachable, whether both the reasoning and embedding models are
+API is reachable, whether both the semantic/reasoning and embedding models are
 installed, whether optional digests match, whether the embedding role advertises
 its capability, and whether either role is resident according to `/api/ps`. It
 does not print prompts, Discord messages, unrelated model metadata, or secrets.
 
-The default native context budget is `OLLAMA_NUM_CTX=16384`,
-`OLLAMA_MAX_INPUT_TOKENS=13824`, `OLLAMA_MAX_OUTPUT_TOKENS=1024`, and
-`OLLAMA_CONTEXT_RESERVE_TOKENS=1536`. Startup validates that the input budget,
-output budget, and reserve fit inside the configured context window before a
-model request is accepted.
+The default semantic model is `qwen3:14b`, pinned to digest
+`bdbd181c33f2ed1b31c972991882db3cf4d192569092138a7d29e973cd9debe8`. The
+embedding model remains `qwen3-embedding:4b` with `EMBEDDING_DIMENSIONS=1024`.
+There is no configured fallback semantic model.
+
+The default native context budget is `OLLAMA_NUM_CTX=32768`,
+`OLLAMA_MAX_INPUT_TOKENS=26624`, `OLLAMA_MAX_OUTPUT_TOKENS=2048`, and
+`OLLAMA_CONTEXT_RESERVE_TOKENS=4096`; the accepted runtime also uses
+`OLLAMA_NUM_BATCH=32`, `OLLAMA_MAX_CONCURRENCY=1`, `OLLAMA_REASONING=false`,
+and `OLLAMA_STRUCTURED_OUTPUT_TRANSPORT=json_schema`. Startup validates that
+the input budget, output budget, and reserve fit inside the configured context
+window before a model request is accepted.
 
 Native conversations no longer replay the entire transcript into each model
 call. The exact artifact-backed transcript remains canonical for audit and
@@ -109,16 +116,20 @@ when the operator explicitly requests the download:
 scripts/ollama_qwen_start.sh --pull
 ```
 
-If a digest does not match, first confirm `OLLAMA_MODEL`, `EMBEDDING_MODEL`, and
-the installed roles returned by:
+If a digest does not match, first confirm `OLLAMA_MODEL`, `OLLAMA_MODEL_DIGEST`,
+`EMBEDDING_MODEL`, `EMBEDDING_MODEL_DIGEST`, and the installed roles returned by:
 
 ```bash
 scripts/ollama_qwen_status.sh
+curl --fail http://127.0.0.1:11434/api/tags \
+  | jq -r '.models[] | select(.name == "qwen3:14b") | "\(.name) \(.digest)"'
 ```
 
 If a new digest is intentional, update the matching `OLLAMA_MODEL_DIGEST` or
 `EMBEDDING_MODEL_DIGEST` after verification. If it is not intentional, reinstall
-or pull the expected model with `--pull`.
+or pull the expected model with `--pull`. The accepted `qwen3:14b` digest is
+`bdbd181c33f2ed1b31c972991882db3cf4d192569092138a7d29e973cd9debe8`; do not
+switch to an older semantic model to work around a mismatch.
 
 If the models are healthy but `academic_embeddings` reports stale vectors, run
 the counts-only dry run, then the bounded backfill:
@@ -138,6 +149,10 @@ After changing `.env`, deploy the shared image and restart the native runtime:
 ```bash
 scripts/lifeagent_host_runtime.sh deploy
 ```
+
+Use this canonical deploy path before declaring model recovery complete. It
+builds the shared image, runs the deployment preflight, and refreshes the native
+runtime snapshot; an ad hoc Compose restart is only a diagnostic step.
 
 Do not give the API container a Docker socket, SSH key, or environment command
 that can start host processes. Only the native coordinator runs the fixed
@@ -169,10 +184,12 @@ durable answer, proposal preview, clarification, or failure response remains
 authoritative and precedes a successful terminal status; a progress `PATCH`
 failure must not suppress it.
 
-That first real structured request loads the model and can be noticeably slower
-than later warm requests. `OLLAMA_MODEL_KEEP_ALIVE_SECONDS=300` keeps Qwen
-resident across one bounded planner loop and lets Ollama unload it after about
-five idle minutes. To unload immediately without deleting model files:
+That first real structured request loads the 14B model at a 32,768-token
+context and can be noticeably slower than later warm requests.
+`OLLAMA_TIMEOUT_SECONDS=300` is the bounded request timeout for the accepted
+profile. `OLLAMA_MODEL_KEEP_ALIVE_SECONDS=300` keeps Qwen resident across one
+bounded planner loop and lets Ollama unload it after about five idle minutes.
+To unload immediately without deleting model files:
 
 ```bash
 scripts/ollama_qwen_unload.sh
@@ -193,12 +210,15 @@ learning-focus memory. Active writes require explicit owner language such as
 be unavailable while exact/category retrieval continues; that state must not be
 reported as proof that memory is empty.
 
-Do not promote this Mac to the 32K profile until the checked-in 32K benchmark
-artifact reports `gate_passed=true`, observed resident context exactly `32768`,
-stable model identity, physical model concurrency one, successful combined
-generation-plus-embedding residency, p95 below 300 seconds, at least 10% host
-free memory, and no more than 1 GiB steady swap growth. Until then, keep the
-single 16K configured default; do not add a legacy/full-replay alternate profile.
+The 32K profile is the documented default because the checked-in acceptance
+artifact passed with `gate_passed=true`, observed resident context exactly
+`32768`, stable model identity, physical model concurrency one, successful
+combined generation-plus-embedding residency, p95 below 300 seconds, at least
+10% host free memory, and no more than 1 GiB steady swap growth. If slow turns
+coincide with lower free memory, continuing swap growth, or another resident
+model, run `scripts/ollama_qwen_unload.sh`, stop competing workloads, confirm
+`ollama ps`, and retry from the canonical deploy. Do not add a legacy model or
+full-replay alternate profile as a workaround.
 
 ## Gateway and local handoff
 

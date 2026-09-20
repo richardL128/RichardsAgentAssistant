@@ -201,6 +201,8 @@ class NotionCourse(BaseModel):
     title_property_name: str | None = Field(default=None, max_length=128)
     date_property_id: str | None = Field(default=None, max_length=128)
     date_property_name: str | None = Field(default=None, max_length=128)
+    learn_context_property_id: str | None = Field(default=None, max_length=128)
+    learn_context_property_name: str | None = Field(default=None, max_length=128)
     assessments: tuple[NotionAssessment, ...] = Field(default=(), max_length=500)
     properties: Mapping[str, Any]
 
@@ -984,6 +986,16 @@ def _title_segments(title: str) -> list[dict[str, Any]]:
     return [{"type": "text", "text": {"content": title}}]
 
 
+def _bounded_rich_text_segments(value: str) -> list[dict[str, Any]]:
+    text_value = value.strip()
+    if not text_value or len(text_value) > 10_000:
+        raise permanent_error(ErrorCode.INPUT_INVALID, "Notion rich text is invalid")
+    return [
+        {"type": "text", "text": {"content": text_value[offset : offset + 2_000]}}
+        for offset in range(0, len(text_value), 2_000)
+    ]
+
+
 def _validate_title_text(value: str) -> str:
     if not value.strip():
         raise permanent_error(ErrorCode.INPUT_INVALID, "Notion title must not be empty")
@@ -1729,6 +1741,8 @@ class NotionConnector:
         due: datetime | str,
         ends_at: datetime | str | None = None,
         uploaded_pdfs: Sequence[NotionUploadedPdf] = (),
+        rich_text_property_id: str | None = None,
+        rich_text_value: str | None = None,
     ) -> NotionWriteReceipt:
         """Create one assessment page under a discovered Notion data source."""
 
@@ -1744,6 +1758,19 @@ class NotionConnector:
                 date_id: _date_property_value(due, ends_at=ends_at),
             },
         }
+        if (rich_text_property_id is None) != (rich_text_value is None):
+            raise permanent_error(
+                ErrorCode.INPUT_INVALID,
+                "Notion rich-text property and value must be provided together",
+            )
+        if rich_text_property_id is not None and rich_text_value is not None:
+            rich_text_id = _validate_property_reference(
+                rich_text_property_id,
+                "rich-text property",
+            )
+            cast(dict[str, Any], json_body["properties"])[rich_text_id] = {
+                "rich_text": _bounded_rich_text_segments(rich_text_value)
+            }
         if children:
             json_body["children"] = children
         response = await self._request(
@@ -1762,6 +1789,90 @@ class NotionConnector:
             page_id=_validate_page_id(page_id_value),
             url=data.get("url") if isinstance(data.get("url"), str) else None,
             file_upload_ids=_uploaded_pdf_ids(uploaded_pdfs),
+        )
+
+    async def guarded_update_learn_context(
+        self,
+        *,
+        proposal_id: str,
+        page_id: str,
+        title_property_id: str,
+        date_property_id: str,
+        learn_context_property_id: str,
+        expected_title: str,
+        expected_due: datetime | str,
+        expected_ends_at: datetime | str | None,
+        expected_last_edited_at: datetime,
+        learn_context: str,
+    ) -> NotionWriteReceipt:
+        """Update only LEARN Context after title/date/edit preconditions still match."""
+
+        receipt_id = _validate_proposal_id(proposal_id)
+        page = _validate_page_id(page_id)
+        title_id = _validate_property_reference(title_property_id, "title property")
+        date_id = _validate_property_reference(date_property_id, "date property")
+        context_id = _validate_property_reference(
+            learn_context_property_id,
+            "LEARN Context property",
+        )
+        if expected_last_edited_at.tzinfo is None or expected_last_edited_at.utcoffset() is None:
+            raise permanent_error(
+                ErrorCode.INPUT_INVALID,
+                "Notion edited timestamp must be timezone-aware",
+            )
+        response = await self._request("GET", f"/pages/{quote(page, safe='')}", json_body=None)
+        data = self._json_object(response, "Notion LEARN target")
+        properties = data.get("properties")
+        if not isinstance(properties, Mapping):
+            raise transient_error(ErrorCode.CONNECTOR_TRANSIENT, "Notion returned invalid page")
+        property_map = cast(Mapping[str, Any], properties)
+        title_property = self._property_by_id(property_map, title_id)
+        date_property = self._property_by_id(property_map, date_id)
+        context_property = self._property_by_id(property_map, context_id)
+        if (
+            title_property is None
+            or title_property[1].get("type") != "title"
+            or date_property is None
+            or date_property[1].get("type") != "date"
+            or context_property is None
+            or context_property[1].get("type") != "rich_text"
+        ):
+            raise permanent_error(
+                ErrorCode.INPUT_INVALID,
+                "Notion LEARN target schema changed",
+            )
+        expected_date = _date_property_value(expected_due, ends_at=expected_ends_at)["date"]
+        current_date = date_property[1].get("date")
+        if (
+            data.get("archived") is True
+            or data.get("in_trash") is True
+            or _plain_text(title_property[1].get("title")) != expected_title
+            or current_date != expected_date
+            or _parse_edited(data.get("last_edited_time"))
+            != expected_last_edited_at.astimezone(UTC)
+        ):
+            raise NotionWriteConflict("LEARN target changed since proposal preview")
+        patched = await self._request(
+            "PATCH",
+            f"/pages/{quote(page, safe='')}",
+            json_body={
+                "properties": {
+                    context_id: {"rich_text": _bounded_rich_text_segments(learn_context)}
+                }
+            },
+        )
+        payload = self._json_object(patched, "Notion LEARN Context update")
+        patched_id = payload.get("id")
+        if not isinstance(patched_id, str):
+            raise transient_error(
+                ErrorCode.CONNECTOR_TRANSIENT,
+                "Notion returned invalid LEARN write receipt",
+            )
+        return NotionWriteReceipt(
+            proposal_id=receipt_id,
+            page_id=_validate_page_id(patched_id),
+            url=payload.get("url") if isinstance(payload.get("url"), str) else None,
+            property_id=context_id,
         )
 
     async def create_pdf_file_upload(self, *, filename: str) -> NotionFileUploadReceipt:
@@ -2718,6 +2829,8 @@ class NotionConnector:
         title_property_name: str | None = None
         date_property_id: str | None = None
         date_property_name: str | None = None
+        learn_context_property_id: str | None = None
+        learn_context_property_name: str | None = None
         if len(child_database_ids) == 1:
             child_database_id = child_database_ids[0]
             child_source = await self._assessment_source(
@@ -2727,9 +2840,19 @@ class NotionConnector:
                 diagnostics=diagnostics,
             )
             if child_source is not None:
-                child_source_id, child_source_type, title_schema, date_schema = child_source
+                (
+                    child_source_id,
+                    child_source_type,
+                    title_schema,
+                    date_schema,
+                    learn_context_schema,
+                ) = child_source
                 title_property_id, title_property_name, _ = title_schema
                 date_property_id, date_property_name, _ = date_schema
+                if learn_context_schema is not None:
+                    learn_context_property_id, learn_context_property_name, _ = (
+                        learn_context_schema
+                    )
                 found = await self._assessment_pages(
                     child_source_id,
                     child_source_type=child_source_type,
@@ -2764,6 +2887,8 @@ class NotionConnector:
             title_property_name=title_property_name,
             date_property_id=date_property_id,
             date_property_name=date_property_name,
+            learn_context_property_id=learn_context_property_id,
+            learn_context_property_name=learn_context_property_name,
             assessments=assessments,
             properties=normalized_properties,
         )
@@ -3599,6 +3724,7 @@ class NotionConnector:
             NotionSourceType,
             tuple[str, str, str],
             tuple[str, str, str],
+            tuple[str, str, str] | None,
         ]
         | None
     ):
@@ -3678,11 +3804,40 @@ class NotionConnector:
                 )
             )
             return None
+        learn_context_schema: tuple[str, str, str] | None = None
+        if " ".join(course_title.casefold().split()) == "classes + tutorials + labs":
+            learn_context_property = _schema_property(
+                cast(Mapping[str, Any], properties),
+                expected_name="LEARN Context",
+                expected_type="rich_text",
+            )
+            if learn_context_property is None:
+                diagnostics.append(
+                    NotionDiscoveryDiagnostic(
+                        code="learn_context_property_invalid",
+                        severity="error",
+                        message=(
+                            "Classes + Tutorials + Labs must have exactly one rich-text "
+                            "property named LEARN Context"
+                        ),
+                        source_id=source[0],
+                        source_type=source[1],
+                        course_page_id=course_page_id,
+                        course_title=course_title[:255],
+                    )
+                )
+                return None
+            learn_context_schema = (
+                learn_context_property[0],
+                learn_context_property[2],
+                "rich_text",
+            )
         return (
             source[0],
             source[1],
             (title_property[0], title_property[2], "title"),
             (date_property[0], date_property[2], "date"),
+            learn_context_schema,
         )
 
     async def _assessment_pages(

@@ -29,6 +29,11 @@ def test_host_settings_are_standalone_and_restrict_local_handoff(tmp_path: Path)
     assert settings.compose_file == tmp_path / "compose.yaml"
     assert settings.backend_handoff_url.startswith("http://127.0.0.1:")
     assert settings.discord_academic_authorized_user_ids == frozenset({"333333333333333333"})
+    assert settings.ollama_model == "qwen3:14b"
+    assert (
+        settings.ollama_model_digest
+        == "bdbd181c33f2ed1b31c972991882db3cf4d192569092138a7d29e973cd9debe8"
+    )
     assert settings.embedding_model == "qwen3-embedding:4b"
     assert settings.embedding_dimensions == 1024
 
@@ -71,8 +76,19 @@ def test_host_settings_from_env_requires_handoff_secret(tmp_path: Path) -> None:
     loaded = HostWakeSettings.from_env(env, repository_root=tmp_path)
 
     assert loaded.host_handoff_secret.get_secret_value() == "handoff-secret"
+    assert loaded.ollama_model == "qwen3:14b"
+    assert (
+        loaded.ollama_model_digest
+        == "bdbd181c33f2ed1b31c972991882db3cf4d192569092138a7d29e973cd9debe8"
+    )
     assert loaded.embedding_model == "qwen3-embedding:4b"
     assert loaded.embedding_dimensions == 1024
+
+    explicitly_unpinned = HostWakeSettings.from_env(
+        {**env, "OLLAMA_MODEL_DIGEST": ""},
+        repository_root=tmp_path,
+    )
+    assert explicitly_unpinned.ollama_model_digest is None
 
 
 def test_host_settings_from_env_requires_discord_handoff_secret(tmp_path: Path) -> None:

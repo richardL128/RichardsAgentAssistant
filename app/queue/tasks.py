@@ -39,7 +39,11 @@ from app.health.checks import (
 )
 from app.health.evaluator import DeliveryStatus as HealthDeliveryStatus
 from app.health.evaluator import OperationalFacts, OperationalHealth, ProcessingStatus
-from app.health.service import evaluate_academic_morning_health, evaluate_and_persist
+from app.health.service import (
+    evaluate_academic_end_of_day_health,
+    evaluate_academic_morning_health,
+    evaluate_and_persist,
+)
 from app.queue.app import default_retry_strategy, procrastinate_app
 from app.queue.execution import execute_recorded_attempt
 from app.queue.idempotency import build_idempotency_key, validate_idempotency_key
@@ -67,15 +71,21 @@ AcademicMorningNotificationHandler = Callable[
     [str, str, str, int, int],
     Awaitable[dict[str, Any]],
 ]
+AcademicNightlyCheckinHandler = Callable[
+    [str, str, str, int, int],
+    Awaitable[dict[str, Any]],
+]
 _academic_clarification_handler: AcademicClarificationHandler | None = None
 _academic_clarification_status_handler: AcademicClarificationStatusHandler | None = None
 _academic_material_ingestion_handler: AcademicMaterialIngestionHandler | None = None
 _discord_wake_handler: DiscordWakeHandler | None = None
 _academic_morning_notification_handler: AcademicMorningNotificationHandler | None = None
+_academic_nightly_checkin_handler: AcademicNightlyCheckinHandler | None = None
 _database = Database(get_settings())
 _MODEL_LOCK = "ollama:exclusive"
 _ACADEMIC_CLARIFICATION_LOCK_PREFIX = "academic-clarification"
 _ACADEMIC_MORNING_SCHEDULE_NAME = "academic-morning"
+_ACADEMIC_NIGHTLY_SCHEDULE_NAME = "academic-end-of-day"
 _MATERIAL_PAGE_ID = re.compile(r"\A[A-Za-z0-9_-]{1,128}\Z")
 _SHA256_HEX = re.compile(r"\A[0-9a-f]{64}\Z")
 
@@ -135,6 +145,13 @@ def register_academic_morning_notification_handler(
 
     global _academic_morning_notification_handler
     _academic_morning_notification_handler = handler
+
+
+def register_academic_nightly_checkin_handler(handler: AcademicNightlyCheckinHandler) -> None:
+    """Register the focused scheduled nightly proactive check-in."""
+
+    global _academic_nightly_checkin_handler
+    _academic_nightly_checkin_handler = handler
 
 
 async def defer_discord_wake(wake_id: str) -> int:
@@ -215,6 +232,31 @@ def _terminal_academic_morning_status(status: str) -> bool:
     }
 
 
+def _create_academic_nightly_run(
+    *,
+    period_key: str,
+    occurrence_at: datetime,
+) -> tuple[UUID, str]:
+    with Session(_database.engine) as session, session.begin():
+        run = RunRepository.create_or_get(
+            session,
+            idempotency_key=period_key,
+            agent_name="academic_nightly_checkin",
+            trigger="schedule",
+            schedule=_ACADEMIC_NIGHTLY_SCHEDULE_NAME,
+            input_version=occurrence_at.isoformat(),
+        )
+        session.flush()
+        return run.id, _run_status_value(run.status)
+
+
+def _terminal_academic_nightly_status(status: str) -> bool:
+    return status in {
+        RunStatus.SUCCEEDED.value,
+        RunStatus.CANCELLED.value,
+    }
+
+
 async def defer_academic_morning_notification(occurrence: PeriodicOccurrence) -> Any:
     """Queue one semantic morning notification for a stable local period."""
 
@@ -233,6 +275,44 @@ async def defer_academic_morning_notification(occurrence: PeriodicOccurrence) ->
         }
     try:
         job_id = await academic_morning_notification_task.configure(
+            queueing_lock=period_key,
+        ).defer_async(
+            occurrence_at_iso=occurrence.scheduled_at.isoformat(),
+            run_id=str(run_id),
+            period_key=period_key,
+        )
+    except AlreadyEnqueued:
+        return {
+            "status": "already_enqueued",
+            "run_id": str(run_id),
+            "period_key": period_key,
+        }
+    return {
+        "status": "enqueued",
+        "run_id": str(run_id),
+        "period_key": period_key,
+        "job_id": job_id,
+    }
+
+
+async def defer_academic_nightly_checkin(occurrence: PeriodicOccurrence) -> Any:
+    """Queue one proactive nightly check-in for a stable local period."""
+
+    period_key = stable_period_key(_ACADEMIC_NIGHTLY_SCHEDULE_NAME, occurrence)
+    validate_idempotency_key(period_key)
+    run_id, status = await asyncio.to_thread(
+        _create_academic_nightly_run,
+        period_key=period_key,
+        occurrence_at=occurrence.scheduled_at,
+    )
+    if _terminal_academic_nightly_status(status):
+        return {
+            "status": "already_complete",
+            "run_id": str(run_id),
+            "period_key": period_key,
+        }
+    try:
+        job_id = await academic_nightly_checkin_task.configure(
             queueing_lock=period_key,
         ).defer_async(
             occurrence_at_iso=occurrence.scheduled_at.isoformat(),
@@ -460,6 +540,52 @@ async def academic_morning_notification_task(
         engine=_database.engine,
         run_id=parsed_run_id,
         node_name="queue.academic_morning_notification",
+        attempt=attempt,
+        retry_policy=default_retry_strategy.policy,
+    )
+    response = dict(result)
+    response.setdefault("run_id", str(parsed_run_id))
+    response.setdefault("period_key", parsed_period_key)
+    return response
+
+
+@procrastinate_app.task(
+    name="lifeagent.academic_nightly_checkin",
+    queue="academic_planner",
+    retry=default_retry_strategy,
+    pass_context=True,
+)
+async def academic_nightly_checkin_task(
+    context: JobContext,
+    occurrence_at_iso: str,
+    run_id: str,
+    period_key: str,
+) -> dict[str, Any]:
+    """Execute one anchored nightly proactive check-in attempt."""
+
+    if _academic_nightly_checkin_handler is None:
+        raise RuntimeError("no handler registered for academic_nightly_checkin")
+    handler = _academic_nightly_checkin_handler
+    parsed_run_id = UUID(run_id)
+    parsed_period_key = validate_idempotency_key(period_key)
+    occurrence_at = _parse_occurrence_at_iso(occurrence_at_iso)
+    attempt = context.job.attempts + 1
+    attempt_limit = default_retry_strategy.policy.max_attempts
+
+    async def operation() -> dict[str, object]:
+        return await handler(
+            occurrence_at.isoformat(),
+            str(parsed_run_id),
+            parsed_period_key,
+            attempt,
+            attempt_limit,
+        )
+
+    result = await execute_recorded_attempt(
+        operation,
+        engine=_database.engine,
+        run_id=parsed_run_id,
+        node_name="queue.academic_nightly_checkin",
         attempt=attempt,
         retry_policy=default_retry_strategy.policy,
     )
@@ -699,6 +825,26 @@ async def academic_morning_notification_periodic(timestamp: int) -> dict[str, ob
     return await defer_academic_morning_notification(occurrence)
 
 
+@procrastinate_app.periodic(cron="* * * * *", periodic_id="academic-nightly-checkin")
+@procrastinate_app.task(
+    name="lifeagent.schedule.academic_nightly_checkin",
+    queue="academic_planner",
+)
+async def academic_nightly_checkin_periodic(timestamp: int) -> dict[str, object]:
+    """Defer the configured Toronto-local nightly check-in with bounded catch-up."""
+
+    evaluated_at = datetime.fromtimestamp(timestamp, UTC)
+    schedule = TorontoPeriodicSchedule.from_time(
+        _settings.academic_end_of_day_schedule,
+        timezone_name=_settings.app_timezone,
+    )
+    grace = timedelta(minutes=_settings.academic_end_of_day_catchup_grace_minutes)
+    occurrence = schedule.due_within_grace(evaluated_at, grace=grace)
+    if occurrence is None:
+        return {"status": "not_due"}
+    return await defer_academic_nightly_checkin(occurrence)
+
+
 @procrastinate_app.periodic(cron="* * * * *", periodic_id="artifact-retention-dynamic")
 @procrastinate_app.task(name="lifeagent.artifacts.retention", queue="academic_planner")
 async def artifact_retention_periodic(timestamp: int) -> dict[str, object]:
@@ -738,6 +884,11 @@ async def shared_services_periodic(timestamp: int) -> dict[str, object]:
             settings=_settings,
             evaluated_at=evaluated_at,
         )
+        academic_end_of_day_health = evaluate_academic_end_of_day_health(
+            session,
+            settings=_settings,
+            evaluated_at=evaluated_at,
+        )
     checks = [
         *database_checks,
         await asyncio.to_thread(_check_queue_with_settings, _database, _settings, evaluated_at),
@@ -747,6 +898,11 @@ async def shared_services_periodic(timestamp: int) -> dict[str, object]:
             name="academic_morning",
             state=academic_morning_health.state,
             diagnostic=academic_morning_health.diagnostic,
+        ),
+        HealthCheck(
+            name="academic_end_of_day",
+            state=academic_end_of_day_health.state,
+            diagnostic=academic_end_of_day_health.diagnostic,
         ),
         *connector_liveness_checks,
         ollama_check,
@@ -805,17 +961,21 @@ __all__ = [
     "academic_material_ingestion_task",
     "academic_morning_notification_periodic",
     "academic_morning_notification_task",
+    "academic_nightly_checkin_periodic",
+    "academic_nightly_checkin_task",
     "artifact_retention_periodic",
     "defer_academic_clarification",
     "defer_academic_clarification_status",
     "defer_academic_material_ingestion",
     "defer_academic_morning_notification",
+    "defer_academic_nightly_checkin",
     "defer_discord_wake",
     "discord_wake_task",
     "register_academic_clarification_handler",
     "register_academic_clarification_status_handler",
     "register_academic_material_ingestion_handler",
     "register_academic_morning_notification_handler",
+    "register_academic_nightly_checkin_handler",
     "register_discord_wake_handler",
     "shared_services_periodic",
 ]

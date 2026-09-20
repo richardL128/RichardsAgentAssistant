@@ -1,0 +1,34 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
+  "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>com.lifeagent.learn-bridge</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>__SCRIPT_DIR__/lifeagent_learn_bridge.sh</string>
+    <string>run</string>
+    <string>--env-file</string>
+    <string>__ENV_FILE__</string>
+    <string>--secret-file</string>
+    <string>__LEARN_HMAC_SECRET_FILE__</string>
+    <string>--profile-dir</string>
+    <string>__LEARN_PROFILE_DIR__</string>
+    <string>--python</string>
+    <string>__PYTHON_BIN__</string>
+  </array>
+  <key>WorkingDirectory</key>
+  <string>__REPO_DIR__</string>
+  <key>RunAtLoad</key>
+  <true/>
+  <key>KeepAlive</key>
+  <true/>
+  <key>ThrottleInterval</key>
+  <integer>10</integer>
+  <key>StandardOutPath</key>
+  <string>__LOG_DIR__/learn-bridge.stdout.log</string>
+  <key>StandardErrorPath</key>
+  <string>__LOG_DIR__/learn-bridge.stderr.log</string>
+</dict>
+</plist>

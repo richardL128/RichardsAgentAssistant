@@ -62,16 +62,34 @@ def test_settings_diagnostics_redact_credentials(tmp_path: Path) -> None:
     assert diagnostics["discord_host_handoff_configured"] is False
     assert diagnostics["discord_academic_message_content_enabled"] is False
     assert diagnostics["ops_console_auth_configured"] is True
-    assert diagnostics["ollama_context_reserve_tokens"] == 1_536
+    assert diagnostics["ollama_context_reserve_tokens"] == 4_096
     assert diagnostics["user_memory_enabled"] is True
     assert diagnostics["user_memory_retrieval_limit"] == 8
     assert diagnostics["user_memory_context_max_chars"] == 3_000
     assert diagnostics["conversation_summary_enabled"] is True
-    assert diagnostics["conversation_compaction_trigger_tokens"] == 10_368
-    assert diagnostics["conversation_compaction_target_tokens"] == 7_168
-    assert diagnostics["conversation_recent_tail_max_tokens"] == 4_096
-    assert diagnostics["conversation_compaction_max_output_tokens"] == 1_024
+    assert diagnostics["conversation_compaction_trigger_tokens"] == 19_968
+    assert diagnostics["conversation_compaction_target_tokens"] == 14_336
+    assert diagnostics["conversation_recent_tail_max_tokens"] == 8_192
+    assert diagnostics["conversation_compaction_max_output_tokens"] == 2_048
     assert diagnostics["conversation_context_manifest_retention_days"] == 30
+
+
+def test_learn_bridge_settings_are_local_secret_gated_and_redacted() -> None:
+    with pytest.raises(ValidationError, match="LEARN_BRIDGE_HMAC_SECRET"):
+        Settings(_env_file=None, learn_bridge_enabled=True)
+    with pytest.raises(ValidationError, match="local host"):
+        Settings(_env_file=None, learn_bridge_url="http://example.com:8765")
+
+    settings = Settings(
+        _env_file=None,
+        learn_bridge_enabled=True,
+        learn_bridge_hmac_secret="learn-secret-value-that-must-not-leak",
+    )
+    diagnostics = settings.safe_diagnostics()
+
+    assert diagnostics["learn_bridge_enabled"] is True
+    assert diagnostics["learn_bridge_hmac_configured"] is True
+    assert "learn-secret-value" not in str(diagnostics)
 
 
 def test_empty_finance_credentials_are_normalized() -> None:
@@ -94,23 +112,32 @@ def test_empty_finance_credentials_are_normalized() -> None:
 def test_qwen_runtime_settings_are_closed_and_bounded() -> None:
     settings = Settings(_env_file=None)
 
+    assert settings.ollama_model == "qwen3:14b"
+    assert (
+        settings.ollama_model_digest
+        == "bdbd181c33f2ed1b31c972991882db3cf4d192569092138a7d29e973cd9debe8"
+    )
     assert settings.model_trigger_mode == "authorized_discord_channel"
-    assert settings.ollama_num_ctx == 16_384
-    assert settings.ollama_max_input_tokens == 13_824
-    assert settings.ollama_max_output_tokens == 1_024
-    assert settings.ollama_context_reserve_tokens == 1_536
+    assert settings.ollama_num_ctx == 32_768
+    assert settings.ollama_num_batch == 32
+    assert settings.ollama_max_input_tokens == 26_624
+    assert settings.ollama_max_output_tokens == 2_048
+    assert settings.ollama_context_reserve_tokens == 4_096
     assert settings.ollama_max_concurrency == 1
-    assert settings.conversation_compaction_trigger_tokens == 10_368
-    assert settings.conversation_compaction_target_tokens == 7_168
-    assert settings.conversation_recent_tail_max_tokens == 4_096
-    assert settings.conversation_compaction_max_output_tokens == 1_024
+    assert settings.ollama_timeout_seconds == 300
+    assert settings.ollama_model_keep_alive_seconds == 300
+    assert settings.ollama_reasoning is False
+    assert settings.ollama_structured_output_transport == "json_schema"
+    assert settings.conversation_compaction_trigger_tokens == 19_968
+    assert settings.conversation_compaction_target_tokens == 14_336
+    assert settings.conversation_recent_tail_max_tokens == 8_192
+    assert settings.conversation_compaction_max_output_tokens == 2_048
     assert (
         settings.ollama_max_input_tokens
         + settings.ollama_max_output_tokens
         + settings.ollama_context_reserve_tokens
         <= settings.ollama_num_ctx
     )
-    assert settings.ollama_model_keep_alive_seconds == 300
     assert settings.ollama_startup_timeout_seconds == 30
     with pytest.raises(ValidationError):
         Settings(_env_file=None, model_trigger_mode="scheduled")  # type: ignore[arg-type]
@@ -131,13 +158,13 @@ def test_qwen_runtime_settings_are_closed_and_bounded() -> None:
     with pytest.raises(ValidationError):
         Settings(
             _env_file=None,
-            conversation_compaction_target_tokens=10_368,
-            conversation_compaction_trigger_tokens=7_168,
+            conversation_compaction_target_tokens=19_968,
+            conversation_compaction_trigger_tokens=14_336,
         )
     with pytest.raises(ValidationError):
-        Settings(_env_file=None, conversation_recent_tail_max_tokens=13_824)
+        Settings(_env_file=None, conversation_recent_tail_max_tokens=26_624)
     with pytest.raises(ValidationError):
-        Settings(_env_file=None, conversation_compaction_max_output_tokens=2_048)
+        Settings(_env_file=None, conversation_compaction_max_output_tokens=4_096)
 
 
 def test_fixed_pdf_page_limit_parses_from_container_environment(monkeypatch) -> None:
@@ -154,20 +181,25 @@ def test_default_compose_enables_only_discord_mention_model_triggers() -> None:
     compose = (REPOSITORY_ROOT / "compose.yaml").read_text(encoding="utf-8")
 
     assert "MODEL_TRIGGER_MODE: ${MODEL_TRIGGER_MODE:-authorized_discord_channel}" in compose
-    assert "OLLAMA_NUM_CTX: ${OLLAMA_NUM_CTX:-16384}" in compose
-    assert "OLLAMA_MAX_INPUT_TOKENS: ${OLLAMA_MAX_INPUT_TOKENS:-13824}" in compose
-    assert "OLLAMA_MAX_OUTPUT_TOKENS: ${OLLAMA_MAX_OUTPUT_TOKENS:-1024}" in compose
-    assert "OLLAMA_CONTEXT_RESERVE_TOKENS: ${OLLAMA_CONTEXT_RESERVE_TOKENS:-1536}" in compose
+    assert "OLLAMA_MODEL: ${OLLAMA_MODEL:-qwen3:14b}" in compose
+    assert "OLLAMA_NUM_CTX: ${OLLAMA_NUM_CTX:-32768}" in compose
+    assert "OLLAMA_MAX_INPUT_TOKENS: ${OLLAMA_MAX_INPUT_TOKENS:-26624}" in compose
+    assert "OLLAMA_MAX_OUTPUT_TOKENS: ${OLLAMA_MAX_OUTPUT_TOKENS:-2048}" in compose
+    assert "OLLAMA_CONTEXT_RESERVE_TOKENS: ${OLLAMA_CONTEXT_RESERVE_TOKENS:-4096}" in compose
+    assert (
+        "OLLAMA_STRUCTURED_OUTPUT_TRANSPORT: "
+        "${OLLAMA_STRUCTURED_OUTPUT_TRANSPORT:-json_schema}" in compose
+    )
     assert "USER_MEMORY_ENABLED: ${USER_MEMORY_ENABLED:-true}" in compose
     assert "USER_MEMORY_RETRIEVAL_LIMIT: ${USER_MEMORY_RETRIEVAL_LIMIT:-8}" in compose
     assert "CONVERSATION_SUMMARY_ENABLED: ${CONVERSATION_SUMMARY_ENABLED:-true}" in compose
     assert (
         "CONVERSATION_COMPACTION_TRIGGER_TOKENS: "
-        "${CONVERSATION_COMPACTION_TRIGGER_TOKENS:-10368}" in compose
+        "${CONVERSATION_COMPACTION_TRIGGER_TOKENS:-19968}" in compose
     )
     assert (
         "CONVERSATION_COMPACTION_TARGET_TOKENS: "
-        "${CONVERSATION_COMPACTION_TARGET_TOKENS:-7168}" in compose
+        "${CONVERSATION_COMPACTION_TARGET_TOKENS:-14336}" in compose
     )
     assert "OLLAMA_MODEL_KEEP_ALIVE_SECONDS" in compose
     assert "OLLAMA_STARTUP_TIMEOUT_SECONDS" in compose
@@ -364,9 +396,9 @@ def test_readiness_reports_all_phase0_dependencies(tmp_path: Path, monkeypatch) 
                 json={
                     "models": [
                         {
-                            "name": "qwen3-32gb:latest",
+                            "name": "qwen3:14b",
                             "digest": (
-                                "d039cde69ac1f5a43d5134182adfefa65bdb533362a625b936e6171a53296eb3"
+                                "bdbd181c33f2ed1b31c972991882db3cf4d192569092138a7d29e973cd9debe8"
                             ),
                         },
                         {
@@ -405,6 +437,7 @@ def test_readiness_reports_all_phase0_dependencies(tmp_path: Path, monkeypatch) 
         "code_review_schema",
         "artifacts",
         "academic_notion",
+        "academic_end_of_day",
         "ollama",
         "academic_embeddings",
     }
@@ -556,7 +589,7 @@ def test_ollama_pinned_identity_must_match(tmp_path: Path) -> None:
         _env_file=None,
         database_url="sqlite+pysqlite:///:memory:",
         artifact_root=tmp_path,
-        ollama_model="qwen3-32gb:latest",
+        ollama_model="qwen3:14b",
         ollama_model_digest="expected-digest",
     )
 
@@ -566,7 +599,7 @@ def test_ollama_pinned_identity_must_match(tmp_path: Path) -> None:
                 200,
                 json={
                     "models": [
-                        {"name": "qwen3-32gb:latest", "digest": digest, "size": 123},
+                        {"name": "qwen3:14b", "digest": digest, "size": 123},
                     ]
                 },
             )
@@ -587,9 +620,9 @@ def test_ollama_diagnostic_reports_resident_context_and_vram(tmp_path: Path) -> 
         _env_file=None,
         database_url="sqlite+pysqlite:///:memory:",
         artifact_root=tmp_path,
-        ollama_model="qwen3-32gb:latest",
+        ollama_model="qwen3:14b",
         ollama_model_digest="expected-digest",
-        ollama_num_ctx=16_384,
+        ollama_num_ctx=32_768,
     )
 
     async def run(context_length: int) -> object:
@@ -600,7 +633,7 @@ def test_ollama_diagnostic_reports_resident_context_and_vram(tmp_path: Path) -> 
                     json={
                         "models": [
                             {
-                                "name": "qwen3-32gb:latest",
+                                "name": "qwen3:14b",
                                 "context_length": context_length,
                                 "size_vram": 25_000_000_000,
                             }
@@ -611,7 +644,7 @@ def test_ollama_diagnostic_reports_resident_context_and_vram(tmp_path: Path) -> 
                 200,
                 json={
                     "models": [
-                        {"name": "qwen3-32gb:latest", "digest": "expected-digest"},
+                        {"name": "qwen3:14b", "digest": "expected-digest"},
                     ]
                 },
             )
@@ -619,11 +652,11 @@ def test_ollama_diagnostic_reports_resident_context_and_vram(tmp_path: Path) -> 
         async with httpx.AsyncClient(transport=httpx.MockTransport(respond)) as client:
             return await check_ollama(settings, client)
 
-    matching = asyncio.run(run(16_384))
-    mismatch = asyncio.run(run(32_768))
+    matching = asyncio.run(run(32_768))
+    mismatch = asyncio.run(run(16_384))
     assert matching.state is HealthState.HEALTHY
-    assert "resident context_length=16384" in matching.diagnostic
+    assert "resident context_length=32768" in matching.diagnostic
     assert "size_vram=25000000000" in matching.diagnostic
     assert "host_memory_free_percent=" in matching.diagnostic
     assert mismatch.state is HealthState.ATTENTION
-    assert "expected context_length=16384" in mismatch.diagnostic
+    assert "expected context_length=32768" in mismatch.diagnostic

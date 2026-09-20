@@ -12,11 +12,11 @@ a rule such as `run_overdue`, `required_delivery_failed`, or
 ## Current architecture
 
 The combined planner morning notification is the only executable automatic
-agenda schedule. Host code owns source refresh, the exact Toronto-local calendar
-window, dates, ordering, citation checks, rendering, and delivery. Qwen receives
-only bounded text from each selected calendar event and may produce an
-independently validated activity intent, cited overview, and optional
-substantive description.
+agenda schedule. Host code owns source refresh, Toronto-local day boundaries,
+coverage, dates, links, ordering, rendering, and delivery. Qwen first receives
+bounded text from each selected event, then a bounded four-category composer
+produces only prose and schedule inferences. Both stages are critic-checked with
+one repair attempt.
 
 The schedule is configured by:
 
@@ -38,15 +38,16 @@ Each occurrence uses stable identities:
 - run agent: `academic_morning_notification`;
 - run schedule: `academic-morning`;
 - run idempotency key: `academic-morning:YYYY-MM-DD:HHMM:v1`;
-- delivery key prefix: `planner-morning-delivery-v2:YYYY-MM-DD:HHMM:v1`;
-- ordered part keys: `planner-morning-delivery-v2:YYYY-MM-DD:HHMM:v1:NNN`;
+- delivery key prefix: `planner-morning-four-v3:YYYY-MM-DD:HHMM:v1`;
+- category keys: `planner-morning-four-v3:YYYY-MM-DD:HHMM:v1:<category>:v1`;
 - health row: `academic_morning`.
 
-The event window starts at midnight on the intended scheduled Toronto-local
-date and ends inclusively 10 days and 12 hours later. It applies equally to
-active, non-archived course, misc, and Jobs/Interviews rows. Completed course
-rows are included and marked; date-less rows remain outside the inventory and
-continue through existing diagnostics.
+The course window starts at midnight on the intended Toronto-local date and
+contains today plus the following seven local dates. Jobs, misc, and the exact
+reserved `Classes + Tutorials + Labs` calendar use interval overlap with today.
+Completed rows are excluded. Every active real course appears once, including
+courses with no selected work; reserved `misc` and schedule rows are not real
+courses.
 
 ## Diagnosis
 
@@ -95,7 +96,7 @@ model prompts, or responses.
 docker compose exec -T postgres sh -lc 'psql -U "$POSTGRES_USER" -d "$POSTGRES_DB" -c "
 SELECT run_id, channel, target, idempotency_key, status, attempt_count, error_code, external_url
 FROM deliveries
-WHERE idempotency_key LIKE '\''planner-morning-delivery-v2:%:___'\''
+WHERE idempotency_key LIKE '\''planner-morning-four-v3:%:%:v1'\''
 ORDER BY created_at DESC
 LIMIT 10;"'
 ```
@@ -117,12 +118,10 @@ LIMIT 20;"'
 
 ## Source freshness requirement
 
-The normal morning message requires a fresh complete academic Notion sync
-immediately before rendering, followed by a Jobs/Interviews sync. Missing Courses
-sharing, missing nested Assessments calendars, missing required title/date
-properties, partial academic source failure, or stale academic sync must be
-reported as an operational condition. A career sync failure is disclosed in the
-same message without hiding a valid academic agenda.
+The normal morning messages require fresh Notion syncs immediately before
+rendering. Missing sharing, invalid required properties, partial source failure,
+or stale data is reported inside the affected category's unavailable embed.
+Independently fresh categories still render; stale cached rows never do.
 
 ## Semantic availability and cache
 
@@ -135,14 +134,14 @@ one rejected component does not erase another supported component.
 
 A cached result is reusable only when the event fingerprint, Notion edit time,
 model identity, model configuration version, and prompt version all match. If
-Ollama is unavailable, the deadline expires, output is invalid, or the critic
-rejects the repair, the event's trusted title/date metadata still appears and
-the briefing reports one aggregate semantic-details condition. Do not recover
-by extracting a `Description` property or applying keyword rules.
+Ollama is unavailable, the deadline expires, output is invalid, or either
+critic rejects the repair, trusted Notion metadata still appears behind a
+visible facts-only marker. Do not recover by guessing schedule fields or
+applying keyword rules.
 
-The complete rendered part manifest is stored before the first Discord send.
-On retry, the worker loads that manifest and sends only ordinals not already
-recorded as delivered; it does not re-sync sources and repartition content.
+The complete versioned four-embed manifest is stored before the first Discord
+send. On retry, the worker loads that manifest and sends only categories whose
+ordinals are not already recorded as delivered.
 
 ## Expected health behavior
 
@@ -164,18 +163,19 @@ Use a controlled trigger in a non-production or explicitly approved live window:
 2. Start `postgres`, `api`, and `worker-academic-planner`.
 3. Verify the worker records one run with the expected
    `academic-morning:YYYY-MM-DD:HHMM:v1` key.
-4. Verify one or more ordered Discord deliveries with corresponding
-   `planner-morning-delivery-v2:YYYY-MM-DD:HHMM:v1:NNN` keys and no part over
-   2,000 characters.
-5. Replay the same period and verify delivered parts are not sent again.
+4. Verify exactly four Discord embed deliveries in category order with
+   `planner-morning-four-v3:YYYY-MM-DD:HHMM:v1:<category>:v1` keys, titles at
+   most 256 characters, descriptions at most 4,096, and mentions disabled.
+5. Replay the same period and verify delivered categories are not sent again.
 6. Temporarily break Notion sharing or use a mocked/source-failure environment
-   and verify the job reports setup/source failure instead of a normal plan.
-7. Add course and interview fixtures at, immediately before, and immediately
-   after the window endpoint. Verify only in-window metadata renders and a
-   completed course row remains visible.
+   and verify the affected category is an unavailable embed, fresh independent
+   categories still render, and no stale rows appear.
+7. Add course and interview fixtures at Toronto-local boundaries and across a
+   DST transition. Verify interval overlap, the seven-following-days course
+   horizon, and completed-item exclusion.
 8. Exercise a validated description, a no-description decision, and an Ollama
    failure. Verify Qwen prose appears only for accepted citations and metadata
    survives the failure.
-9. Force a failure after part one, replay the same period, and verify delivery
-   resumes at part two from the stored manifest.
+9. Force a failure after one category, replay the same period, and verify
+   delivery resumes at the next category from the stored manifest.
 10. Restore the real Notion sharing and confirm the next period returns healthy.

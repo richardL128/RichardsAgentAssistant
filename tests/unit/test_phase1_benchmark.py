@@ -4,7 +4,17 @@ import asyncio
 
 import httpx
 
-from scripts.phase1_benchmark import _benchmark_gate_passed, _embedding_probe, _memory_summary
+from scripts.phase1_benchmark import (
+    ACCEPTED_MAX_INPUT_TOKENS,
+    ACCEPTED_MAX_OUTPUT_TOKENS,
+    ACCEPTED_MODEL,
+    ACCEPTED_NUM_CTX,
+    _benchmark_context_profile,
+    _benchmark_gate_passed,
+    _embedding_probe,
+    _memory_summary,
+    _parser,
+)
 
 
 def test_benchmark_gate_requires_resource_advisories() -> None:
@@ -89,3 +99,62 @@ def test_memory_summary_tracks_reasoning_context_separately_from_embedding() -> 
     assert summary["peak_model_vram_bytes"] == 8_000_000_000
     assert summary["peak_combined_model_size_bytes"] == 12_000_000_000
     assert summary["peak_combined_model_vram_bytes"] == 10_000_000_000
+
+
+def test_memory_summary_accepts_32k_reasoning_context_with_embedding_resident() -> None:
+    summary = _memory_summary(
+        [
+            {
+                "models": [
+                    {
+                        "name": "qwen3:14b",
+                        "context_length": 32_768,
+                        "size": 11_000_000_000,
+                        "size_vram": 10_000_000_000,
+                    },
+                    {
+                        "name": "qwen3-embedding:4b",
+                        "context_length": 2_048,
+                        "size": 3_000_000_000,
+                        "size_vram": 2_000_000_000,
+                    },
+                ],
+                "host": {"free_percent": 24.0},
+            }
+        ],
+        {"swapouts": 10, "page_size_bytes": 4096},
+        {"swapouts": 10, "page_size_bytes": 4096},
+        reasoning_model="qwen3:14b",
+    )
+
+    assert summary["observed_context_lengths"] == [2_048, 32_768]
+    assert summary["observed_reasoning_context_lengths"] == [32_768]
+
+
+def test_benchmark_cli_defaults_to_accepted_14b_profile() -> None:
+    parser = _parser()
+    args = parser.parse_args(
+        [
+            "--expected-digest",
+            "bdbd181c33f2ed1b31c972991882db3cf4d192569092138a7d29e973cd9debe8",
+            "--output",
+            "benchmark.json",
+        ]
+    )
+
+    assert args.model == ACCEPTED_MODEL
+    assert args.num_ctx == ACCEPTED_NUM_CTX
+    assert args.num_batch == 32
+    assert args.max_output_tokens == ACCEPTED_MAX_OUTPUT_TOKENS
+    assert args.reasoning is False
+    assert args.structured_output_transport == "json_schema"
+
+
+def test_benchmark_context_profile_defaults_to_accepted_32k_budget() -> None:
+    assert _benchmark_context_profile(ACCEPTED_NUM_CTX, ACCEPTED_MAX_OUTPUT_TOKENS) == {
+        "max_input_tokens": ACCEPTED_MAX_INPUT_TOKENS,
+        "context_reserve_tokens": 4_096,
+        "compaction_trigger_tokens": 19_968,
+        "compaction_target_tokens": 14_336,
+        "recent_tail_max_tokens": 8_192,
+    }

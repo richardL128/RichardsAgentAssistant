@@ -730,6 +730,57 @@ async def test_durable_session_supports_two_clarifications_and_owner_topic_pivot
 
 
 @pytest.mark.asyncio
+async def test_nightly_proactive_skip_closes_before_runtime_model_or_tools(tmp_path) -> None:
+    engine = create_engine(f"sqlite+pysqlite:///{tmp_path / 'nightly-skip.db'}")
+    Base.metadata.create_all(engine)
+    artifacts = ArtifactStore(tmp_path / "nightly-skip-artifacts")
+    conversation_service = NativeConversationService(engine=engine, artifact_store=artifacts)
+    opened = conversation_service.open_proactive_prompt(
+        root_event_id="academic-end-of-day:2026-09-09:2100:v1",
+        discord_channel_id="222222222222222222",
+        owner_discord_user_id="333333333333333333",
+        prompt_text="Evening check-in: reply naturally, or reply skip.",
+        expires_at=NOW.replace(hour=23),
+        model_identity="qwen@test",
+        prompt_config_version="nightly-v1",
+        proactive_kind="academic_end_of_day_reflection",
+        proactive_period="2026-09-09",
+        now=NOW,
+    )
+    assert opened.session_id is not None
+    runtime_events: list[str] = []
+    delivery = _Delivery()
+    store = _Store()
+    gateway = _Gateway([])
+
+    result = await _handler(
+        gateway,
+        store,
+        delivery,
+        runtime=_Runtime(runtime_events),
+        conversation_service=conversation_service,
+    )(_message("skip", message_id="111111111111111112", timestamp=NOW))
+
+    assert result.status == "handled"
+    assert delivery.responses == ["Skipped tonight's check-in. Nothing was changed."]
+    assert runtime_events == []
+    assert gateway.inputs == []
+    assert store.proposals == []
+    with Session(engine) as session:
+        row = session.scalar(select(NativeConversationSession))
+        assert row is not None
+        assert row.state == "cancelled"
+        assert row.last_disposition == "cancelled"
+    assert [
+        message.type for message in conversation_service.load_messages(session_id=opened.session_id)
+    ] == [
+        "ai",
+        "human",
+    ]
+    engine.dispose()
+
+
+@pytest.mark.asyncio
 async def test_completed_proposal_replay_recovers_confirmation_without_duplicate_proposal(
     tmp_path,
 ) -> None:

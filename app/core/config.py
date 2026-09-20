@@ -47,23 +47,23 @@ class Settings(BaseSettings):
     artifact_write_probe: bool = True
 
     ollama_base_url: AnyHttpUrl = AnyHttpUrl("http://host.docker.internal:11434")
-    ollama_model: str = "qwen3-32gb:latest"
+    ollama_model: str = "qwen3:14b"
     model_trigger_mode: Literal["authorized_discord_channel"] = "authorized_discord_channel"
     ollama_max_concurrency: Annotated[int, Field(ge=1, le=1)] = 1
-    ollama_num_ctx: Annotated[int, Field(gt=0)] = 16_384
+    ollama_num_ctx: Annotated[int, Field(gt=0)] = 32_768
     ollama_num_batch: Annotated[int, Field(ge=32, le=512)] = 32
     ollama_timeout_seconds: Annotated[float, Field(gt=0, le=1800)] = 300.0
     ollama_model_keep_alive_seconds: Annotated[int, Field(gt=0, le=3600)] = 300
     ollama_startup_timeout_seconds: Annotated[float, Field(gt=0, le=300)] = 30.0
-    ollama_max_input_tokens: Annotated[int, Field(gt=0)] = 13_824
-    ollama_max_output_tokens: Annotated[int, Field(gt=0)] = 1_024
-    ollama_context_reserve_tokens: Annotated[int, Field(ge=0)] = 1_536
+    ollama_max_input_tokens: Annotated[int, Field(gt=0)] = 26_624
+    ollama_max_output_tokens: Annotated[int, Field(gt=0)] = 2_048
+    ollama_context_reserve_tokens: Annotated[int, Field(ge=0)] = 4_096
     ollama_repair_attempts: Annotated[int, Field(ge=0, le=1)] = 1
     ollama_seed: int = 1729
     ollama_reasoning: bool = False
     ollama_structured_output_transport: Literal["json_schema", "json"] = "json_schema"
     ollama_model_digest: str | None = (
-        "d039cde69ac1f5a43d5134182adfefa65bdb533362a625b936e6171a53296eb3"
+        "bdbd181c33f2ed1b31c972991882db3cf4d192569092138a7d29e973cd9debe8"
     )
     embedding_model: str = "qwen3-embedding:4b"
     embedding_model_digest: str | None = None
@@ -74,10 +74,10 @@ class Settings(BaseSettings):
     user_memory_retrieval_limit: Annotated[int, Field(gt=0, le=32)] = 8
     user_memory_context_max_chars: Annotated[int, Field(gt=0, le=12_000)] = 3_000
     conversation_summary_enabled: bool = True
-    conversation_compaction_trigger_tokens: Annotated[int, Field(gt=0)] = 10_368
-    conversation_compaction_target_tokens: Annotated[int, Field(gt=0)] = 7_168
-    conversation_recent_tail_max_tokens: Annotated[int, Field(gt=0)] = 4_096
-    conversation_compaction_max_output_tokens: Annotated[int, Field(gt=0)] = 1_024
+    conversation_compaction_trigger_tokens: Annotated[int, Field(gt=0)] = 19_968
+    conversation_compaction_target_tokens: Annotated[int, Field(gt=0)] = 14_336
+    conversation_recent_tail_max_tokens: Annotated[int, Field(gt=0)] = 8_192
+    conversation_compaction_max_output_tokens: Annotated[int, Field(gt=0)] = 2_048
     conversation_context_manifest_retention_days: Annotated[int, Field(gt=0, le=365)] = 30
     discord_api_base_url: AnyHttpUrl = AnyHttpUrl(DISCORD_API_BASE_URL)
 
@@ -90,6 +90,7 @@ class Settings(BaseSettings):
     discord_bot_token: SecretValue = None
     discord_webhook_secret: SecretValue = None
     discord_host_handoff_secret: SecretValue = None
+    learn_bridge_hmac_secret: SecretValue = None
     notion_token: SecretValue = None
     ops_console_username: SecretValue = None
     ops_console_password: SecretValue = None
@@ -123,11 +124,24 @@ class Settings(BaseSettings):
     discord_finance_channel_id: str | None = None
     discord_application_id: str | None = None
     discord_academic_authorized_user_ids: list[int] = Field(default_factory=lambda: list[int]())
+    discord_academic_proactive_user_id: int | None = None
     discord_academic_message_content_enabled: bool = False
     discord_handoff_max_body_bytes: Annotated[int, Field(gt=0, le=65_536)] = 4_096
     discord_handoff_max_clock_skew_seconds: Annotated[int, Field(gt=0, le=300)] = 60
     discord_handoff_request_timeout_seconds: Annotated[float, Field(gt=0, le=30)] = 10.0
     discord_handoff_retry_attempts: Annotated[int, Field(gt=0, le=5)] = 3
+    learn_bridge_enabled: bool = False
+    learn_bridge_url: AnyHttpUrl = AnyHttpUrl("http://host.docker.internal:8765")
+    learn_bridge_timeout_seconds: Annotated[float, Field(gt=0, le=120)] = 20.0
+    learn_bridge_max_clock_skew_seconds: Annotated[int, Field(gt=0, le=300)] = 60
+    learn_bridge_max_response_bytes: Annotated[int, Field(ge=16_384, le=8_388_608)] = 1_048_576
+    learn_bridge_max_courses: Annotated[int, Field(ge=1, le=200)] = 100
+    learn_bridge_max_scheduled_items: Annotated[int, Field(ge=1, le=2_000)] = 500
+    learn_bridge_max_announcements: Annotated[int, Field(ge=1, le=1_000)] = 250
+    learn_announcement_lookback_hours: Annotated[int, Field(ge=1, le=168)] = 72
+    learn_query_max_window_days: Annotated[int, Field(ge=1, le=31)] = 31
+    learn_announcement_max_body_chars: Annotated[int, Field(ge=1_000, le=250_000)] = 60_000
+    learn_announcement_chunk_chars: Annotated[int, Field(ge=500, le=16_000)] = 8_000
     discord_abort_wait_timeout_seconds: Annotated[float, Field(gt=0, le=9)] = 2.0
     discord_academic_pdf_max_attachments: Annotated[int, Field(gt=0, le=5)] = 5
     discord_academic_pdf_max_bytes: Annotated[int, Field(gt=0, le=20_971_520)] = 20_971_520
@@ -173,6 +187,7 @@ class Settings(BaseSettings):
     calendar_semantic_total_timeout_seconds: Annotated[float, Field(gt=0, le=1_500)] = 600.0
     calendar_semantic_prompt_max_chars: Annotated[int, Field(ge=1_000, le=16_000)] = 16_000
     academic_end_of_day_schedule: time = time(hour=21)
+    academic_end_of_day_catchup_grace_minutes: Annotated[int, Field(ge=1, le=180)] = 30
     job_research_timeout_seconds: Annotated[float, Field(gt=0, le=60)] = 10.0
     job_research_max_redirects: Annotated[int, Field(ge=0, le=8)] = 3
     job_research_max_response_bytes: Annotated[int, Field(ge=16_384, le=5_242_880)] = 1_048_576
@@ -194,6 +209,7 @@ class Settings(BaseSettings):
         "discord_bot_token",
         "discord_webhook_secret",
         "discord_host_handoff_secret",
+        "learn_bridge_hmac_secret",
         "notion_token",
         "ops_console_username",
         "ops_console_password",
@@ -209,7 +225,12 @@ class Settings(BaseSettings):
     def empty_secret_is_none(cls, value: Any) -> Any:
         return None if value == "" else value
 
-    @field_validator("github_app_id", "github_installation_id", mode="before")
+    @field_validator(
+        "github_app_id",
+        "github_installation_id",
+        "discord_academic_proactive_user_id",
+        mode="before",
+    )
     @classmethod
     def empty_optional_integer_is_none(cls, value: Any) -> Any:
         return None if value == "" else value
@@ -298,6 +319,18 @@ class Settings(BaseSettings):
             )
         if self.finance_eia_mode == "api" and self.eia_api_key is None:
             raise ValueError("FINANCE_EIA_MODE=api requires EIA_API_KEY")
+        learn_host = (urlsplit(str(self.learn_bridge_url)).hostname or "").casefold()
+        if learn_host not in {"127.0.0.1", "localhost", "host.docker.internal"}:
+            raise ValueError("LEARN bridge URL must target the local host")
+        if self.learn_bridge_enabled and self.learn_bridge_hmac_secret is None:
+            raise ValueError("LEARN_BRIDGE_ENABLED requires LEARN_BRIDGE_HMAC_SECRET")
+        if (
+            self.learn_bridge_hmac_secret is not None
+            and len(self.learn_bridge_hmac_secret.get_secret_value()) < 32
+        ):
+            raise ValueError("LEARN_BRIDGE_HMAC_SECRET must be at least 32 characters")
+        if self.learn_announcement_chunk_chars > self.learn_announcement_max_body_chars:
+            raise ValueError("LEARN announcement chunk size cannot exceed body limit")
         if (
             self.ollama_max_input_tokens
             + self.ollama_max_output_tokens
@@ -451,10 +484,31 @@ class Settings(BaseSettings):
             "discord_academic_authorized_user_count": len(
                 self.discord_academic_authorized_user_ids
             ),
+            "discord_academic_proactive_user_configured": (
+                self.discord_academic_proactive_user_id is not None
+            ),
+            "discord_academic_proactive_user_authorized": (
+                self.discord_academic_proactive_user_id is not None
+                and self.discord_academic_proactive_user_id
+                in self.discord_academic_authorized_user_ids
+            ),
             "discord_academic_message_content_enabled": (
                 self.discord_academic_message_content_enabled
             ),
             "discord_host_handoff_configured": self.discord_host_handoff_secret is not None,
+            "learn_bridge_enabled": self.learn_bridge_enabled,
+            "learn_bridge_url": self._safe_url(str(self.learn_bridge_url)),
+            "learn_bridge_hmac_configured": self.learn_bridge_hmac_secret is not None,
+            "learn_bridge_timeout_seconds": self.learn_bridge_timeout_seconds,
+            "learn_bridge_max_clock_skew_seconds": self.learn_bridge_max_clock_skew_seconds,
+            "learn_bridge_max_response_bytes": self.learn_bridge_max_response_bytes,
+            "learn_bridge_max_courses": self.learn_bridge_max_courses,
+            "learn_bridge_max_scheduled_items": self.learn_bridge_max_scheduled_items,
+            "learn_bridge_max_announcements": self.learn_bridge_max_announcements,
+            "learn_announcement_lookback_hours": self.learn_announcement_lookback_hours,
+            "learn_query_max_window_days": self.learn_query_max_window_days,
+            "learn_announcement_max_body_chars": self.learn_announcement_max_body_chars,
+            "learn_announcement_chunk_chars": self.learn_announcement_chunk_chars,
             "discord_handoff_max_body_bytes": self.discord_handoff_max_body_bytes,
             "discord_handoff_max_clock_skew_seconds": (self.discord_handoff_max_clock_skew_seconds),
             "discord_handoff_request_timeout_seconds": (
@@ -563,6 +617,9 @@ class Settings(BaseSettings):
             ),
             "academic_end_of_day_schedule": self.academic_end_of_day_schedule.isoformat(
                 timespec="minutes"
+            ),
+            "academic_end_of_day_catchup_grace_minutes": (
+                self.academic_end_of_day_catchup_grace_minutes
             ),
             "finance_market_open_schedule": self.finance_market_open_schedule.isoformat(
                 timespec="minutes"

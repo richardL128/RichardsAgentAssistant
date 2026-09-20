@@ -210,6 +210,8 @@ def test_procrastinate_app_is_configured_without_opening_connections() -> None:
         tasks.academic_material_ingestion_task.queue,
         tasks.academic_morning_notification_periodic.queue,
         tasks.academic_morning_notification_task.queue,
+        tasks.academic_nightly_checkin_periodic.queue,
+        tasks.academic_nightly_checkin_task.queue,
         tasks.artifact_retention_periodic.queue,
         tasks.shared_services_periodic.queue,
     } == {"academic_planner"}
@@ -220,6 +222,14 @@ def _morning_settings(*, schedule: time = time(8, 0), grace_minutes: int = 30) -
         academic_morning_schedule=schedule,
         app_timezone="America/Toronto",
         academic_morning_catchup_grace_minutes=grace_minutes,
+    )
+
+
+def _nightly_settings(*, schedule: time = time(21, 0), grace_minutes: int = 30) -> SimpleNamespace:
+    return SimpleNamespace(
+        academic_end_of_day_schedule=schedule,
+        app_timezone="America/Toronto",
+        academic_end_of_day_catchup_grace_minutes=grace_minutes,
     )
 
 
@@ -310,6 +320,69 @@ async def test_academic_morning_periodic_skips_after_grace(
     assert result == {"status": "not_due"}
 
 
+@pytest.mark.asyncio
+async def test_academic_nightly_periodic_defers_at_exact_configured_time(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls: list[PeriodicOccurrence] = []
+
+    async def defer(occurrence: PeriodicOccurrence) -> dict[str, object]:
+        calls.append(occurrence)
+        return {
+            "status": "enqueued",
+            "period_key": stable_period_key("academic-end-of-day", occurrence),
+        }
+
+    monkeypatch.setattr(tasks, "_settings", _nightly_settings())
+    monkeypatch.setattr(tasks, "defer_academic_nightly_checkin", defer)
+
+    result = await tasks.academic_nightly_checkin_periodic.func(
+        timestamp=int(datetime(2026, 9, 20, 1, 0, tzinfo=UTC).timestamp())
+    )
+
+    assert result["status"] == "enqueued"
+    assert calls[0].local_time == datetime(2026, 9, 19, 21, 0, tzinfo=ZoneInfo("America/Toronto"))
+    assert result["period_key"] == "academic-end-of-day:2026-09-19:2100:v1"
+
+
+@pytest.mark.asyncio
+async def test_academic_nightly_periodic_catches_up_inside_grace(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls: list[PeriodicOccurrence] = []
+
+    async def defer(occurrence: PeriodicOccurrence) -> dict[str, object]:
+        calls.append(occurrence)
+        return {"status": "enqueued"}
+
+    monkeypatch.setattr(tasks, "_settings", _nightly_settings(grace_minutes=30))
+    monkeypatch.setattr(tasks, "defer_academic_nightly_checkin", defer)
+
+    result = await tasks.academic_nightly_checkin_periodic.func(
+        timestamp=int(datetime(2026, 9, 20, 1, 20, tzinfo=UTC).timestamp())
+    )
+
+    assert result == {"status": "enqueued"}
+    assert calls[0].scheduled_at == datetime(2026, 9, 20, 1, 0, tzinfo=UTC)
+
+
+@pytest.mark.asyncio
+async def test_academic_nightly_periodic_skips_after_grace(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async def defer(occurrence: PeriodicOccurrence) -> dict[str, object]:
+        raise AssertionError(f"unexpected stale deferral for {occurrence}")
+
+    monkeypatch.setattr(tasks, "_settings", _nightly_settings(grace_minutes=30))
+    monkeypatch.setattr(tasks, "defer_academic_nightly_checkin", defer)
+
+    result = await tasks.academic_nightly_checkin_periodic.func(
+        timestamp=int(datetime(2026, 9, 20, 1, 31, tzinfo=UTC).timestamp())
+    )
+
+    assert result == {"status": "not_due"}
+
+
 async def test_shared_services_periodic_persists_the_aggregate_health(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -340,6 +413,14 @@ async def test_shared_services_periodic_persists_the_aggregate_health(
         lambda *_args, **_kwargs: SimpleNamespace(
             state=HealthState.HEALTHY,
             diagnostic="academic morning schedule healthy",
+        ),
+    )
+    monkeypatch.setattr(
+        tasks,
+        "evaluate_academic_end_of_day_health",
+        lambda *_args, **_kwargs: SimpleNamespace(
+            state=HealthState.HEALTHY,
+            diagnostic="academic end-of-day schedule healthy",
         ),
     )
 
@@ -737,6 +818,104 @@ async def test_academic_morning_terminal_run_does_not_reenqueue(
 
 
 @pytest.mark.asyncio
+async def test_academic_nightly_deferral_uses_shared_period_key_without_model_lock(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class FakeTask:
+        def configure(self, **kwargs: str) -> FakeTask:
+            self.configuration = kwargs
+            return self
+
+        async def defer_async(self, **kwargs: str) -> int:
+            self.arguments = kwargs
+            return 52
+
+    task = FakeTask()
+    run_id = uuid4()
+    occurrence = _occurrence(datetime(2026, 9, 19, 21, 0, tzinfo=ZoneInfo("America/Toronto")))
+    monkeypatch.setattr(tasks, "academic_nightly_checkin_task", task)
+    monkeypatch.setattr(
+        tasks,
+        "_create_academic_nightly_run",
+        lambda **_kwargs: (run_id, "attention"),
+    )
+
+    result = await tasks.defer_academic_nightly_checkin(occurrence)
+
+    assert result == {
+        "status": "enqueued",
+        "run_id": str(run_id),
+        "period_key": "academic-end-of-day:2026-09-19:2100:v1",
+        "job_id": 52,
+    }
+    assert task.configuration == {"queueing_lock": "academic-end-of-day:2026-09-19:2100:v1"}
+    assert task.arguments == {
+        "occurrence_at_iso": "2026-09-20T01:00:00+00:00",
+        "run_id": str(run_id),
+        "period_key": "academic-end-of-day:2026-09-19:2100:v1",
+    }
+
+
+@pytest.mark.asyncio
+async def test_academic_nightly_duplicate_queueing_lock_is_idempotent_success(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class FakeTask:
+        def configure(self, **kwargs: str) -> FakeTask:
+            self.configuration = kwargs
+            return self
+
+        async def defer_async(self, **kwargs: str) -> int:
+            self.arguments = kwargs
+            raise AlreadyEnqueued("duplicate queueing lock")
+
+    task = FakeTask()
+    run_id = uuid4()
+    occurrence = _occurrence(datetime(2026, 9, 19, 21, 0, tzinfo=ZoneInfo("America/Toronto")))
+    monkeypatch.setattr(tasks, "academic_nightly_checkin_task", task)
+    monkeypatch.setattr(
+        tasks,
+        "_create_academic_nightly_run",
+        lambda **_kwargs: (run_id, "queued"),
+    )
+
+    result = await tasks.defer_academic_nightly_checkin(occurrence)
+
+    assert result == {
+        "status": "already_enqueued",
+        "run_id": str(run_id),
+        "period_key": "academic-end-of-day:2026-09-19:2100:v1",
+    }
+    assert task.configuration == {"queueing_lock": "academic-end-of-day:2026-09-19:2100:v1"}
+
+
+@pytest.mark.asyncio
+async def test_academic_nightly_successful_run_does_not_reenqueue(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class FakeTask:
+        def configure(self, **kwargs: str) -> FakeTask:
+            raise AssertionError(f"terminal run should not configure task: {kwargs}")
+
+    run_id = uuid4()
+    occurrence = _occurrence(datetime(2026, 9, 19, 21, 0, tzinfo=ZoneInfo("America/Toronto")))
+    monkeypatch.setattr(tasks, "academic_nightly_checkin_task", FakeTask())
+    monkeypatch.setattr(
+        tasks,
+        "_create_academic_nightly_run",
+        lambda **_kwargs: (run_id, "succeeded"),
+    )
+
+    result = await tasks.defer_academic_nightly_checkin(occurrence)
+
+    assert result == {
+        "status": "already_complete",
+        "run_id": str(run_id),
+        "period_key": "academic-end-of-day:2026-09-19:2100:v1",
+    }
+
+
+@pytest.mark.asyncio
 async def test_academic_morning_task_records_attempt_with_anchored_occurrence(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -792,12 +971,83 @@ async def test_academic_morning_task_records_attempt_with_anchored_occurrence(
     }
 
 
+@pytest.mark.asyncio
+async def test_academic_nightly_task_records_attempt_with_anchored_occurrence(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    run_id = uuid4()
+    period_key = "academic-end-of-day:2026-09-19:2100:v1"
+    handler_calls: list[tuple[str, str, str, int, int]] = []
+    execution: dict[str, object] = {}
+
+    async def handler(
+        occurrence_at_iso: str,
+        queued_run_id: str,
+        queued_period_key: str,
+        attempt: int,
+        attempt_limit: int,
+    ) -> dict[str, Any]:
+        handler_calls.append(
+            (occurrence_at_iso, queued_run_id, queued_period_key, attempt, attempt_limit)
+        )
+        return {"status": "succeeded", "delivery_count": 1}
+
+    async def execute(operation: Any, **kwargs: object) -> dict[str, object]:
+        execution.update(kwargs)
+        return await operation()
+
+    monkeypatch.setattr(tasks, "_academic_nightly_checkin_handler", handler)
+    monkeypatch.setattr(tasks, "execute_recorded_attempt", execute)
+    context = SimpleNamespace(job=SimpleNamespace(attempts=0))
+
+    result = await tasks.academic_nightly_checkin_task.func(
+        context,
+        occurrence_at_iso="2026-09-20T01:00:00+00:00",
+        run_id=str(run_id),
+        period_key=period_key,
+    )
+
+    assert handler_calls == [
+        (
+            "2026-09-20T01:00:00+00:00",
+            str(run_id),
+            period_key,
+            1,
+            tasks.default_retry_strategy.policy.max_attempts,
+        )
+    ]
+    assert execution["node_name"] == "queue.academic_nightly_checkin"
+    assert execution["run_id"] == run_id
+    assert execution["attempt"] == 1
+    assert result == {
+        "status": "succeeded",
+        "delivery_count": 1,
+        "run_id": str(run_id),
+        "period_key": period_key,
+    }
+
+
 def test_worker_registers_discord_wake_and_ingestion_handlers(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     import importlib
 
     async def run_scheduled_morning_notification(
+        occurrence_at_iso: str,
+        run_id: str,
+        period_key: str,
+        attempt: int,
+        attempt_limit: int,
+    ) -> dict[str, Any]:
+        return {
+            "occurrence_at_iso": occurrence_at_iso,
+            "run_id": run_id,
+            "period_key": period_key,
+            "attempt": attempt,
+            "attempt_limit": attempt_limit,
+        }
+
+    async def run_scheduled_nightly_checkin(
         occurrence_at_iso: str,
         run_id: str,
         period_key: str,
@@ -820,6 +1070,14 @@ def test_worker_registers_discord_wake_and_ingestion_handlers(
         "app.agents.academic_planner.morning_notification",
         module,
     )
+    nightly_module = ModuleType("app.agents.academic_planner.nightly_checkin")
+    nightly_module_any: Any = nightly_module
+    nightly_module_any.run_scheduled_nightly_checkin = run_scheduled_nightly_checkin
+    monkeypatch.setitem(
+        sys.modules,
+        "app.agents.academic_planner.nightly_checkin",
+        nightly_module,
+    )
     import app.queue as queue_package
 
     sys.modules.pop("app.queue.worker", None)
@@ -833,6 +1091,7 @@ def test_worker_registers_discord_wake_and_ingestion_handlers(
         assert tasks._academic_clarification_handler is not None
         assert tasks._academic_clarification_status_handler is not None
         assert tasks._academic_morning_notification_handler is run_scheduled_morning_notification
+        assert tasks._academic_nightly_checkin_handler is run_scheduled_nightly_checkin
         assert tasks._academic_material_ingestion_handler is not None
         assert tasks._discord_wake_handler is not None
     finally:
@@ -848,6 +1107,7 @@ def test_default_periodic_registry_has_no_academic_model_schedule() -> None:
 
     assert registered == {
         "lifeagent.schedule.academic_morning_notification",
+        "lifeagent.schedule.academic_nightly_checkin",
         "lifeagent.artifacts.retention",
         "lifeagent.health.shared_services",
     }

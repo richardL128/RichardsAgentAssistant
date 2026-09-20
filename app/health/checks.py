@@ -13,6 +13,7 @@ from enum import StrEnum
 import httpx
 from pydantic import BaseModel, ConfigDict, Field, ValidationError
 from sqlalchemy.exc import SQLAlchemyError
+from sqlalchemy.orm import Session
 
 from app.connectors.github import GitHubAppConnector, InstallationToken
 from app.connectors.notion import NOTION_API_BASE_URL, NOTION_API_VERSION
@@ -870,6 +871,30 @@ async def readiness(
     db_checks = await asyncio.to_thread(check_database, database)
     checks = [*db_checks, check_artifact_root(settings)]
     checks.append(check_academic_notion_status(settings, database))
+    try:
+        from app.health.service import evaluate_academic_end_of_day_health
+
+        with Session(database.engine) as session, session.begin():
+            academic_end_of_day = evaluate_academic_end_of_day_health(
+                session,
+                settings=settings,
+                evaluated_at=datetime.now(UTC),
+            )
+        checks.append(
+            HealthCheck(
+                name="academic_end_of_day",
+                state=academic_end_of_day.state,
+                diagnostic=academic_end_of_day.diagnostic,
+            )
+        )
+    except (SQLAlchemyError, OSError, ValueError) as exc:
+        checks.append(
+            HealthCheck(
+                name="academic_end_of_day",
+                state=HealthState.ATTENTION,
+                diagnostic=f"academic end-of-day health unavailable ({exc.__class__.__name__})",
+            )
+        )
     checks.append(await check_ollama(settings, ollama_client))
     checks.append(await check_academic_embeddings(settings, ollama_client, database=database))
     states = {check.state for check in checks}

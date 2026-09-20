@@ -10,7 +10,6 @@ from uuid import UUID
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 from app.agents.academic_planner.calendar_roles import AcademicCalendarRole
-from app.agents.job_interviews.contracts import InterviewReminderFact
 
 
 class PlannerModel(BaseModel):
@@ -265,32 +264,6 @@ class MorningBriefing(PlannerModel):
         return value
 
 
-class ScheduledMorningNotification(PlannerModel):
-    """Logical scheduled briefing and its deterministic Discord-sized parts."""
-
-    model_config = ConfigDict(extra="ignore", str_strip_whitespace=True)
-
-    period_key: str = Field(min_length=1, max_length=512)
-    intended_local_date: date
-    scheduled_at: datetime
-    source_synced_at: datetime
-    interview_items: tuple[InterviewReminderFact, ...] = Field(default=(), max_length=100)
-    message_text: str = Field(min_length=1)
-    message_parts: tuple[str, ...] = Field(min_length=1)
-
-    @field_validator("scheduled_at", "source_synced_at")
-    @classmethod
-    def timestamps_aware(cls, value: datetime) -> datetime:
-        return _aware(value)
-
-    @field_validator("message_parts")
-    @classmethod
-    def message_parts_fit_discord(cls, value: tuple[str, ...]) -> tuple[str, ...]:
-        if any(len(part) > 2_000 for part in value):
-            raise ValueError("scheduled morning message part exceeds Discord's content limit")
-        return value
-
-
 class InboundMaterialProposalPreview(PlannerModel):
     """Bounded PDF metadata safe to show in an exact-confirmation preview."""
 
@@ -310,6 +283,8 @@ class ProposedChange(PlannerModel):
         "attach_assessment_material",
         "update_assessment",
         "archive_assessment",
+        "create_learn_calendar_event",
+        "enrich_learn_calendar_event",
     ]
     value: str = Field(min_length=1, max_length=1_000)
     assessment_id: str | None = Field(default=None, max_length=255)
@@ -326,13 +301,69 @@ class ProposedChange(PlannerModel):
         default=None, max_length=5
     )
     supersedes_proposal_id: UUID | None = None
+    learn_source_id: str | None = Field(default=None, min_length=1, max_length=255)
+    learn_source_fingerprint: str | None = Field(default=None, min_length=64, max_length=64)
+    learn_course_code: str | None = Field(default=None, min_length=1, max_length=80)
+    learn_summary: str | None = Field(default=None, min_length=1, max_length=1_500)
+    learn_source_url: str | None = Field(default=None, min_length=1, max_length=4_096)
+    learn_date: date | datetime | None = None
+    learn_ends_at: date | datetime | None = None
+    learn_date_precision: Literal["date", "datetime"] | None = None
+    learn_context: str | None = Field(default=None, min_length=1, max_length=10_000)
+    target_page_id: str | None = Field(default=None, min_length=1, max_length=255)
+    expected_due_value: date | datetime | None = None
 
     @field_validator("due_at", "ends_at", "expected_last_edited_at")
     @classmethod
     def optional_times_aware(cls, value: datetime | None) -> datetime | None:
         return _aware(value) if value is not None else None
 
+    @field_validator("learn_date", "learn_ends_at", "expected_due_value")
+    @classmethod
+    def learn_values_are_valid(cls, value: date | datetime | None) -> date | datetime | None:
+        if isinstance(value, datetime):
+            return _aware(value)
+        return value
+
     def model_post_init(self, __context: object) -> None:
+        if self.field in {"create_learn_calendar_event", "enrich_learn_calendar_event"}:
+            required = (
+                self.learn_source_id,
+                self.learn_source_fingerprint,
+                self.learn_course_code,
+                self.learn_summary,
+                self.learn_source_url,
+                self.learn_date,
+                self.learn_date_precision,
+                self.learn_context,
+            )
+            if any(value is None for value in required):
+                raise ValueError("LEARN proposal is missing grounded source context")
+            if self.learn_date_precision == "date" and isinstance(self.learn_date, datetime):
+                raise ValueError("date-precision LEARN proposal must use a date value")
+            if self.learn_date_precision == "datetime" and not isinstance(
+                self.learn_date, datetime
+            ):
+                raise ValueError("datetime-precision LEARN proposal must use a datetime")
+            if self.field == "create_learn_calendar_event" and self.title is None:
+                raise ValueError("LEARN event creation requires a title")
+            if self.field == "enrich_learn_calendar_event" and (
+                self.assessment_id is None
+                or self.course_id is None
+                or self.target_page_id is None
+                or self.expected_title is None
+                or self.expected_last_edited_at is None
+                or self.expected_due_value is None
+            ):
+                raise ValueError("LEARN enrichment requires guarded target preconditions")
+            if self.learn_ends_at is not None:
+                learn_start = self.learn_date
+                if learn_start is None:
+                    raise ValueError("LEARN proposal is missing its start value")
+                if isinstance(learn_start, datetime) != isinstance(self.learn_ends_at, datetime):
+                    raise ValueError("LEARN start and end precision must match")
+                if self.learn_ends_at <= learn_start:
+                    raise ValueError("LEARN end must be after start")
         if self.ends_at is None:
             return
         if self.due_at is None:
@@ -753,7 +784,6 @@ __all__ = [
     "ProposedChange",
     "ReinforceLearningFocusAction",
     "ResolveLearningFocusAction",
-    "ScheduledMorningNotification",
     "SearchAssessmentsCall",
     "SearchCoursesCall",
     "SearchLearningFocusesCall",

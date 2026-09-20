@@ -3,7 +3,7 @@ from __future__ import annotations
 import hashlib
 from collections.abc import Sequence
 from dataclasses import dataclass
-from datetime import UTC, datetime
+from datetime import UTC, date, datetime
 from types import SimpleNamespace
 from typing import Any, Literal, cast
 from uuid import UUID
@@ -61,6 +61,14 @@ class _Targets:
         title_property_id="titleProp",
         date_property_id="dateProp",
     )
+    learn_course = AcademicCourseMutationTarget(
+        course_id="learn-course",
+        course_code="Classes + Tutorials + Labs",
+        data_source_id="learn-source",
+        title_property_id="learn-title",
+        date_property_id="learn-date",
+        learn_context_property_id="learn-context",
+    )
 
     def resolve_course_mutation_target(self, course_id: str) -> AcademicCourseMutationTarget | None:
         return self.course if course_id == self.course.course_id else None
@@ -69,6 +77,9 @@ class _Targets:
         self, assessment_id: str
     ) -> AcademicAssessmentMutationTarget | None:
         return self.assessment if assessment_id == self.assessment.assessment_id else None
+
+    def resolve_learn_calendar_targets(self) -> tuple[AcademicCourseMutationTarget, ...]:
+        return (self.learn_course,)
 
     def __init__(self) -> None:
         self.operations: dict[tuple[UUID, int], dict[str, Any]] = {}
@@ -256,6 +267,14 @@ class _Connector:
         self.calls.append(("archive", kwargs))
         return NotionWriteReceipt(proposal_id=str(kwargs["proposal_id"]), page_id="archived-page")
 
+    async def guarded_update_learn_context(self, **kwargs: Any) -> NotionWriteReceipt:
+        self.calls.append(("learn_context", kwargs))
+        return NotionWriteReceipt(
+            proposal_id=str(kwargs["proposal_id"]),
+            page_id=kwargs["page_id"],
+            property_id=kwargs["learn_context_property_id"],
+        )
+
     async def create_pdf_file_upload(self, **kwargs: Any) -> NotionFileUploadReceipt:
         self.calls.append(("create_upload", kwargs))
         upload_id = f"upload-{len([call for call in self.calls if call[0] == 'create_upload'])}"
@@ -303,6 +322,75 @@ def _review(changes: Sequence[ProposedChange]) -> NotionMutationReview:
         proposal_id=PROPOSAL_ID,
         confirmation_event=f"confirm {PROPOSAL_ID}",
     )
+
+
+def _learn_create_change() -> ProposedChange:
+    return ProposedChange(
+        field="create_learn_calendar_event",
+        value="create in Classes + Tutorials + Labs",
+        title="ECE 240 Tutorial",
+        learn_source_id="scheduled-1",
+        learn_source_fingerprint="f" * 64,
+        learn_course_code="ECE 240",
+        learn_summary="Tutorial meets in the lab room.",
+        learn_source_url="https://learn.uwaterloo.ca/d2l/le/calendar/1/7",
+        learn_date=date(2026, 9, 21),
+        learn_date_precision="date",
+        learn_context=(
+            "ECE 240: Tutorial meets in the lab room.\n"
+            "Source: https://learn.uwaterloo.ca/d2l/le/calendar/1/7"
+        ),
+    )
+
+
+@pytest.mark.asyncio
+async def test_confirmed_learn_create_routes_only_to_reserved_date_only_calendar() -> None:
+    connector = _Connector()
+    targets = _Targets()
+    writer = DiscoveredAcademicNotionWriter(
+        connector=connector,  # type: ignore[arg-type]
+        target_store=targets,
+    )
+    change = _learn_create_change()
+
+    await writer.apply_confirmed_changes(
+        (change,),
+        proposal_id=PROPOSAL_ID,
+        confirmation_event=f"confirm {PROPOSAL_ID}",
+        review=_review((change,)),
+    )
+
+    assert [name for name, _ in connector.calls] == ["create"]
+    payload = connector.calls[0][1]
+    assert payload["data_source_id"] == "learn-source"
+    assert payload["due"] == "2026-09-21"
+    assert payload["rich_text_property_id"] == "learn-context"
+    assert payload["rich_text_value"] == change.learn_context
+
+
+@pytest.mark.asyncio
+async def test_learn_create_fails_closed_when_reserved_target_is_not_unique() -> None:
+    class DuplicateTargets(_Targets):
+        def resolve_learn_calendar_targets(self):
+            return (self.learn_course, self.learn_course)
+
+    connector = _Connector()
+    writer = DiscoveredAcademicNotionWriter(
+        connector=connector,  # type: ignore[arg-type]
+        target_store=DuplicateTargets(),
+    )
+    change = _learn_create_change()
+
+    with pytest.raises(LifeAgentError) as raised:
+        await writer.apply_confirmed_changes(
+            (change,),
+            proposal_id=PROPOSAL_ID,
+            confirmation_event=f"confirm {PROPOSAL_ID}",
+            review=_review((change,)),
+        )
+
+    assert raised.value.record.code.value == "source_setup_required"
+    assert connector.calls == []
 
 
 @pytest.mark.asyncio

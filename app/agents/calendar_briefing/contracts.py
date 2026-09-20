@@ -19,6 +19,7 @@ class CalendarEventSourceArea(StrEnum):
     COURSE = "course"
     MISC = "misc"
     JOBS = "jobs"
+    LEARN = "learn"
 
 
 class CalendarEventSourceKind(StrEnum):
@@ -167,6 +168,7 @@ class ScheduledMorningCalendarItem(CalendarBriefingModel):
     """Host-approved rendering facts for one scheduled morning calendar item."""
 
     event_id: str = Field(min_length=1, max_length=255)
+    source_id: str = Field(min_length=1, max_length=255)
     source_area: CalendarEventSourceArea
     source_label: str = Field(min_length=1, max_length=255)
     title: str = Field(min_length=1, max_length=500)
@@ -186,6 +188,18 @@ class ScheduledMorningCalendarItem(CalendarBriefingModel):
     intent_evidence_fragment_ids: tuple[str, ...] = Field(default=(), max_length=12)
     intent_rationale: str | None = Field(default=None, min_length=1, max_length=500)
     source_url: str | None = Field(default=None, max_length=1_000)
+    starts_at: datetime
+    ends_at: datetime | None = None
+    schedule_context: str | None = Field(default=None, max_length=4_000)
+
+    @field_validator("starts_at", "ends_at")
+    @classmethod
+    def event_times_are_aware(cls, value: datetime | None) -> datetime | None:
+        if value is None:
+            return None
+        if value.tzinfo is None or value.utcoffset() is None:
+            raise ValueError("calendar event timestamps must be timezone-aware")
+        return value.astimezone(UTC)
 
     @model_validator(mode="after")
     def semantic_status_matches_payload(self) -> ScheduledMorningCalendarItem:
@@ -216,6 +230,14 @@ class ScheduledMorningCalendarItem(CalendarBriefingModel):
             if self.intent_evidence_fragment_ids:
                 raise ValueError("invalid or unavailable calendar intent cannot carry citations")
         return self
+
+
+class ActiveMorningCourse(CalendarBriefingModel):
+    """One active real course that must appear exactly once in the briefing."""
+
+    course_id: str = Field(min_length=1, max_length=255)
+    course_code: str = Field(min_length=1, max_length=80)
+    title: str = Field(min_length=1, max_length=255)
 
 
 def calendar_title_evidence_fragment(
@@ -291,6 +313,7 @@ def fingerprint_event_evidence(
 
 
 __all__ = [
+    "ActiveMorningCourse",
     "CalendarActivityIntent",
     "CalendarActivityIntentStatus",
     "CalendarEventEvidenceFragment",

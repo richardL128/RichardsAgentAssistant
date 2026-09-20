@@ -219,6 +219,29 @@ if [[ "${1:-}" == "image" && "${2:-}" == "inspect" ]]; then
   exit 0
 fi
 if [[ "${1:-}" == "compose" ]]; then
+  if [[ " $* " == *" up -d --no-build worker-academic-planner "* ]]; then
+    if [[ -n "${DISCORD_HOST_HANDOFF_SECRET:-}" ]]; then
+      printf 'docker:academic-worker-handoff-secret-configured\n' >> "$OLLAMA_FAKE_CALLS_FILE"
+    fi
+  fi
+  for arg in "$@"; do
+    if [[ "$arg" == "ps" ]]; then
+      case " $* " in
+        *" --status running "*)
+          if [[ "${OLLAMA_FAKE_ACADEMIC_WORKER_STATE:-running}" == "running" ]]; then
+            printf 'worker-academic-planner\\n'
+          fi
+          exit 0
+          ;;
+        *" -a "*)
+          if [[ "${OLLAMA_FAKE_ACADEMIC_WORKER_STATE:-running}" != "missing" ]]; then
+            printf 'worker-academic-planner\\n'
+          fi
+          exit 0
+          ;;
+      esac
+    fi
+  done
   exit 0
 fi
 exit 2
@@ -520,7 +543,7 @@ def test_status_reports_exit_codes_without_model_metadata(tmp_path: Path) -> Non
         ps_file,
         {
             "models": [
-                {"name": model, "size": 99999, "context_length": 16384, "size_vram": 25000},
+                {"name": model, "size": 99999, "context_length": 32768, "size_vram": 25000},
                 {
                     "name": DEFAULT_EMBEDDING_MODEL,
                     "size": 888,
@@ -542,7 +565,7 @@ def test_status_reports_exit_codes_without_model_metadata(tmp_path: Path) -> Non
     assert "embedding_digest_match=unchecked" in ok.stdout
     assert "embedding_capability=yes" in ok.stdout
     assert "reasoning_resident=yes" in ok.stdout
-    assert "reasoning_context_length=16384" in ok.stdout
+    assert "reasoning_context_length=32768" in ok.stdout
     assert "reasoning_size_vram=25000" in ok.stdout
     assert "embedding_resident=yes" in ok.stdout
     assert "embedding_context_length=2048" in ok.stdout
@@ -626,6 +649,7 @@ def test_host_runtime_deploy_builds_once_preflights_and_installs_agents(tmp_path
         f"docker:compose --env-file {runtime_dir / '.env'} up -d --no-build "
         "worker-academic-planner" in calls
     )
+    assert "docker:academic-worker-handoff-secret-configured" in calls
     assert f"docker:compose --env-file {runtime_dir / '.env'} stop api" in calls
     assert (
         f"uv:sync --locked --no-dev --project {runtime_dir} --managed-python --python 3.12" in calls
@@ -690,12 +714,41 @@ def test_host_runtime_status_and_uninstall_report_both_launchagents(tmp_path: Pa
 
     assert status_result.returncode == 0
     assert "discord_wake_launchd=running" in status_result.stdout
+    assert "academic_worker_compose=running" in status_result.stdout
     assert "ollama_launchd=running" in status_result.stdout
     assert uninstall.returncode == 0
     assert not (Path(env["LIFEAGENT_LAUNCH_AGENTS_DIR"]) / "com.lifeagent.ollama.plist").exists()
     assert not (
         Path(env["LIFEAGENT_LAUNCH_AGENTS_DIR"]) / "com.lifeagent.discord-wake.plist"
     ).exists()
+
+
+def test_host_runtime_status_fails_when_academic_worker_is_not_running(tmp_path: Path) -> None:
+    env, _calls_file, tags_file, ps_file, _runtime_dir = _fake_tool_env(tmp_path)
+    env["OLLAMA_FAKE_ACADEMIC_WORKER_STATE"] = "exited"
+    model = "qwen-status:latest"
+    digest = "digest-status"
+    env_file = tmp_path / "life.env"
+    env_file.write_text(f"OLLAMA_MODEL={model}\nOLLAMA_MODEL_DIGEST={digest}\n", encoding="utf-8")
+    _write_json(
+        tags_file,
+        {
+            "models": [
+                {"name": model, "digest": digest},
+                {"name": DEFAULT_EMBEDDING_MODEL, "digest": "embedding-digest"},
+            ]
+        },
+    )
+    _write_json(ps_file, {"models": [{"name": model}, {"name": DEFAULT_EMBEDDING_MODEL}]})
+    (tmp_path / "state" / "loaded-com.lifeagent.discord-wake").touch()
+    (tmp_path / "state" / "loaded-com.lifeagent.ollama").touch()
+
+    status_result = _run_script(HOST_RUNTIME_SCRIPT, "status", "--env-file", str(env_file), env=env)
+
+    assert status_result.returncode == 1
+    assert "discord_wake_launchd=running" in status_result.stdout
+    assert "academic_worker_compose=not_running" in status_result.stdout
+    assert "ollama_launchd=running" in status_result.stdout
 
 
 def test_discord_wake_daemon_runs_native_python_without_build_or_pull(tmp_path: Path) -> None:

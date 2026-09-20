@@ -343,7 +343,18 @@ install_agents() {
 activate_scheduled_runtime() {
   # The periodic academic worker must not depend on a conversational wake.
   cd "$REPO_DIR"
-  docker compose --env-file "$ENV_FILE" up -d --no-build worker-academic-planner
+  handoff_secret_file="$(discord_wake_hmac_secret_file)"
+  [ -f "$handoff_secret_file" ] || {
+    echo "Discord wake HMAC secret file is missing: $handoff_secret_file" >&2
+    exit 1
+  }
+  handoff_secret="$(sed -n '1p' "$handoff_secret_file")"
+  [ -n "$handoff_secret" ] || {
+    echo "Discord wake HMAC secret file is empty: $handoff_secret_file" >&2
+    exit 1
+  }
+  DISCORD_HOST_HANDOFF_SECRET="$handoff_secret" \
+    docker compose --env-file "$ENV_FILE" up -d --no-build worker-academic-planner
   docker compose --env-file "$ENV_FILE" stop api
 }
 
@@ -389,12 +400,30 @@ install() {
 
 status() {
   command_required launchctl
+  command_required docker
   discord_state="$(launchd_status "$LIFEAGENT_DISCORD_WAKE_LABEL")"
   echo "discord_wake_launchd=$discord_state"
   discord_status=0
   if [ "$discord_state" != "running" ]; then
     report_launch_agent_failure "$LIFEAGENT_DISCORD_WAKE_LABEL"
     discord_status=1
+  fi
+  academic_worker_status=0
+  academic_worker_services="$(
+    docker compose --env-file "$ENV_FILE" ps --status running --services worker-academic-planner 2>/dev/null || true
+  )"
+  if [ "$academic_worker_services" = "worker-academic-planner" ]; then
+    echo "academic_worker_compose=running"
+  else
+    academic_worker_known="$(
+      docker compose --env-file "$ENV_FILE" ps -a --services worker-academic-planner 2>/dev/null || true
+    )"
+    if [ "$academic_worker_known" = "worker-academic-planner" ]; then
+      echo "academic_worker_compose=not_running"
+    else
+      echo "academic_worker_compose=missing"
+    fi
+    academic_worker_status=1
   fi
   set +e
   "$SCRIPT_DIR/ollama_qwen_status.sh" --env-file "$ENV_FILE"
@@ -403,7 +432,10 @@ status() {
   if [ "$ollama_status" -ne 0 ]; then
     return "$ollama_status"
   fi
-  return "$discord_status"
+  if [ "$discord_status" -ne 0 ]; then
+    return "$discord_status"
+  fi
+  return "$academic_worker_status"
 }
 
 uninstall() {

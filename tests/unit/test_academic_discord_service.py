@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from datetime import time
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
@@ -37,11 +38,14 @@ def test_academic_discord_service_respects_memory_enabled_setting(
         discord_academic_authorized_user_ids=[333333333333333333],
         discord_academic_message_content_enabled=True,
         academic_memory_enabled=enabled,
+        academic_end_of_day_schedule=time(22, 15),
     )
 
     service = discord_service.create_academic_discord_service(settings)
     try:
         assert bool(captured[0]["memory_service"]) is expected_configured
+        if expected_configured:
+            assert captured[0]["memory_service"]._end_of_day_time == time(22, 15)
         assert captured[0]["calendar_semantic_interpreter"] is not None
     finally:
         service.close()

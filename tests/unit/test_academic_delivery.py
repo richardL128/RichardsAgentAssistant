@@ -12,6 +12,7 @@ from sqlalchemy.orm import Session
 from sqlalchemy.pool import StaticPool
 
 from app.agents.academic_planner.contracts import MorningBriefing
+from app.agents.calendar_briefing.morning_manifest import MorningEmbedPayload
 from app.connectors.discord import (
     AcademicDiscordMessage,
     DiscordAcademicPlannerAdapter,
@@ -166,6 +167,54 @@ async def test_scheduled_academic_notification_delivers_exact_content_once(
         assert stored is not None
         assert stored.status == DeliveryStatus.SENT.value
         assert stored.error_code is None
+
+
+@pytest.mark.asyncio
+async def test_scheduled_morning_embed_uses_nonce_mentions_and_idempotency(engine: Engine) -> None:
+    key = "planner-morning-four-v3:2026-09-10:0800:jobs:v1"
+    with Session(engine) as session, session.begin():
+        run = RunRepository.create_or_get(
+            session,
+            idempotency_key="academic-morning:2026-09-10:0800:v1",
+            agent_name="academic_planner",
+            trigger="schedule",
+            schedule="academic_morning",
+        )
+        run_id = run.id
+    calls: list[httpx.Request] = []
+
+    def respond(request: httpx.Request) -> httpx.Response:
+        calls.append(request)
+        return httpx.Response(200, json={"id": "123456789012345678", "guild_id": "42"})
+
+    embed = MorningEmbedPayload(
+        title="Jobs — Thursday, September 10, 2026",
+        description="No incomplete Jobs events overlap today. @everyone",
+    )
+    async with httpx.AsyncClient(
+        base_url="https://discord.com/api/v10", transport=httpx.MockTransport(respond)
+    ) as client:
+        delivery = DiscordAcademicPlannerDelivery(
+            engine=engine,
+            run_id=run_id,
+            channel_id=CHANNEL,
+            adapter=DiscordAcademicPlannerAdapter(
+                token=SecretStr("academic-token"),
+                allowed_channel_ids={CHANNEL},
+                client=client,
+            ),
+        )
+        first = await delivery.send_scheduled_embed(embed, idempotency_key=key)
+        second = await delivery.send_scheduled_embed(embed, idempotency_key=key)
+
+    assert first.id == second.id
+    assert len(calls) == 1
+    body = json.loads(calls[0].content)
+    assert "content" not in body
+    assert body["embeds"] == [embed.model_dump(mode="json")]
+    assert body["nonce"] == first.id.hex[:25]
+    assert body["enforce_nonce"] is True
+    assert body["allowed_mentions"] == {"parse": []}
 
 
 @pytest.mark.asyncio

@@ -338,6 +338,132 @@ def test_begin_turn_coalesces_partial_unique_creation_race(
         assert session.scalar(select(func.count()).select_from(NativeConversationInboundEvent)) == 1
 
 
+def test_open_proactive_prompt_creates_awaiting_artifact_backed_session(
+    engine,
+    artifacts: ArtifactStore,
+) -> None:
+    service = _service(engine, artifacts)
+    prompt = "Evening check-in. token=private-reflection"
+
+    opened = service.open_proactive_prompt(
+        root_event_id="academic-end-of-day:2026-09-09:2100:v1",
+        discord_channel_id=CHANNEL,
+        owner_discord_user_id=OWNER,
+        prompt_text=prompt,
+        expires_at=NOW + timedelta(hours=48),
+        model_identity="qwen@test",
+        prompt_config_version="nightly-v1",
+        proactive_kind="academic_end_of_day_reflection",
+        proactive_period="2026-09-09",
+        now=NOW,
+    )
+
+    assert opened.status == "started"
+    assert opened.state == "awaiting_user"
+    assert opened.session_id is not None
+    assert [message.type for message in opened.transcript_messages] == ["ai"]
+    assert opened.transcript_messages[0].content == prompt
+    with Session(engine) as session:
+        row = session.get(NativeConversationSession, opened.session_id)
+        assert row is not None
+        assert row.state == "awaiting_user"
+        assert row.last_disposition == "awaiting_user"
+        assert row.expires_at.replace(tzinfo=UTC) == NOW + timedelta(hours=24)
+        ordinary_row_payload = json.dumps(
+            {
+                "root_event_id": row.root_event_id,
+                "transcript_artifact_key": row.transcript_artifact_key,
+                "tool_checkpoint_artifact_key": row.tool_checkpoint_artifact_key,
+                "model_identity": row.model_identity,
+                "prompt_config_version": row.prompt_config_version,
+            },
+            sort_keys=True,
+        )
+        assert "private-reflection" not in ordinary_row_payload
+        manifest = NativeTranscriptManifest.model_validate(
+            json.loads(artifacts.get(row.transcript_artifact_key).decode("utf-8"))
+        )
+        assert manifest.conversation_id == row.id
+        assert manifest.lifecycle_events[0].content is None
+        assert manifest.lifecycle_events[0].metadata == {
+            "proactive": {
+                "kind": "academic_end_of_day_reflection",
+                "period": "2026-09-09",
+                "root_event_id": "academic-end-of-day:2026-09-09:2100:v1",
+            }
+        }
+
+    duplicate = service.open_proactive_prompt(
+        root_event_id="academic-end-of-day:2026-09-09:2100:v1",
+        discord_channel_id=CHANNEL,
+        owner_discord_user_id=OWNER,
+        prompt_text=prompt,
+        expires_at=NOW + timedelta(hours=2),
+        model_identity="qwen@test",
+        prompt_config_version="nightly-v1",
+        proactive_kind="academic_end_of_day_reflection",
+        proactive_period="2026-09-09",
+        now=NOW + timedelta(minutes=1),
+    )
+
+    assert duplicate.status == "duplicate"
+    assert duplicate.duplicate is True
+    assert duplicate.session_id == opened.session_id
+    assert duplicate.state == "awaiting_user"
+    with Session(engine) as session:
+        assert session.scalar(select(func.count()).select_from(NativeConversationSession)) == 1
+
+    reply = service.begin_turn(
+        external_event_id="owner-reply-1",
+        discord_channel_id=CHANNEL,
+        owner_discord_user_id=OWNER,
+        content="I struggled with proofs today.",
+        model_identity="qwen@test",
+        prompt_config_version="nightly-v1",
+        now=NOW + timedelta(minutes=2),
+    )
+
+    assert reply.status == "resumed"
+    assert reply.session_id == opened.session_id
+    assert reply.root_event_id == "academic-end-of-day:2026-09-09:2100:v1"
+    assert [message.type for message in reply.transcript_messages] == ["ai", "human"]
+
+
+def test_open_proactive_prompt_fails_closed_when_another_conversation_is_open(
+    engine,
+    artifacts: ArtifactStore,
+) -> None:
+    service = _service(engine, artifacts)
+    started = service.begin_turn(
+        external_event_id="event-1",
+        discord_channel_id=CHANNEL,
+        owner_discord_user_id=OWNER,
+        content="start",
+        model_identity="qwen@test",
+        prompt_config_version="policy-v1",
+        now=NOW,
+    )
+
+    proactive = service.open_proactive_prompt(
+        root_event_id="academic-end-of-day:2026-09-09:2100:v1",
+        discord_channel_id=CHANNEL,
+        owner_discord_user_id=OWNER,
+        prompt_text="Evening check-in.",
+        expires_at=NOW + timedelta(hours=1),
+        model_identity="qwen@test",
+        prompt_config_version="nightly-v1",
+        proactive_kind="academic_end_of_day_reflection",
+        proactive_period="2026-09-09",
+        now=NOW + timedelta(minutes=1),
+    )
+
+    assert proactive.status == "in_progress"
+    assert proactive.session_id == started.session_id
+    assert proactive.root_event_id == "event-1"
+    with Session(engine) as session:
+        assert session.scalar(select(func.count()).select_from(NativeConversationSession)) == 1
+
+
 def test_corrupt_transcript_artifact_fails_closed(
     engine,
     artifacts: ArtifactStore,

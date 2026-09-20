@@ -7,9 +7,9 @@ import uuid
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
-from typing import Any, Literal
+from typing import Any, Literal, cast
 
-from langchain_core.messages import BaseMessage, HumanMessage, messages_to_dict
+from langchain_core.messages import AIMessage, BaseMessage, HumanMessage, messages_to_dict
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
@@ -282,6 +282,144 @@ class NativeConversationService:
                 revision=row.revision,
                 transcript_messages=transcript.to_messages(),
                 checkpoint=checkpoint,
+            )
+
+    def open_proactive_prompt(
+        self,
+        *,
+        root_event_id: str,
+        discord_channel_id: str,
+        owner_discord_user_id: str,
+        prompt_text: str,
+        expires_at: datetime,
+        model_identity: str | None,
+        prompt_config_version: str | None,
+        proactive_kind: str,
+        proactive_period: str,
+        now: datetime | None = None,
+    ) -> NativeConversationBeginResult:
+        """Open an artifact-backed host prompt that waits for the owner's reply.
+
+        Raw prompt content is stored only in the private transcript artifact. The
+        relational row and lifecycle metadata carry stable, non-content ids.
+        """
+
+        current = _aware(now or self._clock())
+        expiry = _aware(expires_at)
+        if expiry <= current:
+            raise ValueError("expires_at must be in the future")
+        expiry = min(expiry, current + timedelta(hours=24))
+        kind = _safe_metadata_value(proactive_kind, "proactive_kind", 128)
+        period = _safe_metadata_value(proactive_period, "proactive_period", 255)
+        prompt = prompt_text.strip()
+        if not prompt:
+            raise ValueError("prompt_text must not be empty")
+        lifecycle = NativeLifecycleEvent(
+            disposition="awaiting_user",
+            content=None,
+            occurred_at=current,
+            metadata={
+                "proactive": {
+                    "kind": kind,
+                    "period": period,
+                    "root_event_id": root_event_id,
+                }
+            },
+        )
+
+        with Session(self._engine) as session, session.begin():
+            NativeConversationRepository.expire_open_session_for_owner(
+                session,
+                discord_channel_id=discord_channel_id,
+                owner_discord_user_id=owner_discord_user_id,
+                now=current,
+            )
+            NativeConversationRepository.expire_open_sessions(session, now=current)
+            winner = NativeConversationRepository.lock_open_for_owner(
+                session,
+                discord_channel_id=discord_channel_id,
+                owner_discord_user_id=owner_discord_user_id,
+                now=current,
+            )
+            if winner is not None:
+                if winner.root_event_id != root_event_id:
+                    return NativeConversationBeginResult(
+                        status="in_progress",
+                        session_id=winner.id,
+                        root_event_id=winner.root_event_id,
+                        state=winner.state,
+                        revision=winner.revision,
+                        response="Another conversation is already waiting for this owner.",
+                    )
+                return self._finish_existing_proactive_prompt(
+                    session,
+                    row=winner,
+                    lifecycle=lifecycle,
+                    now=current,
+                )
+
+            transcript = NativeTranscriptManifest.from_messages(
+                (AIMessage(content=prompt),),
+                revision=1,
+                lifecycle_events=(lifecycle,),
+            )
+            transcript_key = self._store_transcript(transcript).key
+            try:
+                row = NativeConversationRepository.create_session(
+                    session,
+                    root_event_id=root_event_id,
+                    discord_channel_id=discord_channel_id,
+                    owner_discord_user_id=owner_discord_user_id,
+                    transcript_artifact_key=transcript_key,
+                    started_at=current,
+                    expires_at=expiry,
+                    model_identity=model_identity,
+                    prompt_config_version=prompt_config_version,
+                )
+            except IntegrityError:
+                winner = NativeConversationRepository.lock_open_for_owner(
+                    session,
+                    discord_channel_id=discord_channel_id,
+                    owner_discord_user_id=owner_discord_user_id,
+                    now=current,
+                )
+                if winner is None:
+                    raise
+                return NativeConversationBeginResult(
+                    status="in_progress",
+                    session_id=winner.id,
+                    root_event_id=winner.root_event_id,
+                    state=winner.state,
+                    revision=winner.revision,
+                    response="Another conversation is already waiting for this owner.",
+                )
+            if row.root_event_id == root_event_id and row.transcript_artifact_key != transcript_key:
+                return self._finish_existing_proactive_prompt(
+                    session,
+                    row=row,
+                    lifecycle=lifecycle,
+                    now=current,
+                )
+            transcript = transcript.model_copy(
+                update={"conversation_id": row.id, "revision": row.revision + 1}
+            )
+            transcript_key = self._store_transcript(transcript).key
+            row = NativeConversationRepository.update_artifacts(
+                session,
+                conversation_id=row.id,
+                transcript_artifact_key=transcript_key,
+                now=current,
+                state="awaiting_user",
+                last_disposition="awaiting_user",
+            )
+            return NativeConversationBeginResult(
+                status="started",
+                session_id=row.id,
+                root_event_id=row.root_event_id,
+                state=row.state,
+                revision=row.revision,
+                transcript_messages=transcript.to_messages(),
+                checkpoint={},
             )
 
     def checkpoint_messages(
@@ -729,6 +867,67 @@ class NativeConversationService:
                 response=content,
             )
 
+    def _finish_existing_proactive_prompt(
+        self,
+        session: Session,
+        *,
+        row: Any,
+        lifecycle: NativeLifecycleEvent,
+        now: datetime,
+    ) -> NativeConversationBeginResult:
+        try:
+            transcript = self._load_transcript_for_row(session, row.id)
+            checkpoint = self._load_checkpoint_for_row(row, session=session)
+        except NativeConversationCorruptionError:
+            return NativeConversationBeginResult(
+                status="corrupt",
+                session_id=row.id,
+                root_event_id=row.root_event_id,
+                state="failed",
+                revision=row.revision,
+                response="I could not safely resume that conversation. Please start again.",
+            )
+        if row.state == "processing" and _looks_like_unanswered_proactive_prompt(transcript):
+            if not _has_matching_proactive_lifecycle(transcript, lifecycle):
+                transcript = transcript.with_lifecycle_event(lifecycle, revision=row.revision + 1)
+            else:
+                transcript = transcript.model_copy(
+                    update={
+                        "conversation_id": row.id,
+                        "revision": row.revision + 1,
+                    }
+                )
+            key = self._store_transcript(transcript).key
+            row = NativeConversationRepository.update_artifacts(
+                session,
+                conversation_id=row.id,
+                transcript_artifact_key=key,
+                now=now,
+                state="awaiting_user",
+                last_disposition="awaiting_user",
+            )
+            return NativeConversationBeginResult(
+                status="duplicate",
+                session_id=row.id,
+                root_event_id=row.root_event_id,
+                state=row.state,
+                revision=row.revision,
+                transcript_messages=transcript.to_messages(),
+                checkpoint=checkpoint,
+                duplicate=True,
+            )
+        return NativeConversationBeginResult(
+            status="duplicate",
+            session_id=row.id,
+            root_event_id=row.root_event_id,
+            state=row.state,
+            revision=row.revision,
+            transcript_messages=transcript.to_messages(),
+            checkpoint=checkpoint,
+            response=_last_lifecycle_content(transcript),
+            duplicate=True,
+        )
+
     def _load_transcript_for_row(
         self,
         session: Session,
@@ -855,6 +1054,40 @@ def _last_lifecycle_content(manifest: NativeTranscriptManifest) -> str | None:
         if event.content:
             return event.content
     return None
+
+
+def _safe_metadata_value(value: str, field: str, max_length: int) -> str:
+    cleaned = value.strip()
+    if not cleaned:
+        raise ValueError(f"{field} must not be empty")
+    if len(cleaned) > max_length:
+        raise ValueError(f"{field} must be at most {max_length} characters")
+    return cleaned
+
+
+def _looks_like_unanswered_proactive_prompt(manifest: NativeTranscriptManifest) -> bool:
+    messages = manifest.to_messages()
+    return len(messages) == 1 and isinstance(messages[0], AIMessage)
+
+
+def _has_matching_proactive_lifecycle(
+    manifest: NativeTranscriptManifest,
+    lifecycle: NativeLifecycleEvent,
+) -> bool:
+    expected_obj = lifecycle.metadata.get("proactive")
+    if not isinstance(expected_obj, Mapping):
+        return False
+    expected = cast(Mapping[str, object], expected_obj)
+    for event in manifest.lifecycle_events:
+        if event.disposition != "awaiting_user":
+            continue
+        actual_obj = event.metadata.get("proactive")
+        if not isinstance(actual_obj, Mapping):
+            continue
+        actual = cast(Mapping[str, object], actual_obj)
+        if dict(actual) == dict(expected):
+            return True
+    return False
 
 
 def _aware(value: datetime) -> datetime:

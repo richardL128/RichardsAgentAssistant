@@ -42,7 +42,7 @@ def test_run_context_requires_aware_timestamp_and_stable_versions() -> None:
         idempotency_key="review:repo:abc123",
         config_version="config-v1",
         input_version="sha256-input",
-        model_identifier="qwen3-32gb:latest",
+        model_identifier="qwen3:14b",
         model_digest="digest",
     )
 

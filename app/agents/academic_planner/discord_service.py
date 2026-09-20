@@ -19,12 +19,16 @@ from app.agents.harness import AbortCheck
 from app.agents.job_interviews.agent_loop import CareerAgentToolState
 from app.agents.job_interviews.notion_mutations import DiscoveredCareerNotionWriter
 from app.agents.job_interviews.sync import JobInterviewNotionSync
+from app.agents.learn.notion_proposals import LearnNotionProposalBuilder
+from app.agents.learn.semantic_interpreter import LearnAnnouncementSemanticInterpreter
+from app.agents.learn.tool_state import LearnToolState
 from app.agents.memory.service import UserMemoryService
 from app.artifacts.store import ArtifactStore
 from app.connectors.discord import (
     DiscordAcademicPlannerAdapter,
     DiscordAcademicResponseDelivery,
 )
+from app.connectors.learn_bridge import LearnBridgeConnector
 from app.connectors.notion import NotionConnector
 from app.core.config import Settings, get_settings
 from app.core.errors import LifeAgentError
@@ -211,6 +215,7 @@ def create_academic_discord_service(
             model_gateway=gateway,
             embedding_gateway=embedding_gateway,
             timezone=app_settings.app_timezone,
+            end_of_day_time=app_settings.academic_end_of_day_schedule,
             default_practice_minutes=app_settings.academic_memory_default_practice_minutes,
         )
         if app_settings.academic_memory_enabled
@@ -219,6 +224,12 @@ def create_academic_discord_service(
     calendar_semantic_interpreter = CalendarEventSemanticInterpreter(
         gateway,
         max_prompt_chars=app_settings.calendar_semantic_prompt_max_chars,
+    )
+    learn_connector = _create_learn_connector(app_settings)
+    learn_semantic_interpreter = LearnAnnouncementSemanticInterpreter(
+        gateway,
+        max_body_chars=app_settings.learn_announcement_max_body_chars,
+        max_chunk_chars=app_settings.learn_announcement_chunk_chars,
     )
     handler = NativeAcademicDiscordHandler(
         store=store,
@@ -255,6 +266,22 @@ def create_academic_discord_service(
             research_max_pages=app_settings.job_research_max_pages,
             research_max_search_results=app_settings.job_research_max_search_results,
         ),
+        learn_tool_state_factory=(
+            lambda message: LearnToolState(
+                connector=learn_connector,
+                semantic_interpreter=learn_semantic_interpreter,
+                now=message.timestamp,
+                proposal_builder=LearnNotionProposalBuilder(
+                    model=gateway,
+                    store=store,
+                    timezone=app_settings.app_timezone,
+                ),
+                engine=database.engine,
+                explicit_request_key=message.message_id,
+            )
+            if learn_connector is not None
+            else None
+        ),
         career_engine=database.engine,
         career_writer_provider=lambda: career_writer,
         material_intake=material_intake,
@@ -279,6 +306,24 @@ def _create_notion_connector(settings: Settings) -> NotionConnector | None:
             timeout_seconds=settings.connector_timeout_seconds,
         )
     except (LifeAgentError, ValueError):
+        return None
+
+
+def _create_learn_connector(settings: Settings) -> LearnBridgeConnector | None:
+    if not settings.learn_bridge_enabled or settings.learn_bridge_hmac_secret is None:
+        return None
+    try:
+        return LearnBridgeConnector(
+            base_url=str(settings.learn_bridge_url),
+            hmac_secret=settings.learn_bridge_hmac_secret,
+            timeout_seconds=settings.learn_bridge_timeout_seconds,
+            max_response_bytes=settings.learn_bridge_max_response_bytes,
+            max_clock_skew_seconds=settings.learn_bridge_max_clock_skew_seconds,
+            max_courses=settings.learn_bridge_max_courses,
+            max_scheduled_items=settings.learn_bridge_max_scheduled_items,
+            max_announcements=settings.learn_bridge_max_announcements,
+        )
+    except ValueError:
         return None
 
 
