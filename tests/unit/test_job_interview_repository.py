@@ -391,7 +391,6 @@ def test_jobs_calendar_items_are_upper_bounded_and_semantic_cache_is_optimistic(
             semantics=CalendarSemanticResultInput(
                 status="valid",
                 overview="A technical interview at the inclusive window endpoint.",
-                description="The event is exactly at noon Toronto time.",
                 source_fingerprint="endpoint-source",
                 source_last_edited_at=datetime(2026, 9, 9, 12, tzinfo=UTC),
                 model_identity="qwen-test",
@@ -399,7 +398,6 @@ def test_jobs_calendar_items_are_upper_bounded_and_semantic_cache_is_optimistic(
                 prompt_version="prompt-v1",
                 analyzed_at=datetime(2026, 9, 9, 13, tzinfo=UTC),
                 evidence_ids=("frag-1",),
-                description_evidence_ids=("frag-1",),
                 intent_value="regular",
                 intent_status="valid",
                 intent_rationale="Career interviews are ordinary calendar events.",
@@ -436,7 +434,7 @@ def test_jobs_calendar_items_are_upper_bounded_and_semantic_cache_is_optimistic(
     ]
     assert items[0]["is_all_day"] is True
     assert items[1]["semantic_status"] == "valid"
-    assert items[1]["semantic_description"] == "The event is exactly at noon Toronto time."
+    assert items[1]["semantic_description"] is None
     assert items[1]["semantic_intent_value"] == "regular"
     assert items[1]["semantic_intent_status"] == "valid"
     assert items[1]["semantic_cache"]["intent_value"] == "regular"

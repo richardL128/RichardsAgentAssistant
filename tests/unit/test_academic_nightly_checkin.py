@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, date, datetime, timedelta
 from types import SimpleNamespace
 from zoneinfo import ZoneInfo
 
@@ -13,7 +13,11 @@ from app.agents.academic_planner.nightly_checkin import (
     execute_nightly_checkin,
     nightly_delivery_key,
     nightly_period_key,
-    render_nightly_checkin_prompt,
+)
+from app.agents.academic_planner.nightly_task_semantics import (
+    NightlyTaskEligibilityDecision,
+    NightlyTaskEligibilityResult,
+    NightlyTaskEligibilityStatus,
 )
 from app.core.errors import LifeAgentError
 from app.queue.periodic import PeriodicOccurrence
@@ -50,6 +54,18 @@ class DurableDelivery(Delivery):
         return SimpleNamespace(status="sent")
 
 
+class FailOnceDelivery(DurableDelivery):
+    def __init__(self) -> None:
+        super().__init__()
+        self.failed = False
+
+    async def send_scheduled_notification(self, content: str, *, idempotency_key: str):
+        if not self.failed:
+            self.failed = True
+            raise RuntimeError("simulated Discord timeout")
+        return await super().send_scheduled_notification(content, idempotency_key=idempotency_key)
+
+
 class ConversationService:
     def __init__(self, *, open_result: object | None = None) -> None:
         self.open_result = open_result or SimpleNamespace(status="no_open", state=None)
@@ -69,6 +85,12 @@ class ConversationService:
 
     def open_proactive_prompt(self, **kwargs: object):
         self.opened.append(kwargs)
+        self.open_result = SimpleNamespace(
+            status="resumed",
+            state="awaiting_user",
+            root_event_id=kwargs["root_event_id"],
+            checkpoint=kwargs.get("initial_checkpoint", {}),
+        )
         return SimpleNamespace(status="started", state="awaiting_user")
 
 
@@ -90,6 +112,79 @@ class CrashAfterDeliveryConversationService(ConversationService):
         return super().open_proactive_prompt(**kwargs)
 
 
+class Syncer:
+    async def sync(self, *, now=None):
+        return SimpleNamespace(status="succeeded", synced_at=now)
+
+
+class Catalog:
+    def __init__(self, candidates=None) -> None:
+        self.candidates = tuple(candidates or (_candidate(),))
+
+    def load_nightly_current_day_assessment_candidates(self, **kwargs):
+        assert kwargs["local_date"] == date(2026, 9, 19)
+        return self.candidates
+
+
+class Semantics:
+    model_identity = "qwen-test"
+
+    async def analyze(self, item):
+        return SimpleNamespace(
+            status=NightlyTaskEligibilityStatus.ELIGIBLE,
+            movable=True,
+            result=NightlyTaskEligibilityResult(
+                event_id=item.event_id,
+                decision=NightlyTaskEligibilityDecision.MOVABLE_WORK_TASK,
+                rationale="This is owner-performable review work.",
+                evidence_fragment_ids=(f"{item.event_id}:host:title",),
+            ),
+            model_identity="qwen-test",
+            prompt_version="nightly-eligibility-v1",
+            critic_version="nightly-critic-v1",
+        )
+
+
+class FixedSemantics(Semantics):
+    async def analyze(self, item):
+        return SimpleNamespace(
+            status=NightlyTaskEligibilityStatus.NOT_ELIGIBLE,
+            movable=False,
+            result=NightlyTaskEligibilityResult(
+                event_id=item.event_id,
+                decision=NightlyTaskEligibilityDecision.FIXED_COMMITMENT,
+                rationale="This is a fixed assessment occurrence.",
+                evidence_fragment_ids=(f"{item.event_id}:host:title",),
+            ),
+            model_identity="qwen-test",
+            prompt_version="nightly-eligibility-v1",
+            critic_version="nightly-critic-v1",
+        )
+
+
+def _candidate():
+    return SimpleNamespace(
+        assessment_id="assessment-1",
+        course_id="course-1",
+        course_code="ECE 250",
+        course_title="ECE 250",
+        title="Review merge sort",
+        assessment_type="task",
+        starts_at=datetime(2026, 9, 19, 18, 0, tzinfo=ZoneInfo("America/Toronto")),
+        ends_at=None,
+        local_date=date(2026, 9, 19),
+        local_start_label="September 19 at 6:00 PM",
+        local_end_label=None,
+        is_all_day=False,
+        source_last_edited_at=datetime(2026, 9, 19, 20, 0, tzinfo=UTC),
+        semantic_status="valid",
+        semantic_overview="Review merge sort material.",
+        semantic_description=None,
+        semantic_intent_rationale="A review work session.",
+        semantic_source_fingerprint="semantic-fp",
+    )
+
+
 def _runtime(
     *,
     delivery: Delivery | None = None,
@@ -97,6 +192,8 @@ def _runtime(
     owner: str | None = OWNER,
     authorized: frozenset[str] = frozenset({OWNER}),
     message_content_enabled: bool = True,
+    catalog: object | None = None,
+    semantics: object | None = None,
 ) -> NightlyCheckinRuntime:
     return NightlyCheckinRuntime(
         config=NightlyCheckinConfig(
@@ -113,18 +210,10 @@ def _runtime(
         ),
         delivery=delivery,
         conversation_service=conversation_service or ConversationService(),
+        catalog_syncer=Syncer(),
+        candidate_catalog=catalog or Catalog(),
+        semantic_interpreter=semantics or Semantics(),
     )
-
-
-def test_prompt_discloses_memory_scope_confirmation_and_skip() -> None:
-    prompt = render_nightly_checkin_prompt(OCCURRENCE)
-
-    assert "Evening check-in for Saturday, September 19" in prompt
-    assert "study-related reflections" in prompt
-    assert "private academic memory" in prompt
-    assert "Calendar changes still require your confirmation" in prompt
-    assert "skip" in prompt
-    assert len(prompt) <= 2_000
 
 
 @pytest.mark.asyncio
@@ -143,6 +232,9 @@ async def test_nightly_checkin_delivers_once_and_opens_proactive_session() -> No
     assert result["status"] == "succeeded"
     assert result["period_key"] == PERIOD_KEY
     assert len(delivery.messages) == 1
+    assert delivery.messages[0][0] == (
+        'Evening check-in - ECE 250 (1/1): Did you complete "Review merge sort" today?'
+    )
     assert delivery.messages[0][1] == nightly_delivery_key(PERIOD_KEY, OCCURRENCE)
     assert len(conversation.opened) == 1
     opened = conversation.opened[0]
@@ -151,17 +243,31 @@ async def test_nightly_checkin_delivers_once_and_opens_proactive_session() -> No
     assert opened["owner_discord_user_id"] == OWNER
     assert opened["proactive_kind"] == NIGHTLY_CHECKIN_KIND
     assert opened["proactive_period"] == PERIOD_KEY
+    assert opened["initial_checkpoint"]["version"] == "academic-discord-native-tools.v3"
+    assert "nightly_checkin" in opened["initial_checkpoint"]
     assert opened["expires_at"] == OCCURRENCE.scheduled_at + timedelta(minutes=2, hours=24)
 
 
 @pytest.mark.asyncio
 async def test_existing_same_period_session_is_replay_safe_without_redelivery() -> None:
     delivery = Delivery()
+    first_conversation = ConversationService()
+    first = await execute_nightly_checkin(
+        runtime=_runtime(delivery=delivery, conversation_service=first_conversation),
+        occurrence=OCCURRENCE,
+        period_key=PERIOD_KEY,
+        executed_at=OCCURRENCE.scheduled_at + timedelta(minutes=2),
+        catchup_grace_minutes=30,
+    )
+    assert first["status"] == "succeeded"
+    checkpoint = first_conversation.opened[0]["initial_checkpoint"]
+    delivery.messages.clear()
     conversation = ConversationService(
         open_result=SimpleNamespace(
             status="resumed",
             state="awaiting_user",
             root_event_id=PERIOD_KEY,
+            checkpoint=checkpoint,
         )
     )
 
@@ -177,12 +283,12 @@ async def test_existing_same_period_session_is_replay_safe_without_redelivery() 
     assert result["conversation_status"] == "already_open"
     assert result["delivery_count"] == 1
     assert result["replayed"] is True
-    assert delivery.messages == []
+    assert len(delivery.messages) == 1
     assert conversation.opened == []
 
 
 @pytest.mark.asyncio
-async def test_retry_after_persisted_delivery_opens_session_without_duplicate_send() -> None:
+async def test_retry_after_failed_open_does_not_send_before_checkpoint_exists() -> None:
     delivery = DurableDelivery()
     conversation = CrashAfterDeliveryConversationService()
     runtime = _runtime(delivery=delivery, conversation_service=conversation)
@@ -206,9 +312,86 @@ async def test_retry_after_persisted_delivery_opens_session_without_duplicate_se
 
     assert result["status"] == "succeeded"
     assert delivery.external_send_count == 1
-    assert len(delivery.messages) == 2
+    assert len(delivery.messages) == 1
     assert conversation.open_attempts == 2
     assert len(conversation.opened) == 1
+
+
+@pytest.mark.asyncio
+async def test_retry_after_delivery_timeout_reuses_atomic_checkpoint_and_delivery_key() -> None:
+    delivery = FailOnceDelivery()
+    conversation = ConversationService()
+    runtime = _runtime(delivery=delivery, conversation_service=conversation)
+
+    with pytest.raises(RuntimeError, match="Discord timeout"):
+        await execute_nightly_checkin(
+            runtime=runtime,
+            occurrence=OCCURRENCE,
+            period_key=PERIOD_KEY,
+            executed_at=OCCURRENCE.scheduled_at + timedelta(minutes=2),
+            catchup_grace_minutes=30,
+        )
+
+    result = await execute_nightly_checkin(
+        runtime=runtime,
+        occurrence=OCCURRENCE,
+        period_key=PERIOD_KEY,
+        executed_at=OCCURRENCE.scheduled_at + timedelta(minutes=3),
+        catchup_grace_minutes=30,
+    )
+
+    assert result["status"] == "succeeded"
+    assert result["replayed"] is True
+    assert len(conversation.opened) == 1
+    assert delivery.external_send_count == 1
+
+
+@pytest.mark.asyncio
+async def test_no_movable_tasks_sends_terminal_message_without_open_session() -> None:
+    delivery = Delivery()
+    conversation = ConversationService()
+
+    result = await execute_nightly_checkin(
+        runtime=_runtime(
+            delivery=delivery,
+            conversation_service=conversation,
+            semantics=FixedSemantics(),
+        ),
+        occurrence=OCCURRENCE,
+        period_key=PERIOD_KEY,
+        executed_at=OCCURRENCE.scheduled_at + timedelta(minutes=2),
+        catchup_grace_minutes=30,
+    )
+
+    assert result["conversation_status"] == "not_opened_no_tasks"
+    assert delivery.messages == [
+        (
+            "No movable course tasks are scheduled for tonight's check-in.",
+            nightly_delivery_key(PERIOD_KEY, OCCURRENCE),
+        )
+    ]
+    assert conversation.opened == []
+
+
+@pytest.mark.asyncio
+async def test_missing_nightly_dependencies_fail_closed_and_message_on_last_attempt() -> None:
+    delivery = Delivery()
+    runtime = _runtime(delivery=delivery)
+    runtime.semantic_interpreter = None
+
+    result = await execute_nightly_checkin(
+        runtime=runtime,
+        occurrence=OCCURRENCE,
+        period_key=PERIOD_KEY,
+        executed_at=OCCURRENCE.scheduled_at + timedelta(minutes=2),
+        catchup_grace_minutes=30,
+        attempt=3,
+        attempt_limit=3,
+    )
+
+    assert result["status"] == "failed"
+    assert result["error_code"] == "nightly_dependencies_unavailable"
+    assert delivery.messages[0][0].endswith("Nothing was changed.")
 
 
 @pytest.mark.asyncio

@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import uuid
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from types import SimpleNamespace
 from typing import Any, cast
 
@@ -21,6 +21,7 @@ from app.connectors.discord_gateway import (
     DiscordClarificationAction,
     DiscordClarificationInteraction,
 )
+from app.connectors.google_calendar import GoogleCalendarEvent, GoogleCalendarSnapshot
 from app.connectors.notion import (
     NotionAssessment,
     NotionConnector,
@@ -68,6 +69,18 @@ class _Connector:
             )
             raise NotionWriteConflict(current=current)
         return object()
+
+
+class _ScheduleConnector:
+    def __init__(self, snapshot: GoogleCalendarSnapshot) -> None:
+        self.snapshot = snapshot
+        self.windows: list[tuple[datetime, datetime]] = []
+
+    async def fetch_events(
+        self, *, window_start: datetime, window_end: datetime
+    ) -> GoogleCalendarSnapshot:
+        self.windows.append((window_start, window_end))
+        return self.snapshot
 
 
 class _BlockingConnector(_Connector):
@@ -611,6 +624,99 @@ async def test_sync_duplicate_reserved_misc_rows_fail_closed() -> None:
         ("duplicate", "misc_calendar_duplicate"),
     ]
     assert store.assessments == []
+
+
+@pytest.mark.asyncio
+async def test_reserved_schedule_row_syncs_google_ical_without_seeded_database() -> None:
+    course = _course(
+        "schedule-row",
+        "Classes + Tutorials + Labs",
+        valid=False,
+    )
+    discovery = NotionDiscoveryResult(
+        courses_database_id="courses-db",
+        courses_source_id="courses-source",
+        courses_source_type="data_source",
+        courses=(course,),
+        synced_at=NOW,
+    )
+    event = GoogleCalendarEvent(
+        event_id="google-calendar-event:lecture-1",
+        source_event_id="lecture-1@example.test:2026-09-07T14:00:00+00:00",
+        title="ECE 240 Lecture",
+        starts_at=datetime(2026, 9, 7, 14, tzinfo=UTC),
+        ends_at=datetime(2026, 9, 7, 15, 20, tzinfo=UTC),
+        is_all_day=False,
+        updated_at=NOW,
+        fingerprint="a" * 64,
+        description="Small-signal transistor models",
+        location="E5 6004",
+    )
+    snapshot = GoogleCalendarSnapshot(
+        source_id="google-calendar-source:academic",
+        retrieved_at=NOW,
+        window_start=NOW,
+        window_end=NOW + timedelta(days=14),
+        events=(event,),
+    )
+    schedule = _ScheduleConnector(snapshot)
+    store = _Store()
+    syncer = AcademicNotionSync(
+        connector=cast(NotionConnector, _Connector(discovery)),
+        schedule_connector=schedule,
+        store=store,
+    )
+
+    result = await syncer.sync(now=NOW)
+
+    assert result.status == "succeeded"
+    assert result.valid_course_count == 1
+    assert result.assessment_count == 1
+    assert result.clarification_count == 0
+    course_record, status, diagnostic = store.calendars[0]
+    assert (status, diagnostic) == ("valid", None)
+    assert course_record.source_kind == "google_ical"
+    assert course_record.external_source_id == snapshot.source_id
+    assessment, kind, label_source = store.assessments[0]
+    assert assessment.title == "ECE 240 Lecture"
+    assert assessment.source_scope == f"google_ical:{snapshot.source_id}"
+    assert "Small-signal transistor models" in assessment.scope
+    assert kind == "event"
+    assert label_source == "reserved_learn_google_ical"
+    assert store.reconciled == [(snapshot.source_id, (event.event_id,))]
+    assert schedule.windows == [(NOW - timedelta(days=7), NOW + timedelta(days=14))]
+
+
+@pytest.mark.asyncio
+async def test_reserved_schedule_row_fails_closed_without_secret_ical_setting() -> None:
+    discovery = NotionDiscoveryResult(
+        courses_database_id="courses-db",
+        courses_source_id="courses-source",
+        courses_source_type="data_source",
+        courses=(
+            _course(
+                "schedule-row",
+                "Classes + Tutorials + Labs",
+                valid=False,
+            ),
+        ),
+        synced_at=NOW,
+    )
+    store = _Store()
+    syncer = AcademicNotionSync(
+        connector=cast(NotionConnector, _Connector(discovery)),
+        store=store,
+    )
+
+    result = await syncer.sync(now=NOW)
+
+    assert result.status == "partial"
+    assert result.assessment_count == 0
+    assert result.diagnostic_codes == ("academic_schedule_ical_configuration_missing",)
+    assert store.calendars[0][1:] == (
+        "missing",
+        "academic_schedule_ical_configuration_missing",
+    )
 
 
 @pytest.mark.asyncio

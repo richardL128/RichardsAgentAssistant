@@ -92,16 +92,40 @@ class AcademicMemoryHandleResult:
 class _OwnerScopedCatalog:
     """Bind model-selected focus reads to one authorized Discord owner."""
 
-    def __init__(self, store: Any, *, owner_user_id: str, owner_channel_id: str) -> None:
+    def __init__(
+        self,
+        store: Any,
+        *,
+        owner_user_id: str,
+        owner_channel_id: str,
+        now: datetime,
+        timezone: ZoneInfo,
+    ) -> None:
         self._store = store
         self._owner_user_id = owner_user_id
         self._owner_channel_id = owner_channel_id
+        self._now = now
+        self._timezone = timezone
 
     def search_courses(self, query: str) -> Sequence[Any]:
-        return self._store.search_courses(query)
+        from app.agents.academic_planner.contracts import AcademicCourseQueryArgs
+
+        return self._store.search_courses(
+            AcademicCourseQueryArgs(query=query),
+            as_of=self._now,
+            timezone=self._timezone.key,
+            owner_scope=f"{self._owner_user_id}:{self._owner_channel_id}",
+        ).results
 
     def search_assessments(self, query: str, course_id: str | None = None) -> Sequence[Any]:
-        return self._store.search_assessments(query, course_id)
+        from app.agents.academic_planner.contracts import AcademicAssessmentQueryArgs
+
+        return self._store.search_assessments(
+            AcademicAssessmentQueryArgs(query=query, course_id=course_id),
+            as_of=self._now,
+            timezone=self._timezone.key,
+            owner_scope=f"{self._owner_user_id}:{self._owner_channel_id}",
+        ).results
 
     def search_learning_focuses(self, query: str | None, statuses: Sequence[Any]) -> Sequence[Any]:
         return self._store.search_learning_focuses(
@@ -896,6 +920,8 @@ class AcademicMemoryService:
                 self._store,
                 owner_user_id=user_id,
                 owner_channel_id=channel_id,
+                now=current,
+                timezone=self._zone,
             ),
             message=raw_text,
             now=current,

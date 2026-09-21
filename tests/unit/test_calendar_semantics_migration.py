@@ -8,7 +8,8 @@ from pathlib import Path
 import pytest
 from alembic.operations import Operations
 from alembic.runtime.migration import MigrationContext
-from sqlalchemy import create_engine, text
+from sqlalchemy import create_engine, inspect, text
+from sqlalchemy.exc import IntegrityError
 
 
 def test_0023_adds_nullable_semantic_fields_without_losing_calendar_rows(
@@ -200,8 +201,110 @@ def test_0026_replaces_study_block_schema_with_semantic_event_fields(
         engine.dispose()
 
 
+def test_0033_clears_legacy_semantics_and_tightens_status_constraints(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    migration = importlib.import_module(
+        "app.db.migrations.versions.0033_grounded_morning_task_summaries"
+    )
+    assert migration.revision == "0033_grounded_morning_summaries"
+    assert migration.down_revision == "0032_model_query_contract_index"
+
+    engine = create_engine(f"sqlite+pysqlite:///{tmp_path / 'grounded-morning.db'}")
+    try:
+        with engine.begin() as connection:
+            semantic_columns = ", ".join(
+                (
+                    "calendar_semantic_overview VARCHAR(700)",
+                    "calendar_semantic_description VARCHAR(1500)",
+                    "calendar_semantic_status VARCHAR(32)",
+                    "calendar_semantic_intent_value VARCHAR(128)",
+                    "calendar_semantic_intent_status VARCHAR(32)",
+                    "calendar_semantic_intent_rationale VARCHAR(500)",
+                    "calendar_semantic_intent_evidence_ids JSON",
+                    "calendar_semantic_evidence_ids JSON",
+                    "calendar_semantic_description_evidence_ids JSON",
+                    "calendar_semantic_source_fingerprint VARCHAR(128)",
+                    "calendar_semantic_source_last_edited_at DATETIME",
+                    "calendar_semantic_model_identity VARCHAR(128)",
+                    "calendar_semantic_config_version VARCHAR(128)",
+                    "calendar_semantic_prompt_version VARCHAR(128)",
+                    "calendar_semantic_analyzed_at DATETIME",
+                )
+            )
+            for table_name in ("assessments", "career_interview_events"):
+                connection.execute(
+                    text(
+                        f"CREATE TABLE {table_name} ("
+                        "id VARCHAR(32) PRIMARY KEY, title VARCHAR(255), "
+                        f"{semantic_columns}, "
+                        "CONSTRAINT calendar_semantic_status_valid CHECK ("
+                        "calendar_semantic_status IS NULL OR calendar_semantic_status IN "
+                        "('valid','not_substantive','unavailable','invalid')))"
+                    )
+                )
+                connection.execute(
+                    text(
+                        f"INSERT INTO {table_name} ("  # noqa: S608
+                        "id, title, calendar_semantic_overview, calendar_semantic_status, "
+                        "calendar_semantic_intent_status, calendar_semantic_evidence_ids, "
+                        "calendar_semantic_source_fingerprint, calendar_semantic_prompt_version) "
+                        "VALUES ('legacy', 'Legacy task', 'Generic event metadata', "
+                        "'not_substantive', 'valid', '[\"frag-1\"]', 'sha256:old', 'v3'), "
+                        "('current', 'Current task', 'Grounded task meaning', "
+                        "'valid', 'valid', '[\"frag-2\"]', 'sha256:new', 'v4')"
+                    )
+                )
+
+            monkeypatch.setattr(
+                migration,
+                "op",
+                Operations(MigrationContext.configure(connection)),
+            )
+            migration.upgrade()
+
+            for table_name in ("assessments", "career_interview_events"):
+                rows = connection.execute(
+                    text(
+                        f"SELECT id, title, calendar_semantic_status, "  # noqa: S608
+                        f"calendar_semantic_overview, calendar_semantic_source_fingerprint "
+                        f"FROM {table_name} ORDER BY id"
+                    )
+                ).all()
+                assert rows == [
+                    ("current", "Current task", "valid", "Grounded task meaning", "sha256:new"),
+                    ("legacy", "Legacy task", None, None, None),
+                ]
+                constraint = next(
+                    item
+                    for item in inspect(connection).get_check_constraints(table_name)
+                    if item["name"] == "calendar_semantic_status_valid"
+                )
+                assert "not_substantive" not in constraint["sqltext"]
+                with pytest.raises(IntegrityError):
+                    connection.execute(
+                        text(
+                            f"INSERT INTO {table_name} "  # noqa: S608
+                            "(id, title, calendar_semantic_status) "
+                            "VALUES ('rejected', 'Rejected', 'not_substantive')"
+                        )
+                    )
+    finally:
+        engine.dispose()
+
+
 def test_0026_downgrade_does_not_restore_removed_scheduling_architecture() -> None:
     migration = importlib.import_module("app.db.migrations.versions.0026_semantic_calendar_events")
+
+    with pytest.raises(RuntimeError, match="irreversible"):
+        migration.downgrade()
+
+
+def test_0033_downgrade_does_not_restore_non_substantive_runtime_status() -> None:
+    migration = importlib.import_module(
+        "app.db.migrations.versions.0033_grounded_morning_task_summaries"
+    )
 
     with pytest.raises(RuntimeError, match="irreversible"):
         migration.downgrade()

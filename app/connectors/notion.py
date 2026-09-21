@@ -57,6 +57,7 @@ _ASSESSMENT_DATABASE_TITLES: Final[frozenset[str]] = frozenset(
 )
 _JOBS_PAGE_TITLE: Final[str] = "jobs"
 _INTERVIEWS_DATABASE_TITLE: Final[str] = "interviews"
+_LEARN_CALENDAR_TITLE: Final[str] = "classestutorialslabs"
 _HTTPS_URL_PATTERN: Final[re.Pattern[str]] = re.compile(r"https://[^\s<>()\"']+")
 MAX_NOTION_RESPONSE_BYTES = 5 * 1024 * 1024
 MAX_ATTACHMENT_BYTES = 25 * 1024 * 1024
@@ -1051,6 +1052,18 @@ def _notion_datetime_for_range(value: datetime | str, field_name: str) -> dateti
     return parsed.astimezone(UTC)
 
 
+def _date_only_for_range(value: datetime | str, field_name: str) -> date | None:
+    if isinstance(value, datetime):
+        return None
+    raw = value.strip()
+    if "T" in raw:
+        return None
+    try:
+        return date.fromisoformat(raw)
+    except ValueError:
+        raise permanent_error(ErrorCode.INPUT_INVALID, f"Notion {field_name} is invalid") from None
+
+
 def _date_property_value(
     value: datetime | str,
     *,
@@ -1059,17 +1072,27 @@ def _date_property_value(
     start = _notion_date_start(value)
     date_value = {"start": start}
     if ends_at is not None:
-        start_at = _notion_datetime_for_range(value, "start date")
-        end_at = _notion_datetime_for_range(ends_at, "end date")
-        duration = end_at - start_at
-        if duration.total_seconds() <= 0:
-            raise permanent_error(ErrorCode.INPUT_INVALID, "Notion end date must be after start")
-        if duration.total_seconds() < 5 * 60 or duration.total_seconds() > 240 * 60:
+        start_date = _date_only_for_range(value, "start date")
+        end_date = _date_only_for_range(ends_at, "end date")
+        if (start_date is None) != (end_date is None):
             raise permanent_error(
                 ErrorCode.INPUT_INVALID,
-                "Notion event duration must be between 5 and 240 minutes",
+                "Notion start and end date precision must match",
             )
-        date_value["end"] = end_at.isoformat().replace("+00:00", "Z")
+        if start_date is not None and end_date is not None:
+            if end_date <= start_date:
+                raise permanent_error(
+                    ErrorCode.INPUT_INVALID, "Notion end date must be after start"
+                )
+            date_value["end"] = end_date.isoformat()
+        else:
+            start_at = _notion_datetime_for_range(value, "start date")
+            end_at = _notion_datetime_for_range(ends_at, "end date")
+            if end_at <= start_at:
+                raise permanent_error(
+                    ErrorCode.INPUT_INVALID, "Notion end date must be after start"
+                )
+            date_value["end"] = end_at.isoformat().replace("+00:00", "Z")
     return {"date": date_value}
 
 
@@ -2107,6 +2130,7 @@ class NotionConnector:
         expected_last_edited_at: datetime,
         title: str | None = None,
         due: datetime | str | None = None,
+        ends_at: datetime | str | None = None,
     ) -> NotionWriteReceipt:
         """Patch only discovered assessment title/date fields when the page is unchanged."""
 
@@ -2116,6 +2140,10 @@ class NotionConnector:
         if title is None and due is None:
             raise permanent_error(
                 ErrorCode.INPUT_INVALID, "Notion assessment update requires a title or due date"
+            )
+        if due is None and ends_at is not None:
+            raise permanent_error(
+                ErrorCode.INPUT_INVALID, "Notion assessment end date requires a start date"
             )
         current = await self._guarded_assessment_precondition(
             page_id=page_id,
@@ -2127,7 +2155,7 @@ class NotionConnector:
         if title is not None:
             properties[title_id] = {"title": _title_segments(_validate_title_text(title))}
         if due is not None:
-            properties[date_id] = _date_property_value(due)
+            properties[date_id] = _date_property_value(due, ends_at=ends_at)
         response = await self._request(
             "PATCH",
             f"/pages/{quote(current.page_id, safe='')}",
@@ -2818,8 +2846,16 @@ class NotionConnector:
             else course_page_id
         )
         course_title = course_title or course_page_id
-        child_database_ids = await self._assessment_child_database_ids(
-            course_page_id, course_title=course_title, diagnostics=diagnostics, page_size=page_size
+        is_external_schedule = _normalized_name(course_title) == _LEARN_CALENDAR_TITLE
+        child_database_ids = (
+            ()
+            if is_external_schedule
+            else await self._assessment_child_database_ids(
+                course_page_id,
+                course_title=course_title,
+                diagnostics=diagnostics,
+                page_size=page_size,
+            )
         )
         assessments: tuple[NotionAssessment, ...] = ()
         child_database_id: str | None = None
@@ -2850,9 +2886,7 @@ class NotionConnector:
                 title_property_id, title_property_name, _ = title_schema
                 date_property_id, date_property_name, _ = date_schema
                 if learn_context_schema is not None:
-                    learn_context_property_id, learn_context_property_name, _ = (
-                        learn_context_schema
-                    )
+                    learn_context_property_id, learn_context_property_name, _ = learn_context_schema
                 found = await self._assessment_pages(
                     child_source_id,
                     child_source_type=child_source_type,

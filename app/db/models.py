@@ -1027,7 +1027,7 @@ class Assessment(TimestampMixin, Base):
         ),
         CheckConstraint(
             "calendar_semantic_status IS NULL OR calendar_semantic_status IN "
-            "('valid','not_substantive','unavailable','invalid')",
+            "('valid','unavailable','invalid')",
             name="calendar_semantic_status_valid",
         ),
         CheckConstraint(
@@ -1046,6 +1046,21 @@ class Assessment(TimestampMixin, Base):
             name="calendar_semantic_intent_rationale_nonempty",
         ),
         Index("ix_assessments_course_due", "course_id", "due_at"),
+        Index(
+            "ix_assessments_active_incomplete_temporal",
+            "is_all_day",
+            "due_at",
+            "title",
+            "id",
+            postgresql_where=text(
+                "active IS TRUE AND archived IS FALSE AND completed IS FALSE "
+                "AND notion_last_edited_at IS NOT NULL"
+            ),
+            sqlite_where=text(
+                "active = 1 AND archived = 0 AND completed = 0 "
+                "AND notion_last_edited_at IS NOT NULL"
+            ),
+        ),
         Index("ix_assessments_fact_state", "fact_state", "due_at"),
         Index("ix_assessments_source_active", "source_id", "active"),
     )
@@ -1099,12 +1114,13 @@ class Assessment(TimestampMixin, Base):
 
 
 class AcademicCourseCalendar(TimestampMixin, Base):
-    """Discovered Assessments database/data-source mapping for one course page."""
+    """Discovered calendar source mapping for one course page."""
 
     __tablename__ = "academic_course_calendars"
     __table_args__ = (
         UniqueConstraint("course_id", name="uq_academic_course_calendars_course"),
         UniqueConstraint("child_data_source_id", name="uq_academic_course_calendars_source"),
+        UniqueConstraint("external_source_id", name="uq_academic_course_calendars_external_source"),
         CheckConstraint("length(course_page_id) > 0", name="course_page_id_nonempty"),
         CheckConstraint(
             "child_database_id IS NULL OR length(child_database_id) > 0",
@@ -1113,6 +1129,14 @@ class AcademicCourseCalendar(TimestampMixin, Base):
         CheckConstraint(
             "child_data_source_id IS NULL OR length(child_data_source_id) > 0",
             name="child_data_source_id_nonempty",
+        ),
+        CheckConstraint(
+            "external_source_id IS NULL OR length(external_source_id) > 0",
+            name="external_source_id_nonempty",
+        ),
+        CheckConstraint(
+            "source_kind IN ('notion','google_ical')",
+            name="source_kind_valid",
         ),
         CheckConstraint(
             "discovery_status IN ('valid','missing','inaccessible','malformed','duplicate')",
@@ -1128,6 +1152,8 @@ class AcademicCourseCalendar(TimestampMixin, Base):
     course_page_id: Mapped[str] = mapped_column(String(255), nullable=False)
     child_database_id: Mapped[str | None] = mapped_column(String(255))
     child_data_source_id: Mapped[str | None] = mapped_column(String(255))
+    source_kind: Mapped[str] = mapped_column(String(32), nullable=False, default="notion")
+    external_source_id: Mapped[str | None] = mapped_column(String(255))
     title_property_id: Mapped[str | None] = mapped_column(String(255))
     title_property_name: Mapped[str | None] = mapped_column(String(255))
     date_property_id: Mapped[str | None] = mapped_column(String(255))
@@ -1591,7 +1617,7 @@ class CareerInterviewEvent(TimestampMixin, Base):
         CheckConstraint("length(title) > 0", name="title_nonempty"),
         CheckConstraint(
             "calendar_semantic_status IS NULL OR calendar_semantic_status IN "
-            "('valid','not_substantive','unavailable','invalid')",
+            "('valid','unavailable','invalid')",
             name="calendar_semantic_status_valid",
         ),
         CheckConstraint(

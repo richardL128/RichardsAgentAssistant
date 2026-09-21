@@ -7,7 +7,7 @@ import re
 import uuid
 from collections import defaultdict
 from collections.abc import Awaitable, Callable, Mapping, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import UTC, date, datetime, time, timedelta
 from typing import Any, Literal, Protocol
 from zoneinfo import ZoneInfo
@@ -76,6 +76,9 @@ _SETUP_LABELS: dict[str, str] = {
     "assessment_name_property_invalid": "missing or invalid Name property",
     "assessment_date_property_invalid": "missing or invalid Date property",
     "learn_context_property_invalid": "missing or invalid LEARN Context property",
+    "academic_schedule_ical_configuration_missing": "missing academic schedule iCal URL",
+    "academic_schedule_ical_unavailable": "academic schedule iCal feed unavailable",
+    "academic_schedule_row_duplicate": "duplicate Classes + Tutorials + Labs rows",
     "course_persistence_failed": "course calendar persistence failed",
     "course_discovery_failed": "course calendar discovery failed",
     "notion_sync_failed": "Courses database synchronization failed",
@@ -177,6 +180,17 @@ class AcademicInteractionDelivery(Protocol):
     ) -> DiscordDeliveryReceipt: ...
 
 
+class AcademicScheduleConnector(Protocol):
+    """Read-only calendar feed used by the reserved academic schedule row."""
+
+    async def fetch_events(
+        self,
+        *,
+        window_start: datetime,
+        window_end: datetime,
+    ) -> Any: ...
+
+
 @dataclass(frozen=True, slots=True)
 class AcademicNotionSyncResult:
     """Bounded synchronization summary safe for APIs, jobs, and health logs."""
@@ -191,6 +205,7 @@ class AcademicNotionSyncResult:
     invalid_calendar_count: int = 0
     diagnostic_codes: tuple[str, ...] = ()
     unavailable_roles: tuple[AcademicCalendarRole, ...] = ()
+    unavailable_course_page_ids: tuple[str, ...] = ()
     synced_at: datetime | None = None
     error_code: str | None = None
     retryable: bool = False
@@ -206,6 +221,8 @@ class AcademicNotionSyncResult:
             "material_job_count": self.material_job_count,
             "invalid_calendar_count": self.invalid_calendar_count,
             "diagnostic_codes": list(self.diagnostic_codes),
+            "unavailable_roles": [role.value for role in self.unavailable_roles],
+            "unavailable_course_page_ids": list(self.unavailable_course_page_ids),
             "synced_at": self.synced_at.isoformat() if self.synced_at is not None else None,
             "error_code": self.error_code,
             "retryable": self.retryable,
@@ -233,6 +250,8 @@ class _CourseRecord:
     date_property_name: str | None
     learn_context_property_id: str | None
     learn_context_property_name: str | None
+    source_kind: str = "notion"
+    external_source_id: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -253,7 +272,9 @@ class _AssessmentRecord:
     is_all_day: bool
     source_id: str
     assessments_source_id: str
-    title_property_id: str
+    title_property_id: str | None
+    source_scope: str
+    scope: str | None
     notion_last_edited_at: datetime
     last_edited_at: datetime
     source_url: str | None
@@ -281,6 +302,9 @@ class AcademicNotionSync:
         clarification_ttl_hours: int = 24,
         setup_condition_code: str = "notion_configuration_missing",
         material_enqueuer: Callable[[str, str], Awaitable[object]] | None = None,
+        schedule_connector: AcademicScheduleConnector | None = None,
+        schedule_lookback_days: int = 7,
+        schedule_horizon_days: int = 14,
     ) -> None:
         self._connector = connector
         self._store = store
@@ -290,6 +314,13 @@ class AcademicNotionSync:
         self._clarification_ttl = timedelta(hours=clarification_ttl_hours)
         self._setup_condition_code = setup_condition_code
         self._material_enqueuer = material_enqueuer
+        if schedule_lookback_days < 0 or schedule_lookback_days > 90:
+            raise ValueError("schedule lookback must be between 0 and 90 days")
+        if schedule_horizon_days < 11 or schedule_horizon_days > 366:
+            raise ValueError("schedule horizon must be between 11 and 366 days")
+        self._schedule_connector = schedule_connector
+        self._schedule_lookback_days = schedule_lookback_days
+        self._schedule_horizon_days = schedule_horizon_days
 
     @property
     def connector(self) -> NotionConnector | None:
@@ -348,6 +379,12 @@ class AcademicNotionSync:
             if not (course.archived or course.in_trash)
             and academic_calendar_role(course.course_title) is AcademicCalendarRole.MISC
         )
+        active_schedule_courses = tuple(
+            course
+            for course in result.courses
+            if not (course.archived or course.in_trash)
+            and academic_calendar_role(course.course_title) is AcademicCalendarRole.LEARN
+        )
         if len(active_misc_courses) > 1:
             diagnostics.extend(
                 NotionDiscoveryDiagnostic(
@@ -362,6 +399,52 @@ class AcademicNotionSync:
                 )
                 for course in active_misc_courses
             )
+        schedule_snapshot: Any | None = None
+        if len(active_schedule_courses) > 1:
+            diagnostics.extend(
+                NotionDiscoveryDiagnostic(
+                    code="academic_schedule_row_duplicate",
+                    severity="error",
+                    message=(
+                        "Courses database must contain exactly one active "
+                        "Classes + Tutorials + Labs row"
+                    ),
+                    source_id=result.courses_source_id,
+                    source_type=result.courses_source_type,
+                    course_page_id=course.course_page_id,
+                    course_title=course.course_title,
+                    count=min(len(active_schedule_courses), 100),
+                )
+                for course in active_schedule_courses
+            )
+        elif len(active_schedule_courses) == 1:
+            schedule_course = active_schedule_courses[0]
+            if self._schedule_connector is None:
+                diagnostics.append(
+                    NotionDiscoveryDiagnostic(
+                        code="academic_schedule_ical_configuration_missing",
+                        severity="error",
+                        message="Academic schedule requires a configured secret iCal URL",
+                        course_page_id=schedule_course.course_page_id,
+                        course_title=schedule_course.course_title,
+                    )
+                )
+            else:
+                try:
+                    schedule_snapshot = await self._schedule_connector.fetch_events(
+                        window_start=current - timedelta(days=self._schedule_lookback_days),
+                        window_end=current + timedelta(days=self._schedule_horizon_days),
+                    )
+                except (LifeAgentError, TypeError, ValueError):
+                    diagnostics.append(
+                        NotionDiscoveryDiagnostic(
+                            code="academic_schedule_ical_unavailable",
+                            severity="error",
+                            message="Academic schedule iCal feed could not be synchronized",
+                            course_page_id=schedule_course.course_page_id,
+                            course_title=schedule_course.course_title,
+                        )
+                    )
         if result.courses_source_id is not None:
             self._store.save_sync_cursor(
                 result.courses_source_id,
@@ -375,8 +458,11 @@ class AcademicNotionSync:
         material_job_count = 0
         invalid_calendars = 0
         unavailable_roles: set[AcademicCalendarRole] = set()
+        unavailable_course_page_ids: set[str] = set()
         if len(active_misc_courses) > 1:
             unavailable_roles.add(AcademicCalendarRole.MISC)
+        if len(active_schedule_courses) > 1:
+            unavailable_roles.add(AcademicCalendarRole.LEARN)
         for course in result.courses:
             course_record = _course_record(course)
             course_role = academic_calendar_role(course.course_title)
@@ -388,6 +474,7 @@ class AcademicNotionSync:
                 if invalid is not None:
                     invalid_calendars += 1
                     unavailable_roles.add(course_role)
+                    unavailable_course_page_ids.add(course.course_page_id)
                     self._store.upsert_course_calendar(
                         course_record,
                         status=_calendar_status(invalid.code),
@@ -395,10 +482,40 @@ class AcademicNotionSync:
                         schema_fingerprint=_diagnostic_fingerprint(invalid),
                     )
                     continue
+                if course_role is AcademicCalendarRole.LEARN:
+                    source_id = str(getattr(schedule_snapshot, "source_id", ""))
+                    course_record = replace(
+                        course_record,
+                        source_kind="google_ical",
+                        external_source_id=source_id,
+                    )
                 self._store.upsert_course_calendar(course_record)
                 valid_courses += 1
                 seen: list[str] = []
-                for assessment in course.assessments:
+                synchronized_assessments: Sequence[Any] = (
+                    tuple(getattr(schedule_snapshot, "events", ()))
+                    if course_role is AcademicCalendarRole.LEARN
+                    else course.assessments
+                )
+                for assessment in synchronized_assessments:
+                    if course_role is AcademicCalendarRole.LEARN:
+                        record = _schedule_assessment_record(
+                            assessment,
+                            source_id=course_record.external_source_id or "",
+                        )
+                        classification: Any = _ResolvedClassification(
+                            kind="event",
+                            source="reserved_learn_google_ical",
+                        )
+                        seen.append(record.notion_id)
+                        self._store.upsert_synced_assessment(
+                            course_record,
+                            record,
+                            kind="event",
+                            label_source=classification.source,
+                        )
+                        assessment_count += 1
+                        continue
                     seen.append(assessment.page_id)
                     record, classification = _assessment_record(
                         assessment,
@@ -449,7 +566,11 @@ class AcademicNotionSync:
                             now=current,
                         )
                         clarification_count += int(created)
-                source_id = course.assessments_source_id or course_record.child_data_source_id
+                source_id = (
+                    course_record.external_source_id
+                    if course_role is AcademicCalendarRole.LEARN
+                    else course.assessments_source_id or course_record.child_data_source_id
+                )
                 if source_id:
                     archived_count += self._store.reconcile_assessment_source(
                         source_id,
@@ -460,6 +581,7 @@ class AcademicNotionSync:
             except Exception:
                 invalid_calendars += 1
                 unavailable_roles.add(course_role)
+                unavailable_course_page_ids.add(course.course_page_id)
                 diagnostics.append(
                     NotionDiscoveryDiagnostic(
                         code="course_persistence_failed",
@@ -499,6 +621,7 @@ class AcademicNotionSync:
             invalid_calendar_count=invalid_calendars,
             diagnostic_codes=codes,
             unavailable_roles=tuple(sorted(unavailable_roles, key=lambda role: role.value)),
+            unavailable_course_page_ids=tuple(sorted(unavailable_course_page_ids)),
             synced_at=result.synced_at,
             error_code=(ErrorCode.SOURCE_SYNC_PARTIAL.value if status == "partial" else None),
         )
@@ -862,6 +985,8 @@ def _assessment_record(
             source_id=assessment.assessments_source_id,
             assessments_source_id=assessment.assessments_source_id,
             title_property_id=assessment.title_property_id,
+            source_scope=f"notion:{assessment.assessments_source_id}",
+            scope=None,
             notion_last_edited_at=assessment.last_edited_at,
             last_edited_at=assessment.last_edited_at,
             source_url=assessment.source_url,
@@ -869,6 +994,63 @@ def _assessment_record(
             archived=archived,
         ),
         classification,
+    )
+
+
+def _schedule_assessment_record(event: Any, *, source_id: str) -> _AssessmentRecord:
+    """Normalize one bounded Google iCal occurrence for existing calendar persistence."""
+
+    event_id = str(getattr(event, "event_id", "")).strip()
+    title = " ".join(str(getattr(event, "title", "")).split())
+    starts_at = getattr(event, "starts_at", None)
+    ends_at = getattr(event, "ends_at", None)
+    updated_at = getattr(event, "updated_at", None)
+    if not event_id or not title or not source_id:
+        raise ValueError("Google iCal event identity is incomplete")
+    if not isinstance(starts_at, datetime) or starts_at.tzinfo is None:
+        raise ValueError("Google iCal event start must be timezone-aware")
+    if ends_at is not None and (
+        not isinstance(ends_at, datetime) or ends_at.tzinfo is None or ends_at <= starts_at
+    ):
+        raise ValueError("Google iCal event end must follow its start")
+    if not isinstance(updated_at, datetime) or updated_at.tzinfo is None:
+        updated_at = starts_at
+    description = " ".join(str(getattr(event, "description", "") or "").split())
+    location = " ".join(str(getattr(event, "location", "") or "").split())
+    evidence_parts: list[str] = []
+    if description:
+        evidence_parts.append(f"Description: {description}")
+    if location:
+        evidence_parts.append(f"Location: {location}")
+    duration_minutes = 60
+    if ends_at is not None:
+        duration_minutes = max(1, min(10_080, int((ends_at - starts_at).total_seconds() / 60)))
+    source_url = getattr(event, "source_url", None)
+    return _AssessmentRecord(
+        notion_id=event_id[:255],
+        page_id=event_id[:255],
+        title=title[:255],
+        current_title=title[:255],
+        due_at=starts_at.astimezone(UTC),
+        ends_at=ends_at.astimezone(UTC) if ends_at is not None else None,
+        weight=None,
+        estimated_minutes=duration_minutes,
+        status=None,
+        fact_state="confirmed",
+        ambiguity_reason=None,
+        confidence=1.0,
+        completed=False,
+        is_all_day=bool(getattr(event, "is_all_day", False)),
+        source_id=source_id,
+        assessments_source_id=source_id,
+        title_property_id=None,
+        source_scope=f"google_ical:{source_id}"[:255],
+        scope="\n".join(evidence_parts)[:4_000] or None,
+        notion_last_edited_at=updated_at.astimezone(UTC),
+        last_edited_at=updated_at.astimezone(UTC),
+        source_url=str(source_url)[:1_000] if source_url else None,
+        active=True,
+        archived=False,
     )
 
 
@@ -979,6 +1161,8 @@ def _course_setup_diagnostic(
     relevant = [item for item in diagnostics if item.severity == "error"]
     if relevant:
         return relevant[0]
+    if academic_calendar_role(course.course_title) is AcademicCalendarRole.LEARN:
+        return None
     source_id = getattr(course, "child_data_source_id", None) or course.assessments_source_id
     database_id = getattr(course, "child_database_id", None) or course.assessments_database_id
     if not database_id or not source_id:

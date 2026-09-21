@@ -13,10 +13,12 @@ a rule such as `run_overdue`, `required_delivery_failed`, or
 
 The combined planner morning notification is the only executable automatic
 agenda schedule. Host code owns source refresh, Toronto-local day boundaries,
-coverage, dates, links, ordering, rendering, and delivery. Qwen first receives
-bounded text from each selected event, then a bounded four-category composer
-produces only prose and schedule inferences. Both stages are critic-checked with
-one repair attempt.
+coverage, dates, links, ordering, rendering, and delivery. Qwen receives bounded
+text from each selected event and produces a grounded event overview plus an
+optional description. Courses are then rendered deterministically from those
+event overviews and host-owned due labels. Jobs, Misc, and the schedule table
+may still use the bounded category composer for short digests or schedule
+inferences. Model stages are critic-checked with one repair attempt.
 
 The schedule is configured by:
 
@@ -24,6 +26,9 @@ The schedule is configured by:
 APP_TIMEZONE=America/Toronto
 ACADEMIC_MORNING_SCHEDULE=08:00
 ACADEMIC_MORNING_CATCHUP_GRACE_MINUTES=30
+ACADEMIC_SCHEDULE_ICAL_URL=https://calendar.google.com/calendar/ical/.../private-.../basic.ics
+ACADEMIC_SCHEDULE_ICAL_TIMEOUT_SECONDS=10
+ACADEMIC_SCHEDULE_ICAL_MAX_BYTES=1048576
 CALENDAR_SEMANTIC_EVENT_TIMEOUT_SECONDS=180
 CALENDAR_SEMANTIC_TOTAL_TIMEOUT_SECONDS=600
 CALENDAR_SEMANTIC_PROMPT_MAX_CHARS=16000
@@ -47,7 +52,8 @@ contains today plus the following seven local dates. Jobs, misc, and the exact
 reserved `Classes + Tutorials + Labs` calendar use interval overlap with today.
 Completed rows are excluded. Every active real course appears once, including
 courses with no selected work; reserved `misc` and schedule rows are not real
-courses.
+courses. The schedule row is a category marker only; its events come from the
+secret, read-only Google iCal feed rather than a seeded Notion database.
 
 ## Diagnosis
 
@@ -118,26 +124,41 @@ LIMIT 20;"'
 
 ## Source freshness requirement
 
-The normal morning messages require fresh Notion syncs immediately before
-rendering. Missing sharing, invalid required properties, partial source failure,
-or stale data is reported inside the affected category's unavailable embed.
+The normal morning messages require fresh Notion and Google iCal syncs
+immediately before rendering. Missing sharing, invalid required properties,
+an inaccessible or malformed iCal feed, partial source failure, or stale data
+is reported inside the affected category's unavailable embed.
 Independently fresh categories still render; stale cached rows never do.
 
 ## Semantic availability and cache
 
 Qwen analyzes one selected event at a time from bounded, event-local textual
-properties and supported Notion page-body blocks. It does not receive files,
+properties, supported Notion page-body blocks, or bounded Google iCal
+description/location fields. It does not receive files,
 relations, attachment/OCR content, external posting research, credentials, or
 raw vendor envelopes. The normalized title is always a citable evidence fragment.
+For course work, the title alone can support a valid overview; an empty page
+body means there are no extra details, not that there is no work. The model does
+not own due dates, times, urgency, or completion state. Those facts are rendered
+after semantic interpretation from synchronized host data.
 The critic validates activity intent independently from overview/description, so
 one rejected component does not erase another supported component.
 
 A cached result is reusable only when the event fingerprint, Notion edit time,
 model identity, model configuration version, and prompt version all match. If
-Ollama is unavailable, the deadline expires, output is invalid, or either
-critic rejects the repair, trusted Notion metadata still appears behind a
-visible facts-only marker. Do not recover by guessing schedule fields or
-applying keyword rules.
+Ollama is unavailable, the deadline expires, output is invalid, or the critic
+rejects the repair, every selected course event still appears with its trusted
+title and host-owned due label; it must not become a quiet course. Do not
+recover by guessing schedule fields or applying keyword rules.
+
+The grounded morning-summary migration removes the legacy
+`not_substantive` runtime status. Rows with that legacy semantic/cache payload
+are cleared so the next fresh run recomputes them under the current prompt
+version. The rollout advances generation to `calendar-event-semantics-v4` and
+the critic to `calendar-event-semantics-critic-v3`, so matching older `valid`
+cache rows are also recomputed once through normal prompt-version mismatch. A
+`valid` event may have an overview, `description_present=false`, and no
+description.
 
 The complete versioned four-embed manifest is stored before the first Discord
 send. On retry, the worker loads that manifest and sends only categories whose
@@ -167,15 +188,18 @@ Use a controlled trigger in a non-production or explicitly approved live window:
    `planner-morning-four-v3:YYYY-MM-DD:HHMM:v1:<category>:v1` keys, titles at
    most 256 characters, descriptions at most 4,096, and mentions disabled.
 5. Replay the same period and verify delivered categories are not sent again.
-6. Temporarily break Notion sharing or use a mocked/source-failure environment
+6. Temporarily break Notion sharing and separately reject the iCal request in a
+   mocked/source-failure environment
    and verify the affected category is an unavailable embed, fresh independent
    categories still render, and no stale rows appear.
 7. Add course and interview fixtures at Toronto-local boundaries and across a
    DST transition. Verify interval overlap, the seven-following-days course
    horizon, and completed-item exclusion.
-8. Exercise a validated description, a no-description decision, and an Ollama
-   failure. Verify Qwen prose appears only for accepted citations and metadata
-   survives the failure.
+8. Exercise a validated description, a title-only valid overview with no
+   description, and an Ollama failure. Verify Qwen prose appears only for
+   accepted citations, every course event includes its host-owned due label, and
+   metadata survives the failure.
 9. Force a failure after one category, replay the same period, and verify
    delivery resumes at the next category from the stored manifest.
-10. Restore the real Notion sharing and confirm the next period returns healthy.
+10. Restore the real Notion sharing and iCal source, then confirm the next
+    period returns healthy.

@@ -228,10 +228,7 @@ class LearnBridgeSettings:
         root = (repository_root or Path(env.get("LIFEAGENT_REPOSITORY_ROOT", "."))).resolve()
         return cls(
             secret=SecretStr(_required(env, "LEARN_BRIDGE_HMAC_SECRET")),
-            profile_dir=Path(
-                env.get("LEARN_BRIDGE_PROFILE_DIR")
-                or default_profile_dir()
-            ),
+            profile_dir=Path(env.get("LEARN_BRIDGE_PROFILE_DIR") or default_profile_dir()),
             repository_root=root,
             host=env.get("LEARN_BRIDGE_HOST", "127.0.0.1"),
             port=_env_int(env, "LEARN_BRIDGE_PORT", 8765),
@@ -532,9 +529,7 @@ class PlaywrightLearnBrowser:
                 due_value = _parse_dom_date_value(item["due_at"])
                 end_value = _parse_dom_date_value(item["end_at"])
                 values = tuple(
-                    value
-                    for value in (start_value, due_value, end_value)
-                    if value is not None
+                    value for value in (start_value, due_value, end_value) if value is not None
                 )
                 if not values:
                     continue
@@ -906,12 +901,7 @@ def ensure_private_profile_dir(profile_dir: Path) -> None:
 
 def default_profile_dir() -> Path:
     return (
-        Path.home()
-        / "Library"
-        / "Application Support"
-        / "LifeAgent"
-        / "learn-bridge"
-        / "profile"
+        Path.home() / "Library" / "Application Support" / "LifeAgent" / "learn-bridge" / "profile"
     )
 
 
@@ -1010,8 +1000,7 @@ def _normalized_body(value: str) -> str:
     text = html.unescape(value).replace("\r\n", "\n").replace("\r", "\n")
     text = _CONTROL_CHARS.sub(" ", text)
     paragraphs = [
-        _WHITESPACE.sub(" ", paragraph).strip()
-        for paragraph in re.split(r"\n\s*\n+", text)
+        _WHITESPACE.sub(" ", paragraph).strip() for paragraph in re.split(r"\n\s*\n+", text)
     ]
     return "\n\n".join(paragraph for paragraph in paragraphs if paragraph)
 

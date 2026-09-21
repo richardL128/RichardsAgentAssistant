@@ -98,6 +98,7 @@ requires the expected name and type before enabling that course.
 | --- | --- |
 | Course | Courses: `Course Code` title; optional term and priority |
 | Assessment | Per-course inline Assessments: `Name` title, `Date` date; optional weight, status, and estimated minutes |
+| Classes + Tutorials + Labs schedule | Secret Google Calendar iCal address in `ACADEMIC_SCHEDULE_ICAL_URL`; read-only |
 | Work block | PostgreSQL planner state; no separately configured Notion database ID |
 
 Keep the Notion page URL and page ID for every imported object. Download an attached PDF during sync to the artifact store because Notion-hosted file URLs can expire; record the original attachment metadata and retrieval timestamp.
@@ -107,7 +108,10 @@ Keep the Notion page URL and page ID for every imported object. Download an atta
 **Read path**
 
 1. Retrieve the configured Courses database, discover its data source, and query course rows.
-2. Paginate each course page's children, discover exactly one seeded Assessments database and its physical data source, then query its event pages.
+2. For ordinary course and `misc` pages, paginate children, discover exactly one
+   seeded Assessments database and its physical data source, then query its event
+   pages. For the exact `Classes + Tutorials + Labs` row, skip child discovery
+   and fetch the configured secret Google iCal feed instead.
 3. Convert properties and blocks to a Pydantic `NotionAssessment`/`NotionCourse` record.
 4. Extract PDF/page text, retain page/block citations, and compare its source-version hash with the stored version.
 5. Upsert normalized records. Flag conflicting or ambiguous fields rather than guessing.

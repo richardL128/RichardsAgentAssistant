@@ -183,8 +183,7 @@ class LearnMorningService:
             return LearnMorningDigest(
                 condition="LEARN needs reauthentication; the Notion calendar is unaffected.",
                 reconnect_alert=(
-                    "LEARN needs reauthentication. Run "
-                    "`scripts/lifeagent_learn_bridge.sh login`."
+                    "LEARN needs reauthentication. Run `scripts/lifeagent_learn_bridge.sh login`."
                     if created
                     else None
                 ),
@@ -209,9 +208,7 @@ class LearnMorningService:
                 reminder_date=local_date,
             )
             reminder_ids = {row.announcement_id for row in reminder_rows}
-            announcement_ids = {
-                row.announcement_id for row in window_results
-            } | reminder_ids
+            announcement_ids = {row.announcement_id for row in window_results} | reminder_ids
             if not announcement_ids:
                 return LearnMorningDigest(refresh_status="ready")
             rows = session.execute(
@@ -222,17 +219,14 @@ class LearnMorningService:
                 )
                 .join(
                     LearnAnnouncementSource,
-                    LearnAnnouncementSource.id
-                    == LearnAnnouncementSemanticResult.announcement_id,
+                    LearnAnnouncementSource.id == LearnAnnouncementSemanticResult.announcement_id,
                 )
                 .join(LearnCourse, LearnCourse.id == LearnAnnouncementSource.course_id)
                 .where(
                     LearnAnnouncementSemanticResult.announcement_id.in_(announcement_ids),
                     LearnAnnouncementSemanticResult.source_fingerprint
                     == LearnAnnouncementSource.fingerprint,
-                    LearnAnnouncementSemanticResult.status.in_(
-                        ("valid", "summary_unavailable")
-                    ),
+                    LearnAnnouncementSemanticResult.status.in_(("valid", "summary_unavailable")),
                     LearnAnnouncementSource.visible.is_(True),
                 )
             )
@@ -334,9 +328,7 @@ def semantic_result_input(
             else []
         ),
         evidence_fragments=(
-            [{"id": value} for value in result.evidence_fragment_ids]
-            if result is not None
-            else []
+            [{"id": value} for value in result.evidence_fragment_ids] if result is not None else []
         ),
         source_url=outcome.source_url,
         model_identity=outcome.model_identity or "unknown-local-model",
@@ -354,9 +346,7 @@ def semantic_result_input(
 
 def dated_implication_input(value: LearnDatedImplication) -> LearnDatedImplicationInput:
     academic_date = (
-        value.date_value.date()
-        if isinstance(value.date_value, datetime)
-        else value.date_value
+        value.date_value.date() if isinstance(value.date_value, datetime) else value.date_value
     )
     digest = hashlib.sha256(
         repr(

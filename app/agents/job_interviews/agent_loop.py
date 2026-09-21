@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 from collections.abc import Mapping, Sequence
 from datetime import datetime
 from typing import Any, cast
@@ -11,7 +12,12 @@ from zoneinfo import ZoneInfo
 import httpx
 from pydantic import BaseModel, ConfigDict, Field
 
-from app.agents.harness import NativeTool, ToolExecutionError, ToolSideEffectClass
+from app.agents.harness import (
+    NativeTool,
+    TerminalGrounding,
+    ToolExecutionError,
+    ToolSideEffectClass,
+)
 from app.agents.job_interviews.contracts import (
     ApplicationInterpretation,
     CareerClarificationRequest,
@@ -29,6 +35,19 @@ from app.agents.job_interviews.notion_mutations import (
 )
 from app.agents.job_interviews.preparation import maintain_preparation_plan
 from app.agents.job_interviews.research import JobInterviewResearchInput, research_job_interview
+from app.agents.query_contracts import (
+    MAX_QUERY_PAGE_SIZE,
+    CompletenessState,
+    CompletionMode,
+    CursorCodec,
+    FreshnessState,
+    NormalizedQueryFilters,
+    QueryEnvelope,
+    SourceFreshness,
+    TemporalQuery,
+    TemporalScope,
+    resolve_temporal_window,
+)
 from app.connectors.job_research import (
     CompanyResearchClient,
     UnconfiguredCompanyResearchSearchProvider,
@@ -41,10 +60,14 @@ class _Args(BaseModel):
 
 class _SearchInterviewsArgs(_Args):
     query: str = Field(default="", max_length=300)
+    limit: int = Field(default=10, ge=1, le=MAX_QUERY_PAGE_SIZE)
+    cursor: str | None = Field(default=None, max_length=2_000)
 
 
 class _SearchJobsContextArgs(_Args):
     query: str = Field(default="", max_length=300)
+    limit: int = Field(default=10, ge=1, le=MAX_QUERY_PAGE_SIZE)
+    cursor: str | None = Field(default=None, max_length=2_000)
 
 
 class _PrepareInterviewArgs(_Args):
@@ -75,6 +98,45 @@ _CAREER_TOOL_SIDE_EFFECT_CLASS: dict[str, ToolSideEffectClass] = {
     "propose_interview_date": "proposal_only",
     "propose_interview_plan_save": "proposal_only",
 }
+_CAREER_CURSOR_CODEC = CursorCodec(b"career-query-cursor-v1")
+_CAREER_QUERY_STOPWORDS = frozenset(
+    {
+        "a",
+        "about",
+        "all",
+        "an",
+        "and",
+        "any",
+        "application",
+        "applications",
+        "are",
+        "coming",
+        "date",
+        "dates",
+        "for",
+        "interview",
+        "interviews",
+        "is",
+        "job",
+        "jobs",
+        "me",
+        "my",
+        "of",
+        "on",
+        "please",
+        "process",
+        "role",
+        "roles",
+        "status",
+        "statuses",
+        "the",
+        "up",
+        "upcoming",
+        "what",
+        "when",
+        "with",
+    }
+)
 
 
 class CareerAgentToolState:
@@ -115,13 +177,15 @@ class CareerAgentToolState:
         self._sync_attempted = False
         self._sync_warning: dict[str, object] | None = None
         self._known_interviews: dict[str, InterviewEventSnapshot] = {}
+        self._query_envelopes: dict[str, QueryEnvelope[dict[str, object]]] = {}
+        self._proposal_prepared = False
 
     def restore_checkpoint(self, value: Mapping[str, object] | None) -> None:
         """Restore verified interview capabilities from host-only state."""
 
         if value is None:
             return
-        if value.get("version") != "career-native-tools.v1":
+        if value.get("version") != "career-native-tools.v2":
             raise ValueError("career tool checkpoint version is unsupported")
         raw_interviews: object = value.get("known_interviews", ())
         if not isinstance(raw_interviews, Sequence) or isinstance(raw_interviews, str | bytes):
@@ -134,12 +198,27 @@ class CareerAgentToolState:
             for raw in interview_values
             for item in (InterviewEventSnapshot.model_validate(raw),)
         }
+        raw_envelopes: object = value.get("query_envelopes", ())
+        if not isinstance(raw_envelopes, Sequence) or isinstance(raw_envelopes, str | bytes):
+            raise ValueError("career checkpoint query envelopes are invalid")
+        envelope_values = cast(Sequence[object], raw_envelopes)
+        if len(envelope_values) > 20:
+            raise ValueError("career checkpoint query envelopes are invalid")
+        self._query_envelopes = {
+            envelope.query_id: envelope
+            for raw in envelope_values
+            for envelope in (QueryEnvelope[dict[str, object]].model_validate(raw),)
+        }
+        raw_proposal_prepared = value.get("proposal_prepared", False)
+        if not isinstance(raw_proposal_prepared, bool):
+            raise ValueError("career checkpoint proposal state is invalid")
+        self._proposal_prepared = raw_proposal_prepared
 
     def export_checkpoint(self) -> dict[str, object]:
         """Return the bounded host-only state needed to validate resumed tools."""
 
         return {
-            "version": "career-native-tools.v1",
+            "version": "career-native-tools.v2",
             "known_interviews": [
                 item.model_dump(mode="json")
                 for item in sorted(
@@ -147,6 +226,14 @@ class CareerAgentToolState:
                     key=lambda item: item.interview_page_id,
                 )
             ],
+            "query_envelopes": [
+                envelope.model_dump(mode="json")
+                for envelope in sorted(
+                    getattr(self, "_query_envelopes", {}).values(),
+                    key=lambda item: item.query_id,
+                )
+            ],
+            "proposal_prepared": bool(getattr(self, "_proposal_prepared", False)),
         }
 
     def tools(self) -> tuple[NativeTool, ...]:
@@ -266,34 +353,80 @@ class CareerAgentToolState:
         await self._ensure_synced(cached_available=bool(cached_interviews or cached_rows))
         interviews = self._load_interview_context()
         rows = self._load_application_table_context()
-        self._known_interviews.update((item.interview_page_id, item) for item in interviews)
-        return {
-            "query": args.query,
-            "sync": self._sync_warning
-            or {
-                "status": "fresh",
-                "sync_status": "succeeded",
-                "message": "Jobs sync succeeded before this lookup.",
-            },
-            "interviews": [self._interview_payload(item) for item in interviews],
-            "application_tables": _application_table_payloads(rows),
-        }
+        terms = _career_query_terms(args.query)
+        filtered_interviews = tuple(item for item in interviews if _interview_matches(item, terms))
+        filtered_rows = _application_row_payloads(rows, terms)
+        items_with_keys: list[
+            tuple[tuple[str, ...], dict[str, object], InterviewEventSnapshot | None]
+        ]
+        items_with_keys = [
+            (
+                _interview_sort_key(item),
+                {"kind": "interview", **dict(self._interview_payload(item))},
+                item,
+            )
+            for item in filtered_interviews
+        ]
+        items_with_keys.extend(
+            (
+                _application_row_sort_key(item),
+                item,
+                None,
+            )
+            for item in filtered_rows
+        )
+        envelope = self._query_envelope(
+            tool_name="search_jobs_context",
+            query=args.query,
+            limit=args.limit,
+            cursor=args.cursor,
+            source_id="career_jobs_context",
+            items_with_keys=tuple(sorted(items_with_keys, key=lambda item: item[0])),
+        )
+        self._known_interviews.update(
+            (item.interview_page_id, item)
+            for _key, _payload, item in items_with_keys
+            if item is not None
+            and any(
+                returned.get("kind") == "interview"
+                and returned.get("interview_page_id") == item.interview_page_id
+                for returned in envelope.items
+            )
+        )
+        self._query_envelopes[envelope.query_id] = envelope
+        return envelope.model_dump(mode="json")
 
     async def _search_interviews(self, arguments: Mapping[str, object]) -> object:
         args = _SearchInterviewsArgs.model_validate(arguments)
-        cached = tuple(self._store.search_interviews(args.query, now=self._now))[:50]
+        cached = tuple(self._store.search_interviews(args.query, now=self._now))
         await self._ensure_synced(cached_available=bool(cached))
-        results = tuple(self._store.search_interviews(args.query, now=self._now))[:50]
-        self._known_interviews.update((item.interview_page_id, item) for item in results)
-        return {
-            "sync": self._sync_warning
-            or {
-                "status": "fresh",
-                "sync_status": "succeeded",
-                "message": "Jobs sync succeeded before this lookup.",
-            },
-            "interviews": [self._interview_payload(item) for item in results],
-        }
+        results = tuple(self._store.search_interviews(args.query, now=self._now))
+        items_with_keys = tuple(
+            (
+                _interview_sort_key(item),
+                {"kind": "interview", **dict(self._interview_payload(item))},
+                item,
+            )
+            for item in sorted(results, key=_interview_sort_key)
+        )
+        envelope = self._query_envelope(
+            tool_name="search_job_interviews",
+            query=args.query,
+            limit=args.limit,
+            cursor=args.cursor,
+            source_id="career_interviews",
+            items_with_keys=items_with_keys,
+        )
+        self._known_interviews.update(
+            (item.interview_page_id, item)
+            for _key, _payload, item in items_with_keys
+            if any(
+                returned.get("interview_page_id") == item.interview_page_id
+                for returned in envelope.items
+            )
+        )
+        self._query_envelopes[envelope.query_id] = envelope
+        return envelope.model_dump(mode="json")
 
     async def _prepare_interview(self, arguments: Mapping[str, object]) -> object:
         args = _PrepareInterviewArgs.model_validate(arguments)
@@ -527,6 +660,7 @@ class CareerAgentToolState:
             idempotency_key=f"discord:{self._external_event_id}:interview-date",
             now=self._now,
         )
+        self._proposal_prepared = True
         return {"review": "required", **proposal}
 
     async def _propose_plan_save(self, arguments: Mapping[str, object]) -> object:
@@ -541,7 +675,69 @@ class CareerAgentToolState:
             idempotency_key=f"discord:{self._external_event_id}:preparation-plan",
             now=self._now,
         )
+        self._proposal_prepared = True
         return {"review": "required", **proposal}
+
+    @property
+    def has_query_results(self) -> bool:
+        return bool(self._query_envelopes)
+
+    @property
+    def has_prepared_proposal(self) -> bool:
+        return self._proposal_prepared
+
+    def query_envelope(self, query_id: str) -> QueryEnvelope[dict[str, object]] | None:
+        return self._query_envelopes.get(query_id)
+
+    def validate_grounding(self, grounding: TerminalGrounding) -> str | None:
+        envelope = self._query_envelopes.get(grounding.query_id)
+        if envelope is None:
+            return "grounding query_id was not returned by a current trusted career query"
+        known_ids = {_career_item_id(item) for item in envelope.items}
+        if not set(grounding.item_ids).issubset(known_ids):
+            return "grounding item_ids contain an unknown or out-of-scope career item"
+        if envelope.has_more and not grounding.acknowledge_incomplete:
+            return "grounding must acknowledge that more career items are available"
+        if (
+            envelope.completeness is CompletenessState.CACHED_STALE
+            and not grounding.acknowledge_stale
+        ):
+            return "grounding must acknowledge stale cached career data"
+        return None
+
+    def render_grounding(self, grounding: TerminalGrounding) -> str:
+        envelope = self._query_envelopes[grounding.query_id]
+        selected = {_career_item_id(item): item for item in envelope.items}
+        items = [selected[item_id] for item_id in grounding.item_ids]
+        lines = (
+            ["Here are the matching career items:"]
+            if items
+            else ["I found no matching career items in the requested scope."]
+        )
+        for item in items:
+            if item.get("kind") == "interview":
+                date_label = str(item.get("date") or "date unavailable")
+                if item.get("time"):
+                    date_label += f" at {item['time']}"
+                lines.append(f"- {item.get('title', 'Interview')} — {date_label}")
+            else:
+                cells = item.get("cells")
+                cell_values = (
+                    cast(Sequence[object], cells)
+                    if isinstance(cells, Sequence) and not isinstance(cells, str | bytes)
+                    else ()
+                )
+                summary = (
+                    " | ".join(str(value) for value in cell_values[:4])
+                    if cell_values
+                    else "Application row"
+                )
+                lines.append(f"- {summary}")
+        if envelope.has_more:
+            lines.append("More matching career items are available; ask me for the next page.")
+        if envelope.completeness is CompletenessState.CACHED_STALE:
+            lines.append("Jobs sync was unavailable, so these career results are cached and stale.")
+        return "\n".join(lines)
 
     def _selected(self, interview_page_id: str) -> InterviewEventSnapshot:
         interview = self._known_interviews.get(interview_page_id)
@@ -554,6 +750,7 @@ class CareerAgentToolState:
 
     def _interview_payload(self, item: InterviewEventSnapshot) -> Mapping[str, object]:
         return {
+            "stable_id": item.interview_page_id,
             "interview_page_id": item.interview_page_id,
             "title": item.title,
             "date": item.local_date.isoformat(),
@@ -575,18 +772,131 @@ class CareerAgentToolState:
         if callable(loader):
             loaded = loader(now=self._now)
             if isinstance(loaded, Sequence):
-                return tuple(cast(Sequence[InterviewEventSnapshot], loaded))[:50]
+                return tuple(cast(Sequence[InterviewEventSnapshot], loaded))
             return ()
-        return tuple(self._store.search_interviews("", now=self._now))[:50]
+        return tuple(self._store.search_interviews("", now=self._now))
 
     def _load_application_table_context(self) -> tuple[Any, ...]:
         loader = getattr(self._store, "application_table_snapshots", None)
         if callable(loader):
             loaded = loader()
             if isinstance(loaded, Sequence):
-                return tuple(cast(Sequence[Any], loaded))[:75]
+                return tuple(cast(Sequence[Any], loaded))
             return ()
-        return tuple(self._store.application_row_snapshots())[:75]
+        return tuple(self._store.application_row_snapshots())
+
+    def _query_envelope(
+        self,
+        *,
+        tool_name: str,
+        query: str,
+        limit: int,
+        cursor: str | None,
+        source_id: str,
+        items_with_keys: tuple[
+            tuple[tuple[str, ...], dict[str, object], InterviewEventSnapshot | None], ...
+        ],
+    ) -> QueryEnvelope[dict[str, object]]:
+        filters = _career_filters(query=query, limit=limit, now=self._now, timezone=self._timezone)
+        snapshot = self._snapshot_identity()
+        owner_scope = f"career:{self._requester}:{tool_name}"
+        try:
+            cursor_last = (
+                _CAREER_CURSOR_CODEC.decode(
+                    cursor,
+                    filters=filters,
+                    owner_scope=owner_scope,
+                    snapshot=snapshot,
+                )
+                if cursor is not None
+                else None
+            )
+        except ValueError as exc:
+            raise ToolExecutionError(
+                "Career query cursor is invalid or no longer current."
+            ) from exc
+        page_source = (
+            tuple(item for item in items_with_keys if item[0] > cursor_last)
+            if cursor_last is not None
+            else items_with_keys
+        )
+        page = page_source[:limit]
+        has_more = len(page_source) > limit
+        next_cursor = (
+            _CAREER_CURSOR_CODEC.encode(
+                filters=filters,
+                owner_scope=owner_scope,
+                snapshot=snapshot,
+                last_key=page[-1][0],
+            )
+            if has_more and page
+            else None
+        )
+        freshness = self._freshness(source_id)
+        freshness_states = {item.state for item in freshness}
+        completeness = CompletenessState.MORE_AVAILABLE if has_more else CompletenessState.COMPLETE
+        if FreshnessState.UNAVAILABLE in freshness_states:
+            completeness = CompletenessState.UNAVAILABLE
+        elif FreshnessState.CACHED_STALE in freshness_states:
+            completeness = CompletenessState.CACHED_STALE
+        return QueryEnvelope[dict[str, object]](
+            query_id=_query_id(tool_name, self._external_event_id, query, cursor),
+            as_of=self._now,
+            timezone=self._timezone,
+            applied_filters=filters,
+            freshness=freshness,
+            items=tuple(item[1] for item in page),
+            result_count=len(page),
+            has_more=has_more,
+            next_cursor=next_cursor,
+            completeness=completeness,
+        )
+
+    def _freshness(self, source_id: str) -> tuple[SourceFreshness, ...]:
+        warning = self._sync_warning or {}
+        status = str(warning.get("status", "fresh"))
+        sync_status = str(warning.get("sync_status", "succeeded"))
+        raw_codes = warning.get("diagnostic_codes", ())
+        codes = (
+            tuple(str(item) for item in cast(Sequence[object], raw_codes))
+            if isinstance(raw_codes, Sequence) and not isinstance(raw_codes, str | bytes)
+            else ()
+        )
+        if status == "cached_fallback":
+            diagnostics = (sync_status, *codes) if sync_status else codes
+            return (
+                SourceFreshness(
+                    source_id=source_id,
+                    state=FreshnessState.CACHED_STALE,
+                    diagnostic_codes=diagnostics[:10],
+                ),
+            )
+        if status == "fresh_partial":
+            return (
+                SourceFreshness(
+                    source_id=source_id,
+                    state=FreshnessState.FRESH_PARTIAL_FOR_UNREQUESTED_SOURCES,
+                    as_of=self._now,
+                    diagnostic_codes=codes[:10],
+                ),
+            )
+        return (
+            SourceFreshness(
+                source_id=source_id,
+                state=FreshnessState.FRESH_COMPLETE,
+                as_of=self._now,
+            ),
+        )
+
+    def _snapshot_identity(self) -> str:
+        warning = self._sync_warning or {}
+        parts = (
+            self._now.isoformat(),
+            str(warning.get("status", "fresh")),
+            str(warning.get("sync_status", "succeeded")),
+            ",".join(_diagnostic_codes(warning.get("diagnostic_codes", ()))),
+        )
+        return hashlib.sha256("|".join(parts).encode()).hexdigest()
 
     def _clarify(
         self,
@@ -616,11 +926,92 @@ def _optional_text(value: object) -> str | None:
     return str(value) if value is not None and str(value).strip() else None
 
 
+def _career_item_id(item: Mapping[str, object]) -> str:
+    value = item.get("stable_id") or item.get("interview_page_id") or item.get("row_block_id")
+    return str(value or "")
+
+
 def _confidence(value: object) -> float:
     return float(value) if isinstance(value, int | float) else 0.0
 
 
-def _application_table_payloads(rows: tuple[Any, ...]) -> list[dict[str, object]]:
+def _career_filters(
+    *,
+    query: str,
+    limit: int,
+    now: datetime,
+    timezone: str,
+) -> NormalizedQueryFilters:
+    return NormalizedQueryFilters(
+        temporal=resolve_temporal_window(
+            TemporalQuery(scope=TemporalScope.UPCOMING),
+            request_time=now,
+            timezone=timezone,
+        ),
+        completion=CompletionMode.INCOMPLETE,
+        text=query,
+        roles=("career",),
+        limit=limit,
+    )
+
+
+def _diagnostic_codes(value: object) -> tuple[str, ...]:
+    if not isinstance(value, Sequence) or isinstance(value, str | bytes):
+        return ()
+    return tuple(str(item) for item in cast(Sequence[object], value))
+
+
+def _query_id(tool_name: str, event_id: str, query: str, cursor: str | None) -> str:
+    digest = hashlib.sha256(f"{event_id}|{tool_name}|{query}|{cursor or ''}".encode()).hexdigest()
+    return f"{tool_name}:{digest[:24]}"
+
+
+def _career_query_terms(query: str) -> tuple[str, ...]:
+    return tuple(
+        term
+        for raw in query.casefold().replace("/", " ").replace("-", " ").split()
+        for term in ("".join(char for char in raw if char.isalnum()),)
+        if len(term) >= 2 and term not in _CAREER_QUERY_STOPWORDS
+    )
+
+
+def _interview_matches(item: InterviewEventSnapshot, terms: tuple[str, ...]) -> bool:
+    if not terms:
+        return True
+    haystack = " ".join(
+        (
+            item.title,
+            " ".join(item.tags),
+            item.calendar_semantic_overview or "",
+            item.calendar_semantic_description or "",
+        )
+    ).casefold()
+    return all(term in haystack for term in terms)
+
+
+def _interview_sort_key(item: InterviewEventSnapshot) -> tuple[str, ...]:
+    return (
+        "0",
+        item.local_date.isoformat(),
+        item.date_start.isoformat() if item.date_start is not None else "",
+        item.title.casefold(),
+        item.interview_page_id,
+    )
+
+
+def _application_row_sort_key(item: Mapping[str, object]) -> tuple[str, ...]:
+    return (
+        "1",
+        str(item["table_block_id"]),
+        f"{int(cast(int, item['row_order'])):012d}",
+        str(item["row_block_id"]),
+    )
+
+
+def _application_row_payloads(
+    rows: tuple[Any, ...],
+    terms: tuple[str, ...],
+) -> tuple[dict[str, object], ...]:
     grouped: dict[str, list[Any]] = {}
     for row in rows:
         grouped.setdefault(str(row.table_block_id), []).append(row)
@@ -632,31 +1023,35 @@ def _application_table_payloads(rows: tuple[Any, ...]) -> list[dict[str, object]
         data_rows = [row for row in ordered if not bool(getattr(row, "is_header", False))]
         max_columns = max((len(tuple(getattr(row, "cells", ()))) for row in ordered), default=0)
         columns = [
-            {
-                "index": index,
-                "header": headers[index] if index < len(headers) else f"column_{index + 1}",
-            }
+            headers[index] if index < len(headers) else f"column_{index + 1}"
             for index in range(max_columns)
         ]
-        payloads.append(
-            {
-                "table_block_id": table_block_id,
-                "columns": columns,
-                "rows": [
-                    {
-                        "row_block_id": row.row_block_id,
-                        "row_order": row.row_order,
-                        "cells": list(row.cells),
-                        "column_values": {
-                            str(columns[index]["header"]): cell
-                            for index, cell in enumerate(row.cells[: len(columns)])
-                        },
-                    }
-                    for row in data_rows[:50]
-                ],
+        for row in data_rows:
+            column_values = {
+                str(columns[index]): cell for index, cell in enumerate(row.cells[: len(columns)])
             }
-        )
-    return payloads
+            haystack = " ".join(
+                (
+                    " ".join(str(cell) for cell in getattr(row, "cells", ())),
+                    " ".join(str(cell) for cell in getattr(row, "normalized_cells", ())),
+                    " ".join(column_values),
+                    " ".join(str(value) for value in column_values.values()),
+                )
+            ).casefold()
+            if terms and not all(term in haystack for term in terms):
+                continue
+            payloads.append(
+                {
+                    "kind": "application_row",
+                    "stable_id": row.row_block_id,
+                    "table_block_id": table_block_id,
+                    "row_block_id": row.row_block_id,
+                    "row_order": row.row_order,
+                    "cells": list(row.cells),
+                    "column_values": column_values,
+                }
+            )
+    return tuple(sorted(payloads, key=_application_row_sort_key))
 
 
 __all__ = ["CareerAgentToolState"]

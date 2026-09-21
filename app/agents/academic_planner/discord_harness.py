@@ -12,15 +12,17 @@ from datetime import UTC, datetime, timedelta
 from typing import Any, Literal, Protocol, cast
 from zoneinfo import ZoneInfo
 
-from langchain_core.messages import AIMessage, BaseMessage, HumanMessage, SystemMessage
+from langchain_core.messages import AIMessage, BaseMessage, HumanMessage, SystemMessage, ToolMessage
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 from sqlalchemy.orm import Session
 
-from app.agents.academic_planner.calendar_roles import AcademicCalendarRole
+from app.agents.academic_planner.calendar_roles import AcademicCalendarRole, academic_calendar_role
 from app.agents.academic_planner.commands import parse_academic_command
 from app.agents.academic_planner.contracts import (
     AcademicAssessmentOption,
+    AcademicAssessmentQueryArgs,
     AcademicCourseOption,
+    AcademicCourseQueryArgs,
     ArchiveAssessmentCall,
     AttachAssessmentMaterialCall,
     CheckinProposal,
@@ -36,7 +38,25 @@ from app.agents.academic_planner.discord_memory import (
     NativeAcademicMemoryTool,
     resume_open_academic_memory_session,
 )
+from app.agents.academic_planner.nightly_conversation import (
+    NIGHTLY_CHECKPOINT_VERSION,
+    NightlyChecklistCheckpoint,
+    NightlyItemOutcome,
+    NightlyReplySemanticAudit,
+    advance_nightly_checkpoint,
+    build_move_preview_proof,
+    current_item,
+    export_nightly_checkpoint,
+    parse_nightly_checkpoint,
+    render_completion_question,
+    render_move_preview,
+    render_summary,
+    shift_toronto_local_calendar_day,
+    stable_nightly_proposal_id,
+    with_pending_move_proposal,
+)
 from app.agents.academic_planner.proposal_review import (
+    apply_bound_nightly_proposal,
     confirm_checkin_proposal,
     reject_checkin_proposal,
 )
@@ -74,6 +94,7 @@ from app.agents.job_interviews.notion_mutations import (
 )
 from app.agents.learn.tool_state import LearnToolState
 from app.agents.memory.native_tool import NativeUserMemoryTool
+from app.agents.query_contracts import FreshnessState, QueryEnvelope, SourceFreshness, TemporalScope
 from app.connectors.discord_gateway import (
     DiscordAcademicMessageCreate,
     DiscordMessageCallbackResult,
@@ -81,6 +102,8 @@ from app.connectors.discord_gateway import (
 from app.db.job_interviews import JobInterviewRepository
 
 _PROPOSAL_NAMESPACE = uuid.UUID("6f7240e2-48d0-44bd-b9bf-a8bd8d9adccc")
+_NIGHTLY_PROPOSAL_NAMESPACE = uuid.UUID("d7d36258-66a5-4adf-8cf4-12555b56fc02")
+_NIGHTLY_REPLY_PROMPT_VERSION = "academic-nightly-reply-semantics-v1"
 _DEFAULT_CATALOG_SYNC_TIMEOUT_SECONDS = 30.0
 _TOOL_PROGRESS_ACTIVITY = {
     "search_courses": "course_data",
@@ -151,11 +174,10 @@ that search in the current turn. Interpret LEARN meaning semantically; never rou
 announcement from isolated keywords. Announcement tools return validated summaries and grounded
 dated implications, never raw titles or bodies. If LEARN needs reauthentication, say so and give
 the operator command scripts/lifeagent_learn_bridge.sh login. A LEARN lookup is read-only and
-never means that a Notion write occurred. LEARN-derived dates may only target the exact reserved
-Classes + Tutorials + Labs calendar through a separate confirmation-gated proposal; never use a
-per-course or misc calendar as a fallback. Use propose_learn_calendar_change only when the owner
-asks to add or enrich a grounded LEARN date, and only with a proposal_source_id returned by a
-LEARN lookup in this turn. It prepares review; the write still requires exact confirm <proposal_id>.
+never means that a calendar write occurred. The reserved Classes + Tutorials + Labs schedule is
+synchronized from a read-only Google iCal feed. Never offer or attempt to create, enrich, update,
+or delete that schedule through Notion, and never use a per-course or misc calendar as a fallback
+for a LEARN-derived date.
 For Jobs/career questions about dates, interviews, applications, companies, roles, or statuses,
 use search_jobs_context first. Use prepare_job_interview only after selecting an interview from
 career search results. Never invent a company fact, interview format, posting requirement, date,
@@ -181,12 +203,6 @@ manage_academic_memory and also propose concrete ordinary course calendar event 
 turn. Search the course, inspect relevant assessment material when it is needed, use
 find_course_event_slots when the owner did not give a time, then call create_course_event with a
 natural title and requires_study_intent=true. Do not promise future internal scheduled study time.
-When the restored context begins with a proactive evening or nightly academic reflection prompt,
-the owner's reply is allowed academic reflection input: use manage_academic_memory for validated
-study-related struggles, confidence, practice needs, and learning-focus reflections, and prepare
-confirmation-gated course-event proposals when useful. This nightly context does not activate
-generic personal memory; manage_user_memory still requires explicit remember, forget, or correct
-language from the owner. It also never confirms Notion or calendar writes.
 Notion create, update, and archive tools only prepare a proposal for human review. They never
 perform a write. Never claim that a proposed change has already happened. Search first when you
 need an owner-scoped course or assessment id; create_misc_task resolves its reserved target
@@ -203,14 +219,45 @@ After finishing all ordinary tool work for the current turn, call emit_conversat
 the only tool in that assistant message. Use disposition awaiting_user only when information from
 the owner is genuinely required before completing the request, and put one concise answerable
 clarification in content. Use completed for a final answer, refusal, or terminal explanation.
+After any academic, career, or LEARN list query, include grounding with the exact returned
+query_id and only returned `stable_id` values in item_ids. Set acknowledge_incomplete when
+has_more is true and acknowledge_stale when the selected envelope is cached_stale. Always include
+both acknowledgement booleans and set them false otherwise. The host renders authoritative item
+titles and dates from those IDs, so do not use model-written date strings as evidence.
 Consider the bounded host-provided context, including prior tool results and owner answers. Never
 repeat a semantic clarification that the owner has already answered. If the owner changes topics,
 handle the pivot from the full context instead of blindly treating it as the prior missing slot.
 Do not reveal hidden reasoning or narrate private reasoning as answer text."""
 
+_NIGHTLY_SYSTEM_MESSAGE = """You are LifeAgent handling one host-controlled evening task
+check-in. Read the full conversation and interpret the owner's latest reply semantically; do not
+route from keywords or regex-like word matching. The host checkpoint identifies exactly one
+current task and phase. In awaiting_completion, call nightly_record_task_result exactly once only
+when the reply clearly means completed or incomplete. In awaiting_move_confirmation, call
+nightly_resolve_move exactly once only when the reply clearly confirms or declines the exact
+previewed one-day move. Call nightly_skip only when the owner clearly wants to stop this check-in.
+For ambiguity, topic pivots, or replies that do not answer the current question, call no nightly
+action and ask one concise question for the same phase. Never infer confirmation from generic
+conversation context. Never name or calculate a target date yourself and never claim a Notion
+write succeeded; host tool results are authoritative. After an action tool result, call
+emit_conversation_response with the disposition implied by that result. The host will render the
+exact response. Do not call ordinary academic, career, LEARN, or memory tools in this flow."""
+
 
 class _Args(BaseModel):
     model_config = ConfigDict(extra="forbid")
+
+
+class _NightlyCompletionArgs(_Args):
+    result: Literal["completed", "incomplete"]
+
+
+class _NightlyMoveResolutionArgs(_Args):
+    decision: Literal["confirm", "decline"]
+
+
+class _NightlySkipArgs(_Args):
+    action: Literal["skip"]
 
 
 class _ProgressReporter(Protocol):
@@ -228,13 +275,8 @@ class _ProgressReporter(Protocol):
 type ActivitySink = Callable[[Mapping[str, object]], Awaitable[None] | None]
 
 
-class _SearchCoursesArgs(_Args):
-    query: str = Field(min_length=1, max_length=300)
-
-
-class _SearchAssessmentsArgs(_Args):
-    query: str = Field(min_length=1, max_length=300)
-    course_id: str | None = Field(default=None, min_length=1, max_length=255)
+_SearchCoursesArgs = AcademicCourseQueryArgs
+_SearchAssessmentsArgs = AcademicAssessmentQueryArgs
 
 
 class _CreateAssessmentArgs(_Args):
@@ -300,6 +342,361 @@ class _UpdateAssessmentArgs(_Args):
 
 class _ArchiveAssessmentArgs(_Args):
     assessment_id: str = Field(min_length=1, max_length=255)
+
+
+class _NightlyConversationToolState:
+    """Host-enforced nightly protocol; the model chooses only semantic actions."""
+
+    def __init__(
+        self,
+        *,
+        checkpoint: NightlyChecklistCheckpoint,
+        store: Any,
+        writer_provider: Any,
+        delivery: Any,
+        message: DiscordAcademicMessageCreate,
+        model_identity: str,
+    ) -> None:
+        self.checkpoint = checkpoint
+        self._store = store
+        self._writer_provider = writer_provider
+        self._delivery = delivery
+        self._message = message
+        self._model_identity = model_identity
+        self.last_response: str | None = None
+        self.action_count = 0
+
+    def tools(self) -> tuple[NativeTool, ...]:
+        return (
+            self._tool(
+                "nightly_record_task_result",
+                "Record whether the owner semantically completed or did not complete only "
+                "the current nightly task.",
+                _NightlyCompletionArgs,
+                self._record_task_result,
+                "external_write",
+            ),
+            self._tool(
+                "nightly_resolve_move",
+                "Confirm or decline only the single exact one-day move currently previewed "
+                "by the host.",
+                _NightlyMoveResolutionArgs,
+                self._resolve_move,
+                "external_write",
+            ),
+            self._tool(
+                "nightly_skip",
+                "Stop the current nightly checklist without changing unresolved tasks.",
+                _NightlySkipArgs,
+                self._skip,
+                "durable_local_write",
+            ),
+        )
+
+    def export_checkpoint(self) -> dict[str, object]:
+        return {
+            "version": "academic-discord-native-tools.v3",
+            "nightly_checkin": export_nightly_checkpoint(self.checkpoint),
+        }
+
+    def lifecycle_error(self, lifecycle: ConversationLifecycle) -> str | None:
+        terminal = self.checkpoint.phase in {"completed", "cancelled"}
+        expected = "completed" if terminal else "awaiting_user"
+        if lifecycle.disposition != expected:
+            return f"nightly state requires disposition {expected}"
+        if self.action_count > 1:
+            return "only one nightly action is allowed per owner turn"
+        return None
+
+    def render_lifecycle(self, lifecycle: ConversationLifecycle) -> str:
+        if self.last_response is not None:
+            return self.last_response
+        item = current_item(self.checkpoint)
+        if item is None:
+            return render_summary(self.checkpoint)
+        if self.checkpoint.phase == "awaiting_move_confirmation":
+            return render_move_preview(
+                self.checkpoint,
+                shifted_range=self.checkpoint.pending_preview_proof.new_date_range
+                if self.checkpoint.pending_preview_proof is not None
+                else None,
+            )
+        return render_completion_question(self.checkpoint)
+
+    async def _record_task_result(self, arguments: Mapping[str, object]) -> object:
+        self._claim_action()
+        args = _NightlyCompletionArgs.model_validate(arguments)
+        if self.checkpoint.phase != "awaiting_completion":
+            raise ToolExecutionError("The nightly check-in is not awaiting a completion answer.")
+        item = current_item(self.checkpoint)
+        if item is None:
+            raise ToolExecutionError("The nightly checklist is already complete.")
+        audit = self._audit("completed" if args.result == "completed" else "incomplete")
+        if args.result == "incomplete":
+            proposal_id = self._proposal_uuid(item.item_id, "move_one_day")
+            shifted = shift_toronto_local_calendar_day(item.date_range)
+            proposal = self._move_proposal(proposal_id, item, shifted)
+            self._persist(proposal, item_id=item.item_id, operation="move")
+            proof = build_move_preview_proof(
+                self.checkpoint,
+                proposal_id=str(proposal_id),
+                shifted_range=shifted,
+                rendered_at=self._message.timestamp,
+            )
+            self.checkpoint = with_pending_move_proposal(
+                self.checkpoint,
+                proposal_id=str(proposal_id),
+                preview_proof=proof,
+                reply_semantic_audit=audit,
+            )
+            self.last_response = "I understand. " + render_move_preview(
+                self.checkpoint,
+                shifted_range=shifted,
+            )
+            return {"status": "awaiting_move_confirmation", "response": self.last_response}
+
+        proposal_id = self._proposal_uuid(item.item_id, "mark_completed")
+        completed_title = f"Completed — {item.title}"
+        if len(completed_title) > 500:
+            return self._advance_after_write(
+                item=item,
+                status="failed",
+                proposal_id=proposal_id,
+                audit=audit,
+                result_text=(
+                    "I couldn't mark that task because its completed title is too long. "
+                    "It was left unchanged."
+                ),
+            )
+        proposal = CheckinProposal(
+            proposal_id=proposal_id,
+            confirmation_event=f"confirm {proposal_id}",
+            changes=(
+                ProposedChange(
+                    field="update_assessment",
+                    value="update_assessment",
+                    assessment_id=item.source_id,
+                    title=completed_title,
+                    expected_title=item.title,
+                    expected_last_edited_at=item.expected_last_edited_at,
+                ),
+            ),
+            expires_at=self._message.timestamp
+            + timedelta(hours=self._store.confirmation_ttl_hours),
+        )
+        self._persist(proposal, item_id=item.item_id, operation="complete")
+        await self._delivery.send_response(
+            "Great — I'm marking that task completed in Notion now.",
+            idempotency_key=(
+                f"academic-discord-message:{self._message.message_id}:nightly-completion-ack:v2"
+            ),
+        )
+        applied = await self._apply(proposal_id)
+        if applied:
+            text = f'Marked it as "{completed_title}".'
+            status: Literal["completed", "failed"] = "completed"
+        else:
+            text = "I couldn't safely mark that task completed. It was left unchanged."
+            status = "failed"
+        return self._advance_after_write(
+            item=item,
+            status=status,
+            proposal_id=proposal_id,
+            audit=audit,
+            result_text=text,
+        )
+
+    async def _resolve_move(self, arguments: Mapping[str, object]) -> object:
+        self._claim_action()
+        args = _NightlyMoveResolutionArgs.model_validate(arguments)
+        if self.checkpoint.phase != "awaiting_move_confirmation":
+            raise ToolExecutionError("No nightly move is awaiting confirmation.")
+        item = current_item(self.checkpoint)
+        proof = self.checkpoint.pending_preview_proof
+        raw_proposal_id = self.checkpoint.pending_proposal_id
+        if item is None or proof is None or raw_proposal_id is None:
+            raise ToolExecutionError("The bound nightly move preview is unavailable.")
+        if (
+            proof.item_id != item.item_id
+            or proof.title != item.title
+            or proof.proposal_id != raw_proposal_id
+            or proof.old_date_range != item.date_range
+        ):
+            raise ToolExecutionError("The bound nightly move preview is invalid.")
+        proposal_id = uuid.UUID(raw_proposal_id)
+        audit = self._audit("confirm_move" if args.decision == "confirm" else "decline_move")
+        if args.decision == "decline":
+            result = reject_checkin_proposal(
+                store=self._store,
+                proposal_id=proposal_id,
+                rejection_event=f"reject {proposal_id}",
+                now=self._message.timestamp,
+            )
+            status = str(result.get("status", ""))
+            result_text = (
+                "Okay — I left that task in place."
+                if status in {"rejected", "already_rejected"}
+                else "I couldn't safely close that move proposal. The task was left unchanged."
+            )
+            return self._advance_after_write(
+                item=item,
+                status="left_in_place" if status in {"rejected", "already_rejected"} else "failed",
+                proposal_id=proposal_id,
+                audit=audit,
+                result_text=result_text,
+            )
+        await self._delivery.send_response(
+            "Got it — I'm moving that task to tomorrow now.",
+            idempotency_key=(
+                f"academic-discord-message:{self._message.message_id}:nightly-move-ack:v2"
+            ),
+        )
+        applied = await self._apply(proposal_id)
+        target_label = proof.new_date_range.start_date.strftime("%B %-d")
+        return self._advance_after_write(
+            item=item,
+            status="moved" if applied else "failed",
+            proposal_id=proposal_id,
+            audit=audit,
+            result_text=(
+                f"Moved it to {target_label}."
+                if applied
+                else "I couldn't safely move that task. It was left unchanged."
+            ),
+        )
+
+    async def _skip(self, arguments: Mapping[str, object]) -> object:
+        self._claim_action()
+        _NightlySkipArgs.model_validate(arguments)
+        self.checkpoint = self.checkpoint.model_copy(
+            update={
+                "phase": "cancelled",
+                "pending_proposal_id": None,
+                "pending_preview_proof": None,
+                "pending_reply_semantic_audit": None,
+            }
+        )
+        self.last_response = "Skipped tonight's check-in. No additional tasks were changed."
+        return {"status": "cancelled", "response": self.last_response}
+
+    def _advance_after_write(
+        self,
+        *,
+        item: Any,
+        status: Any,
+        proposal_id: uuid.UUID,
+        audit: NightlyReplySemanticAudit,
+        result_text: str,
+    ) -> object:
+        self.checkpoint = advance_nightly_checkpoint(
+            self.checkpoint,
+            NightlyItemOutcome(
+                item_id=item.item_id,
+                status=status,
+                proposal_id=str(proposal_id),
+                owner_event_id=audit.owner_event_id,
+                reply_model_identity=audit.model_identity,
+                reply_prompt_version=audit.prompt_version,
+                reply_semantic_action=audit.action,
+                occurred_at=self._message.timestamp,
+            ),
+        )
+        if self.checkpoint.phase == "completed":
+            self.last_response = f"{result_text} {render_summary(self.checkpoint)}"
+        else:
+            next_question = render_completion_question(self.checkpoint)
+            self.last_response = f"{result_text} Next, {next_question}"
+        return {"status": status, "response": self.last_response}
+
+    async def _apply(self, proposal_id: uuid.UUID) -> bool:
+        writer = self._writer_provider()
+        if writer is None:
+            return False
+        try:
+            result = await apply_bound_nightly_proposal(
+                store=self._store,
+                writer=writer,
+                proposal_id=proposal_id,
+                now=self._message.timestamp,
+            )
+        except Exception:
+            return False
+        return str(result.get("status", "")) == "applied"
+
+    def _move_proposal(self, proposal_id: uuid.UUID, item: Any, shifted: Any) -> CheckinProposal:
+        start, end = _nightly_range_values(shifted)
+        return CheckinProposal(
+            proposal_id=proposal_id,
+            confirmation_event=f"confirm {proposal_id}",
+            changes=(
+                ProposedChange(
+                    field="update_assessment",
+                    value="update_assessment",
+                    assessment_id=item.source_id,
+                    due_at=start,
+                    ends_at=end,
+                    is_all_day=True if shifted.all_day else None,
+                    expected_title=item.title,
+                    expected_last_edited_at=item.expected_last_edited_at,
+                ),
+            ),
+            expires_at=self._message.timestamp
+            + timedelta(hours=self._store.confirmation_ttl_hours),
+        )
+
+    def _persist(self, proposal: CheckinProposal, *, item_id: str, operation: str) -> None:
+        self._store.save_discord_checkin(
+            proposal,
+            external_event_id=f"nightly:{self.checkpoint.period_key}:{item_id}:{operation}",
+            channel=self._message.channel_id,
+            received_at=self._message.timestamp,
+            owner_discord_user_id=self._message.author_id,
+        )
+
+    def _proposal_uuid(self, item_id: str, operation: Any) -> uuid.UUID:
+        stable = stable_nightly_proposal_id(
+            period_key=self.checkpoint.period_key,
+            item_id=item_id,
+            operation=operation,
+        )
+        return uuid.uuid5(_NIGHTLY_PROPOSAL_NAMESPACE, stable)
+
+    def _audit(self, action: Any) -> NightlyReplySemanticAudit:
+        return NightlyReplySemanticAudit(
+            owner_event_id=self._message.message_id,
+            action=action,
+            model_identity=self._model_identity,
+            prompt_version=_NIGHTLY_REPLY_PROMPT_VERSION,
+            occurred_at=self._message.timestamp,
+        )
+
+    def _claim_action(self) -> None:
+        if self.action_count:
+            raise ToolExecutionError("Only one nightly action may be applied per owner turn.")
+        self.action_count += 1
+
+    @staticmethod
+    def _tool(
+        name: str,
+        description: str,
+        model: type[BaseModel],
+        handler: Any,
+        side_effect_class: ToolSideEffectClass,
+    ) -> NativeTool:
+        return NativeTool(
+            schema={
+                "type": "function",
+                "function": {
+                    "name": name,
+                    "description": description,
+                    "parameters": model.model_json_schema(),
+                },
+            },
+            handler=handler,
+            name=name,
+            side_effect_class=side_effect_class,
+            activity="nightly_checkin",
+        )
 
 
 class _InspectInboundPdfArgs(_Args):
@@ -525,6 +922,7 @@ class NativeAcademicDiscordHandler:
                     suffix="memory-session",
                 )
         conversation_turn: NativeConversationBeginResult | None = None
+        nightly_checkpoint: NightlyChecklistCheckpoint | None = None
         if self._conversation_service is not None:
             conversation_turn = cast(
                 NativeConversationBeginResult,
@@ -608,6 +1006,49 @@ class NativeAcademicDiscordHandler:
                 finally:
                     await _safe_progress_finish(reporter, "finish_completed")
                 return DiscordMessageCallbackResult(status="handled")
+            raw_checkpoint = getattr(conversation_turn, "checkpoint", None)
+            if isinstance(raw_checkpoint, Mapping) and "nightly_checkin" in raw_checkpoint:
+                try:
+                    nightly_checkpoint = parse_nightly_checkpoint(
+                        cast(Mapping[str, Any], raw_checkpoint)
+                    )
+                    if nightly_checkpoint.period_key != conversation_turn.root_event_id:
+                        raise ValueError("nightly checkpoint period mismatch")
+                except (TypeError, ValueError):
+                    await self._fail_conversation(conversation_turn, "nightly_checkpoint_invalid")
+                    return await self._send_agent_failure(
+                        message,
+                        reporter=reporter,
+                        response=(
+                            "I could not safely restore tonight's task checklist. "
+                            "Nothing was changed."
+                        ),
+                        suffix="nightly-checkpoint-invalid",
+                    )
+            elif (
+                conversation_turn.session_id is not None
+                and await self._is_nightly_proactive_conversation(conversation_turn.session_id)
+            ):
+                response = (
+                    "That evening check-in started before the checklist update. "
+                    "I closed it and nothing was changed."
+                )
+                await _invoke_service(
+                    self._conversation_service.cancel,
+                    session_id=conversation_turn.session_id,
+                    content=response,
+                    now=message.timestamp,
+                )
+                try:
+                    await self._delivery.send_response(
+                        response,
+                        idempotency_key=(
+                            f"academic-discord-message:{message.message_id}:nightly-v1-closed:v1"
+                        ),
+                    )
+                finally:
+                    await _safe_progress_finish(reporter, "finish_completed")
+                return DiscordMessageCallbackResult(status="handled")
         await _safe_activity_update(self._activity_sink, {"phase": "runtime_check"})
         await _safe_progress_start(reporter, "runtime_checking")
         await _raise_if_abort_requested(self._abort_check)
@@ -622,6 +1063,15 @@ class NativeAcademicDiscordHandler:
         await _raise_if_abort_requested(self._abort_check)
         await _safe_activity_update(self._activity_sink, {"phase": "runtime_ready"})
         await _safe_progress_update(reporter, {"phase": "runtime_ready"})
+
+        if nightly_checkpoint is not None and conversation_turn is not None:
+            return await self._handle_nightly_turn(
+                message,
+                reporter=reporter,
+                conversation_turn=conversation_turn,
+                checkpoint=nightly_checkpoint,
+                content=content,
+            )
 
         tool_state = _AcademicToolState(
             catalog=self._agent_catalog,
@@ -650,7 +1100,7 @@ class NativeAcademicDiscordHandler:
         if isinstance(raw_trusted_checkpoint, Mapping):
             trusted_checkpoint = cast(Mapping[str, object], raw_trusted_checkpoint)
             root_version = trusted_checkpoint.get("version")
-            if root_version not in {None, "academic-discord-native-tools.v1"}:
+            if trusted_checkpoint and root_version != "academic-discord-native-tools.v2":
                 await self._fail_conversation(
                     conversation_turn,
                     "tool_checkpoint_invalid",
@@ -675,6 +1125,13 @@ class NativeAcademicDiscordHandler:
                     career_tool_state.restore_checkpoint(
                         cast(Mapping[str, object], career_checkpoint)
                         if isinstance(career_checkpoint, Mapping)
+                        else None
+                    )
+                learn_checkpoint = trusted_checkpoint.get("learn")
+                if learn_tool_state is not None:
+                    learn_tool_state.restore_checkpoint(
+                        cast(Mapping[str, object], learn_checkpoint)
+                        if isinstance(learn_checkpoint, Mapping)
                         else None
                     )
             except (TypeError, ValueError):
@@ -756,11 +1213,13 @@ class NativeAcademicDiscordHandler:
                 now=message.timestamp,
             )
             trusted: dict[str, object] = {
-                "version": "academic-discord-native-tools.v1",
+                "version": "academic-discord-native-tools.v2",
                 "academic": tool_state.export_checkpoint(),
             }
             if career_tool_state is not None:
                 trusted["career"] = career_tool_state.export_checkpoint()
+            if learn_tool_state is not None:
+                trusted["learn"] = learn_tool_state.export_checkpoint()
             await _invoke_service(
                 self._conversation_service.save_checkpoint,
                 session_id=session_id,
@@ -806,6 +1265,63 @@ class NativeAcademicDiscordHandler:
             )
             context_hook_holder["hook"] = context_hook
 
+        grounding_states = tuple(
+            state
+            for state in (tool_state, career_tool_state, learn_tool_state)
+            if state is not None
+        )
+
+        def validate_current_lifecycle(
+            lifecycle: ConversationLifecycle,
+            messages: Sequence[BaseMessage],
+        ) -> str | None:
+            lifecycle_error = _validate_conversation_lifecycle(lifecycle, messages)
+            if lifecycle_error is not None or lifecycle.disposition != "completed":
+                return lifecycle_error
+            if not _current_turn_has_grounded_query(messages):
+                return None
+            if any(
+                bool(getattr(state, "has_prepared_proposal", False)) for state in grounding_states
+            ):
+                return None
+            grounding = lifecycle.grounding
+            if grounding is None:
+                return (
+                    "a structured grounding selection is required after a list query; provide "
+                    "the returned query_id and selected returned item_ids"
+                )
+            owners = [
+                state
+                for state in grounding_states
+                if callable(getattr(state, "query_envelope", None))
+                and state.query_envelope(grounding.query_id) is not None
+            ]
+            if len(owners) != 1:
+                return "grounding query_id was not returned by one current trusted query"
+            validator = getattr(owners[0], "validate_grounding", None)
+            if not callable(validator):
+                return None
+            validation_result = validator(grounding)
+            return str(validation_result) if validation_result is not None else None
+
+        def render_current_lifecycle(
+            lifecycle: ConversationLifecycle,
+            _messages: Sequence[BaseMessage],
+        ) -> str:
+            grounding = lifecycle.grounding
+            if grounding is None:
+                return lifecycle.content
+            for state in grounding_states:
+                finder = getattr(state, "query_envelope", None)
+                renderer = getattr(state, "render_grounding", None)
+                if (
+                    callable(finder)
+                    and finder(grounding.query_id) is not None
+                    and callable(renderer)
+                ):
+                    return str(renderer(grounding))
+            return "I could not safely render that result. Please run the search again."
+
         try:
             result = await run_native_tool_loop(
                 gateway=self._agent_gateway,
@@ -820,7 +1336,10 @@ class NativeAcademicDiscordHandler:
                 restored_messages=restored_messages,
                 require_terminal_response=conversation_turn is not None,
                 lifecycle_validator=(
-                    _validate_conversation_lifecycle if conversation_turn is not None else None
+                    validate_current_lifecycle if conversation_turn is not None else None
+                ),
+                lifecycle_renderer=(
+                    render_current_lifecycle if conversation_turn is not None else None
                 ),
                 pre_model_context_hook=context_hook,
                 _model_pending_elapsed_seconds=self._model_pending_elapsed_seconds,
@@ -1139,6 +1658,159 @@ class NativeAcademicDiscordHandler:
         await _safe_progress_finish(reporter, "finish_completed")
         return DiscordMessageCallbackResult(status="handled")
 
+    async def _handle_nightly_turn(
+        self,
+        message: DiscordAcademicMessageCreate,
+        *,
+        reporter: _ProgressReporter | None,
+        conversation_turn: NativeConversationBeginResult,
+        checkpoint: NightlyChecklistCheckpoint,
+        content: str,
+    ) -> DiscordMessageCallbackResult:
+        """Run the narrow semantic nightly tools instead of the ordinary proposal surface."""
+
+        if conversation_turn.session_id is None or self._conversation_service is None:
+            return await self._send_agent_failure(
+                message,
+                reporter=reporter,
+                response="I could not safely resume tonight's checklist. Nothing was changed.",
+                suffix="nightly-session-missing",
+            )
+        conversation_service = self._conversation_service
+        state = _NightlyConversationToolState(
+            checkpoint=checkpoint,
+            store=self._store,
+            writer_provider=self._writer_provider,
+            delivery=self._delivery,
+            message=message,
+            model_identity=str(getattr(self._agent_gateway, "model_identity", "native")),
+        )
+
+        async def checkpoint_state(native_checkpoint: AgentTranscriptCheckpoint) -> None:
+            if native_checkpoint.message_index < 0 or native_checkpoint.message_index >= len(
+                native_checkpoint.messages
+            ):
+                raise RuntimeError("native_checkpoint_index_invalid")
+            await _invoke_service(
+                conversation_service.append_checkpoint_message,
+                session_id=conversation_turn.session_id,
+                message=native_checkpoint.messages[native_checkpoint.message_index],
+                now=message.timestamp,
+            )
+            await _invoke_service(
+                conversation_service.save_checkpoint,
+                session_id=conversation_turn.session_id,
+                checkpoint=state.export_checkpoint(),
+                now=message.timestamp,
+            )
+
+        async def nightly_publish(event: AgentHarnessEvent) -> None:
+            await _safe_activity_update(
+                self._activity_sink,
+                _safe_activity_for_harness_event(event),
+            )
+            progress = _progress_for_harness_event(event, has_inbound_material=False)
+            if progress is not None:
+                await _safe_progress_update(reporter, progress)
+
+        transcript_messages = tuple(
+            item
+            for item in getattr(conversation_turn, "transcript_messages", ())
+            if not isinstance(item, SystemMessage)
+        )
+        restored_messages: tuple[BaseMessage, ...] = transcript_messages
+        harness_user_input: str | None = None
+        if transcript_messages and isinstance(transcript_messages[-1], HumanMessage):
+            restored_messages = transcript_messages[:-1]
+            harness_user_input = content
+        if (
+            bool(getattr(conversation_turn, "duplicate", False))
+            and str(getattr(conversation_turn, "state", "")) == "processing"
+        ):
+            restored_messages = transcript_messages
+            harness_user_input = None
+
+        try:
+            result = await run_native_tool_loop(
+                gateway=self._agent_gateway,
+                user_input=harness_user_input,
+                tools=state.tools(),
+                system_message=_NIGHTLY_SYSTEM_MESSAGE,
+                event_sink=nightly_publish,
+                checkpoint_sink=checkpoint_state,
+                abort_check=self._abort_check,
+                restored_messages=restored_messages,
+                require_terminal_response=True,
+                lifecycle_validator=lambda lifecycle, _messages: state.lifecycle_error(lifecycle),
+                lifecycle_renderer=lambda lifecycle, _messages: state.render_lifecycle(lifecycle),
+                _model_pending_elapsed_seconds=self._model_pending_elapsed_seconds,
+                _model_pending_repeat_seconds=self._model_pending_repeat_seconds,
+            )
+        except UserAbortRequested:
+            await _invoke_service(
+                conversation_service.cancel,
+                session_id=conversation_turn.session_id,
+                content=None,
+                now=message.timestamp,
+            )
+            await _safe_progress_finish(reporter, "finish_aborted")
+            raise
+        except Exception:
+            await self._fail_conversation(conversation_turn, "nightly_native_harness_failed")
+            return await self._send_agent_failure(
+                message,
+                reporter=reporter,
+                response=(
+                    "I could not safely interpret that checklist reply. No additional "
+                    "Notion change was made."
+                ),
+                suffix="nightly-harness-failed",
+            )
+
+        if result.status not in {"awaiting_user", "completed"}:
+            await self._fail_conversation(conversation_turn, f"nightly_harness_{result.status}")
+            return await self._send_agent_failure(
+                message,
+                reporter=reporter,
+                response=(
+                    "I could not safely interpret that checklist reply. No additional "
+                    "Notion change was made."
+                ),
+                suffix="nightly-response-invalid",
+            )
+        if state.checkpoint.phase == "cancelled":
+            await _invoke_service(
+                conversation_service.cancel,
+                session_id=conversation_turn.session_id,
+                content=result.final_response,
+                now=message.timestamp,
+            )
+        else:
+            await _invoke_service(
+                conversation_service.finish_turn,
+                session_id=conversation_turn.session_id,
+                disposition=(
+                    "completed" if state.checkpoint.phase == "completed" else "awaiting_user"
+                ),
+                content=result.final_response,
+                metadata={
+                    "turns": result.turns,
+                    "nightly_phase": state.checkpoint.phase,
+                    "nightly_checkpoint_version": NIGHTLY_CHECKPOINT_VERSION,
+                },
+                now=message.timestamp,
+            )
+        try:
+            await self._delivery.send_response(
+                result.final_response,
+                idempotency_key=(
+                    f"academic-discord-message:{message.message_id}:nightly-final-response:v2"
+                ),
+            )
+        finally:
+            await _safe_progress_finish(reporter, "finish_completed")
+        return DiscordMessageCallbackResult(status="handled")
+
     def _has_open_memory_session(self, message: DiscordAcademicMessageCreate) -> bool:
         if self._memory_service is None:
             return False
@@ -1194,6 +1866,7 @@ class NativeAcademicDiscordHandler:
             if isinstance(kind, str) and kind in {
                 "academic_end_of_day",
                 "academic_end_of_day_reflection",
+                "academic_nightly_task_checklist",
                 "nightly_reflection",
             }:
                 return True
@@ -1551,6 +2224,9 @@ class _AcademicToolState:
         self._calendar_semantic_interpreter = calendar_semantic_interpreter
         self._sync_attempted = False
         self._sync_error: str | None = None
+        self._sync_result: object | None = None
+        self._query_owner_scope = f"{owner_user_id or 'owner'}:{channel_id or 'channel'}"
+        self._query_envelopes: dict[str, QueryEnvelope[AcademicAssessmentOption]] = {}
         self._courses: dict[str, AcademicCourseOption] = {}
         self._assessments: dict[str, AcademicAssessmentOption] = {}
         self._validated_inbound_material_ids: set[uuid.UUID] = set()
@@ -1572,12 +2248,13 @@ class _AcademicToolState:
 
         if value is None:
             return
-        if value.get("version") != "academic-native-tools.v1":
+        if value.get("version") != "academic-native-tools.v2":
             raise ValueError("academic tool checkpoint version is unsupported")
         courses = _checkpoint_sequence(value, "courses", limit=100)
         assessments = _checkpoint_sequence(value, "assessments", limit=250)
         previews = _checkpoint_sequence(value, "inbound_material_previews", limit=5)
         mutations = _checkpoint_sequence(value, "mutations", limit=50)
+        query_envelopes = _checkpoint_sequence(value, "query_envelopes", limit=20)
         self._courses = {
             item.course_id: item
             for raw in courses
@@ -1587,6 +2264,11 @@ class _AcademicToolState:
             item.assessment_id: item
             for raw in assessments
             for item in (AcademicAssessmentOption.model_validate(raw),)
+        }
+        self._query_envelopes = {
+            envelope.query_id: envelope
+            for raw in query_envelopes
+            for envelope in (QueryEnvelope[AcademicAssessmentOption].model_validate(raw),)
         }
         self._validated_inbound_material_ids = {
             uuid.UUID(str(item))
@@ -1649,7 +2331,7 @@ class _AcademicToolState:
         """Return the bounded host-only state needed by a later owner turn."""
 
         return {
-            "version": "academic-native-tools.v1",
+            "version": "academic-native-tools.v2",
             "courses": [
                 item.model_dump(mode="json")
                 for item in sorted(self._courses.values(), key=lambda item: item.course_id)
@@ -1657,6 +2339,12 @@ class _AcademicToolState:
             "assessments": [
                 item.model_dump(mode="json")
                 for item in sorted(self._assessments.values(), key=lambda item: item.assessment_id)
+            ],
+            "query_envelopes": [
+                envelope.model_dump(mode="json")
+                for envelope in sorted(
+                    self._query_envelopes.values(), key=lambda item: item.query_id
+                )
             ],
             "validated_inbound_material_ids": sorted(
                 str(item) for item in self._validated_inbound_material_ids
@@ -1687,7 +2375,10 @@ class _AcademicToolState:
             ),
             self._tool(
                 "search_assessments",
-                "Search the owner's synchronized Notion course assessments and misc tasks.",
+                "Search the owner's synchronized academic items using host-enforced temporal, "
+                "completion, course, pagination, and freshness filters. Use temporal.scope for "
+                "today, tomorrow, this_week, upcoming, overdue, date_range, or all. Completion "
+                "defaults to incomplete; use completion=completed or all only when requested.",
                 _SearchAssessmentsArgs,
                 self._search_assessments,
             ),
@@ -1785,21 +2476,54 @@ class _AcademicToolState:
 
     async def _search_courses(self, arguments: Mapping[str, object]) -> object:
         args = _SearchCoursesArgs.model_validate(arguments)
-        await self._ensure_catalog_current()
-        results = tuple(self._catalog.search_courses(args.query)) if self._catalog else ()
+        freshness = await self._ensure_catalog_current(
+            requested_roles=set(args.roles) or {academic_calendar_role(args.query)},
+            course_query=args.query,
+        )
+        if self._catalog is None:
+            raise ToolExecutionError("The academic catalog is unavailable.")
+        result = self._catalog.search_courses(
+            args,
+            as_of=self._now,
+            timezone=self._timezone.key,
+            owner_scope=self._query_owner_scope,
+        )
+        results = tuple(result.results)
         self._courses.update((item.course_id, item) for item in results)
-        return [item.model_dump(mode="json") for item in results]
+        payload = result.envelope.model_dump(mode="json")
+        payload["items"] = [
+            {**item.model_dump(mode="json"), "stable_id": item.course_id} for item in results
+        ]
+        payload["freshness"] = freshness
+        return payload
 
     async def _search_assessments(self, arguments: Mapping[str, object]) -> object:
         args = _SearchAssessmentsArgs.model_validate(arguments)
-        await self._ensure_catalog_current()
+        args = args.model_copy(
+            update={
+                "temporal": args.temporal.model_copy(
+                    update={"scope": _normalize_temporal_scope(args.temporal.scope, args.query)}
+                )
+            }
+        )
+        requested_roles = set(args.roles)
+        if args.course_id is not None and args.course_id in self._courses:
+            requested_roles.add(self._courses[args.course_id].calendar_role)
+        freshness = await self._ensure_catalog_current(
+            requested_roles=requested_roles,
+            course_ids=(args.course_id,) if args.course_id is not None else (),
+        )
         if args.course_id is not None and args.course_id not in self._courses:
             raise ToolExecutionError("course_id must come from search_courses in this turn")
-        results = (
-            tuple(self._catalog.search_assessments(args.query, args.course_id))
-            if self._catalog
-            else ()
+        if self._catalog is None:
+            raise ToolExecutionError("The academic catalog is unavailable.")
+        result = self._catalog.search_assessments(
+            args,
+            as_of=self._now,
+            timezone=self._timezone.key,
+            owner_scope=self._query_owner_scope,
         )
+        results = tuple(result.results)
         self._assessments.update((item.assessment_id, item) for item in results)
         for item in results:
             self._courses.setdefault(
@@ -1810,7 +2534,16 @@ class _AcademicToolState:
                     title=item.course_code,
                 ),
             )
-        return [_assessment_result_for_model(item, self._timezone) for item in results]
+        rendered_items = [_assessment_result_for_model(item, self._timezone) for item in results]
+        payload = result.envelope.model_dump(mode="json")
+        payload["items"] = rendered_items
+        payload["result_count"] = len(rendered_items)
+        payload["freshness"] = freshness
+        trusted_freshness = tuple(SourceFreshness.model_validate(item) for item in freshness)
+        self._query_envelopes[result.envelope.query_id] = result.envelope.model_copy(
+            update={"freshness": trusted_freshness}
+        )
+        return payload
 
     async def _inspect_inbound_pdf(self, arguments: Mapping[str, object]) -> object:
         args = _InspectInboundPdfArgs.model_validate(arguments)
@@ -1936,46 +2669,108 @@ class _AcademicToolState:
         self._material_searched_assessment_ids.add(args.assessment_id)
         return safe_rows
 
-    async def _ensure_catalog_current(self) -> None:
-        if self._sync_attempted:
-            if self._sync_error is not None:
-                raise ToolExecutionError(self._sync_error)
-            return
-        self._sync_attempted = True
-        if self._syncer is None:
-            self._sync_error = (
-                "Notion academic catalog sync is not configured, so I cannot trust cached "
-                "catalog rows for this search."
-            )
+    async def _ensure_catalog_current(
+        self,
+        *,
+        requested_roles: set[AcademicCalendarRole] | None = None,
+        course_ids: tuple[str, ...] = (),
+        course_query: str = "",
+    ) -> list[dict[str, object]]:
+        requested = requested_roles or set(AcademicCalendarRole)
+        if not self._sync_attempted:
+            self._sync_attempted = True
+            if self._syncer is None:
+                self._sync_error = (
+                    "Academic catalog sync is not configured, so cached rows cannot be trusted."
+                )
+            else:
+                try:
+                    self._sync_result = await asyncio.wait_for(
+                        self._syncer.sync(now=self._now),
+                        timeout=self._sync_timeout_seconds,
+                    )
+                except TimeoutError:
+                    self._sync_error = (
+                        "Academic catalog sync timed out, so cached rows cannot be trusted."
+                    )
+                except Exception:
+                    self._sync_error = (
+                        "Academic catalog sync failed, so cached rows cannot be trusted."
+                    )
+        if self._sync_error is not None:
             raise ToolExecutionError(self._sync_error)
-        try:
-            result = await asyncio.wait_for(
-                self._syncer.sync(now=self._now),
-                timeout=self._sync_timeout_seconds,
-            )
-        except TimeoutError:
-            self._sync_error = (
-                "Notion academic catalog sync timed out before search, so I cannot trust "
-                "cached catalog rows."
-            )
-            raise ToolExecutionError(self._sync_error) from None
-        except Exception:
-            self._sync_error = (
-                "Notion academic catalog sync failed before search, so I cannot trust cached "
-                "catalog rows."
-            )
-            raise ToolExecutionError(self._sync_error) from None
+        result = self._sync_result
         status = str(getattr(result, "status", ""))
-        if status != "succeeded":
-            diagnostic_codes = tuple(str(code) for code in getattr(result, "diagnostic_codes", ()))
-            suffix = (
-                f" Diagnostic codes: {', '.join(diagnostic_codes[:5])}." if diagnostic_codes else ""
+        diagnostics = tuple(str(code) for code in getattr(result, "diagnostic_codes", ()))
+        raw_unavailable = cast(Sequence[object], getattr(result, "unavailable_roles", ()))
+        unavailable: set[AcademicCalendarRole] = {
+            role if isinstance(role, AcademicCalendarRole) else AcademicCalendarRole(str(role))
+            for role in raw_unavailable
+        }
+        unavailable_pages = {
+            str(item) for item in getattr(result, "unavailable_course_page_ids", ())
+        }
+        persisted_sources: tuple[Mapping[str, object], ...] = ()
+        source_probe = getattr(self._catalog, "academic_source_freshness", None)
+        if callable(source_probe):
+            raw_sources = source_probe(
+                query=course_query,
+                roles=tuple(sorted(requested, key=lambda role: role.value)),
+                course_ids=course_ids,
             )
-            self._sync_error = (
-                f"Notion academic catalog sync returned {status or 'unknown'} before search, "
-                "so I cannot trust cached catalog rows." + suffix
+            if inspect.isawaitable(raw_sources):
+                raw_sources = await raw_sources
+            persisted_sources = tuple(cast(Sequence[Mapping[str, object]], raw_sources))
+        bad_sources = tuple(
+            source
+            for source in persisted_sources
+            if source.get("discovery_status") != "valid"
+            or source.get("last_synced_at") is None
+            or str(source.get("course_page_id", "")) in unavailable_pages
+        )
+        scope_proven = bool(persisted_sources) and not bad_sources
+        blocking = requested & unavailable
+        if scope_proven:
+            blocking = set[AcademicCalendarRole]()
+        role_scope_proven = bool(requested_roles) and bool(unavailable) and not blocking
+        partial_without_scope_proof = (
+            status == "partial" and not scope_proven and not role_scope_proven
+        )
+        if (
+            status not in {"succeeded", "partial"}
+            or blocking
+            or bad_sources
+            or partial_without_scope_proof
+        ):
+            relevant = ", ".join(sorted(role.value for role in blocking))
+            suffix = f" Requested unavailable roles: {relevant}." if relevant else ""
+            codes = f" Diagnostic codes: {', '.join(diagnostics[:5])}." if diagnostics else ""
+            raise ToolExecutionError(
+                f"Notion academic catalog sync returned {status or 'unknown'} before search; "
+                "sources required by this query are unavailable or stale, so I cannot trust "
+                "cached catalog rows." + suffix + codes
             )
-            raise ToolExecutionError(self._sync_error)
+        synced_at = getattr(result, "synced_at", None) or self._now
+        state = (
+            FreshnessState.FRESH_COMPLETE
+            if status == "succeeded"
+            else FreshnessState.FRESH_PARTIAL_FOR_UNREQUESTED_SOURCES
+        )
+        if persisted_sources:
+            return [
+                SourceFreshness(
+                    source_id=str(source.get("source_id") or source.get("course_page_id")),
+                    state=state,
+                    as_of=cast(datetime, source.get("last_synced_at") or synced_at),
+                    diagnostic_codes=(),
+                ).model_dump(mode="json")
+                for source in persisted_sources
+            ]
+        return [
+            SourceFreshness(source_id="academic_catalog", state=state, as_of=synced_at).model_dump(
+                mode="json"
+            )
+        ]
 
     async def _create_assessment(self, arguments: Mapping[str, object]) -> object:
         args = _CreateAssessmentArgs.model_validate(arguments)
@@ -1993,7 +2788,7 @@ class _AcademicToolState:
 
     async def _create_misc_task(self, arguments: Mapping[str, object]) -> object:
         args = _CreateMiscTaskArgs.model_validate(arguments)
-        await self._ensure_catalog_current()
+        await self._ensure_catalog_current(requested_roles={AcademicCalendarRole.MISC})
         finder = getattr(self._catalog, "search_misc_courses", None)
         if not callable(finder):
             raise ToolExecutionError("The reserved misc calendar lookup is unavailable.")
@@ -2255,6 +3050,96 @@ class _AcademicToolState:
             inbound_material_previews=self._inbound_material_previews,
         )
 
+    def validate_lifecycle(
+        self,
+        lifecycle: ConversationLifecycle,
+        messages: Sequence[BaseMessage],
+    ) -> str | None:
+        lifecycle_error = _validate_conversation_lifecycle(lifecycle, messages)
+        if lifecycle_error is not None:
+            return lifecycle_error
+        if (
+            lifecycle.disposition != "completed"
+            or not self.has_query_results
+            or self.has_prepared_proposal
+        ):
+            return None
+        grounding = lifecycle.grounding
+        if grounding is None:
+            return (
+                "a structured grounding selection is required after an academic list query; "
+                "provide its query_id and selected returned item_ids"
+            )
+        return self.validate_grounding(grounding)
+
+    @property
+    def has_query_results(self) -> bool:
+        return bool(self._query_envelopes)
+
+    @property
+    def has_prepared_proposal(self) -> bool:
+        return bool(self._mutations)
+
+    def query_envelope(self, query_id: str) -> QueryEnvelope[AcademicAssessmentOption] | None:
+        return self._query_envelopes.get(query_id)
+
+    def validate_grounding(self, grounding: Any) -> str | None:
+        envelope = self.query_envelope(grounding.query_id)
+        if envelope is None:
+            return "grounding query_id was not returned by a current trusted academic query"
+        known_ids = {item.assessment_id for item in envelope.items}
+        unknown = set(grounding.item_ids) - known_ids
+        if unknown:
+            return "grounding item_ids contain an unknown or out-of-scope item"
+        if envelope.has_more and not grounding.acknowledge_incomplete:
+            return "grounding must acknowledge that more matching items are available"
+        stale = any(item.state is FreshnessState.CACHED_STALE for item in envelope.freshness)
+        if stale and not grounding.acknowledge_stale:
+            return "grounding must acknowledge stale cached source data"
+        return None
+
+    def render_lifecycle(
+        self,
+        lifecycle: ConversationLifecycle,
+        _messages: Sequence[BaseMessage],
+    ) -> str:
+        grounding = lifecycle.grounding
+        if grounding is None:
+            return lifecycle.content
+        return self.render_grounding(grounding)
+
+    def render_grounding(self, grounding: Any) -> str:
+        envelope = self.query_envelope(grounding.query_id)
+        if envelope is None:
+            return "I could not safely render that academic result. Please run the search again."
+        selected = {item.assessment_id: item for item in envelope.items}
+        items = [selected[item_id] for item_id in grounding.item_ids]
+        if not items:
+            lines = ["I found no matching academic items in the requested scope."]
+        else:
+            lines = ["Here are the matching academic items:"]
+            for item in items:
+                if item.due_date_local is None:
+                    date_label = "date unavailable"
+                elif item.is_all_day:
+                    date_label = item.due_date_local.strftime("%A, %B %-d, %Y")
+                elif item.due_at_local is not None:
+                    local_due = datetime.fromisoformat(item.due_at_local)
+                    date_label = local_due.strftime("%A, %B %-d, %Y at %-I:%M %p")
+                else:
+                    date_label = item.due_date_local.strftime("%A, %B %-d, %Y")
+                lines.append(f"- {item.course_code}: {item.title} — {date_label}")
+        if envelope.has_more:
+            lines.append("More matching items are available; ask me for the next page.")
+        if any(
+            item.state is FreshnessState.FRESH_PARTIAL_FOR_UNREQUESTED_SOURCES
+            for item in envelope.freshness
+        ):
+            lines.append(
+                "The requested sources are fresh; unrelated academic sources need attention."
+            )
+        return "\n".join(lines)
+
 
 def _render_event(event: AgentHarnessEvent) -> str | None:
     if event.kind == "assistant_text" and event.content:
@@ -2296,6 +3181,27 @@ def _is_proactive_skip_command(content: str) -> bool:
     }
 
 
+def _nightly_range_values(date_range: Any) -> tuple[datetime, datetime | None]:
+    if date_range.all_day:
+        start = datetime.combine(date_range.start_date, datetime.min.time(), tzinfo=UTC)
+        end = (
+            datetime.combine(date_range.end_date, datetime.min.time(), tzinfo=UTC)
+            if date_range.end_date is not None
+            else None
+        )
+        return start, end
+    zone = ZoneInfo(date_range.timezone_name)
+    start = datetime.combine(date_range.start_date, date_range.start_time, tzinfo=zone).astimezone(
+        UTC
+    )
+    end = (
+        datetime.combine(date_range.end_date, date_range.end_time, tzinfo=zone).astimezone(UTC)
+        if date_range.end_date is not None and date_range.end_time is not None
+        else None
+    )
+    return start, end
+
+
 def _normalize_clarification(content: str) -> str:
     return " ".join(re.findall(r"[a-z0-9]+", content.casefold()))
 
@@ -2315,6 +3221,29 @@ def _terminal_lifecycle(message: AIMessage) -> ConversationLifecycle | None:
         disposition=cast(Literal["awaiting_user", "completed"], disposition),
         content=content,
     )
+
+
+_GROUNDED_QUERY_TOOLS = frozenset(
+    {
+        "search_assessments",
+        "search_jobs_context",
+        "search_job_interviews",
+        "search_learn_courses",
+        "get_learn_scheduled_items",
+        "get_learn_announcements",
+    }
+)
+
+
+def _current_turn_has_grounded_query(messages: Sequence[BaseMessage]) -> bool:
+    for message in reversed(messages[:-1]):
+        if isinstance(message, HumanMessage):
+            break
+        if not isinstance(message, ToolMessage) or message.status != "success":
+            continue
+        if str(getattr(message, "name", "")) in _GROUNDED_QUERY_TOOLS:
+            return True
+    return False
 
 
 def _validate_conversation_lifecycle(
@@ -2806,10 +3735,31 @@ def _assessment_result_for_model(
     timezone: ZoneInfo,
 ) -> dict[str, object]:
     payload = assessment.model_dump(mode="json")
-    if assessment.due_at is not None:
+    payload["stable_id"] = assessment.assessment_id
+    if assessment.is_all_day and assessment.due_date_local is not None:
+        payload["due_at"] = assessment.due_date_local.isoformat()
+        payload["due_at_timezone"] = timezone.key
+    elif assessment.due_at is not None:
         payload["due_at"] = assessment.due_at.astimezone(timezone).isoformat()
         payload["due_at_timezone"] = timezone.key
     return payload
+
+
+def _normalize_temporal_scope(scope: TemporalScope, query: str) -> TemporalScope:
+    if scope is not TemporalScope.ALL:
+        return scope
+    words = set(re.findall(r"[a-z0-9]+", query.casefold()))
+    if {"today", "todays"} & words:
+        return TemporalScope.TODAY
+    if "tomorrow" in words:
+        return TemporalScope.TOMORROW
+    if "overdue" in words:
+        return TemporalScope.OVERDUE
+    if "upcoming" in words or ({"coming", "up"} <= words):
+        return TemporalScope.UPCOMING
+    if "week" in words and ("this" in words or "due" in words):
+        return TemporalScope.THIS_WEEK
+    return scope
 
 
 def _render_tool_error(error: str | None) -> str | None:

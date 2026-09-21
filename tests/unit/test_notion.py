@@ -369,6 +369,36 @@ async def test_missing_or_duplicate_child_calendar_is_a_diagnostic(
 
 
 @pytest.mark.asyncio
+async def test_reserved_schedule_row_does_not_discover_seeded_assessments_database() -> None:
+    requests: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        if request.url.path == "/v1/databases/courses-db":
+            return httpx.Response(200, json={"data_sources": [{"id": "courses-source"}]})
+        if request.url.path == "/v1/data_sources/courses-source/query":
+            return httpx.Response(
+                200,
+                json={
+                    "results": [_course_page("schedule-row", " Classes + Tutorials + Labs ")],
+                    "has_more": False,
+                    "next_cursor": None,
+                },
+            )
+        return httpx.Response(404, json={"message": "child discovery must not run"})
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+        connector = NotionConnector(token="secret", courses_database_id="courses-db", client=client)
+        result = await connector.discover_course_assessments()
+
+    assert len(result.courses) == 1
+    assert result.courses[0].assessments == ()
+    assert result.courses[0].assessments_database_id is None
+    assert result.diagnostics == ()
+    assert not any(request.url.path.startswith("/v1/blocks/") for request in requests)
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize(
     ("schema", "code"),
     [

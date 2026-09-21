@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import math
 import re
+import secrets
 import uuid
 from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass
@@ -87,7 +88,7 @@ AcademicDocumentExtractionStatus = Literal[
     "failed",
     "inactive",
 ]
-CalendarSemanticStatus = Literal["valid", "not_substantive", "unavailable", "invalid"]
+CalendarSemanticStatus = Literal["valid", "unavailable", "invalid"]
 AcademicClarificationWriteAction = Literal[
     "quiz",
     "assignment",
@@ -247,12 +248,14 @@ class ReflectionEmbeddingBackfillCandidate:
 
 @dataclass(frozen=True, slots=True)
 class CourseCalendarInput:
-    """Normalized discovered Notion Assessments source for one course page."""
+    """Normalized discovered calendar source for one course page."""
 
     course_id: uuid.UUID
     course_page_id: str
     child_database_id: str | None
     child_data_source_id: str | None
+    source_kind: str = "notion"
+    external_source_id: str | None = None
     title_property_id: str | None = None
     title_property_name: str | None = None
     date_property_id: str | None = None
@@ -268,12 +271,12 @@ class CourseCalendarInput:
 
 @dataclass(frozen=True, slots=True)
 class AssessmentSourceTrace:
-    """Trace fields preserved for guarded title-only Notion writes."""
+    """Trace fields preserved for external source reconciliation and guarded writes."""
 
     source_id: str
     source_scope: str
     notion_last_edited_at: datetime
-    title_property_id: str
+    title_property_id: str | None
     label_source: str | None = None
     source_url: str | None = None
     active: bool = True
@@ -307,6 +310,42 @@ class AcademicAssessmentMutationTarget:
     ends_at: datetime | None = None
     learn_context_property_id: str | None = None
     is_all_day: bool = False
+
+
+@dataclass(frozen=True, slots=True)
+class NightlyAcademicAssessmentCandidate:
+    """Trusted current-day course-calendar item for nightly semantic eligibility."""
+
+    course_id: str
+    course_code: str
+    course_title: str
+    assessment_id: str
+    page_id: str
+    title: str
+    assessment_type: str
+    starts_at: datetime
+    ends_at: datetime | None
+    local_date: date
+    local_start_label: str
+    local_end_label: str | None
+    is_all_day: bool
+    source_id: str
+    source_scope: str | None
+    source_url: str | None
+    source_last_edited_at: datetime
+    source_synced_at: datetime
+    title_property_id: str
+    date_property_id: str
+    semantic_status: CalendarSemanticStatus
+    semantic_overview: str | None = None
+    semantic_description: str | None = None
+    semantic_intent_value: str | None = None
+    semantic_intent_status: str | None = None
+    semantic_intent_rationale: str | None = None
+    semantic_evidence_fragment_ids: tuple[str, ...] = ()
+    semantic_description_fragment_ids: tuple[str, ...] = ()
+    semantic_intent_evidence_fragment_ids: tuple[str, ...] = ()
+    semantic_source_fingerprint: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -1038,15 +1077,26 @@ class AcademicRepository:
             raise ValueError("invalid course calendar discovery status")
         if not calendar.course_page_id.strip():
             raise ValueError("course page identifier must not be empty")
-        if calendar.discovery_status == "valid" and (
-            not calendar.child_database_id or not calendar.child_data_source_id
-        ):
-            raise ValueError("valid course calendars require database and data-source identifiers")
+        if calendar.source_kind not in {"notion", "google_ical"}:
+            raise ValueError("invalid course calendar source kind")
+        if calendar.discovery_status == "valid":
+            if calendar.source_kind == "notion" and (
+                not calendar.child_database_id or not calendar.child_data_source_id
+            ):
+                raise ValueError(
+                    "valid Notion course calendars require database and data-source identifiers"
+                )
+            if calendar.source_kind == "google_ical" and not calendar.external_source_id:
+                raise ValueError(
+                    "valid Google iCal schedules require an external source identifier"
+                )
         values = {
             "course_id": calendar.course_id,
             "course_page_id": _bounded(calendar.course_page_id),
             "child_database_id": _bounded_optional(calendar.child_database_id),
             "child_data_source_id": _bounded_optional(calendar.child_data_source_id),
+            "source_kind": calendar.source_kind,
+            "external_source_id": _bounded_optional(calendar.external_source_id),
             "title_property_id": _bounded_optional(calendar.title_property_id),
             "title_property_name": _bounded_optional(calendar.title_property_name),
             "date_property_id": _bounded_optional(calendar.date_property_id),
@@ -1135,7 +1185,7 @@ class AcademicRepository:
                     "notion_last_edited_at": _utc(
                         trace.notion_last_edited_at, "notion_last_edited_at"
                     ),
-                    "title_property_id": _bounded(trace.title_property_id),
+                    "title_property_id": _bounded_optional(trace.title_property_id),
                     "label_source": _bounded_optional(trace.label_source),
                     "source_url": trace.source_url or values["source_url"],
                     "active": trace.active,
@@ -4155,15 +4205,61 @@ class SQLAlchemyAcademicPlannerStore:
         self.confirmation_ttl_hours = confirmation_ttl_hours
         self.embedding_gateway = embedding_gateway
         self.default_practice_minutes = default_practice_minutes
+        from app.agents.query_contracts import CursorCodec
 
-    def search_courses(self, query: str) -> Sequence[Any]:
-        """Return a bounded writable course inventory for semantic model selection."""
+        self._query_cursor_codec = CursorCodec(secrets.token_bytes(32))
 
-        from app.agents.academic_planner.contracts import AcademicCourseOption
+    def search_courses(
+        self,
+        query: Any,
+        *,
+        as_of: datetime,
+        timezone: str,
+        owner_scope: str,
+    ) -> Any:
+        """Return a filtered, cursor-bound course page in the common envelope."""
 
-        del query
+        from app.agents.academic_planner.contracts import (
+            AcademicCourseOption,
+            AcademicCourseQueryArgs,
+            AcademicCourseSearchResult,
+        )
+        from app.agents.query_contracts import (
+            MODEL_TOOL_RESULT_MAX_CHARS,
+            CompletenessState,
+            FreshnessState,
+            NormalizedQueryFilters,
+            QueryEnvelope,
+            SourceFreshness,
+            TemporalQuery,
+            model_json_size,
+            resolve_temporal_window,
+        )
+
+        args = AcademicCourseQueryArgs.model_validate(query)
+        query_as_of = _utc(as_of, "as_of")
+        filters = NormalizedQueryFilters(
+            temporal=resolve_temporal_window(
+                TemporalQuery(), request_time=query_as_of, timezone=timezone
+            ),
+            text=args.query,
+            roles=tuple(role.value for role in args.roles),
+            limit=args.limit,
+        )
+        snapshot = query_as_of.isoformat()
+        cursor_last = (
+            self._query_cursor_codec.decode(
+                args.cursor,
+                filters=filters,
+                owner_scope=owner_scope,
+                snapshot=snapshot,
+            )
+            if args.cursor is not None
+            else None
+        )
+        terms = _academic_query_terms(args.query)
         with Session(self.engine) as session:
-            rows = session.execute(
+            statement = (
                 select(Course, AcademicCourseCalendar)
                 .join(AcademicCourseCalendar, AcademicCourseCalendar.course_id == Course.id)
                 .where(
@@ -4174,19 +4270,103 @@ class SQLAlchemyAcademicPlannerStore:
                     AcademicCourseCalendar.date_property_id.is_not(None),
                 )
                 .order_by(Course.course_code, Course.term, Course.id)
-                .limit(20)
             )
-            options = [
-                AcademicCourseOption(
-                    course_id=str(course.id),
-                    course_code=course.course_code,
-                    title=course.title,
-                    calendar_role=academic_calendar_role(course.title),
+            for term in terms:
+                pattern = f"%{term}%"
+                statement = statement.where(
+                    or_(
+                        func.lower(Course.course_code).like(pattern),
+                        func.lower(Course.title).like(pattern),
+                        func.lower(Course.term).like(pattern),
+                    )
                 )
-                for course, _calendar in rows
-                if academic_calendar_role(course.title) is AcademicCalendarRole.COURSE
+            rows = session.execute(statement)
+            candidates = [
+                (
+                    AcademicCourseOption(
+                        course_id=str(course.id),
+                        course_code=course.course_code,
+                        title=course.title,
+                        calendar_role=academic_calendar_role(course.title),
+                    ),
+                    calendar,
+                    course.term,
+                )
+                for course, calendar in rows
+                if not args.roles or academic_calendar_role(course.title) in args.roles
             ]
-        return tuple(options)
+        if cursor_last is not None:
+            if len(cursor_last) != 3:
+                raise ValueError("course cursor is invalid")
+            candidates = [
+                item
+                for item in candidates
+                if (item[0].course_code, item[2], item[0].course_id) > cursor_last
+            ]
+        page = list(candidates[: args.limit])
+        has_more = len(candidates) > args.limit
+        query_id = f"acad-course:{uuid.uuid4()}"
+        while True:
+            options = tuple(item[0] for item in page)
+            next_cursor = None
+            if has_more and page:
+                last, _calendar, term = page[-1]
+                next_cursor = self._query_cursor_codec.encode(
+                    filters=filters,
+                    owner_scope=owner_scope,
+                    snapshot=snapshot,
+                    last_key=(last.course_code, term, last.course_id),
+                )
+            freshness = tuple(
+                SourceFreshness(
+                    source_id=str(
+                        calendar.external_source_id
+                        or calendar.child_data_source_id
+                        or option.course_id
+                    ),
+                    state=FreshnessState.FRESH_COMPLETE,
+                    as_of=(
+                        _aware_db(calendar.last_synced_at)
+                        if calendar.last_synced_at is not None
+                        else query_as_of
+                    ),
+                )
+                for option, calendar, _term in page
+            ) or (
+                SourceFreshness(
+                    source_id="academic_catalog",
+                    state=FreshnessState.FRESH_COMPLETE,
+                    as_of=query_as_of,
+                ),
+            )
+            envelope = QueryEnvelope[AcademicCourseOption](
+                query_id=query_id,
+                as_of=query_as_of,
+                timezone=timezone,
+                applied_filters=filters,
+                freshness=freshness,
+                items=options,
+                result_count=len(options),
+                has_more=has_more,
+                next_cursor=next_cursor,
+                completeness=(
+                    CompletenessState.MORE_AVAILABLE if has_more else CompletenessState.COMPLETE
+                ),
+            )
+            if (
+                model_json_size(
+                    {"status": "succeeded", "content": envelope.model_dump(mode="json")}
+                )
+                <= MODEL_TOOL_RESULT_MAX_CHARS - 256
+            ):
+                break
+            if not page:
+                from app.agents.harness import ToolResultOversizeError
+
+                raise ToolResultOversizeError
+            page.pop()
+            has_more = True
+        return AcademicCourseSearchResult(results=options, envelope=envelope)
 
     def load_active_morning_courses(self) -> tuple[Mapping[str, str], ...]:
         """Return every active, valid, non-reserved course in stable display order."""
@@ -4212,6 +4392,61 @@ class SQLAlchemyAcademicPlannerStore:
                 }
                 for course, _calendar in rows
                 if academic_calendar_role(course.title) is AcademicCalendarRole.COURSE
+            )
+
+    def academic_source_freshness(
+        self,
+        *,
+        query: str = "",
+        roles: Sequence[AcademicCalendarRole] = (),
+        course_ids: Sequence[str] = (),
+    ) -> tuple[Mapping[str, Any], ...]:
+        """Return persisted freshness facts for exactly the sources a read can depend on."""
+
+        parsed_ids = tuple(filter(None, (_parse_uuid(value) for value in course_ids)))
+        if course_ids and len(parsed_ids) != len(course_ids):
+            raise ValueError("course_ids contain an invalid identifier")
+        terms = _academic_query_terms(query)
+        with Session(self.engine) as session:
+            statement = (
+                select(Course, AcademicCourseCalendar)
+                .join(AcademicCourseCalendar, AcademicCourseCalendar.course_id == Course.id)
+                .where(Course.active.is_(True))
+                .order_by(Course.course_code, Course.term, Course.id)
+            )
+            if parsed_ids:
+                statement = statement.where(Course.id.in_(parsed_ids))
+            for term in terms:
+                pattern = f"%{term}%"
+                statement = statement.where(
+                    or_(
+                        func.lower(Course.course_code).like(pattern),
+                        func.lower(Course.title).like(pattern),
+                        func.lower(Course.term).like(pattern),
+                    )
+                )
+            rows = session.execute(statement)
+            return tuple(
+                {
+                    "course_id": str(course.id),
+                    "course_page_id": course.notion_id,
+                    "source_id": (
+                        calendar.external_source_id
+                        or calendar.child_data_source_id
+                        or course.notion_id
+                    ),
+                    "role": role.value,
+                    "discovery_status": calendar.discovery_status,
+                    "diagnostic_code": calendar.diagnostic_code,
+                    "last_synced_at": (
+                        _aware_db(calendar.last_synced_at)
+                        if calendar.last_synced_at is not None
+                        else None
+                    ),
+                }
+                for course, calendar in rows
+                for role in (academic_calendar_role(course.title),)
+                if not roles or role in roles
             )
 
     def search_misc_courses(self) -> Sequence[Any]:
@@ -4341,23 +4576,68 @@ class SQLAlchemyAcademicPlannerStore:
 
     def search_assessments(
         self,
-        query: str,
-        course_id: str | None = None,
-    ) -> Sequence[Any]:
-        """Return a bounded active assessment inventory for semantic model selection."""
+        query: Any,
+        *,
+        as_of: datetime,
+        timezone: str,
+        owner_scope: str,
+    ) -> Any:
+        """Return a deterministic bounded assessment result envelope."""
 
         from app.agents.academic_planner.contracts import (
             AcademicAssessmentOption,
+            AcademicAssessmentQueryArgs,
+            AcademicAssessmentSearchResult,
             AssessmentType,
         )
+        from app.agents.query_contracts import (
+            MODEL_TOOL_RESULT_MAX_CHARS,
+            CompletenessState,
+            CompletionMode,
+            FreshnessState,
+            NormalizedQueryFilters,
+            QueryEnvelope,
+            SourceFreshness,
+            model_json_size,
+            resolve_temporal_window,
+        )
 
-        del query
-        selected_course_id = _parse_uuid(course_id) if course_id is not None else None
-        if course_id is not None and selected_course_id is None:
-            return ()
+        args = AcademicAssessmentQueryArgs.model_validate(query)
+        selected_course_id = _parse_uuid(args.course_id) if args.course_id is not None else None
+        if args.course_id is not None and selected_course_id is None:
+            raise ValueError("course_id is invalid")
+        query_as_of = _utc(as_of, "as_of")
+        scope = _normalize_academic_temporal_scope(args.temporal.scope, args.query)
+        zone = ZoneInfo(timezone)
+        temporal = args.temporal.model_copy(update={"scope": scope})
+        window = resolve_temporal_window(
+            temporal,
+            request_time=query_as_of,
+            timezone=timezone,
+        )
+        terms = _academic_query_terms(args.query)
+        applied_filters = NormalizedQueryFilters(
+            temporal=window,
+            completion=args.completion,
+            text=args.query,
+            roles=tuple(role.value for role in args.roles),
+            source_ids=(args.course_id,) if args.course_id else (),
+            limit=args.limit,
+        )
+        snapshot = query_as_of.isoformat()
+        cursor_last = (
+            self._query_cursor_codec.decode(
+                args.cursor,
+                filters=applied_filters,
+                owner_scope=owner_scope,
+                snapshot=snapshot,
+            )
+            if args.cursor is not None
+            else None
+        )
         with Session(self.engine) as session:
             statement = (
-                select(Assessment, Course)
+                select(Assessment, Course, AcademicCourseCalendar)
                 .join(Course, Course.id == Assessment.course_id)
                 .join(AcademicCourseCalendar, AcademicCourseCalendar.course_id == Course.id)
                 .where(
@@ -4365,34 +4645,351 @@ class SQLAlchemyAcademicPlannerStore:
                     Assessment.active.is_(True),
                     Assessment.archived.is_(False),
                     Assessment.notion_last_edited_at.is_not(None),
-                    Assessment.title_property_id.is_not(None),
                     AcademicCourseCalendar.discovery_status == "valid",
-                    AcademicCourseCalendar.date_property_id.is_not(None),
                 )
                 .order_by(Assessment.due_at, Assessment.title, Assessment.id)
-                .limit(20)
             )
+            if args.completion is CompletionMode.INCOMPLETE:
+                statement = statement.where(Assessment.completed.is_(False))
+            elif args.completion is CompletionMode.COMPLETED:
+                statement = statement.where(Assessment.completed.is_(True))
             if selected_course_id is not None:
                 statement = statement.where(Course.id == selected_course_id)
+            if window.start_at is not None or window.end_at is not None:
+                statement = statement.where(Assessment.due_at.is_not(None))
+                timed_constraints: list[Any] = [Assessment.is_all_day.is_(False)]
+                all_day_constraints: list[Any] = [Assessment.is_all_day.is_(True)]
+                if window.start_at is not None:
+                    timed_constraints.append(Assessment.due_at >= window.start_at.astimezone(UTC))
+                if window.start_local_date is not None:
+                    all_day_constraints.append(
+                        Assessment.due_at
+                        >= datetime.combine(
+                            window.start_local_date,
+                            datetime.min.time(),
+                            tzinfo=UTC,
+                        )
+                    )
+                if window.end_at is not None:
+                    timed_constraints.append(Assessment.due_at < window.end_at.astimezone(UTC))
+                if window.end_local_date_exclusive is not None:
+                    all_day_constraints.append(
+                        Assessment.due_at
+                        < datetime.combine(
+                            window.end_local_date_exclusive,
+                            datetime.min.time(),
+                            tzinfo=UTC,
+                        )
+                    )
+                statement = statement.where(
+                    or_(and_(*timed_constraints), and_(*all_day_constraints))
+                )
+            for term in terms:
+                pattern = f"%{term}%"
+                statement = statement.where(
+                    or_(
+                        func.lower(Assessment.title).like(pattern),
+                        func.lower(Course.course_code).like(pattern),
+                        func.lower(Course.title).like(pattern),
+                    )
+                )
             rows = session.execute(statement)
-            options = [
-                AcademicAssessmentOption(
+            options: list[AcademicAssessmentOption] = []
+            freshness: dict[str, SourceFreshness] = {}
+            last_sort: dict[str, str] | None = None
+            has_more = False
+            for assessment, course, calendar in rows:
+                due_at = _aware_db(assessment.due_at) if assessment.due_at is not None else None
+                if due_at is None:
+                    continue
+                role = academic_calendar_role(course.title)
+                if args.roles and role not in args.roles:
+                    continue
+                if not _assessment_in_window(
+                    due_at,
+                    is_all_day=bool(assessment.is_all_day),
+                    window=window,
+                    timezone=zone,
+                ):
+                    continue
+                if cursor_last is not None and not _assessment_after_cursor(
+                    due_at=due_at,
+                    title=assessment.title,
+                    assessment_id=str(assessment.id),
+                    cursor_last=cursor_last,
+                ):
+                    continue
+                source_id = (
+                    calendar.external_source_id
+                    or calendar.child_data_source_id
+                    or assessment.source_id
+                    or str(course.id)
+                )
+                if source_id not in freshness:
+                    freshness[source_id] = SourceFreshness(
+                        source_id=str(source_id),
+                        state=(
+                            FreshnessState.FRESH_COMPLETE
+                            if calendar.last_synced_at is not None
+                            else FreshnessState.UNAVAILABLE
+                        ),
+                        as_of=(
+                            _aware_db(calendar.last_synced_at)
+                            if calendar.last_synced_at is not None
+                            else None
+                        ),
+                        diagnostic_codes=(
+                            (str(calendar.diagnostic_code),) if calendar.diagnostic_code else ()
+                        ),
+                    )
+                due_date_local = (
+                    due_at.date() if assessment.is_all_day else due_at.astimezone(zone).date()
+                )
+                item = AcademicAssessmentOption(
                     assessment_id=str(assessment.id),
                     course_id=str(course.id),
                     course_code=course.course_code,
                     title=assessment.title,
-                    due_at=(
-                        _aware_db(assessment.due_at) if assessment.due_at is not None else None
+                    due_at=due_at,
+                    ends_at=(
+                        _aware_db(assessment.ends_at) if assessment.ends_at is not None else None
                     ),
+                    due_at_local=(
+                        due_date_local.isoformat()
+                        if assessment.is_all_day
+                        else due_at.astimezone(zone).isoformat()
+                    ),
+                    due_date_local=due_date_local,
+                    is_all_day=bool(assessment.is_all_day),
                     assessment_type=_planner_assessment_type(
                         AssessmentType,
                         assessment.assessment_type,
                     ),
                     expected_last_edited_at=_aware_db(assessment.notion_last_edited_at),
                 )
-                for assessment, course in rows
-            ]
-        return tuple(options)
+                if len(options) < args.limit:
+                    options.append(item)
+                    last_sort = {
+                        "due_at": due_at.isoformat(),
+                        "title": assessment.title,
+                        "id": str(assessment.id),
+                    }
+                    continue
+                has_more = True
+                break
+        if not freshness:
+            freshness["academic_catalog"] = SourceFreshness(
+                source_id="academic_catalog",
+                state=FreshnessState.FRESH_COMPLETE,
+                as_of=query_as_of,
+            )
+        query_id = f"acad-assess:{uuid.uuid4()}"
+        while True:
+            if options:
+                last_item = options[-1]
+                last_sort = {
+                    "due_at": cast(datetime, last_item.due_at).isoformat(),
+                    "title": last_item.title,
+                    "id": last_item.assessment_id,
+                }
+            next_cursor = (
+                self._query_cursor_codec.encode(
+                    filters=applied_filters,
+                    owner_scope=owner_scope,
+                    snapshot=snapshot,
+                    last_key=(
+                        str(last_sort["due_at"]),
+                        str(last_sort["title"]),
+                        str(last_sort["id"]),
+                    ),
+                )
+                if has_more and last_sort is not None
+                else None
+            )
+            envelope = QueryEnvelope[AcademicAssessmentOption](
+                query_id=query_id,
+                as_of=query_as_of,
+                timezone=timezone,
+                applied_filters=applied_filters,
+                freshness=tuple(freshness.values()),
+                items=tuple(options),
+                result_count=len(options),
+                has_more=has_more,
+                next_cursor=next_cursor,
+                completeness=(
+                    CompletenessState.MORE_AVAILABLE if has_more else CompletenessState.COMPLETE
+                ),
+            )
+            if (
+                model_json_size(
+                    {"status": "succeeded", "content": envelope.model_dump(mode="json")}
+                )
+                <= MODEL_TOOL_RESULT_MAX_CHARS - 256
+            ):
+                break
+            if not options:
+                from app.agents.harness import ToolResultOversizeError
+
+                raise ToolResultOversizeError
+            options.pop()
+            has_more = True
+        return AcademicAssessmentSearchResult(results=tuple(options), envelope=envelope)
+
+    def load_nightly_current_day_assessment_candidates(
+        self,
+        *,
+        local_date: date,
+        as_of: datetime,
+        timezone: str = "America/Toronto",
+        max_source_age: timedelta = timedelta(hours=26),
+    ) -> tuple[NightlyAcademicAssessmentCandidate, ...]:
+        """Return fresh trusted course-calendar candidates for one nightly checklist day."""
+
+        if max_source_age <= timedelta(0):
+            raise ValueError("max_source_age must be positive")
+        zone = ZoneInfo(timezone)
+        query_as_of = _utc(as_of, "as_of")
+        oldest_fresh_sync = query_as_of - max_source_age
+        latest_reasonable_sync = query_as_of + timedelta(minutes=5)
+        local_start = datetime.combine(local_date, datetime.min.time(), tzinfo=zone)
+        local_end = datetime.combine(
+            local_date + timedelta(days=1),
+            datetime.min.time(),
+            tzinfo=zone,
+        )
+        all_day_start = datetime.combine(local_date, datetime.min.time(), tzinfo=UTC)
+        all_day_end = datetime.combine(
+            local_date + timedelta(days=1),
+            datetime.min.time(),
+            tzinfo=UTC,
+        )
+        with Session(self.engine) as session:
+            rows = session.execute(
+                select(Assessment, Course, AcademicCourseCalendar)
+                .join(Course, Course.id == Assessment.course_id)
+                .join(AcademicCourseCalendar, AcademicCourseCalendar.course_id == Course.id)
+                .where(
+                    Course.active.is_(True),
+                    Assessment.active.is_(True),
+                    Assessment.archived.is_(False),
+                    Assessment.completed.is_(False),
+                    Assessment.due_at.is_not(None),
+                    Assessment.notion_id.is_not(None),
+                    Assessment.notion_last_edited_at.is_not(None),
+                    Assessment.title_property_id.is_not(None),
+                    AcademicCourseCalendar.discovery_status == "valid",
+                    AcademicCourseCalendar.source_kind == "notion",
+                    AcademicCourseCalendar.child_data_source_id.is_not(None),
+                    AcademicCourseCalendar.title_property_id.is_not(None),
+                    AcademicCourseCalendar.date_property_id.is_not(None),
+                    AcademicCourseCalendar.last_synced_at.is_not(None),
+                    AcademicCourseCalendar.last_synced_at >= oldest_fresh_sync,
+                    AcademicCourseCalendar.last_synced_at <= latest_reasonable_sync,
+                    Assessment.source_id == AcademicCourseCalendar.child_data_source_id,
+                    Assessment.title_property_id == AcademicCourseCalendar.title_property_id,
+                    or_(
+                        and_(
+                            Assessment.is_all_day.is_(False),
+                            Assessment.due_at >= local_start.astimezone(UTC),
+                            Assessment.due_at < local_end.astimezone(UTC),
+                        ),
+                        and_(
+                            Assessment.is_all_day.is_(True),
+                            Assessment.due_at >= all_day_start,
+                            Assessment.due_at < all_day_end,
+                        ),
+                    ),
+                )
+            )
+            candidates: list[
+                tuple[str, str, datetime, str, str, NightlyAcademicAssessmentCandidate]
+            ] = []
+            for assessment, course, calendar in rows:
+                if academic_calendar_role(course.title) is not AcademicCalendarRole.COURSE:
+                    continue
+                due_at = _aware_db(cast(datetime, assessment.due_at))
+                ends_at = _aware_db(assessment.ends_at) if assessment.ends_at is not None else None
+                local_due = (
+                    datetime.combine(due_at.date(), datetime.min.time(), tzinfo=zone)
+                    if assessment.is_all_day
+                    else due_at.astimezone(zone)
+                )
+                local_ends_at = (
+                    datetime.combine(ends_at.date(), datetime.min.time(), tzinfo=zone)
+                    if assessment.is_all_day and ends_at is not None
+                    else ends_at.astimezone(zone)
+                    if ends_at is not None
+                    else None
+                )
+                synced_at = _aware_db(cast(datetime, calendar.last_synced_at))
+                edited_at = _aware_db(cast(datetime, assessment.notion_last_edited_at))
+                semantic_status = cast(
+                    CalendarSemanticStatus,
+                    assessment.calendar_semantic_status or "unavailable",
+                )
+                candidate = NightlyAcademicAssessmentCandidate(
+                    course_id=str(course.id),
+                    course_code=course.course_code,
+                    course_title=course.title,
+                    assessment_id=str(assessment.id),
+                    page_id=assessment.notion_id,
+                    title=assessment.title,
+                    assessment_type=assessment.assessment_type,
+                    starts_at=due_at,
+                    ends_at=ends_at,
+                    local_date=local_due.date(),
+                    local_start_label=_calendar_label(
+                        local_due, is_all_day=bool(assessment.is_all_day)
+                    ),
+                    local_end_label=(
+                        _calendar_label(local_ends_at, is_all_day=bool(assessment.is_all_day))
+                        if local_ends_at is not None
+                        else None
+                    ),
+                    is_all_day=bool(assessment.is_all_day),
+                    source_id=cast(str, calendar.child_data_source_id),
+                    source_scope=assessment.source_scope,
+                    source_url=assessment.source_url,
+                    source_last_edited_at=edited_at,
+                    source_synced_at=synced_at,
+                    title_property_id=cast(str, assessment.title_property_id),
+                    date_property_id=cast(str, calendar.date_property_id),
+                    semantic_status=semantic_status,
+                    semantic_overview=(
+                        assessment.calendar_semantic_overview
+                        if semantic_status == "valid"
+                        else None
+                    ),
+                    semantic_description=(
+                        assessment.calendar_semantic_description
+                        if semantic_status == "valid"
+                        else None
+                    ),
+                    semantic_intent_value=assessment.calendar_semantic_intent_value,
+                    semantic_intent_status=assessment.calendar_semantic_intent_status,
+                    semantic_intent_rationale=assessment.calendar_semantic_intent_rationale,
+                    semantic_evidence_fragment_ids=tuple(
+                        assessment.calendar_semantic_evidence_ids or ()
+                    ),
+                    semantic_description_fragment_ids=tuple(
+                        assessment.calendar_semantic_description_evidence_ids or ()
+                    ),
+                    semantic_intent_evidence_fragment_ids=tuple(
+                        assessment.calendar_semantic_intent_evidence_ids or ()
+                    ),
+                    semantic_source_fingerprint=assessment.calendar_semantic_source_fingerprint,
+                )
+                candidates.append(
+                    (
+                        course.course_code,
+                        course.term or "",
+                        local_due,
+                        assessment.title,
+                        str(assessment.id),
+                        candidate,
+                    )
+                )
+        return tuple(item[-1] for item in sorted(candidates))
 
     def search_learning_focuses(
         self,
@@ -5235,8 +5832,13 @@ class SQLAlchemyAcademicPlannerStore:
                 session.execute(
                     select(Assessment, Course)
                     .join(Course, Assessment.course_id == Course.id)
+                    .join(
+                        AcademicCourseCalendar,
+                        AcademicCourseCalendar.course_id == Course.id,
+                    )
                     .where(
                         Course.active.is_(True),
+                        AcademicCourseCalendar.discovery_status == "valid",
                         Assessment.active.is_(True),
                         Assessment.archived.is_(False),
                         Assessment.completed.is_(False),
@@ -5633,6 +6235,8 @@ class SQLAlchemyAcademicPlannerStore:
                         "data_source_id",
                         "source_id",
                     ),
+                    source_kind=str(_field(course, "source_kind") or "notion"),
+                    external_source_id=_field(course, "external_source_id"),
                     title_property_id=_field(course, "title_property_id"),
                     title_property_name=_field(course, "title_property_name"),
                     date_property_id=_field(course, "date_property_id"),
@@ -5669,15 +6273,16 @@ class SQLAlchemyAcademicPlannerStore:
             source_id = str(
                 _field(assessment, "source_id", "assessments_source_id", "data_source_id") or ""
             )
-            title_property_id = str(_field(assessment, "title_property_id") or "")
+            title_property_id = _field(assessment, "title_property_id")
+            source_scope = str(_field(assessment, "source_scope") or "")
             edited_at = _field_datetime(assessment, "notion_last_edited_at", "last_edited_at")
             trace = None
-            if source_id and title_property_id and edited_at is not None:
+            if source_id and edited_at is not None and (title_property_id or source_scope):
                 trace = AssessmentSourceTrace(
                     source_id=source_id,
-                    source_scope=f"notion:{source_id}",
+                    source_scope=source_scope or f"notion:{source_id}",
                     notion_last_edited_at=edited_at,
-                    title_property_id=title_property_id,
+                    title_property_id=str(title_property_id) if title_property_id else None,
                     label_source=label_source,
                     source_url=_field(assessment, "source_url", "url"),
                     active=bool(
@@ -6252,7 +6857,7 @@ def _apply_calendar_semantics(
     source_edit: datetime | None,
     analyzed_at: datetime,
 ) -> None:
-    if semantics.status not in {"valid", "not_substantive", "unavailable", "invalid"}:
+    if semantics.status not in {"valid", "unavailable", "invalid"}:
         raise ValueError("invalid calendar semantic status")
     overview = _bounded_optional(semantics.overview, 700)
     description = _bounded_optional(semantics.description, 1_500)
@@ -6269,9 +6874,12 @@ def _apply_calendar_semantics(
         description = None
         evidence_ids = []
         description_ids = []
-    elif semantics.status == "not_substantive":
-        description = None
-        description_ids = []
+    elif overview is None or not evidence_ids:
+        raise ValueError("valid calendar semantics require a cited overview")
+    elif description is None and description_ids:
+        raise ValueError("missing calendar semantic descriptions cannot carry citations")
+    elif description is not None and not description_ids:
+        raise ValueError("calendar semantic descriptions require citations")
     if intent_status is not None and intent_status not in {"valid", "unavailable", "invalid"}:
         raise ValueError("invalid calendar semantic intent status")
     if intent_status in {"unavailable", "invalid"}:
@@ -6337,9 +6945,7 @@ def _assessment_calendar_item(
     local_due = due_at.astimezone(timezone)
     local_end = _aware_db(row.ends_at).astimezone(timezone) if row.ends_at is not None else None
     semantic_status = row.calendar_semantic_status or "unavailable"
-    overview = (
-        row.calendar_semantic_overview if semantic_status in {"valid", "not_substantive"} else None
-    )
+    overview = row.calendar_semantic_overview if semantic_status == "valid" else None
     description = row.calendar_semantic_description if semantic_status == "valid" else None
     return {
         "event_id": row.notion_id,
@@ -6370,6 +6976,10 @@ def _assessment_calendar_item(
         ),
         "semantic_cache": _calendar_semantic_cache(row),
         "source_url": row.source_url,
+        "source_scope": row.source_scope,
+        "inline_evidence": (
+            row.scope if row.source_scope and row.source_scope.startswith("google_ical:") else None
+        ),
         "starts_at": due_at,
         "ends_at": _aware_db(row.ends_at) if row.ends_at is not None else None,
         "source_last_edited_at": row.notion_last_edited_at,
@@ -6682,6 +7292,113 @@ def _academic_search_text(value: str) -> str:
     return re.sub(r"[^a-z0-9]+", "", bounded)
 
 
+def _academic_query_terms(value: str) -> tuple[str, ...]:
+    """Return deterministic lexical constraints, excluding temporal command glue."""
+
+    stopwords = {
+        "a",
+        "an",
+        "and",
+        "any",
+        "are",
+        "coming",
+        "due",
+        "for",
+        "from",
+        "in",
+        "is",
+        "me",
+        "my",
+        "of",
+        "on",
+        "the",
+        "this",
+        "to",
+        "today",
+        "todays",
+        "todo",
+        "todos",
+        "tomorrow",
+        "task",
+        "tasks",
+        "up",
+        "upcoming",
+        "week",
+        "what",
+        "when",
+    }
+    terms: list[str] = []
+    for raw in re.findall(r"[a-z0-9]+", value.casefold()[:300]):
+        if raw in stopwords or len(raw) < 2:
+            continue
+        if raw not in terms:
+            terms.append(raw)
+    return tuple(terms[:8])
+
+
+def _normalize_academic_temporal_scope(scope: Any, query: str) -> Any:
+    if getattr(scope, "value", scope) != "all":
+        return scope
+    words = set(re.findall(r"[a-z0-9]+", query.casefold()))
+    from app.agents.query_contracts import TemporalScope
+
+    if {"today", "todays"} & words:
+        return TemporalScope.TODAY
+    if "tomorrow" in words:
+        return TemporalScope.TOMORROW
+    if "overdue" in words:
+        return TemporalScope.OVERDUE
+    if "upcoming" in words or ({"coming", "up"} <= words):
+        return TemporalScope.UPCOMING
+    if "week" in words and ("this" in words or "due" in words):
+        return TemporalScope.THIS_WEEK
+    return scope
+
+
+def _assessment_in_window(
+    due_at: datetime,
+    *,
+    is_all_day: bool,
+    window: Any,
+    timezone: ZoneInfo,
+) -> bool:
+    start = getattr(window, "start_at", None)
+    end = getattr(window, "end_at", None)
+    if start is None and end is None:
+        return True
+    if is_all_day:
+        # Notion date-only values are persisted at UTC midnight as a storage
+        # convention. Their UTC date is the owner's calendar date; converting
+        # the instant to a western timezone would incorrectly shift it back a day.
+        due_date = due_at.date()
+        start_date = start.astimezone(timezone).date() if start is not None else None
+        end_date = end.astimezone(timezone).date() if end is not None else None
+        return (start_date is None or due_date >= start_date) and (
+            end_date is None or due_date < end_date
+        )
+    local_due_at = due_at.astimezone(timezone)
+    return (start is None or local_due_at >= start) and (end is None or local_due_at < end)
+
+
+def _assessment_after_cursor(
+    *,
+    due_at: datetime,
+    title: str,
+    assessment_id: str,
+    cursor_last: tuple[str, ...],
+) -> bool:
+    if len(cursor_last) != 3:
+        raise ValueError("invalid assessment search cursor")
+    raw_due_at, raw_title, raw_id = cursor_last
+    try:
+        cursor_due_at = datetime.fromisoformat(raw_due_at)
+    except ValueError as exc:
+        raise ValueError("invalid assessment search cursor") from exc
+    if cursor_due_at.tzinfo is None or cursor_due_at.utcoffset() is None:
+        raise ValueError("invalid assessment search cursor")
+    return (due_at, title, assessment_id) > (cursor_due_at, raw_title, raw_id)
+
+
 def _academic_option_matches(needle: str, *values: str) -> bool:
     if not needle:
         return True
@@ -6777,6 +7494,7 @@ __all__ = [
     "CourseCalendarInput",
     "DocumentChunkInput",
     "FactState",
+    "NightlyAcademicAssessmentCandidate",
     "SQLAlchemyAcademicPlannerStore",
     "SourceCitation",
 ]

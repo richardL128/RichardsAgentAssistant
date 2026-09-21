@@ -53,7 +53,7 @@ CareerProposalStatus = Literal[
     "token_mismatch",
 ]
 CareerReceiptStatus = Literal["ready", "already_applied", "in_progress", "uncertain", "failed"]
-CalendarSemanticStatus = Literal["valid", "not_substantive", "unavailable", "invalid"]
+CalendarSemanticStatus = Literal["valid", "unavailable", "invalid"]
 _SHA256 = re.compile(r"^[0-9a-f]{64}$")
 _RECEIPT_FIELDS = frozenset(("proposal_id", "page_id", "url", "notion_request_id", "edited_at"))
 
@@ -1799,7 +1799,7 @@ def _apply_calendar_semantics(
     source_edit: datetime | None,
     analyzed_at: datetime,
 ) -> None:
-    if semantics.status not in {"valid", "not_substantive", "unavailable", "invalid"}:
+    if semantics.status not in {"valid", "unavailable", "invalid"}:
         raise ValueError("invalid calendar semantic status")
     overview = _bounded_optional(semantics.overview, 700)
     description = _bounded_optional(semantics.description, 1_500)
@@ -1816,9 +1816,12 @@ def _apply_calendar_semantics(
         description = None
         evidence_ids = []
         description_ids = []
-    elif semantics.status == "not_substantive":
-        description = None
-        description_ids = []
+    elif overview is None or not evidence_ids:
+        raise ValueError("valid calendar semantics require a cited overview")
+    elif description is None and description_ids:
+        raise ValueError("missing calendar semantic descriptions cannot carry citations")
+    elif description is not None and not description_ids:
+        raise ValueError("calendar semantic descriptions require citations")
     if intent_status is not None and intent_status not in {"valid", "unavailable", "invalid"}:
         raise ValueError("invalid calendar semantic intent status")
     if intent_status in {"unavailable", "invalid"}:
@@ -1909,9 +1912,7 @@ def _interview_calendar_item(
 ) -> dict[str, Any]:
     local_end = _interview_local_end(row, timezone=timezone)
     semantic_status = row.calendar_semantic_status or CalendarEventSemanticStatus.UNAVAILABLE.value
-    overview = (
-        row.calendar_semantic_overview if semantic_status in {"valid", "not_substantive"} else None
-    )
+    overview = row.calendar_semantic_overview if semantic_status == "valid" else None
     description = row.calendar_semantic_description if semantic_status == "valid" else None
     return {
         "event_id": row.interview_page_id,

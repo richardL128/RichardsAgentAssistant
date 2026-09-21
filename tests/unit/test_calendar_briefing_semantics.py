@@ -93,7 +93,7 @@ def _event(
 def _result(
     *,
     description_present: bool = True,
-    evidence_fragment_ids: tuple[str, ...] = ("frag-1",),
+    evidence_fragment_ids: tuple[str, ...] = ("event-1:host:title", "frag-1"),
     description_fragment_ids: tuple[str, ...] = ("frag-1",),
     description: str | None = "Prepare breadth-first search and runtime analysis.",
     classification_rationale: str | None = "The supplied topics describe substantive prep.",
@@ -123,6 +123,9 @@ def _critique(
     *,
     intent_supported: bool | None = None,
     overview_supported: bool | None = None,
+    overview_useful: bool | None = None,
+    expansions_grounded: bool | None = None,
+    schedule_state_safe: bool | None = None,
     description_supported: bool | None = None,
     common_supported: bool | None = None,
 ) -> CalendarEventSemanticCritique:
@@ -131,8 +134,19 @@ def _critique(
         accepted=accepted,
         intent_supported=accepted if intent_supported is None else intent_supported,
         overview_supported=accepted if overview_supported is None else overview_supported,
+        overview_is_useful_meaning_summary=(
+            (accepted if overview_supported is None else overview_supported)
+            if overview_useful is None
+            else overview_useful
+        ),
+        semantic_expansions_grounded=(
+            common if expansions_grounded is None else expansions_grounded
+        ),
         description_supported=accepted if description_supported is None else description_supported,
         no_invented_claims=common,
+        no_invented_schedule_or_state=(
+            common if schedule_state_safe is None else schedule_state_safe
+        ),
         no_instruction_following=common,
         same_event=common,
         cites_only_supplied_fragments=common,
@@ -369,7 +383,7 @@ async def test_description_named_field_does_not_create_deterministic_fallback() 
 
     outcome = await CalendarEventSemanticInterpreter(gateway).analyze(event)
 
-    assert outcome.status == CalendarEventSemanticStatus.NOT_SUBSTANTIVE
+    assert outcome.status == CalendarEventSemanticStatus.VALID
     assert outcome.result is not None
     assert outcome.result.description is None
 
@@ -392,10 +406,56 @@ async def test_description_named_field_is_not_privileged_when_model_rejects_it()
 
     outcome = await CalendarEventSemanticInterpreter(gateway).analyze(event)
 
-    assert outcome.status == CalendarEventSemanticStatus.NOT_SUBSTANTIVE
+    assert outcome.status == CalendarEventSemanticStatus.VALID
     assert outcome.result is not None
     assert outcome.result.description is None
     assert len(gateway.prompts) == 2
+
+
+@pytest.mark.asyncio
+async def test_title_only_coursework_can_be_valid_without_description() -> None:
+    fragments = with_title_evidence_fragment(
+        event_id="event-1",
+        title="Chemistry p-set from slides",
+        fragments=(),
+    )
+    event = CalendarEventSemanticInput(
+        event_id="event-1",
+        source_area=CalendarEventSourceArea.COURSE,
+        source_label="ECE 190",
+        title="Chemistry p-set from slides",
+        event_kind="Assignment",
+        local_date_label="Sunday, September 20, 2026",
+        local_time_label=None,
+        is_all_day=True,
+        source_last_edited_at=datetime(2026, 9, 19, 14, 30, tzinfo=UTC),
+        source_fingerprint=fingerprint_event_evidence(fragments, event_id="event-1"),
+        evidence_fragments=fragments,
+    )
+    result = _result(
+        description_present=False,
+        description=None,
+        evidence_fragment_ids=("event-1:host:title",),
+        description_fragment_ids=(),
+        classification_rationale="The title describes a chemistry problem set from slides.",
+        intent_evidence_fragment_ids=("event-1:host:title",),
+        intent_rationale="The title names coursework.",
+    ).model_copy(
+        update={
+            "overview": "You have a chemistry problem set from the slide deck.",
+        }
+    )
+    gateway = _FakeGateway([result, _critique(True)])
+
+    outcome = await CalendarEventSemanticInterpreter(gateway).analyze(event)
+
+    assert outcome.status == CalendarEventSemanticStatus.VALID
+    assert outcome.result is not None
+    assert outcome.result.overview == "You have a chemistry problem set from the slide deck."
+    assert outcome.result.description_present is False
+    assert outcome.result.description is None
+    assert "Title-only coursework is still actionable" in gateway.prompts[0]
+    assert "do not add, change, or mention due dates or times" in gateway.prompts[0]
 
 
 @pytest.mark.asyncio
@@ -528,6 +588,42 @@ async def test_critic_rejects_intent_without_discarding_supported_prose() -> Non
     assert outcome.result.description == "Prepare breadth-first search and runtime analysis."
 
 
+@pytest.mark.parametrize(
+    ("critique_overrides", "reason"),
+    [
+        ({"overview_useful": False}, "overview only paraphrases calendar metadata"),
+        ({"expansions_grounded": False}, "semantic expansion is not grounded"),
+        ({"schedule_state_safe": False}, "overview invents a due date or completion state"),
+    ],
+)
+@pytest.mark.asyncio
+async def test_critic_rejects_unhelpful_or_invented_overview_claims(
+    critique_overrides: dict[str, bool],
+    reason: str,
+) -> None:
+    gateway = _FakeGateway(
+        [
+            _result(),
+            _critique(
+                False,
+                reason=reason,
+                intent_supported=True,
+                overview_supported=True,
+                description_supported=True,
+                common_supported=True,
+                **critique_overrides,
+            ),
+            None,
+        ]
+    )
+
+    outcome = await CalendarEventSemanticInterpreter(gateway).analyze(_event())
+
+    assert outcome.status is CalendarEventSemanticStatus.INVALID
+    assert outcome.error_code == "calendar_semantic_prose_invalid"
+    assert len(gateway.prompts) == 3
+
+
 @pytest.mark.asyncio
 async def test_model_failure_omits_semantics_without_description_fallback() -> None:
     gateway = _FakeGateway([None])
@@ -561,7 +657,7 @@ def _cache_record(**overrides: Any) -> CalendarSemanticCacheRecord:
         "source_last_edited_at": _event().source_last_edited_at,
         "model_identity": "qwen-test",
         "config_version": "cfg-test",
-        "prompt_version": "calendar-event-semantics-v3",
+        "prompt_version": "calendar-event-semantics-v4",
         "result": _result(),
         "activity_intent": CalendarActivityIntent.STUDY,
         "intent_status": CalendarActivityIntentStatus.VALID,
@@ -602,6 +698,24 @@ def test_cache_reuse_requires_exact_fingerprint_model_config_prompt_and_edit_ver
         )
         assert decision.reusable is False
         assert decision.reason == reason
+
+
+def test_cache_reuses_matching_valid_title_only_result_without_description() -> None:
+    result = _result(
+        description_present=False,
+        description=None,
+        description_fragment_ids=(),
+    )
+
+    decision = decide_calendar_semantic_cache_reuse(
+        _event(),
+        _cache_record(result=result),
+        model_identity="qwen-test",
+        config_version="cfg-test",
+    )
+
+    assert decision.reusable is True
+    assert decision.reason == "exact_match"
 
 
 def test_cache_reuse_rejects_failed_or_cross_event_records() -> None:

@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import asyncio
 from collections.abc import Mapping, Sequence
-from datetime import UTC, date, datetime
+from datetime import UTC, date, datetime, time
 from types import SimpleNamespace
 from uuid import UUID
 from zoneinfo import ZoneInfo
@@ -13,19 +13,32 @@ from pydantic import SecretStr
 from sqlalchemy import create_engine, select
 from sqlalchemy.orm import Session
 
+from app.agents.academic_planner.calendar_roles import AcademicCalendarRole
 from app.agents.academic_planner.contracts import (
     AcademicAssessmentOption,
+    AcademicAssessmentSearchResult,
     AcademicCourseOption,
+    AcademicCourseSearchResult,
     AssessmentType,
 )
 from app.agents.academic_planner.discord_harness import (
     NativeAcademicDiscordHandler,
     _AcademicToolState,
+    _assessment_result_for_model,
+    _current_turn_has_grounded_query,
     _localize_wall_time,
     _progress_for_harness_event,
     _proposal_has_inbound_material,
     _render_event,
     _validate_conversation_lifecycle,
+)
+from app.agents.academic_planner.nightly_conversation import (
+    NightlyChecklistItem,
+    NightlySemanticDecision,
+    NightlyTaskDateRange,
+    build_nightly_checkpoint,
+    export_nightly_checkpoint,
+    stable_nightly_item_id,
 )
 from app.agents.calendar_briefing import (
     CalendarActivityIntent,
@@ -39,12 +52,22 @@ from app.agents.conversation.context import ConversationContextAssembler
 from app.agents.harness import (
     AgentHarnessEvent,
     ConversationLifecycle,
+    TerminalGrounding,
     ToolExecutionError,
     UserAbortRequested,
 )
 from app.agents.job_interviews.agent_loop import CareerAgentToolState
 from app.agents.job_interviews.contracts import ApplicationRowSnapshot, InterviewEventSnapshot
 from app.agents.memory import UserMemoryOwnerScope, UserMemoryService
+from app.agents.query_contracts import (
+    CompletenessState,
+    FreshnessState,
+    NormalizedQueryFilters,
+    QueryEnvelope,
+    SourceFreshness,
+    TemporalQuery,
+    resolve_temporal_window,
+)
 from app.artifacts.store import ArtifactStore
 from app.connectors.discord_gateway import DiscordAcademicMessageCreate
 from app.db.models import Base, NativeConversationSession
@@ -92,6 +115,84 @@ def test_academic_tool_checkpoint_round_trips_trusted_capabilities() -> None:
 
     assert restored._courses == {course.course_id: course}
     assert restored._assessments == {assessment.assessment_id: assessment}
+
+
+def test_academic_grounding_rejects_unknown_id_and_host_renders_canonical_date() -> None:
+    state = _AcademicToolState(catalog=None, now=NOW, timezone=ZoneInfo("America/Toronto"))
+    assessment = AcademicAssessmentOption(
+        assessment_id="assessment-1",
+        course_id="course-1",
+        course_code="ECE 202",
+        title="Lab report",
+        due_at=datetime(2026, 9, 19, 18, tzinfo=UTC),
+        due_at_local="2026-09-19T14:00:00-04:00",
+        due_date_local=date(2026, 9, 19),
+        assessment_type=AssessmentType.ASSIGNMENT,
+    )
+    envelope = QueryEnvelope[AcademicAssessmentOption].model_validate(
+        _test_envelope((assessment,), query="today", timezone="America/Toronto")
+    )
+    state._query_envelopes[envelope.query_id] = envelope
+
+    unknown = TerminalGrounding(query_id=envelope.query_id, item_ids=("outside",))
+    assert "unknown or out-of-scope" in str(state.validate_grounding(unknown))
+
+    selected = TerminalGrounding(query_id=envelope.query_id, item_ids=("assessment-1",))
+    rendered = state.render_lifecycle(
+        ConversationLifecycle(
+            disposition="completed",
+            content="Lab report is due in 2025.",
+            grounding=selected,
+        ),
+        (),
+    )
+    assert "Saturday, September 19, 2026 at 2:00 PM" in rendered
+    assert "2025" not in rendered
+
+    all_day = assessment.model_copy(
+        update={
+            "due_at": datetime(2026, 9, 19, 0, tzinfo=UTC),
+            "due_at_local": "2026-09-19",
+            "due_date_local": date(2026, 9, 19),
+            "is_all_day": True,
+        }
+    )
+    assert _assessment_result_for_model(all_day, ZoneInfo("America/Toronto"))["due_at"] == (
+        "2026-09-19"
+    )
+
+
+def test_grounding_requirement_survives_later_read_tools_but_ignores_failed_queries() -> None:
+    successful_messages = (
+        HumanMessage(content="What is due today?"),
+        AIMessage(content="", tool_calls=[]),
+        ToolMessage(
+            content='{"status":"succeeded"}',
+            tool_call_id="query-1",
+            name="search_assessments",
+            status="success",
+        ),
+        ToolMessage(
+            content='{"status":"succeeded"}',
+            tool_call_id="read-2",
+            name="search_assessment_materials",
+            status="success",
+        ),
+        AIMessage(content="", tool_calls=[]),
+    )
+    failed_messages = (
+        HumanMessage(content="What is due today?"),
+        ToolMessage(
+            content='{"status":"error","error":"unavailable"}',
+            tool_call_id="query-1",
+            name="search_assessments",
+            status="error",
+        ),
+        AIMessage(content="", tool_calls=[]),
+    )
+
+    assert _current_turn_has_grounded_query(successful_messages)
+    assert not _current_turn_has_grounded_query(failed_messages)
 
 
 def test_career_tool_checkpoint_round_trips_verified_interview() -> None:
@@ -246,26 +347,68 @@ async def test_empty_model_response_is_failed_not_completed() -> None:
     assert store.proposals == []
 
 
+def _test_envelope(items, *, query: str, timezone: str):
+    filters = NormalizedQueryFilters(
+        temporal=resolve_temporal_window(TemporalQuery(), request_time=NOW, timezone=timezone),
+        text=query,
+        limit=10,
+    )
+    return QueryEnvelope(
+        query_id=f"test:{query or 'all'}",
+        as_of=NOW,
+        timezone=timezone,
+        applied_filters=filters,
+        freshness=(
+            SourceFreshness(
+                source_id="test-source",
+                state=FreshnessState.FRESH_COMPLETE,
+                as_of=NOW,
+            ),
+        ),
+        items=tuple(items),
+        result_count=len(items),
+        has_more=False,
+        next_cursor=None,
+        completeness=CompletenessState.COMPLETE,
+    )
+
+
+def _assessment_search_result(items, args, *, timezone: str):
+    values = tuple(items)
+    return AcademicAssessmentSearchResult(
+        results=values,
+        envelope=_test_envelope(values, query=args.query, timezone=timezone),
+    )
+
+
 class _Catalog:
     def __init__(self, events: list[str] | None = None) -> None:
         self.events = events
 
-    def search_courses(self, query: str):
-        assert query == "ECE 202"
+    def search_courses(self, args, *, as_of, timezone, owner_scope):
+        assert args.query == "ECE 202"
+        assert as_of == NOW
+        assert owner_scope
         if self.events is not None:
             self.events.append("search_courses")
-        return (
+        results = (
             AcademicCourseOption(
                 course_id="course-1",
                 course_code="ECE 202",
                 title="Circuits",
             ),
         )
+        return AcademicCourseSearchResult(
+            results=results,
+            envelope=_test_envelope(results, query=args.query, timezone=timezone),
+        )
 
-    def search_assessments(self, query: str, course_id: str | None = None):
+    def search_assessments(self, args, *, as_of, timezone, owner_scope):
+        assert as_of == NOW
+        assert owner_scope
         if self.events is not None:
             self.events.append("search_assessments")
-        return ()
+        return _assessment_search_result((), args, timezone=timezone)
 
 
 class _Syncer:
@@ -275,10 +418,12 @@ class _Syncer:
         *,
         status: str = "succeeded",
         diagnostic_codes: Sequence[str] = (),
+        unavailable_roles: Sequence[AcademicCalendarRole] = (),
     ) -> None:
         self.events = events
         self.status = status
         self.diagnostic_codes = tuple(diagnostic_codes)
+        self.unavailable_roles = tuple(unavailable_roles)
         self.calls = 0
 
     async def sync(self, *, now: datetime | None = None):
@@ -286,7 +431,12 @@ class _Syncer:
         self.calls += 1
         if self.events is not None:
             self.events.append("sync")
-        return SimpleNamespace(status=self.status, diagnostic_codes=self.diagnostic_codes)
+        return SimpleNamespace(
+            status=self.status,
+            diagnostic_codes=self.diagnostic_codes,
+            unavailable_roles=self.unavailable_roles,
+            synced_at=NOW,
+        )
 
 
 class _Store:
@@ -298,6 +448,50 @@ class _Store:
     def save_discord_checkin(self, proposal, **_kwargs):
         self.proposals.append(proposal)
         return SimpleNamespace(status="created")
+
+
+@pytest.mark.asyncio
+async def test_partial_sync_blocks_only_requested_academic_role() -> None:
+    healthy_course_state = _AcademicToolState(
+        catalog=_Catalog(),
+        now=NOW,
+        timezone=ZoneInfo("America/Toronto"),
+        syncer=_Syncer(
+            status="partial",
+            diagnostic_codes=("misc_calendar_missing",),
+            unavailable_roles=(AcademicCalendarRole.MISC,),
+        ),
+    )
+    course_tool = {tool.name: tool for tool in healthy_course_state.tools()}["search_courses"]
+    result = await course_tool.handler({"query": "ECE 202"})
+    assert result["freshness"][0]["state"] == "fresh_partial_for_unrequested_sources"
+    assert result["items"][0]["stable_id"] == "course-1"
+    assessment_tool = {tool.name: tool for tool in healthy_course_state.tools()}[
+        "search_assessments"
+    ]
+    assessment_result = await assessment_tool.handler(
+        {"query": "today", "roles": ["course"], "temporal": {"scope": "today"}}
+    )
+    rendered = healthy_course_state.render_grounding(
+        TerminalGrounding(query_id=assessment_result["query_id"], item_ids=())
+    )
+    assert "unrelated academic sources need attention" in rendered
+
+    unavailable_course_state = _AcademicToolState(
+        catalog=_Catalog(),
+        now=NOW,
+        timezone=ZoneInfo("America/Toronto"),
+        syncer=_Syncer(
+            status="partial",
+            diagnostic_codes=("assessment_calendar_missing",),
+            unavailable_roles=(AcademicCalendarRole.COURSE,),
+        ),
+    )
+    unavailable_tool = {tool.name: tool for tool in unavailable_course_state.tools()}[
+        "search_courses"
+    ]
+    with pytest.raises(ToolExecutionError, match="unavailable or stale"):
+        await unavailable_tool.handler({"query": "ECE 202"})
 
 
 class _IdempotentProposalStore(_Store):
@@ -459,12 +653,14 @@ def _handler(
     material_intake: object | None = None,
     calendar_semantic_interpreter: object | None = None,
     career_tool_state_factory: object | None = None,
+    learn_tool_state_factory: object | None = None,
     memory_service: object | None = None,
     user_memory_service: object | None = None,
     context_assembler: object | None = None,
     abort_check: object | None = None,
     activity_sink: object | None = None,
     conversation_service: object | None = None,
+    writer_provider: object | None = None,
     model_pending_elapsed_seconds: Sequence[float] = (8.0, 20.0, 45.0),
     model_pending_repeat_seconds: float = 30.0,
 ):
@@ -473,7 +669,7 @@ def _handler(
         delivery=delivery,  # type: ignore[arg-type]
         allowed_channel_ids={"222222222222222222"},
         authorized_user_ids={"333333333333333333"},
-        writer_provider=lambda: None,
+        writer_provider=writer_provider or (lambda: None),
         ollama_runtime=runtime or _Runtime(),
         agent_gateway=gateway,  # type: ignore[arg-type]
         agent_catalog=catalog or _Catalog(),
@@ -481,6 +677,7 @@ def _handler(
         catalog_syncer=syncer or _Syncer(),
         catalog_sync_timeout_seconds=1.0,
         career_tool_state_factory=career_tool_state_factory,  # type: ignore[arg-type]
+        learn_tool_state_factory=learn_tool_state_factory,  # type: ignore[arg-type]
         material_intake=material_intake,
         calendar_semantic_interpreter=calendar_semantic_interpreter,
         memory_service=memory_service,
@@ -492,6 +689,168 @@ def _handler(
         model_pending_elapsed_seconds=model_pending_elapsed_seconds,
         model_pending_repeat_seconds=model_pending_repeat_seconds,
     )
+
+
+@pytest.mark.asyncio
+async def test_durable_checkpoint_restores_enabled_learn_capabilities(tmp_path) -> None:
+    engine = create_engine(f"sqlite+pysqlite:///{tmp_path / 'learn-checkpoint.db'}")
+    Base.metadata.create_all(engine)
+    artifacts = ArtifactStore(tmp_path / "learn-checkpoint-artifacts")
+    created_states: list[object] = []
+
+    class LearnState:
+        def __init__(self) -> None:
+            self.marker = "verified-course-1"
+            self.restored: Mapping[str, object] | None = None
+            created_states.append(self)
+
+        def tools(self):
+            return ()
+
+        def export_checkpoint(self):
+            return {"version": "learn-native-tools.v2", "marker": self.marker}
+
+        def restore_checkpoint(self, value):
+            self.restored = value
+            if value is not None:
+                self.marker = str(value["marker"])
+
+        @property
+        def has_query_results(self):
+            return False
+
+        @property
+        def has_prepared_proposal(self):
+            return False
+
+        def query_envelope(self, _query_id):
+            return None
+
+        def proposed_changes(self):
+            return ()
+
+        def persist_proposal_links(self, _proposal_id):
+            return None
+
+    first = await _handler(
+        _Gateway(
+            [
+                AIMessage(
+                    content="",
+                    tool_calls=[
+                        {
+                            "id": "terminal-1",
+                            "name": "emit_conversation_response",
+                            "args": {
+                                "disposition": "awaiting_user",
+                                "content": "Which LEARN course should I use?",
+                            },
+                        }
+                    ],
+                )
+            ]
+        ),
+        _Store(),
+        _Delivery(),
+        learn_tool_state_factory=lambda _message: LearnState(),
+        conversation_service=NativeConversationService(engine=engine, artifact_store=artifacts),
+    )(_message("Check LEARN."))
+
+    assert first.status == "handled"
+    second = await _handler(
+        _Gateway(
+            [
+                AIMessage(
+                    content="",
+                    tool_calls=[
+                        {
+                            "id": "terminal-2",
+                            "name": "emit_conversation_response",
+                            "args": {
+                                "disposition": "completed",
+                                "content": "I kept the verified LEARN course capability.",
+                            },
+                        }
+                    ],
+                )
+            ]
+        ),
+        _Store(),
+        _Delivery(),
+        learn_tool_state_factory=lambda _message: LearnState(),
+        conversation_service=NativeConversationService(engine=engine, artifact_store=artifacts),
+    )(
+        _message(
+            "Use that course.",
+            message_id="111111111111111112",
+            timestamp=NOW,
+        )
+    )
+
+    assert second.status == "handled"
+    assert len(created_states) == 2
+    assert created_states[1].restored == {
+        "version": "learn-native-tools.v2",
+        "marker": "verified-course-1",
+    }
+    engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_incompatible_v1_root_tool_checkpoint_fails_closed(tmp_path) -> None:
+    engine = create_engine(f"sqlite+pysqlite:///{tmp_path / 'v1-checkpoint.db'}")
+    Base.metadata.create_all(engine)
+    service = NativeConversationService(
+        engine=engine,
+        artifact_store=ArtifactStore(tmp_path / "v1-checkpoint-artifacts"),
+    )
+    started = service.begin_turn(
+        external_event_id="111111111111111110",
+        discord_channel_id="222222222222222222",
+        owner_discord_user_id="333333333333333333",
+        content="Continue an old tool conversation.",
+        model_identity="qwen-test",
+        prompt_config_version="native-v1",
+        now=NOW,
+    )
+    assert started.session_id is not None
+    service.save_checkpoint(
+        session_id=started.session_id,
+        checkpoint={
+            "version": "academic-discord-native-tools.v1",
+            "academic": {"version": "academic-native-tools.v1"},
+        },
+        now=NOW,
+    )
+    service.finish_turn(
+        session_id=started.session_id,
+        disposition="awaiting_user",
+        content="Which item?",
+        metadata={},
+        now=NOW,
+    )
+    gateway = _Gateway([])
+    delivery = _Delivery()
+
+    result = await _handler(
+        gateway,
+        _Store(),
+        delivery,
+        conversation_service=service,
+    )(
+        _message(
+            "That item.",
+            message_id="111111111111111112",
+            timestamp=NOW,
+        )
+    )
+
+    assert result.status == "failed"
+    assert gateway.inputs == []
+    assert delivery.responses[-1] == (
+        "I could not safely restore the trusted tool state. Please start again."
+    )
+    engine.dispose()
 
 
 @pytest.mark.asyncio
@@ -569,6 +928,12 @@ async def test_durable_two_wake_clarification_replays_native_context_and_tool_st
                         "args": {
                             "disposition": "completed",
                             "content": "I found no matching lab, so no change was proposed.",
+                            "grounding": {
+                                "query_id": "test:lab",
+                                "item_ids": [],
+                                "acknowledge_incomplete": False,
+                                "acknowledge_stale": False,
+                            },
                         },
                     }
                 ],
@@ -616,7 +981,9 @@ async def test_durable_two_wake_clarification_replays_native_context_and_tool_st
     )
     assert isinstance(replay[5], HumanMessage)
     assert replay[5].content == "The lab."
-    assert second_delivery.responses[-1] == ("I found no matching lab, so no change was proposed.")
+    assert second_delivery.responses[-1] == (
+        "I found no matching academic items in the requested scope."
+    )
     engine.dispose()
 
 
@@ -777,6 +1144,306 @@ async def test_nightly_proactive_skip_closes_before_runtime_model_or_tools(tmp_p
         "ai",
         "human",
     ]
+    engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_nightly_incomplete_natural_confirmation_acknowledges_writes_and_advances(
+    tmp_path,
+) -> None:
+    engine = create_engine(f"sqlite+pysqlite:///{tmp_path / 'nightly-natural-confirm.db'}")
+    Base.metadata.create_all(engine)
+    artifacts = ArtifactStore(tmp_path / "nightly-natural-confirm-artifacts")
+    conversation_service = NativeConversationService(engine=engine, artifact_store=artifacts)
+    period = "academic-end-of-day:2026-09-09:2100:v2"
+    date_range = NightlyTaskDateRange(
+        all_day=False,
+        start_date=date(2026, 9, 9),
+        start_time=time(18, 0),
+    )
+    item_id = stable_nightly_item_id(
+        period_key=period,
+        source_kind="notion_assessment",
+        source_id="assessment-1",
+        title="Review merge sort",
+        date_range=date_range,
+    )
+    second_item_id = stable_nightly_item_id(
+        period_key=period,
+        source_kind="notion_assessment",
+        source_id="assessment-2",
+        title="Practice recurrence proofs",
+        date_range=date_range,
+    )
+    third_item_id = stable_nightly_item_id(
+        period_key=period,
+        source_kind="notion_assessment",
+        source_id="assessment-3",
+        title="Work practice problems",
+        date_range=date_range,
+    )
+    decision = NightlySemanticDecision(
+        kind="movable_work_task",
+        accepted_by_critic=True,
+        evidence_citations=("title",),
+        rationale="Owner-performable review work.",
+        model_identity="qwen@test",
+        prompt_version="eligibility-v1",
+        critic_version="critic-v1",
+        source_fingerprint="source-fingerprint",
+    )
+    checkpoint = build_nightly_checkpoint(
+        period_key=period,
+        local_date=date(2026, 9, 9),
+        items=(
+            NightlyChecklistItem(
+                item_id=item_id,
+                course_id="course-1",
+                course_code="ECE 250",
+                source_kind="notion_assessment",
+                source_id="assessment-1",
+                expected_last_edited_at=NOW,
+                title="Review merge sort",
+                date_range=date_range,
+                semantic_decision=decision,
+                source_fingerprint="source-fingerprint",
+            ),
+            NightlyChecklistItem(
+                item_id=second_item_id,
+                course_id="course-2",
+                course_code="MATH 239",
+                source_kind="notion_assessment",
+                source_id="assessment-2",
+                expected_last_edited_at=NOW,
+                title="Practice recurrence proofs",
+                date_range=date_range,
+                semantic_decision=decision,
+                source_fingerprint="source-fingerprint",
+            ),
+            NightlyChecklistItem(
+                item_id=third_item_id,
+                course_id="course-3",
+                course_code="PHYS 121",
+                source_kind="notion_assessment",
+                source_id="assessment-3",
+                expected_last_edited_at=NOW,
+                title="Work practice problems",
+                date_range=date_range,
+                semantic_decision=decision,
+                source_fingerprint="source-fingerprint",
+            ),
+        ),
+    )
+    opened = conversation_service.open_proactive_prompt(
+        root_event_id=period,
+        discord_channel_id="222222222222222222",
+        owner_discord_user_id="333333333333333333",
+        prompt_text=(
+            'Evening check-in - ECE 250 (1/3): Did you complete "Review merge sort" today?'
+        ),
+        expires_at=NOW.replace(hour=23),
+        model_identity="qwen@test",
+        prompt_config_version="academic-nightly-checkin-v2",
+        proactive_kind="academic_nightly_task_checklist",
+        proactive_period=period,
+        initial_checkpoint={
+            "version": "academic-discord-native-tools.v3",
+            "nightly_checkin": export_nightly_checkpoint(checkpoint),
+        },
+        now=NOW,
+    )
+    assert opened.session_id is not None
+
+    class NightlyStore(_IdempotentProposalStore):
+        def __init__(self) -> None:
+            super().__init__()
+            self.states = {}
+
+        def prepare_checkin_application(self, proposal_id, confirmation_event, **_kwargs):
+            proposal = self._by_id.get(proposal_id)
+            if proposal is None:
+                return "not_found", None
+            if confirmation_event != proposal.confirmation_event:
+                return "confirmation_required", proposal
+            if self.states.get(proposal_id) == "applied":
+                return "already_applied", proposal
+            return "ready", proposal
+
+        def mark_checkin_applied(self, proposal_id, confirmation_event=None):
+            del confirmation_event
+            self.states[proposal_id] = "applied"
+
+        def reject_checkin_proposal(self, proposal_id, **_kwargs):
+            proposal = self._by_id.get(proposal_id)
+            return ("rejected", proposal) if proposal is not None else ("not_found", None)
+
+    events: list[str] = []
+
+    class Writer:
+        calls = 0
+
+        async def apply_confirmed_changes(self, changes, **_kwargs):
+            self.calls += 1
+            events.append("writer")
+            assert len(changes) == 1
+            if self.calls == 1:
+                assert changes[0].due_at == datetime(2026, 9, 10, 22, 0, tzinfo=UTC)
+            elif self.calls == 2:
+                assert changes[0].title == "Completed — Practice recurrence proofs"
+            else:
+                raise TimeoutError("simulated Notion timeout")
+
+    gateway = _Gateway(
+        [
+            AIMessage(
+                content="",
+                tool_calls=[
+                    {
+                        "id": "nightly-incomplete",
+                        "name": "nightly_record_task_result",
+                        "args": {"result": "incomplete"},
+                    }
+                ],
+            ),
+            AIMessage(
+                content="",
+                tool_calls=[
+                    {
+                        "id": "nightly-preview-final",
+                        "name": "emit_conversation_response",
+                        "args": {"disposition": "awaiting_user", "content": "preview"},
+                    }
+                ],
+            ),
+            AIMessage(
+                content="",
+                tool_calls=[
+                    {
+                        "id": "nightly-confirm",
+                        "name": "nightly_resolve_move",
+                        "args": {"decision": "confirm"},
+                    }
+                ],
+            ),
+            AIMessage(
+                content="",
+                tool_calls=[
+                    {
+                        "id": "nightly-complete-final",
+                        "name": "emit_conversation_response",
+                        "args": {"disposition": "awaiting_user", "content": "next"},
+                    }
+                ],
+            ),
+            AIMessage(
+                content="",
+                tool_calls=[
+                    {
+                        "id": "nightly-completed",
+                        "name": "nightly_record_task_result",
+                        "args": {"result": "completed"},
+                    }
+                ],
+            ),
+            AIMessage(
+                content="",
+                tool_calls=[
+                    {
+                        "id": "nightly-summary-final",
+                        "name": "emit_conversation_response",
+                        "args": {"disposition": "awaiting_user", "content": "next"},
+                    }
+                ],
+            ),
+            AIMessage(
+                content="",
+                tool_calls=[
+                    {
+                        "id": "nightly-third-completed",
+                        "name": "nightly_record_task_result",
+                        "args": {"result": "completed"},
+                    }
+                ],
+            ),
+            AIMessage(
+                content="",
+                tool_calls=[
+                    {
+                        "id": "nightly-failure-summary-final",
+                        "name": "emit_conversation_response",
+                        "args": {"disposition": "completed", "content": "summary"},
+                    }
+                ],
+            ),
+        ]
+    )
+    store = NightlyStore()
+    delivery = _Delivery(events=events)
+    writer = Writer()
+    handler = _handler(
+        gateway,
+        store,
+        delivery,
+        conversation_service=conversation_service,
+        writer_provider=lambda: writer,
+    )
+
+    first = await handler(_message("I didn't finish it.", timestamp=NOW))
+    assert first.status == "handled"
+    assert delivery.responses == [
+        'I understand. Do you want me to move "ECE 250 - Review merge sort" '
+        "from September 9 to September 10?"
+    ]
+    assert len(store.proposals) == 1
+    assert store.proposals[0].changes[0].ends_at is None
+
+    second = await handler(
+        _message(
+            "Yeah sure.",
+            message_id="111111111111111112",
+            timestamp=NOW.replace(minute=1),
+        )
+    )
+    assert second.status == "handled"
+    assert delivery.responses[-2:] == [
+        "Got it — I'm moving that task to tomorrow now.",
+        "Moved it to September 10. Next, Evening check-in - MATH 239 (2/3): "
+        'Did you complete "Practice recurrence proofs" today?',
+    ]
+    assert events[-2:] == ["writer", "response"]
+    assert store.states[store.proposals[0].proposal_id] == "applied"
+    third = await handler(
+        _message(
+            "Yes, I finished it.",
+            message_id="111111111111111113",
+            timestamp=NOW.replace(minute=2),
+        )
+    )
+    assert third.status == "handled"
+    assert delivery.responses[-2:] == [
+        "Great — I'm marking that task completed in Notion now.",
+        'Marked it as "Completed — Practice recurrence proofs". Next, Evening check-in - '
+        'PHYS 121 (3/3): Did you complete "Work practice problems" today?',
+    ]
+    assert len(store.proposals) == 2
+    fourth = await handler(
+        _message(
+            "Finished that too.",
+            message_id="111111111111111114",
+            timestamp=NOW.replace(minute=3),
+        )
+    )
+    assert fourth.status == "handled"
+    assert delivery.responses[-2:] == [
+        "Great — I'm marking that task completed in Notion now.",
+        "I couldn't safely mark that task completed. It was left unchanged. "
+        "Evening check-in complete: 1 marked completed, 1 moved, 1 not changed.",
+    ]
+    assert len(store.proposals) == 3
+    with Session(engine) as session:
+        row = session.scalar(select(NativeConversationSession))
+        assert row is not None
+        assert row.state == "completed"
     engine.dispose()
 
 
@@ -2201,8 +2868,8 @@ async def test_assessment_search_answers_with_owner_local_times() -> None:
     )
 
     class Catalog:
-        def search_assessments(self, _query: str, _course_id: str | None = None):
-            return assessments
+        def search_assessments(self, args, *, as_of, timezone, owner_scope):
+            return _assessment_search_result(assessments, args, timezone=timezone)
 
     gateway = _Gateway(
         [
@@ -2721,8 +3388,8 @@ async def test_pdf_attach_requires_current_turn_assessment_and_owner_scoped_inta
     )
 
     class Catalog:
-        def search_assessments(self, _query, _course_id=None):
-            return (assessment,)
+        def search_assessments(self, args, *, as_of, timezone, owner_scope):
+            return _assessment_search_result((assessment,), args, timezone=timezone)
 
     state = _AcademicToolState(
         catalog=Catalog(),
@@ -2772,8 +3439,8 @@ async def test_assessment_material_empty_semantic_result_does_not_fall_back_to_l
     class Catalog:
         lexical_called = False
 
-        def search_assessments(self, _query, _course_id=None):
-            return (assessment,)
+        def search_assessments(self, args, *, as_of, timezone, owner_scope):
+            return _assessment_search_result((assessment,), args, timezone=timezone)
 
         async def search_semantic_assessment_materials(self, assessment_id, query, *, limit):
             assert assessment_id == "assessment-1"
@@ -2816,8 +3483,8 @@ async def test_assessment_material_semantic_unavailable_is_safe_tool_error() -> 
     )
 
     class Catalog:
-        def search_assessments(self, _query, _course_id=None):
-            return (assessment,)
+        def search_assessments(self, args, *, as_of, timezone, owner_scope):
+            return _assessment_search_result((assessment,), args, timezone=timezone)
 
         async def search_semantic_assessment_materials(self, *_args, **_kwargs):
             raise RuntimeError("semantic embeddings unavailable")

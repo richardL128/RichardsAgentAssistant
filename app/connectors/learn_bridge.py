@@ -238,11 +238,11 @@ class LearnBridgeConnector:
         headers: Mapping[str, str],
     ) -> bytes:
         async with client.stream(
-                method,
-                str(self._base_url.join(path)),
-                content=body,
-                headers=headers,
-                timeout=self._timeout_seconds,
+            method,
+            str(self._base_url.join(path)),
+            content=body,
+            headers=headers,
+            timeout=self._timeout_seconds,
         ) as response:
             body_bytes = await _bounded_response_body(response, self._max_response_bytes)
             self._verify_response(path, response.status_code, response.headers, body_bytes)

@@ -429,6 +429,100 @@ def test_open_proactive_prompt_creates_awaiting_artifact_backed_session(
     assert [message.type for message in reply.transcript_messages] == ["ai", "human"]
 
 
+def test_open_proactive_prompt_can_persist_initial_checkpoint_atomically(
+    engine,
+    artifacts: ArtifactStore,
+) -> None:
+    service = _service(engine, artifacts)
+    initial_checkpoint = {
+        "nightly_checkin": {
+            "version": "academic-nightly-checkin-v2",
+            "period_key": "academic-end-of-day:2026-09-09:2100:v2",
+            "local_date": "2026-09-09",
+        }
+    }
+
+    opened = service.open_proactive_prompt(
+        root_event_id="academic-end-of-day:2026-09-09:2100:v2",
+        discord_channel_id=CHANNEL,
+        owner_discord_user_id=OWNER,
+        prompt_text="Evening check-in - ECE 250 (1/1): Did you complete it today?",
+        expires_at=NOW + timedelta(hours=1),
+        model_identity="qwen@test",
+        prompt_config_version="nightly-v2",
+        proactive_kind="academic_end_of_day_reflection",
+        proactive_period="2026-09-09",
+        initial_checkpoint=initial_checkpoint,
+        now=NOW,
+    )
+
+    assert opened.status == "started"
+    assert opened.checkpoint == initial_checkpoint
+    assert opened.session_id is not None
+    with Session(engine) as session:
+        row = session.get(NativeConversationSession, opened.session_id)
+        assert row is not None
+        assert row.state == "awaiting_user"
+        assert row.tool_checkpoint_artifact_key is not None
+
+    inspected = service.inspect_open(
+        discord_channel_id=CHANNEL,
+        owner_discord_user_id=OWNER,
+        now=NOW + timedelta(seconds=1),
+    )
+    assert inspected.checkpoint == initial_checkpoint
+
+    duplicate = service.open_proactive_prompt(
+        root_event_id="academic-end-of-day:2026-09-09:2100:v2",
+        discord_channel_id=CHANNEL,
+        owner_discord_user_id=OWNER,
+        prompt_text="Evening check-in - ECE 250 (1/1): Did you complete it today?",
+        expires_at=NOW + timedelta(hours=1),
+        model_identity="qwen@test",
+        prompt_config_version="nightly-v2",
+        proactive_kind="academic_end_of_day_reflection",
+        proactive_period="2026-09-09",
+        initial_checkpoint=initial_checkpoint,
+        now=NOW + timedelta(seconds=2),
+    )
+    assert duplicate.status == "duplicate"
+    assert duplicate.checkpoint == initial_checkpoint
+    with Session(engine) as session:
+        assert session.scalar(select(func.count()).select_from(NativeConversationSession)) == 1
+
+
+def test_open_proactive_prompt_rolls_back_session_when_initial_checkpoint_store_fails(
+    engine,
+    artifacts: ArtifactStore,
+    monkeypatch,
+) -> None:
+    service = _service(engine, artifacts)
+
+    def fail_checkpoint_store(*args, **kwargs):
+        del args, kwargs
+        raise ValueError("checkpoint too large")
+
+    monkeypatch.setattr(service, "_store_checkpoint", fail_checkpoint_store)
+
+    with pytest.raises(ValueError, match="checkpoint too large"):
+        service.open_proactive_prompt(
+            root_event_id="academic-end-of-day:2026-09-09:2100:v2",
+            discord_channel_id=CHANNEL,
+            owner_discord_user_id=OWNER,
+            prompt_text="Evening check-in - ECE 250 (1/1): Did you complete it today?",
+            expires_at=NOW + timedelta(hours=1),
+            model_identity="qwen@test",
+            prompt_config_version="nightly-v2",
+            proactive_kind="academic_end_of_day_reflection",
+            proactive_period="2026-09-09",
+            initial_checkpoint={"nightly_checkin": {"version": "academic-nightly-checkin-v2"}},
+            now=NOW,
+        )
+
+    with Session(engine) as session:
+        assert session.scalar(select(func.count()).select_from(NativeConversationSession)) == 0
+
+
 def test_open_proactive_prompt_fails_closed_when_another_conversation_is_open(
     engine,
     artifacts: ArtifactStore,

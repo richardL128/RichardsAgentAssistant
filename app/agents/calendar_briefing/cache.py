@@ -47,19 +47,11 @@ class CalendarSemanticCacheRecord(CalendarSemanticCacheModel):
 
     @model_validator(mode="after")
     def status_matches_result(self) -> CalendarSemanticCacheRecord:
-        if self.semantic_status in {
-            CalendarEventSemanticStatus.VALID,
-            CalendarEventSemanticStatus.NOT_SUBSTANTIVE,
-        }:
+        if self.semantic_status == CalendarEventSemanticStatus.VALID:
             if self.result is None:
                 raise ValueError("reusable calendar semantic cache records require a result")
             if self.result.event_id != self.event_id:
                 raise ValueError("calendar semantic cache result belongs to another event")
-            if self.semantic_status == CalendarEventSemanticStatus.VALID:
-                if not self.result.description_present:
-                    raise ValueError("valid cache records require a description result")
-            elif self.result.description_present:
-                raise ValueError("not_substantive cache records cannot carry a description result")
         elif self.result is not None and self.intent_status != CalendarActivityIntentStatus.VALID:
             raise ValueError(
                 "failed calendar semantic cache records cannot carry only invalid data"
@@ -98,12 +90,7 @@ def decide_calendar_semantic_cache_reuse(
         return CalendarSemanticCacheDecision(reusable=False, reason="missing")
     if cached.event_id != event.event_id:
         return CalendarSemanticCacheDecision(reusable=False, reason="event_id_mismatch")
-    reusable_prose = cached.semantic_status in {
-        CalendarEventSemanticStatus.VALID,
-        CalendarEventSemanticStatus.NOT_SUBSTANTIVE,
-    }
-    reusable_intent = cached.intent_status == CalendarActivityIntentStatus.VALID
-    if not (reusable_prose or reusable_intent):
+    if cached.semantic_status != CalendarEventSemanticStatus.VALID:
         return CalendarSemanticCacheDecision(reusable=False, reason="status_not_reusable")
     if cached.source_fingerprint != event.source_fingerprint:
         return CalendarSemanticCacheDecision(reusable=False, reason="source_fingerprint_mismatch")

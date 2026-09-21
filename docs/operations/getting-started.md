@@ -12,7 +12,7 @@ Ollama runs on the host. Keep all credentials in `.env` or a secret manager;
 never commit them or paste them into logs, tickets, or chat.
 
 Qwen is configured for authorized private Discord conversations and bounded
-event interpretation plus category composition in the automatic morning
+event interpretation plus non-course category composition in the automatic morning
 briefing. The native
 macOS Discord wake LaunchAgent remains connected while the API is cold,
 acknowledges an allowlisted owner's message, starts the fixed local services as
@@ -24,15 +24,16 @@ owner allowlist must not load Qwen.
 The morning agenda refreshes Notion, selects course work due today and over the
 following seven days plus Jobs, misc, and reserved schedule events that overlap
 today, validates Qwen-produced semantics, and sends exactly four persisted,
-idempotent Discord embeds. A separate nightly schedule sends one reflection
-prompt to the configured proactive owner and opens a durable conversation; it
-does not load Qwen until the owner replies through the authorized channel.
+idempotent Discord embeds. A separate nightly schedule refreshes the academic
+catalog, uses Qwen plus a critic to select movable current-day course tasks,
+opens a durable checklist conversation for the configured proactive owner, and
+sends the first concrete task question.
 
 Waterloo LEARN support is optional and disabled by default. It uses a separate
 host-only browser profile and LaunchAgent; follow the
 [LEARN bridge runbook](runbooks/learn-bridge.md) before enabling it. A LEARN
 failure never changes the morning source of truth: the scheduled briefing reads
-only the freshly synchronized reserved Notion calendar, not LEARN directly.
+only the freshly synchronized Google iCal schedule, not LEARN directly.
 
 ## 1. Start the platform
 
@@ -95,9 +96,11 @@ need to keep.
 The API container runs migrations automatically. It does not own a Discord
 Gateway listener. `worker-academic-planner` owns durable planner-channel jobs,
 assessment-material ingestion, the combined morning notification, and the
-nightly reflection prompt. The morning path may call the configured Qwen model
-for event-local semantics and the bounded four-category composer/critic;
-no legacy model worker or other scheduled model workflow is a runtime option.
+nightly v2 task checklist. The morning path may call the configured Qwen model
+for event-local semantics and the bounded Jobs/Misc/Schedule composer/critic;
+the nightly path may call it for movable-task eligibility before opening the
+checklist. No legacy model worker or other scheduled model workflow is a
+runtime option.
 
 ## 2. Connect host Ollama to Docker
 
@@ -373,6 +376,33 @@ named `Assessments` or `Assessment Calendar`, exactly one underlying data
 source, one `Name` title property, and one `Date` date property. Zero or
 multiple matches are reported as setup problems rather than guessed.
 
+### Classes, tutorials, and labs schedule
+
+Create exactly one active top-level Courses row/page titled
+`Classes + Tutorials + Labs`. This reserved row is a category marker only: do
+not add a seeded Assessments database or a `LEARN Context` property to it.
+
+In Google Calendar on a computer, open the dedicated course calendar's
+**Settings and sharing** → **Integrate calendar**, then copy **Secret address in
+iCal format**. Put that address only in the owner-readable `.env` file:
+
+```dotenv
+ACADEMIC_SCHEDULE_ICAL_URL=https://calendar.google.com/calendar/ical/.../private-.../basic.ics
+ACADEMIC_SCHEDULE_ICAL_TIMEOUT_SECONDS=10
+ACADEMIC_SCHEDULE_ICAL_MAX_BYTES=1048576
+```
+
+Do not paste the secret iCal address into Notion, Discord, logs, screenshots,
+or issue text. The ordinary Google Calendar browser link may remain in Notion
+as a bookmark, but it is not used for synchronization. Reset the secret address
+in Google Calendar immediately if it is exposed.
+
+LifeAgent reads this feed without write access, expands recurring events and
+exceptions in Toronto time, and uses the results only for the
+`Classes + Tutorials + Labs` morning category. Missing configuration,
+inaccessible feeds, malformed iCal, or duplicate reserved rows fail that
+category closed without falling back to a Notion child database.
+
 ### Misc task structure
 
 Create exactly one active top-level Courses row/page titled `misc`. The title is
@@ -502,7 +532,8 @@ Courses, Jobs, Misc, and Classes + Tutorials + Labs. A category failure is
 disclosed in that category's embed and does not hide independently fresh
 categories. Missing sharing, stale data, malformed reserved calendars, or
 Discord delivery uncertainty remains fail-closed. Semantic model or critic
-failure produces a visible facts-only category using trusted Notion metadata.
+failure produces visible facts-only event rows using trusted metadata and due
+labels; selected course work is not suppressed as a quiet course.
 
 ### Nightly academic check-in
 
@@ -516,18 +547,23 @@ ACADEMIC_END_OF_DAY_CATCHUP_GRACE_MINUTES=30
 
 The proactive user ID must also appear in
 `DISCORD_ACADEMIC_AUTHORIZED_USER_IDS`. At the configured Toronto-local time,
-the academic worker records one `academic_nightly_checkin` run, sends an
-idempotent reflection prompt, and opens an artifact-backed conversation for at
-most the configured session TTL. If another conversation is already open, the
-job retries only inside the catch-up window. A late occurrence does not send a
-stale prompt.
+the academic worker records one `academic_nightly_checkin` run, refreshes
+Notion, semantically filters current-day real-course items to movable work
+tasks, sends the first task question, and opens an artifact-backed conversation
+for at most the configured session TTL. If another conversation is already
+open, the job retries only inside the catch-up window. A late occurrence does
+not send a stale prompt.
 
-The owner's reply follows the normal private-channel model path. Study-related
-reflections may update academic learning-focus memory, and the assistant may
-prepare calendar proposals, but every Notion write still requires the displayed
-exact confirmation command. `skip`, `skip tonight`, `skip this check-in`, or
-`skip this checkin` closes that night's conversation without a write. Generic
-personal memory still requires an explicit remember, correct, or forget request.
+The owner's reply follows the nightly checklist state machine inside the normal
+private-channel model path. A completed answer can apply only the guarded
+`Completed — <existing title>` rename for the current task. An incomplete answer
+previews one Toronto-calendar-day move and waits for a separate natural
+confirmation in the same valid nightly session before writing. Ordinary
+academic, LEARN, material, and career proposals still require the displayed
+exact `confirm <proposal-id>` command. `skip`, `skip tonight`, `skip this
+check-in`, or `skip this checkin` closes that night's conversation without a
+write. Generic personal memory still requires an explicit remember, correct, or
+forget request.
 
 Operational health is persisted as `academic_end_of_day`. Use the
 [nightly check-in runbook](runbooks/academic-nightly-checkin.md) for diagnosis.

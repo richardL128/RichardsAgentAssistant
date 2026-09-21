@@ -110,6 +110,91 @@ def db_session(postgres_engine) -> Generator[Session, None, None]:
         session.rollback()
 
 
+def test_incomplete_temporal_assessment_query_uses_partial_index(
+    postgres_engine: Engine,
+) -> None:
+    """Keep the default date-scoped model query off the historical-row scan path."""
+
+    course_id = uuid.uuid4()
+    calendar_id = uuid.uuid4()
+    seed = uuid.uuid4().hex
+    with postgres_engine.connect() as connection:
+        transaction = connection.begin()
+        try:
+            connection.execute(
+                text(
+                    "INSERT INTO courses "
+                    "(id, notion_id, course_code, title, term, timezone, active) "
+                    "VALUES (:id, :notion_id, 'ECE 999', 'Contract Course', "
+                    "'Fall 2026', 'America/Toronto', true)"
+                ),
+                {"id": course_id, "notion_id": f"contract-course-{seed}"},
+            )
+            connection.execute(
+                text(
+                    "INSERT INTO academic_course_calendars "
+                    "(id, course_id, course_page_id, child_data_source_id, "
+                    "title_property_id, date_property_id, discovery_status, last_synced_at) "
+                    "VALUES (:id, :course_id, :page_id, :source_id, 'title', 'date', "
+                    "'valid', '2026-09-20T00:00:00Z')"
+                ),
+                {
+                    "id": calendar_id,
+                    "course_id": course_id,
+                    "page_id": f"contract-course-{seed}",
+                    "source_id": f"contract-source-{seed}",
+                },
+            )
+            connection.execute(
+                text(
+                    "INSERT INTO assessments "
+                    "(id, course_id, notion_id, title, assessment_type, due_at, "
+                    "estimated_minutes, fact_state, confidence, completed, source_id, "
+                    "notion_last_edited_at, title_property_id, active, archived, is_all_day) "
+                    "SELECT (substr(md5(:seed || i::text),1,8) || '-' || "
+                    "substr(md5(:seed || i::text),9,4) || '-' || "
+                    "substr(md5(:seed || i::text),13,4) || '-' || "
+                    "substr(md5(:seed || i::text),17,4) || '-' || "
+                    "substr(md5(:seed || i::text),21,12))::uuid, "
+                    ":course_id, :seed || '-assessment-' || i, 'Assessment ' || i, "
+                    "'assignment', '2026-01-01T00:00:00Z'::timestamptz + "
+                    "(i % 365) * interval '1 day' + (i % 24) * interval '1 hour', "
+                    "60, 'confirmed', 1.0, false, :source_id, "
+                    "'2026-09-20T00:00:00Z', 'title', true, false, (i % 10 = 0) "
+                    "FROM generate_series(1, 100000) AS generated(i)"
+                ),
+                {
+                    "seed": seed,
+                    "course_id": course_id,
+                    "source_id": f"contract-source-{seed}",
+                },
+            )
+            connection.exec_driver_sql("ANALYZE assessments")
+            plan = "\n".join(
+                str(row[0])
+                for row in connection.exec_driver_sql(
+                    "EXPLAIN (ANALYZE, BUFFERS) "
+                    "SELECT a.id, a.title, a.due_at FROM assessments a "
+                    "JOIN courses c ON c.id = a.course_id "
+                    "JOIN academic_course_calendars acc ON acc.course_id = c.id "
+                    "WHERE c.active IS TRUE AND a.active IS TRUE "
+                    "AND a.archived IS FALSE AND a.completed IS FALSE "
+                    "AND a.notion_last_edited_at IS NOT NULL "
+                    "AND acc.discovery_status = 'valid' AND "
+                    "(((a.is_all_day IS FALSE) "
+                    "AND a.due_at >= '2026-09-19T04:00:00Z' "
+                    "AND a.due_at < '2026-09-20T04:00:00Z') OR "
+                    "((a.is_all_day IS TRUE) "
+                    "AND a.due_at >= '2026-09-19T00:00:00Z' "
+                    "AND a.due_at < '2026-09-20T00:00:00Z')) "
+                    "ORDER BY a.due_at, a.title, a.id LIMIT 21"
+                )
+            )
+            assert "ix_assessments_active_incomplete_temporal" in plan
+        finally:
+            transaction.rollback()
+
+
 def test_duplicate_run_idempotency_returns_one_row(db_session: Session) -> None:
     key = f"integration-run-{uuid.uuid4()}"
     first = RunRepository.create_or_get(

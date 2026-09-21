@@ -19,7 +19,6 @@ from app.agents.harness import AbortCheck
 from app.agents.job_interviews.agent_loop import CareerAgentToolState
 from app.agents.job_interviews.notion_mutations import DiscoveredCareerNotionWriter
 from app.agents.job_interviews.sync import JobInterviewNotionSync
-from app.agents.learn.notion_proposals import LearnNotionProposalBuilder
 from app.agents.learn.semantic_interpreter import LearnAnnouncementSemanticInterpreter
 from app.agents.learn.tool_state import LearnToolState
 from app.agents.memory.service import UserMemoryService
@@ -28,6 +27,7 @@ from app.connectors.discord import (
     DiscordAcademicPlannerAdapter,
     DiscordAcademicResponseDelivery,
 )
+from app.connectors.google_calendar import GoogleCalendarConnector
 from app.connectors.learn_bridge import LearnBridgeConnector
 from app.connectors.notion import NotionConnector
 from app.core.config import Settings, get_settings
@@ -167,6 +167,16 @@ def create_academic_discord_service(
     )
     notion_setup_condition = "notion_configuration_missing"
     notion_connector = _create_notion_connector(app_settings)
+    schedule_connector = None
+    if app_settings.academic_schedule_ical_url is not None:
+        try:
+            schedule_connector = GoogleCalendarConnector(
+                ical_url=app_settings.academic_schedule_ical_url,
+                timeout_seconds=app_settings.academic_schedule_ical_timeout_seconds,
+                max_response_bytes=app_settings.academic_schedule_ical_max_bytes,
+            )
+        except (LifeAgentError, ValueError):
+            schedule_connector = None
     if (
         notion_connector is None
         and app_settings.notion_token is not None
@@ -186,6 +196,9 @@ def create_academic_discord_service(
         clarification_ttl_hours=app_settings.academic_confirmation_ttl_hours,
         setup_condition_code=notion_setup_condition,
         material_enqueuer=enqueue_material,
+        schedule_connector=schedule_connector,
+        schedule_lookback_days=app_settings.academic_sync_lookback_days,
+        schedule_horizon_days=max(11, app_settings.academic_plan_horizon_days),
     )
     career_store = SQLAlchemyJobInterviewStore(database.engine)
     career_syncer = JobInterviewNotionSync(
@@ -267,20 +280,18 @@ def create_academic_discord_service(
             research_max_search_results=app_settings.job_research_max_search_results,
         ),
         learn_tool_state_factory=(
-            lambda message: LearnToolState(
-                connector=learn_connector,
-                semantic_interpreter=learn_semantic_interpreter,
-                now=message.timestamp,
-                proposal_builder=LearnNotionProposalBuilder(
-                    model=gateway,
-                    store=store,
-                    timezone=app_settings.app_timezone,
-                ),
-                engine=database.engine,
-                explicit_request_key=message.message_id,
+            lambda message: (
+                LearnToolState(
+                    connector=learn_connector,
+                    semantic_interpreter=learn_semantic_interpreter,
+                    now=message.timestamp,
+                    proposal_builder=None,
+                    engine=database.engine,
+                    explicit_request_key=message.message_id,
+                )
+                if learn_connector is not None
+                else None
             )
-            if learn_connector is not None
-            else None
         ),
         career_engine=database.engine,
         career_writer_provider=lambda: career_writer,

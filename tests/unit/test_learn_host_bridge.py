@@ -181,7 +181,10 @@ def test_settings_require_loopback_profile_outside_repo_and_private_permissions(
 
 def test_health_requires_valid_signature_and_signs_response(tmp_path: Path) -> None:
     settings = _settings(tmp_path)
-    with _server(settings, StubLearnAdapter(),) as (base_url, effective):
+    with _server(
+        settings,
+        StubLearnAdapter(),
+    ) as (base_url, effective):
         with pytest.raises(HTTPError) as unsigned:
             urlopen(f"{base_url}/health", timeout=5)  # noqa: S310
         assert unsigned.value.code == 401
@@ -196,7 +199,10 @@ def test_health_requires_valid_signature_and_signs_response(tmp_path: Path) -> N
 
 def test_rejects_stale_replayed_bad_signature_and_oversized_requests(tmp_path: Path) -> None:
     settings = _settings(tmp_path, max_request_bytes=32)
-    with _server(settings, StubLearnAdapter(),) as (base_url, effective):
+    with _server(
+        settings,
+        StubLearnAdapter(),
+    ) as (base_url, effective):
         with pytest.raises(HTTPError) as stale:
             _request(base_url, effective, "GET", "/health", timestamp=1)
         assert stale.value.code == 401
@@ -369,11 +375,7 @@ def test_learn_bridge_script_and_plist_are_safe(tmp_path: Path) -> None:
     fake_python = tmp_path / "python"
     fake_python.write_text("#!/usr/bin/env bash\nexit 0\n", encoding="utf-8")
     fake_python.chmod(0o755)
-    env = {
-        key: value
-        for key, value in os.environ.items()
-        if not key.startswith("LEARN_BRIDGE")
-    }
+    env = {key: value for key, value in os.environ.items() if not key.startswith("LEARN_BRIDGE")}
     result = subprocess.run(  # noqa: S603
         [
             "/bin/bash",
@@ -404,16 +406,14 @@ def test_learn_bridge_install_passes_valid_launchd_targets(tmp_path: Path) -> No
     calls_file = tmp_path / "launchctl.calls"
     launchctl = fake_bin / "launchctl"
     launchctl.write_text(
-        "#!/usr/bin/env bash\n"
-        "printf '%s\\n' \"$*\" >> \"$LAUNCHCTL_CALLS_FILE\"\n"
-        "exit 0\n",
+        '#!/usr/bin/env bash\nprintf \'%s\\n\' "$*" >> "$LAUNCHCTL_CALLS_FILE"\nexit 0\n',
         encoding="utf-8",
     )
     launchctl.chmod(0o755)
     fake_uv = tmp_path / "uv"
     fake_uv.write_text(
         "#!/usr/bin/env bash\n"
-        "mkdir -p \"$UV_PROJECT_ENVIRONMENT/bin\"\n"
+        'mkdir -p "$UV_PROJECT_ENVIRONMENT/bin"\n'
         f"printf '%s\\n' '#!/usr/bin/env bash' 'exec \"{sys.executable}\" \"$@\"' "
         '> "$UV_PROJECT_ENVIRONMENT/bin/python"\n'
         'chmod 755 "$UV_PROJECT_ENVIRONMENT/bin/python"\n',

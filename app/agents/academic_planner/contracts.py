@@ -10,6 +10,11 @@ from uuid import UUID
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 from app.agents.academic_planner.calendar_roles import AcademicCalendarRole
+from app.agents.query_contracts import (
+    CompletionMode,
+    QueryEnvelope,
+    TemporalQuery,
+)
 
 
 class PlannerModel(BaseModel):
@@ -293,6 +298,7 @@ class ProposedChange(PlannerModel):
     title: str | None = Field(default=None, min_length=1, max_length=500)
     due_at: datetime | None = None
     ends_at: datetime | None = None
+    is_all_day: Literal[True] | None = None
     assessment_type: AssessmentType | None = None
     expected_last_edited_at: datetime | None = None
     expected_title: str | None = Field(default=None, min_length=1, max_length=500)
@@ -390,21 +396,55 @@ class AcademicAssessmentOption(PlannerModel):
     course_code: str = Field(min_length=1, max_length=80)
     title: str = Field(min_length=1, max_length=500)
     due_at: datetime | None = None
+    ends_at: datetime | None = None
+    due_at_local: str | None = Field(default=None, min_length=1, max_length=64)
+    due_date_local: date | None = None
+    is_all_day: bool = False
     assessment_type: AssessmentType
     expected_last_edited_at: datetime | None = None
 
-    @field_validator("due_at", "expected_last_edited_at")
+    @field_validator("due_at", "ends_at", "expected_last_edited_at")
     @classmethod
     def catalog_times_aware(cls, value: datetime | None) -> datetime | None:
         return _aware(value) if value is not None else None
 
+    def model_post_init(self, __context: object) -> None:
+        if self.ends_at is not None:
+            if self.due_at is None:
+                raise ValueError("assessment end timestamp requires a start timestamp")
+            if self.ends_at <= self.due_at:
+                raise ValueError("assessment end timestamp must be after the start timestamp")
+
 
 class AcademicCourseSearchResult(PlannerModel):
     results: tuple[AcademicCourseOption, ...] = Field(max_length=20)
+    envelope: QueryEnvelope[AcademicCourseOption]
 
 
 class AcademicAssessmentSearchResult(PlannerModel):
     results: tuple[AcademicAssessmentOption, ...] = Field(max_length=20)
+    envelope: QueryEnvelope[AcademicAssessmentOption]
+
+
+class AcademicCourseQueryArgs(PlannerModel):
+    """Deterministic course lookup selected by the model and enforced by the host."""
+
+    query: str = Field(default="", max_length=300)
+    roles: tuple[AcademicCalendarRole, ...] = Field(default=(), max_length=3)
+    limit: int = Field(default=10, ge=1, le=20)
+    cursor: str | None = Field(default=None, min_length=1, max_length=2_000)
+
+
+class AcademicAssessmentQueryArgs(PlannerModel):
+    """Host-enforced deterministic read contract for assessment searches."""
+
+    query: str = Field(default="", max_length=300)
+    course_id: str | None = Field(default=None, min_length=1, max_length=255)
+    roles: tuple[AcademicCalendarRole, ...] = Field(default=(), max_length=3)
+    temporal: TemporalQuery = Field(default_factory=TemporalQuery)
+    completion: CompletionMode = CompletionMode.INCOMPLETE
+    limit: int = Field(default=10, ge=1, le=20)
+    cursor: str | None = Field(default=None, min_length=1, max_length=2_000)
 
 
 class SearchCoursesCall(PlannerModel):
@@ -477,15 +517,21 @@ class UpdateAssessmentCall(PlannerModel):
     assessment_id: str = Field(min_length=1, max_length=255)
     title: str | None = Field(default=None, min_length=1, max_length=500)
     due_at: datetime | None = None
+    ends_at: datetime | None = None
 
-    @field_validator("due_at")
+    @field_validator("due_at", "ends_at")
     @classmethod
     def update_due_at_aware(cls, value: datetime | None) -> datetime | None:
         return _aware(value) if value is not None else None
 
     def model_post_init(self, __context: object) -> None:
-        if self.title is None and self.due_at is None:
+        if self.title is None and self.due_at is None and self.ends_at is None:
             raise ValueError("update_assessment must include title or due_at")
+        if self.ends_at is not None:
+            if self.due_at is None:
+                raise ValueError("update_assessment end timestamp requires due_at")
+            if self.ends_at <= self.due_at:
+                raise ValueError("update_assessment end timestamp must be after due_at")
 
 
 class ArchiveAssessmentCall(PlannerModel):

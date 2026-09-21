@@ -21,7 +21,6 @@ from app.agents.calendar_briefing.contracts import (
     with_title_evidence_fragment,
 )
 from app.agents.calendar_briefing.morning_composer import (
-    CourseComposition,
     EventDigestComposition,
     MorningBriefingComposer,
     MorningCategory,
@@ -63,7 +62,6 @@ __all__ = [
     "CalendarEventSourceKind",
     "CalendarSemanticCacheDecision",
     "CalendarSemanticCacheRecord",
-    "CourseComposition",
     "EventDigestComposition",
     "MorningBriefingComposer",
     "MorningBriefingDeliveryManifest",

@@ -4,7 +4,7 @@ from datetime import UTC, date, datetime
 
 import pytest
 
-from app.agents.harness import ToolExecutionError
+from app.agents.harness import TerminalGrounding, ToolExecutionError
 from app.agents.job_interviews.agent_loop import CareerAgentToolState
 from app.agents.job_interviews.contracts import (
     ApplicationRowSnapshot,
@@ -54,7 +54,7 @@ class _Store:
         )
 
     def get_current_plan(self, interview_page_id):
-        assert interview_page_id == "interview-1"
+        assert interview_page_id
         return self.plan
 
     def application_row_snapshots(self):
@@ -68,14 +68,36 @@ class _Store:
 
 
 def _event():
+    return _interview("interview-1", "Shopify Technical Interview", date(2026, 9, 20))
+
+
+def _interview(interview_id, title, local_date):
     return InterviewEventSnapshot(
-        interview_page_id="interview-1",
-        title="Shopify Technical Interview",
-        local_date=date(2026, 9, 20),
+        interview_page_id=interview_id,
+        title=title,
+        local_date=local_date,
         is_all_day=True,
         last_edited_at=NOW,
-        content_fingerprint="source-fingerprint",
+        content_fingerprint=f"{interview_id}-fingerprint",
     )
+
+
+def _context_items(result, kind):
+    return [item for item in result["items"] if item["kind"] == kind]
+
+
+def _freshness_state(result):
+    return result["freshness"][0]["state"]
+
+
+def _assert_envelope(result, *, query, completeness="complete"):
+    assert result["query_id"]
+    assert result["as_of"] == "2026-09-10T12:00:00Z"
+    assert result["timezone"] == "America/Toronto"
+    assert result["applied_filters"]["text"] == query
+    assert result["applied_filters"]["limit"] <= 20
+    assert result["result_count"] == len(result["items"])
+    assert result["completeness"] == completeness
 
 
 def _row(row_id, order, cells, *, header=False):
@@ -112,16 +134,15 @@ async def test_search_jobs_context_returns_applications_and_interview_dates() ->
 
     result = await tools["search_jobs_context"].handler({"query": "what jobs dates are coming up?"})
 
-    assert result["query"] == "what jobs dates are coming up?"
-    assert result["sync"]["status"] == "fresh"
-    assert result["interviews"][0]["date"] == "2026-09-20"
-    assert result["application_tables"][0]["columns"] == [
-        {"index": 0, "header": "Company"},
-        {"index": 1, "header": "Role"},
-        {"index": 2, "header": "Status"},
-    ]
-    assert result["application_tables"][0]["rows"] == [
+    _assert_envelope(result, query="what jobs dates are coming up?")
+    assert _freshness_state(result) == "fresh_complete"
+    assert _context_items(result, "interview")[0]["stable_id"] == "interview-1"
+    assert _context_items(result, "interview")[0]["date"] == "2026-09-20"
+    assert _context_items(result, "application_row") == [
         {
+            "kind": "application_row",
+            "stable_id": "app-row",
+            "table_block_id": "applications-table",
             "row_block_id": "app-row",
             "row_order": 1,
             "cells": ["Shopify", "Backend Developer", "Applied"],
@@ -144,18 +165,37 @@ async def test_search_jobs_context_uses_cached_data_when_sync_setup_needs_attent
 
     result = await tools["search_jobs_context"].handler({"query": "Shopify"})
 
-    assert result["sync"] == {
-        "status": "cached_fallback",
-        "sync_status": "setup_required",
-        "diagnostic_codes": ["jobs_page_missing"],
-        "message": "Jobs sync needs attention; returned cached career data.",
-    }
-    assert result["interviews"][0]["title"] == "Shopify Technical Interview"
-    assert result["application_tables"][0]["rows"][0]["cells"] == [
+    _assert_envelope(result, query="Shopify", completeness="cached_stale")
+    assert result["freshness"] == [
+        {
+            "source_id": "career_jobs_context",
+            "state": "cached_stale",
+            "as_of": None,
+            "diagnostic_codes": ["setup_required", "jobs_page_missing"],
+        }
+    ]
+    assert _context_items(result, "interview")[0]["title"] == "Shopify Technical Interview"
+    assert _context_items(result, "application_row")[0]["cells"] == [
         "Shopify",
         "Backend Developer",
         "Applied",
     ]
+
+    grounding = TerminalGrounding(
+        query_id=result["query_id"],
+        item_ids=("interview-1",),
+        acknowledge_stale=False,
+    )
+    assert state.validate_grounding(grounding) == (
+        "grounding must acknowledge stale cached career data"
+    )
+    disclosed = grounding.__class__(
+        query_id=grounding.query_id,
+        item_ids=grounding.item_ids,
+        acknowledge_stale=True,
+    )
+    assert state.validate_grounding(disclosed) is None
+    assert "cached and stale" in state.render_grounding(disclosed)
 
 
 async def test_search_jobs_context_uses_cached_data_when_sync_raises() -> None:
@@ -165,9 +205,72 @@ async def test_search_jobs_context_uses_cached_data_when_sync_raises() -> None:
 
     result = await tools["search_jobs_context"].handler({"query": "Shopify"})
 
-    assert result["sync"]["status"] == "cached_fallback"
-    assert result["sync"]["sync_status"] == "failed"
-    assert result["interviews"][0]["date"] == "2026-09-20"
+    _assert_envelope(result, query="Shopify", completeness="cached_stale")
+    assert _freshness_state(result) == "cached_stale"
+    assert result["freshness"][0]["diagnostic_codes"] == ["failed"]
+    assert _context_items(result, "interview")[0]["date"] == "2026-09-20"
+
+
+async def test_search_jobs_context_filters_many_unrelated_rows_before_pagination() -> None:
+    unrelated = tuple(
+        _row(f"other-{index}", index, (f"Company {index}", "Designer", "Rejected"))
+        for index in range(1, 30)
+    )
+    store = _Store(
+        table_rows=(
+            _row("header-row", 0, ("Company", "Role", "Status"), header=True),
+            *unrelated,
+            _row("shopify-row", 30, ("Shopify", "Backend Developer", "Interviewing")),
+        ),
+        interviews=(
+            _interview("interview-1", "Shopify Technical Interview", date(2026, 9, 20)),
+            _interview("interview-2", "Stripe Recruiter Call", date(2026, 9, 21)),
+        ),
+    )
+    state = _state(store)
+    tools = {tool.name: tool for tool in state.tools()}
+
+    result = await tools["search_jobs_context"].handler({"query": "Shopify", "limit": 20})
+
+    _assert_envelope(result, query="Shopify")
+    assert [item["title"] for item in _context_items(result, "interview")] == [
+        "Shopify Technical Interview"
+    ]
+    assert [item["row_block_id"] for item in _context_items(result, "application_row")] == [
+        "shopify-row"
+    ]
+    assert not result["has_more"]
+
+
+async def test_search_job_interviews_paginates_with_cursor_and_preserves_capabilities() -> None:
+    interviews = tuple(
+        _interview(
+            f"interview-{index}",
+            f"Company {index:02d} Technical Interview",
+            date(2026, 9, 20),
+        )
+        for index in range(1, 5)
+    )
+    state = _state(_Store(interviews=interviews))
+    tools = {tool.name: tool for tool in state.tools()}
+
+    first = await tools["search_job_interviews"].handler({"query": "Company", "limit": 2})
+    second = await tools["search_job_interviews"].handler(
+        {"query": "Company", "limit": 2, "cursor": first["next_cursor"]}
+    )
+
+    _assert_envelope(first, query="Company", completeness="more_available")
+    assert first["has_more"] is True
+    assert [item["interview_page_id"] for item in first["items"]] == [
+        "interview-1",
+        "interview-2",
+    ]
+    assert [item["interview_page_id"] for item in second["items"]] == [
+        "interview-3",
+        "interview-4",
+    ]
+    with pytest.raises(ToolExecutionError, match="interview_page_id must come"):
+        await tools["prepare_job_interview"].handler({"interview_page_id": "missing"})
 
 
 async def test_search_jobs_context_preserves_error_when_sync_fails_without_cache() -> None:
@@ -198,7 +301,7 @@ async def test_search_then_cached_preparation_returns_one_maintained_plan() -> N
         {"interview_page_id": "interview-1", "refresh_research": False}
     )
 
-    assert interview_result["interviews"][0]["date"] == "2026-09-20"
+    assert interview_result["items"][0]["date"] == "2026-09-20"
     assert prepared["status"] == "current"
     assert prepared["plan_revision"] == 3
     assert prepared["notion_save_question"] is None

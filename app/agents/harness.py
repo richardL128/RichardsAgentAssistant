@@ -9,10 +9,14 @@ import re
 from collections.abc import Awaitable, Callable, Mapping, Sequence
 from contextlib import suppress
 from dataclasses import dataclass
+from datetime import date, datetime
+from enum import Enum
 from itertools import pairwise
 from typing import Any, Literal, Protocol, cast
+from uuid import UUID
 
 from langchain_core.messages import AIMessage, BaseMessage, HumanMessage, SystemMessage, ToolMessage
+from pydantic import BaseModel
 
 type HarnessEventKind = Literal[
     "assistant_text",
@@ -45,6 +49,10 @@ type LifecycleValidator = Callable[
     ["ConversationLifecycle", Sequence[BaseMessage]],
     Awaitable[str | None] | str | None,
 ]
+type LifecycleRenderer = Callable[
+    ["ConversationLifecycle", Sequence[BaseMessage]],
+    Awaitable[str] | str,
+]
 
 DEFAULT_SYSTEM_MESSAGE = (
     "You are a helpful assistant. Use available tools when they are useful. "
@@ -75,6 +83,26 @@ TERMINAL_RESPONSE_TOOL_SCHEMA: Mapping[str, Any] = {
                     "type": "string",
                     "minLength": 1,
                     "description": "The exact owner-visible Discord response.",
+                },
+                "grounding": {
+                    "type": "object",
+                    "additionalProperties": False,
+                    "properties": {
+                        "query_id": {"type": "string", "minLength": 1, "maxLength": 128},
+                        "item_ids": {
+                            "type": "array",
+                            "items": {"type": "string", "minLength": 1, "maxLength": 255},
+                            "maxItems": 20,
+                        },
+                        "acknowledge_incomplete": {"type": "boolean"},
+                        "acknowledge_stale": {"type": "boolean"},
+                    },
+                    "required": [
+                        "query_id",
+                        "item_ids",
+                        "acknowledge_incomplete",
+                        "acknowledge_stale",
+                    ],
                 },
             },
             "required": ["disposition", "content"],
@@ -135,6 +163,10 @@ class ToolExecutionError(ValueError):
     """Explicit, user-safe tool error that may be shown to the model and owner."""
 
 
+class ToolResultOversizeError(ToolExecutionError):
+    """Signal that a domain envelope cannot fit even after safe page reduction."""
+
+
 class UserAbortRequested(asyncio.CancelledError):
     """Raised when a user-requested abort has been durably observed."""
 
@@ -145,6 +177,15 @@ class ConversationLifecycle:
 
     disposition: ConversationDisposition
     content: str
+    grounding: TerminalGrounding | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class TerminalGrounding:
+    query_id: str
+    item_ids: tuple[str, ...]
+    acknowledge_incomplete: bool = False
+    acknowledge_stale: bool = False
 
 
 @dataclass(frozen=True, slots=True)
@@ -245,6 +286,7 @@ async def run_native_tool_loop(
     restored_messages: Sequence[BaseMessage] = (),
     require_terminal_response: bool = False,
     lifecycle_validator: LifecycleValidator | None = None,
+    lifecycle_renderer: LifecycleRenderer | None = None,
     pre_model_context_hook: PreModelContextHook | None = None,
     _model_pending_elapsed_seconds: Sequence[float] = MODEL_PENDING_ELAPSED_SECONDS,
     _model_pending_repeat_seconds: float = MODEL_PENDING_REPEAT_SECONDS,
@@ -271,6 +313,7 @@ async def run_native_tool_loop(
         tool_map=tool_map,
         require_terminal_response=require_terminal_response,
         lifecycle_validator=lifecycle_validator,
+        lifecycle_renderer=lifecycle_renderer,
         checkpoint_sink=checkpoint_sink,
         event_sink=event_sink,
         abort_check=abort_check,
@@ -330,12 +373,15 @@ async def run_native_tool_loop(
                 lifecycle_validator=lifecycle_validator,
             )
             if lifecycle is not None:
+                rendered_content = await _render_lifecycle(
+                    lifecycle_renderer, lifecycle, tuple(messages)
+                )
                 await _emit(
                     event_sink,
                     AgentHarnessEvent(
                         kind="final_response",
                         turn=turn,
-                        content=lifecycle.content,
+                        content=rendered_content,
                         lifecycle_disposition=lifecycle.disposition,
                     ),
                 )
@@ -343,7 +389,7 @@ async def run_native_tool_loop(
                     status=(
                         "awaiting_user" if lifecycle.disposition == "awaiting_user" else "completed"
                     ),
-                    final_response=lifecycle.content,
+                    final_response=rendered_content,
                     turns=turn,
                     messages=tuple(messages),
                     lifecycle_disposition=lifecycle.disposition,
@@ -431,6 +477,7 @@ async def _resume_checkpointed_tail(
     tool_map: Mapping[str, NativeTool],
     require_terminal_response: bool,
     lifecycle_validator: LifecycleValidator | None,
+    lifecycle_renderer: LifecycleRenderer | None,
     checkpoint_sink: CheckpointSink | None,
     event_sink: EventSink | None,
     abort_check: AbortCheck | None,
@@ -450,12 +497,15 @@ async def _resume_checkpointed_tail(
             lifecycle_validator=lifecycle_validator,
         )
         if lifecycle is not None:
+            rendered_content = await _render_lifecycle(
+                lifecycle_renderer, lifecycle, tuple(messages)
+            )
             await _emit(
                 event_sink,
                 AgentHarnessEvent(
                     kind="final_response",
                     turn=turn,
-                    content=lifecycle.content,
+                    content=rendered_content,
                     lifecycle_disposition=lifecycle.disposition,
                 ),
             )
@@ -463,7 +513,7 @@ async def _resume_checkpointed_tail(
                 status=(
                     "awaiting_user" if lifecycle.disposition == "awaiting_user" else "completed"
                 ),
-                final_response=lifecycle.content,
+                final_response=rendered_content,
                 turns=turn,
                 messages=tuple(messages),
                 lifecycle_disposition=lifecycle.disposition,
@@ -787,17 +837,68 @@ def _lifecycle_from_arguments(
 ) -> tuple[ConversationLifecycle | None, str]:
     disposition = arguments.get("disposition")
     content = arguments.get("content")
+    raw_grounding = arguments.get("grounding")
     if disposition not in {"awaiting_user", "completed"}:
         return None, "terminal response disposition must be awaiting_user or completed"
     if not isinstance(content, str) or not content.strip():
         return None, "terminal response content must be non-empty text"
+    grounding = None
+    if raw_grounding is not None:
+        if not isinstance(raw_grounding, Mapping):
+            return None, "terminal response grounding must be an object"
+        grounding_map = cast(Mapping[str, object], raw_grounding)
+        if set(grounding_map) != {
+            "query_id",
+            "item_ids",
+            "acknowledge_incomplete",
+            "acknowledge_stale",
+        }:
+            return None, "terminal response grounding fields are invalid"
+        query_id = grounding_map.get("query_id")
+        item_ids = grounding_map.get("item_ids")
+        acknowledge_incomplete = grounding_map.get("acknowledge_incomplete")
+        acknowledge_stale = grounding_map.get("acknowledge_stale")
+        if not isinstance(query_id, str) or not query_id.strip():
+            return None, "terminal response grounding query_id is invalid"
+        if not isinstance(item_ids, Sequence) or isinstance(item_ids, str | bytes):
+            return None, "terminal response grounding item_ids are invalid"
+        normalized_ids = tuple(cast(Sequence[object], item_ids))
+        if len(normalized_ids) > 20 or not all(
+            isinstance(item, str) and item for item in normalized_ids
+        ):
+            return None, "terminal response grounding item_ids are invalid"
+        if len(set(normalized_ids)) != len(normalized_ids):
+            return None, "terminal response grounding item_ids must be unique"
+        if not isinstance(acknowledge_incomplete, bool) or not isinstance(acknowledge_stale, bool):
+            return None, "terminal response grounding acknowledgements are invalid"
+        grounding = TerminalGrounding(
+            query_id=query_id,
+            item_ids=cast(tuple[str, ...], normalized_ids),
+            acknowledge_incomplete=acknowledge_incomplete,
+            acknowledge_stale=acknowledge_stale,
+        )
     return (
         ConversationLifecycle(
             disposition=cast(ConversationDisposition, disposition),
             content=content,
+            grounding=grounding,
         ),
         "",
     )
+
+
+async def _render_lifecycle(
+    renderer: LifecycleRenderer | None,
+    lifecycle: ConversationLifecycle,
+    messages: Sequence[BaseMessage],
+) -> str:
+    if renderer is None:
+        return lifecycle.content
+    rendered = renderer(lifecycle, messages)
+    if inspect.isawaitable(rendered):
+        rendered = await rendered
+    text = str(rendered).strip()
+    return text or lifecycle.content
 
 
 def _lifecycle_correction(reason: str) -> str:
@@ -811,6 +912,24 @@ async def _fail_closed_lifecycle(
     messages: Sequence[BaseMessage],
     turn: int,
 ) -> AgentHarnessResult:
+    actionable_failure = _actionable_tool_failure(messages)
+    if actionable_failure is not None:
+        await _emit(
+            event_sink,
+            AgentHarnessEvent(
+                kind="final_response",
+                turn=turn,
+                content=actionable_failure,
+                lifecycle_disposition="completed",
+            ),
+        )
+        return AgentHarnessResult(
+            status="completed",
+            final_response=actionable_failure,
+            turns=turn,
+            messages=tuple(messages),
+            lifecycle_disposition="completed",
+        )
     await _emit(
         event_sink,
         AgentHarnessEvent(
@@ -824,6 +943,49 @@ async def _fail_closed_lifecycle(
         final_response=_LIFECYCLE_FAILURE_RESPONSE,
         turns=turn,
         messages=tuple(messages),
+    )
+
+
+def _actionable_tool_failure(messages: Sequence[BaseMessage]) -> str | None:
+    """Render a safe terminal error when the model cannot repair the lifecycle call.
+
+    This fallback is intentionally limited to turns containing only failed tool calls.
+    A turn with any successful tool result may have prepared a proposal, so it continues
+    to fail closed through the ordinary lifecycle path.
+    """
+
+    current_turn: list[ToolMessage] = []
+    for message in reversed(messages):
+        if isinstance(message, HumanMessage):
+            break
+        if isinstance(message, ToolMessage):
+            current_turn.append(message)
+    if not current_turn or any(message.status != "error" for message in current_turn):
+        return None
+    latest = current_turn[0]
+    try:
+        decoded = json.loads(str(latest.content))
+    except (TypeError, ValueError, json.JSONDecodeError):
+        return None
+    if not isinstance(decoded, Mapping):
+        return None
+    payload = cast(Mapping[str, object], decoded)
+    if payload.get("status") != "error":
+        return None
+    raw_error = payload.get("error")
+    if isinstance(raw_error, str):
+        message = raw_error
+    elif isinstance(raw_error, Mapping):
+        candidate = cast(Mapping[str, object], raw_error).get("message")
+        message = candidate if isinstance(candidate, str) else None
+    else:
+        message = None
+    if message is None or not message.strip():
+        return None
+    safe_message = message.strip()[:MAX_JSON_STRING_CHARS]
+    return (
+        "I couldn't complete that request because the required data was unavailable: "
+        f"{safe_message} No change was made."
     )
 
 
@@ -848,6 +1010,18 @@ async def _execute_tool_call(
     try:
         await _raise_if_abort_requested(abort_check)
         result = await tool.handler(args)
+    except ToolResultOversizeError:
+        return _tool_contract_error(
+            call,
+            code="tool_result_oversize",
+            message=(
+                "The tool result exceeded the model payload budget; retry with narrower "
+                "filters or a smaller limit."
+            ),
+            turn=turn,
+            tool_activity=tool.activity,
+            tool_side_effect_class=tool.side_effect_class,
+        )
     except Exception as exc:
         return _tool_error(
             call,
@@ -857,7 +1031,29 @@ async def _execute_tool_call(
             tool_side_effect_class=tool.side_effect_class,
         )
     payload = _tool_result_payload(result)
-    result_json = _safe_json(payload)
+    try:
+        result_json = _json_for_tool_message(payload)
+    except (TypeError, ValueError):
+        return _tool_contract_error(
+            call,
+            code="tool_result_not_serializable",
+            message="The tool returned a result that could not be serialized safely.",
+            turn=turn,
+            tool_activity=tool.activity,
+            tool_side_effect_class=tool.side_effect_class,
+        )
+    if result_json is None:
+        return _tool_contract_error(
+            call,
+            code="tool_result_oversize",
+            message=(
+                "The tool result exceeded the model payload budget; retry with narrower "
+                "filters, a smaller limit, or the provided pagination contract."
+            ),
+            turn=turn,
+            tool_activity=tool.activity,
+            tool_side_effect_class=tool.side_effect_class,
+        )
     return (
         ToolMessage(
             content=result_json,
@@ -907,6 +1103,37 @@ def _tool_error(
     )
 
 
+def _tool_contract_error(
+    call: _ToolCall,
+    *,
+    code: str,
+    message: str,
+    turn: int,
+    tool_activity: str | None = None,
+    tool_side_effect_class: ToolSideEffectClass | None = None,
+) -> tuple[ToolMessage, AgentHarnessEvent]:
+    payload = {"status": "error", "error": {"code": code, "message": message}}
+    content = json.dumps(payload, ensure_ascii=False, separators=(",", ":"), sort_keys=True)
+    return (
+        ToolMessage(
+            content=content,
+            tool_call_id=call.call_id,
+            name=call.name,
+            status="error",
+        ),
+        AgentHarnessEvent(
+            kind="tool_error",
+            turn=turn,
+            tool_call_id=call.call_id,
+            tool_name=call.name,
+            tool_activity=tool_activity,
+            tool_side_effect_class=tool_side_effect_class,
+            error=f"{code}: {message}",
+            result_json=content,
+        ),
+    )
+
+
 def _tool_result_payload(result: object) -> Mapping[str, object]:
     if isinstance(result, ToolExecutionResult):
         return {"status": result.status, "content": result.content}
@@ -944,16 +1171,43 @@ def _safe_exception_text(exc: Exception) -> str:
 
 
 def _safe_json(value: object, *, max_chars: int = MAX_EVENT_JSON_CHARS) -> str:
-    encoded = json.dumps(
-        _json_safe(value),
-        ensure_ascii=True,
-        separators=(",", ":"),
-        sort_keys=True,
-    )
+    encoded = _encode_json(value)
     if len(encoded) <= max_chars:
         return encoded
     return json.dumps(
         {"truncated": True, "preview": encoded[: max_chars - 128]},
+        ensure_ascii=True,
+        separators=(",", ":"),
+        sort_keys=True,
+    )
+
+
+def _json_for_tool_message(value: object, *, max_chars: int = MAX_EVENT_JSON_CHARS) -> str | None:
+    encoded = json.dumps(
+        value,
+        default=_model_json_default,
+        ensure_ascii=False,
+        separators=(",", ":"),
+        sort_keys=True,
+    )
+    return encoded if len(encoded) <= max_chars else None
+
+
+def _model_json_default(value: object) -> object:
+    if isinstance(value, BaseModel):
+        return value.model_dump(mode="json")
+    if isinstance(value, datetime | date):
+        return value.isoformat()
+    if isinstance(value, UUID):
+        return str(value)
+    if isinstance(value, Enum):
+        return value.value
+    raise TypeError(f"{value.__class__.__name__} is not JSON serializable")
+
+
+def _encode_json(value: object) -> str:
+    return json.dumps(
+        _json_safe(value),
         ensure_ascii=True,
         separators=(",", ":"),
         sort_keys=True,
@@ -999,11 +1253,14 @@ __all__ = [
     "CheckpointSink",
     "ConversationDisposition",
     "ConversationLifecycle",
+    "LifecycleRenderer",
     "LifecycleValidator",
     "NativeTool",
     "NativeToolHandler",
+    "TerminalGrounding",
     "ToolExecutionError",
     "ToolExecutionResult",
+    "ToolResultOversizeError",
     "ToolSideEffectClass",
     "TranscriptCheckpointKind",
     "UserAbortRequested",

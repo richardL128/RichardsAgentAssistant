@@ -1,25 +1,42 @@
-# Runbook: Academic nightly check-in
+# Runbook: Academic nightly task check-in
 
-Use this runbook when the evening reflection prompt is missing, late,
-duplicated, or cannot open a durable conversation.
+Use this runbook when the evening course-task checklist is missing, stale,
+duplicated, or cannot safely update Notion.
 
 ## Current architecture
 
 The resident academic worker evaluates `ACADEMIC_END_OF_DAY_SCHEDULE` in
-`APP_TIMEZONE` every minute. It may catch up only inside
-`ACADEMIC_END_OF_DAY_CATCHUP_GRACE_MINUTES`. Each local occurrence uses:
+`APP_TIMEZONE` every minute and catches up only inside
+`ACADEMIC_END_OF_DAY_CATCHUP_GRACE_MINUTES`. The configured default is the v2
+checklist (`academic-nightly-checkin-v2`); the former free-form reflection is
+not a fallback.
 
-- run agent: `academic_nightly_checkin`;
-- run schedule and period namespace: `academic-end-of-day`;
-- period key: `academic-end-of-day:YYYY-MM-DD:HHMM:v1`;
-- delivery key: `academic-eod-delivery:YYYY-MM-DD:HHMM:v1`;
-- health row: `academic_end_of_day`.
+For each Toronto-local occurrence the worker:
 
-The job sends one host-rendered Discord prompt and opens an artifact-backed
-native conversation for `DISCORD_ACADEMIC_PROACTIVE_USER_ID`. It does not call
-Qwen until that authorized owner replies. A reply may update academic
-learning-focus memory or prepare a calendar proposal, but it cannot bypass exact
-confirmation. A skip command closes the conversation without a write.
+1. refreshes the academic Notion catalog and requires a provably fresh result;
+2. loads active, incomplete items dated for that local day from writable,
+   real course calendars only;
+3. asks the local model and a semantic critic whether each item is movable
+   work, failing closed on uncertainty or model failure;
+4. atomically opens an artifact-backed native conversation with the ordered,
+   versioned checklist checkpoint; and
+5. sends the first concrete task question, one item at a time.
+
+The checkpoint and transcript are private artifacts. Relational lifecycle and
+run metadata contain stable IDs and diagnostic codes, not task titles or owner
+reply text. No session is opened when there are no eligible tasks.
+
+An answer meaning “completed” authorizes only a guarded title change for the
+current item to `Completed — <exact existing title>`. An incomplete answer only
+prepares and previews a one-Toronto-calendar-day move. The move is applied only
+after a separate natural confirmation in the same valid nightly session. Global
+academic, LEARN, material, and career proposals still require exact
+`confirm <proposal_id>` input.
+
+Both writes use stable proposal and operation IDs, re-resolve the Notion target,
+and check its exact title and edit version. Timed items preserve wall-clock time;
+all-day precision and start/end duration are preserved. The bot acknowledges
+before calling Notion, then reports the actual outcome and next task.
 
 ## Required configuration
 
@@ -32,28 +49,17 @@ DISCORD_ACADEMIC_AUTHORIZED_USER_IDS=[123456789012345678]
 DISCORD_ACADEMIC_MESSAGE_CONTENT_ENABLED=true
 ```
 
-The Discord bot token, academic channel, application ID, and host handoff secret
-must also be configured. The proactive owner must be in the authorized-user
-list; otherwise health reports `setup_attention` and no prompt is sent.
+The Discord bot/application settings, Notion token and Courses database ID,
+local Qwen runtime, artifact store, and database must also be available. The
+proactive owner must be allowlisted.
 
-## Diagnosis
+## Safe diagnosis
 
-Inspect health without exposing conversation content:
+Check health and recent runs without selecting private artifact content:
 
 ```bash
 curl --fail http://127.0.0.1:8000/health/ready | jq .
 ```
-
-```bash
-docker compose exec -T postgres sh -lc 'psql -U "$POSTGRES_USER" -d "$POSTGRES_DB" -c "
-SELECT check_name, state, rule, checked_at, last_success_at, next_due_at, diagnostic
-FROM health_checks
-WHERE check_name = '\''academic_end_of_day'\''
-ORDER BY checked_at DESC
-LIMIT 1;"'
-```
-
-Inspect recent runs and durable delivery state:
 
 ```bash
 docker compose exec -T postgres sh -lc 'psql -U "$POSTGRES_USER" -d "$POSTGRES_DB" -c "
@@ -73,37 +79,46 @@ ORDER BY created_at DESC
 LIMIT 10;"'
 ```
 
-If no run exists after the grace deadline, inspect both queue task names:
+For proposal/write state, inspect only stable IDs and statuses. Do not print the
+proposal payload because it contains private task titles.
 
-```bash
-docker compose exec -T postgres sh -lc 'psql -U "$POSTGRES_USER" -d "$POSTGRES_DB" -c "
-SELECT id, task_name, status, attempts, scheduled_at
-FROM procrastinate_jobs
-WHERE task_name IN (
-  '\''lifeagent.schedule.academic_nightly_checkin'\'',
-  '\''lifeagent.academic_nightly_checkin'\''
-)
-ORDER BY scheduled_at DESC
-LIMIT 20;"'
-```
+## Failure and recovery
 
-## Recovery
+- **Catalog refresh failed or stale:** no checklist is built from cached data and
+  no Notion write occurs. Restore Notion connectivity, then wait for the next
+  scheduled occurrence; do not manually replay an out-of-grace period.
+- **Semantic model/critic unavailable:** uncertain items are excluded and there
+  is no deterministic classifier fallback. Restore Qwen with
+  `scripts/ollama_qwen_start.sh` and retry only inside the schedule grace window.
+- **Another native conversation is open:** the scheduler retries inside grace.
+  Finish/cancel the active conversation or allow it to expire.
+- **A v1 conversation is still open after deployment:** the reply path closes it
+  with an owner-visible “started before the checklist update” explanation and
+  makes no change.
+- **Notion target conflict:** the item changed after preview. The guarded write
+  leaves it untouched, reports the conflict, records a terminal failed outcome,
+  and proceeds safely. Do not edit the proposal payload or auto-retry it.
+- **Expired proposal:** no write occurs. The checklist reports the failure and
+  advances or closes; start a new current-day check-in instead of reviving it.
+- **Timeout or uncertain connector result:** no automatic second write is issued.
+  Inspect the Notion page and proposal-operation receipt before any operator
+  action.
+- **Duplicate Discord delivery/reply or worker replay:** stable delivery,
+  proposal, and operation keys return the existing result. Do not delete those
+  records; they are the idempotency proof.
+- **Discord delivery failed after session creation:** retrying the same period
+  reuses the checkpoint and idempotent delivery key. Never create a second
+  session manually.
 
-- `setup_attention`: configure the proactive owner and required Discord handoff
-  settings, ensure the owner is allowlisted, then recreate the worker.
-- `native_conversation_busy`: finish, cancel, or let the existing conversation
-  expire. The scheduler retries only while the occurrence remains in grace.
-- `schedule_late`: do not replay the stale prompt; verify the next occurrence.
-- failed or uncertain delivery: inspect the durable delivery row before retrying
-  so an already accepted Discord message is not duplicated.
-
-After changing `.env`, use the canonical deployment path:
+After configuration changes, deploy through:
 
 ```bash
 scripts/lifeagent_host_runtime.sh deploy
 ```
 
-For a controlled check, temporarily set the schedule to a nearby local minute,
-keep the proactive owner allowlisted, verify one delivery and one
-`awaiting_user` conversation, reply `skip`, and confirm that no Notion or memory
-write occurs.
+For a controlled validation, schedule a nearby local minute with two fake or
+safe course tasks. Verify the first Discord message names exactly one task,
+reply with an incomplete natural sentence, verify the exact old/new-date
+preview, reply “yeah sure,” observe the pre-write acknowledgement, and confirm
+one guarded receipt followed by the second task. Also exercise a fixed exam or
+deadline and verify it produces no proposal or Notion call.

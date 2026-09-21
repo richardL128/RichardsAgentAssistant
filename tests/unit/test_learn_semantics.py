@@ -3,6 +3,7 @@ from __future__ import annotations
 from datetime import UTC, date, datetime, timedelta
 from types import SimpleNamespace
 from typing import Any
+from zoneinfo import ZoneInfo
 
 import pytest
 
@@ -25,6 +26,7 @@ from app.agents.learn.semantic_interpreter import (
     LearnAnnouncementSemanticInterpreter,
 )
 from app.agents.learn.tool_state import LearnToolState
+from app.agents.query_contracts import MODEL_TOOL_RESULT_MAX_CHARS, model_json_size
 from app.connectors.learn_bridge import LearnBridgeSnapshot
 from app.db.academic import AcademicCourseMutationTarget
 
@@ -245,7 +247,10 @@ async def test_learn_tool_state_search_auth_hides_raw_announcements() -> None:
         )
 
     search = await state._search_courses({"query": "ece"})
-    assert search["courses"][0]["course_id"] == "course-1"
+    assert search["items"][0]["course_id"] == "course-1"
+    assert search["items"][0]["stable_id"] == "course-1"
+    assert search["timezone"] == "America/Toronto"
+    assert search["freshness"][0]["state"] == "fresh_complete"
 
     scheduled = await state._get_scheduled_items(
         {
@@ -254,7 +259,9 @@ async def test_learn_tool_state_search_auth_hides_raw_announcements() -> None:
             "end_date": date(2026, 9, 20),
         }
     )
-    assert scheduled["scheduled_items"][0]["title"] == "Tutorial"
+    assert scheduled["items"][0]["title"] == "Tutorial"
+    assert scheduled["items"][0]["stable_id"] == "schedule-1"
+    assert scheduled["applied_filters"]["completion"] == "incomplete"
 
     announcements = await state._get_announcements(
         {
@@ -263,8 +270,140 @@ async def test_learn_tool_state_search_auth_hides_raw_announcements() -> None:
             "until": NOW,
         }
     )
-    assert announcements["announcements"][0]["summary"] == _result().summary
+    assert announcements["items"][0]["summary"] == _result().summary
+    assert announcements["items"][0]["source_id"] == "announcement-1"
     assert "Quiz 2 moved to September 21. Review chapter 4 before class." not in str(announcements)
+    zone = ZoneInfo("America/Toronto")
+    assert connector.calls[0]["start_at"] == datetime(2026, 9, 19, tzinfo=zone)
+    assert connector.calls[0]["end_at"] == datetime(2026, 9, 20, tzinfo=zone)
+    assert connector.calls[1]["start_at"] == datetime(2026, 9, 19, tzinfo=zone)
+    assert connector.calls[1]["end_at"] == datetime(2026, 9, 21, tzinfo=zone)
+    assert connector.calls[2]["start_at"] == datetime(2026, 9, 18, tzinfo=zone)
+    assert connector.calls[2]["end_at"] == datetime(2026, 9, 20, tzinfo=zone)
+
+
+@pytest.mark.asyncio
+async def test_learn_checkpoint_restores_course_capability_for_resumed_lookup() -> None:
+    course = LearnCourse(
+        org_unit_id="course-1",
+        code="ECE 240",
+        name="Electronic Circuits",
+        active=True,
+        url="https://learn.uwaterloo.ca/d2l/home/course-1",
+    )
+    item = LearnScheduledItem(
+        source_id="schedule-1",
+        course_org_unit_id="course-1",
+        course_code="ECE 240",
+        title="Tutorial",
+        start_at=date(2026, 9, 20),
+        date_precision=LearnDatePrecision.DATE,
+        fingerprint="s" * 64,
+    )
+    connector = _Connector(
+        LearnBridgeSnapshot(courses=(course,), scheduled_items=(item,), generated_at=NOW)
+    )
+    initial = LearnToolState(
+        connector=connector,  # type: ignore[arg-type]
+        semantic_interpreter=_Interpreter(),  # type: ignore[arg-type]
+        now=NOW,
+    )
+    search = await initial._search_courses({"query": "ece"})
+
+    resumed = LearnToolState(
+        connector=connector,  # type: ignore[arg-type]
+        semantic_interpreter=_Interpreter(),  # type: ignore[arg-type]
+        now=NOW,
+    )
+    resumed.restore_checkpoint(initial.export_checkpoint())
+    scheduled = await resumed._get_scheduled_items(
+        {
+            "course_ids": ("course-1",),
+            "start_date": date(2026, 9, 19),
+            "end_date": date(2026, 9, 20),
+        }
+    )
+
+    assert resumed.query_envelope(search["query_id"]) is not None
+    assert [entry["source_id"] for entry in scheduled["items"]] == ["schedule-1"]
+
+
+@pytest.mark.asyncio
+async def test_learn_tool_state_uses_toronto_windows_and_bounded_envelopes() -> None:
+    courses = tuple(
+        LearnCourse(
+            org_unit_id=f"course-{index}",
+            code=f"ECE {index:03d}",
+            name=f"Course {index}",
+            active=True,
+            url=f"https://learn.example/course-{index}",
+        )
+        for index in range(25)
+    )
+    previous_local_day = LearnScheduledItem(
+        source_id="schedule-previous",
+        course_org_unit_id="course-1",
+        course_code="ECE 001",
+        title="Previous local day",
+        start_at=datetime(2026, 9, 20, 3, 30, tzinfo=UTC),
+        date_precision=LearnDatePrecision.DATETIME,
+        fingerprint="p" * 64,
+    )
+    included = LearnScheduledItem(
+        source_id="schedule-included",
+        course_org_unit_id="course-1",
+        course_code="ECE 001",
+        title="Included local day",
+        start_at=datetime(2026, 9, 20, 4, 30, tzinfo=UTC),
+        date_precision=LearnDatePrecision.DATETIME,
+        fingerprint="i" * 64,
+    )
+    completed = included.model_copy(
+        update={
+            "source_id": "schedule-completed",
+            "title": "Completed local day",
+            "completed": True,
+        }
+    )
+    connector = _Connector(
+        LearnBridgeSnapshot(
+            courses=courses,
+            scheduled_items=(previous_local_day, included, completed),
+            generated_at=datetime(2026, 9, 20, 4, tzinfo=UTC),
+        )
+    )
+    state = LearnToolState(
+        connector=connector,  # type: ignore[arg-type]
+        semantic_interpreter=_Interpreter(),  # type: ignore[arg-type]
+        now=datetime(2026, 9, 20, 3, 30, tzinfo=UTC),
+        timezone="America/Toronto",
+    )
+
+    search = await state._search_courses({"query": "", "limit": 20})
+    scheduled = await state._get_scheduled_items(
+        {
+            "course_ids": ("course-1",),
+            "start_date": date(2026, 9, 20),
+            "end_date": date(2026, 9, 20),
+        }
+    )
+
+    assert len(search["items"]) == 20
+    assert search["has_more"] is True
+    assert search["next_cursor"]
+    assert (
+        model_json_size({"content": search, "status": "succeeded"}) <= MODEL_TOOL_RESULT_MAX_CHARS
+    )
+    assert [item["source_id"] for item in scheduled["items"]] == ["schedule-included"]
+    assert scheduled["has_more"] is False
+    assert model_json_size({"content": scheduled, "status": "succeeded"}) <= (
+        MODEL_TOOL_RESULT_MAX_CHARS
+    )
+    zone = ZoneInfo("America/Toronto")
+    assert connector.calls[0]["start_at"] == datetime(2026, 9, 19, tzinfo=zone)
+    assert connector.calls[0]["end_at"] == datetime(2026, 9, 20, tzinfo=zone)
+    assert connector.calls[1]["start_at"] == datetime(2026, 9, 20, tzinfo=zone)
+    assert connector.calls[1]["end_at"] == datetime(2026, 9, 21, tzinfo=zone)
 
 
 @pytest.mark.asyncio
@@ -323,7 +462,7 @@ async def test_learn_tool_prepares_reserved_calendar_proposal_without_writing() 
             "end_date": date(2026, 9, 20),
         }
     )
-    source_id = result["scheduled_items"][0]["proposal_source_id"]
+    source_id = result["items"][0]["proposal_source_id"]
     preview = await state._propose_calendar_change({"proposal_source_id": source_id})
 
     assert preview["review"] == "required"

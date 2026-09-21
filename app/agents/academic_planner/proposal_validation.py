@@ -206,6 +206,9 @@ def proposed_changes_from_calls(
         if existing.expected_last_edited_at is None:
             return (), _ASSESSMENT_METADATA_MISSING
         if isinstance(call, UpdateAssessmentCall):
+            ends_at = call.ends_at
+            if ends_at is None and call.due_at is not None:
+                ends_at = _shift_existing_end(existing, call.due_at)
             changes.append(
                 ProposedChange(
                     field="update_assessment",
@@ -213,6 +216,8 @@ def proposed_changes_from_calls(
                     assessment_id=call.assessment_id,
                     title=call.title,
                     due_at=call.due_at,
+                    ends_at=ends_at,
+                    is_all_day=True if existing.is_all_day and call.due_at is not None else None,
                     expected_title=existing.title,
                     expected_last_edited_at=existing.expected_last_edited_at,
                 )
@@ -232,6 +237,15 @@ def proposed_changes_from_calls(
     if not changes:
         return (), _NO_SUPPORTED_CHANGE
     return tuple(changes), None
+
+
+def _shift_existing_end(
+    existing: AcademicAssessmentOption,
+    new_start: datetime,
+) -> datetime | None:
+    if existing.due_at is None or existing.ends_at is None:
+        return None
+    return new_start + (existing.ends_at - existing.due_at)
 
 
 def _validate_course_event_calls(

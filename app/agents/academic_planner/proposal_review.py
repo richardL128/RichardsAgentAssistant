@@ -110,6 +110,74 @@ async def confirm_checkin_proposal(
     }
 
 
+async def apply_bound_nightly_proposal(
+    *,
+    store: ProposalReviewStore,
+    writer: NotionAcademicWriter,
+    proposal_id: uuid.UUID,
+    now: datetime | None = None,
+) -> dict[str, object]:
+    """Apply one host-bound nightly proposal through the canonical review path.
+
+    This entry point deliberately accepts no owner-supplied confirmation text.  The
+    nightly conversation state machine must first prove that the proposal is the
+    single proposal bound to its current task and phase.  Once it has done so, this
+    function derives the same exact token used by ordinary proposal confirmation;
+    the public/global parser therefore remains strict.
+    """
+
+    confirmation_event = f"confirm {proposal_id}"
+    if now is None:
+        status, proposal = store.prepare_checkin_application(proposal_id, confirmation_event)
+    else:
+        status, proposal = store.prepare_checkin_application(
+            proposal_id,
+            confirmation_event,
+            now=now,
+        )
+    if status == "not_found" or proposal is None:
+        return {"status": "not_found", "proposal_id": str(proposal_id)}
+    if status in {"confirmation_required", "expired"}:
+        return {"status": "confirmation_required", "proposal_id": str(proposal_id)}
+    if status == "already_applied":
+        return {
+            "status": "applied",
+            "proposal_id": str(proposal_id),
+            "change_count": len(proposal.changes),
+        }
+    if status not in {"ready", "in_progress"}:
+        raise RuntimeError("nightly proposal entered an unknown confirmation state")
+
+    # A replay may observe the relational proposal in progress after the
+    # operation receipt was durably marked applied. Re-entering the writer is
+    # safe because its proposal/ordinal operation receipt is idempotent. If a
+    # different worker truly still owns the operation, the writer fails closed.
+    if isinstance(writer, DiscoveredAcademicNotionWriter):
+        review = review_notion_mutation_batch(
+            proposal.changes,
+            proposal_id=proposal_id,
+            confirmation_event=confirmation_event,
+        )
+        await writer.apply_confirmed_changes(
+            proposal.changes,
+            proposal_id=proposal_id,
+            confirmation_event=confirmation_event,
+            review=review,
+        )
+    else:
+        await writer.apply_confirmed_changes(
+            proposal.changes,
+            proposal_id=proposal_id,
+            confirmation_event=confirmation_event,
+        )
+    store.mark_checkin_applied(proposal_id, confirmation_event)
+    return {
+        "status": "applied",
+        "proposal_id": str(proposal_id),
+        "change_count": len(proposal.changes),
+    }
+
+
 def reject_checkin_proposal(
     *,
     store: ProposalReviewStore,
@@ -148,6 +216,7 @@ def reject_checkin_proposal(
 __all__ = [
     "NotionAcademicWriter",
     "ProposalReviewStore",
+    "apply_bound_nightly_proposal",
     "confirm_checkin_proposal",
     "reject_checkin_proposal",
 ]

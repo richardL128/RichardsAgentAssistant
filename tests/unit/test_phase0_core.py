@@ -39,6 +39,9 @@ def test_settings_diagnostics_redact_credentials(tmp_path: Path) -> None:
         discord_finance_channel_id="123456789",
         ops_console_username="ops-user-never-print",
         ops_console_password="ops-password",
+        academic_schedule_ical_url=(
+            "https://calendar.google.com/calendar/ical/calendar-id/private-token/basic.ics"
+        ),
         notion_token="",
         notion_courses_database_id="",
     )
@@ -51,6 +54,7 @@ def test_settings_diagnostics_redact_credentials(tmp_path: Path) -> None:
     assert "eia-secret" not in str(diagnostics)
     assert "ops-password" not in str(diagnostics)
     assert "ops-user-never-print" not in str(diagnostics)
+    assert "private-token" not in str(diagnostics)
     assert diagnostics["database"] == "postgresql+psycopg://example.test:5432/lifeagent"
     assert diagnostics["finance_source_allowlist_version"] == "finance-sources-2026.09-v2"
     assert diagnostics["finance_source_credentials_configured"] == 2
@@ -58,6 +62,9 @@ def test_settings_diagnostics_redact_credentials(tmp_path: Path) -> None:
     assert diagnostics["notion_token_configured"] is False
     assert diagnostics["notion_courses_database_configured"] is False
     assert diagnostics["notion_deprecated_database_metadata_count"] == 0
+    assert diagnostics["academic_schedule_ical_configured"] is True
+    assert diagnostics["academic_schedule_ical_timeout_seconds"] == 10
+    assert diagnostics["academic_schedule_ical_max_bytes"] == 1_048_576
     assert diagnostics["discord_academic_authorized_user_count"] == 0
     assert diagnostics["discord_host_handoff_configured"] is False
     assert diagnostics["discord_academic_message_content_enabled"] is False
@@ -192,6 +199,14 @@ def test_default_compose_enables_only_discord_mention_model_triggers() -> None:
     )
     assert "USER_MEMORY_ENABLED: ${USER_MEMORY_ENABLED:-true}" in compose
     assert "USER_MEMORY_RETRIEVAL_LIMIT: ${USER_MEMORY_RETRIEVAL_LIMIT:-8}" in compose
+    assert "ACADEMIC_SCHEDULE_ICAL_URL: ${ACADEMIC_SCHEDULE_ICAL_URL:-}" in compose
+    assert (
+        "ACADEMIC_SCHEDULE_ICAL_TIMEOUT_SECONDS: "
+        "${ACADEMIC_SCHEDULE_ICAL_TIMEOUT_SECONDS:-10}" in compose
+    )
+    assert (
+        "ACADEMIC_SCHEDULE_ICAL_MAX_BYTES: ${ACADEMIC_SCHEDULE_ICAL_MAX_BYTES:-1048576}" in compose
+    )
     assert "CONVERSATION_SUMMARY_ENABLED: ${CONVERSATION_SUMMARY_ENABLED:-true}" in compose
     assert (
         "CONVERSATION_COMPACTION_TRIGGER_TOKENS: "
@@ -248,6 +263,55 @@ def test_academic_notion_settings_are_setup_not_startup_requirements() -> None:
     assert configured.safe_diagnostics()["discord_academic_authorized_user_count"] == 1
     assert configured.safe_diagnostics()["discord_host_handoff_configured"] is True
     assert "notion-secret" not in str(configured.safe_diagnostics())
+
+
+def test_academic_schedule_ical_settings_are_secret_typed_and_bounded() -> None:
+    settings = Settings(
+        _env_file=None,
+        academic_schedule_ical_url=(
+            " https://calendar.google.com/calendar/ical/calendar-id/"
+            "private-academic-token/basic.ics "
+        ),
+        academic_schedule_ical_timeout_seconds=12.5,
+        academic_schedule_ical_max_bytes=1_500_000,
+    )
+    diagnostics = settings.safe_diagnostics()
+
+    assert settings.academic_schedule_ical_url is not None
+    assert (
+        settings.academic_schedule_ical_url.get_secret_value()
+        == "https://calendar.google.com/calendar/ical/calendar-id/"
+        "private-academic-token/basic.ics"
+    )
+    assert diagnostics["academic_schedule_ical_configured"] is True
+    assert diagnostics["academic_schedule_ical_timeout_seconds"] == 12.5
+    assert diagnostics["academic_schedule_ical_max_bytes"] == 1_500_000
+    assert "private-academic-token" not in str(diagnostics)
+    blank = Settings(_env_file=None, academic_schedule_ical_url="")
+    assert blank.academic_schedule_ical_url is None
+    with pytest.raises(ValidationError, match="ACADEMIC_SCHEDULE_ICAL_URL"):
+        Settings(_env_file=None, academic_schedule_ical_url="webcal://example.test/basic.ics")
+    with pytest.raises(ValidationError, match="ACADEMIC_SCHEDULE_ICAL_URL"):
+        Settings(
+            _env_file=None,
+            academic_schedule_ical_url="http://calendar.google.com/calendar/basic.ics",
+        )
+    with pytest.raises(ValidationError, match="ACADEMIC_SCHEDULE_ICAL_URL"):
+        Settings(
+            _env_file=None,
+            academic_schedule_ical_url="https://example.test/calendar/basic.ics",
+        )
+    with pytest.raises(ValidationError, match="ACADEMIC_SCHEDULE_ICAL_URL"):
+        Settings(
+            _env_file=None,
+            academic_schedule_ical_url=(
+                "https://calendar.google.com/calendar/embed?src=calendar-id"
+            ),
+        )
+    with pytest.raises(ValidationError):
+        Settings(_env_file=None, academic_schedule_ical_timeout_seconds=0)
+    with pytest.raises(ValidationError):
+        Settings(_env_file=None, academic_schedule_ical_max_bytes=1_024)
 
 
 def test_connector_configuration_fails_when_a_target_has_no_credential() -> None:

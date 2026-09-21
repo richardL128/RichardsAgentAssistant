@@ -481,7 +481,7 @@ def test_upcoming_calendar_items_use_local_window_and_semantic_cache(engine) -> 
             session,
             notion_id=included_all_day.notion_id,
             semantics=CalendarSemanticResultInput(
-                status="not_substantive",
+                status="valid",
                 overview="A quiz scheduled as an all-day course date.",
                 source_fingerprint="academic-source-v1",
                 source_last_edited_at=edited,
@@ -526,8 +526,9 @@ def test_upcoming_calendar_items_use_local_window_and_semantic_cache(engine) -> 
     ]
     assert items[0]["completed"] is True
     assert items[1]["is_all_day"] is True
-    assert items[1]["semantic_status"] == "not_substantive"
+    assert items[1]["semantic_status"] == "valid"
     assert items[1]["semantic_overview"] == "A quiz scheduled as an all-day course date."
+    assert items[1]["semantic_description"] is None
     assert items[1]["semantic_intent_value"] == "study"
     assert items[1]["semantic_intent_status"] == "valid"
     assert items[1]["semantic_cache"]["intent_value"] == "study"
@@ -1041,6 +1042,50 @@ def test_store_accepts_connector_aliases_for_calendar_and_assessment(engine) -> 
         assert course_row.title == "Modern History"
         assert assessment.source_id == "source-alias"
         assert assessment.label_source == "explicit:quiz"
+
+
+def test_store_persists_read_only_google_ical_schedule_source(engine) -> None:
+    store = SQLAlchemyAcademicPlannerStore(engine)
+    course = {
+        "course_id": "schedule-row",
+        "course_code": "Classes + Tutorials + Labs",
+        "course_title": "Classes + Tutorials + Labs",
+        "term": "unspecified",
+        "source_kind": "google_ical",
+        "external_source_id": "google-calendar-source:academic",
+    }
+
+    calendar_id = store.upsert_course_calendar(course)
+    assessment_id = store.upsert_synced_assessment(
+        course,
+        {
+            "notion_id": "google-calendar-event:lecture",
+            "title": "ECE 240 Lecture",
+            "due_at": "2026-09-21T14:00:00+00:00",
+            "ends_at": "2026-09-21T15:20:00+00:00",
+            "source_id": "google-calendar-source:academic",
+            "source_scope": "google_ical:google-calendar-source:academic",
+            "last_edited_at": "2026-09-20T12:00:00+00:00",
+            "scope": "Location: E5 6004",
+        },
+        kind="event",
+        label_source="reserved_learn_google_ical",
+    )
+
+    assert UUID(calendar_id)
+    assert UUID(assessment_id)
+    with Session(engine) as session:
+        calendar = session.scalar(select(AcademicCourseCalendar))
+        assessment = session.scalar(
+            select(Assessment).where(Assessment.notion_id == "google-calendar-event:lecture")
+        )
+        assert calendar is not None
+        assert calendar.source_kind == "google_ical"
+        assert calendar.external_source_id == "google-calendar-source:academic"
+        assert calendar.child_database_id is None
+        assert assessment is not None
+        assert assessment.source_scope == "google_ical:google-calendar-source:academic"
+        assert assessment.title_property_id is None
 
 
 def test_clarification_claims_ignore_and_write_states_are_replay_safe(engine) -> None:

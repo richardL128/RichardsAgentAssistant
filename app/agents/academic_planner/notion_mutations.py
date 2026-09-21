@@ -429,11 +429,7 @@ class DiscoveredAcademicNotionWriter:
                 ErrorCode.INPUT_INVALID,
                 "LEARN enrichment target date changed after preview",
             )
-        expected_due = (
-            target.due_at.date().isoformat()
-            if target.is_all_day
-            else target.due_at
-        )
+        expected_due = target.due_at.date().isoformat() if target.is_all_day else target.due_at
         expected_end = (
             target.ends_at.date().isoformat()
             if target.is_all_day and target.ends_at is not None
@@ -502,7 +498,8 @@ class DiscoveredAcademicNotionWriter:
             expected_title=target.title,
             expected_last_edited_at=target.last_edited_at,
             title=change.title,
-            due=change.due_at,
+            due=_notion_assessment_update_value(change.due_at, is_all_day=change.is_all_day),
+            ends_at=_notion_assessment_update_value(change.ends_at, is_all_day=change.is_all_day),
         )
 
     async def _archive(self, change: ProposedChange, operation_id: str) -> NotionWriteReceipt:
@@ -687,6 +684,18 @@ def _notion_learn_value(value: object) -> datetime | str | None:
     if hasattr(value, "isoformat"):
         return cast(Any, value).isoformat()
     raise permanent_error(ErrorCode.INPUT_INVALID, "LEARN date value is invalid")
+
+
+def _notion_assessment_update_value(
+    value: datetime | None,
+    *,
+    is_all_day: bool | None,
+) -> datetime | str | None:
+    if value is None:
+        return None
+    if is_all_day:
+        return value.date().isoformat()
+    return value
 
 
 def _learn_expected_date_matches(

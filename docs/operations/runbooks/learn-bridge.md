@@ -7,10 +7,11 @@ fixtures, or model prompts.
 
 ## Prerequisites
 
-Create exactly one Notion course row named `Classes + Tutorials + Labs`. Its child
-calendar must have the standard `Name` title and `Date` date properties plus exactly
-one rich-text property named `LEARN Context`. LifeAgent owns only `LEARN Context`;
-Quest/user workflows continue to own the title, date, and page body.
+Create exactly one Notion course row named `Classes + Tutorials + Labs`. The row is a
+category marker only and must not own a child Assessments database. Configure the
+course schedule separately with `ACADEMIC_SCHEDULE_ICAL_URL`, using Google Calendar's
+secret iCal address. The feed is read-only; never paste it into Notion, Discord, or
+logs.
 
 Install the repository environment and Playwright Chromium before first login:
 
@@ -65,12 +66,13 @@ scripts/lifeagent_learn_bridge.sh uninstall
 
 ## Enable the container-side client
 
-Set the non-secret controls in `.env` only after both the feasibility check and Notion
-schema check pass:
+Set the bridge controls in `.env` only after both the feasibility check and reserved
+row check pass. Configure the secret schedule feed in the same owner-readable file:
 
 ```dotenv
 LEARN_BRIDGE_ENABLED=true
 LEARN_BRIDGE_URL=http://host.docker.internal:8765
+ACADEMIC_SCHEDULE_ICAL_URL=https://calendar.google.com/calendar/ical/.../private-.../basic.ics
 ```
 
 Pass the same host secret to Compose from the owner-only file without printing it or
@@ -89,17 +91,16 @@ The secret is intentionally separate from Discord, Notion, and other credentials
 In the authorized private Discord channel, verify course search, scheduled-item lookup,
 and announcement summaries. Announcement output must contain only Qwen-reviewed
 summaries, grounded dates, and LEARN links—never raw announcement bodies.
-When the owner asks to add a grounded LEARN date, the bot must show a proposal for
-either a new reserved-calendar page or a `LEARN Context`-only enrichment and wait for
-the exact `confirm <proposal_id>` response. Verify that no per-course database changes occur.
+The Google iCal schedule is read-only: the bot must not offer a Notion proposal for a
+grounded LEARN date or claim that it changed the schedule.
 
-If the session expires, interactive LEARN refresh and proposal work becomes unavailable,
-but the scheduled morning briefing continues to use only the reserved Notion calendar.
+If the session expires, interactive LEARN refresh becomes unavailable, but the scheduled
+morning briefing continues to use the independently configured Google iCal feed.
 Reauthenticate with:
 
 ```bash
 scripts/lifeagent_learn_bridge.sh login
 ```
 
-Keep `LEARN_BRIDGE_ENABLED=false` if headless feasibility, the reserved Notion schema,
+Keep `LEARN_BRIDGE_ENABLED=false` if headless feasibility, the reserved Notion row,
 or the live Discord validation has not passed.

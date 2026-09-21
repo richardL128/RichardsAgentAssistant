@@ -27,6 +27,7 @@ from app.agents.calendar_briefing import (
     CalendarEventSemanticInterpreter,
     CalendarEventSemanticStatus,
     CalendarEventSourceArea,
+    CalendarEventSourceKind,
     MorningBriefingComposer,
     MorningBriefingDeliveryManifest,
     MorningCategory,
@@ -345,13 +346,7 @@ def _cache_is_exact(raw: Mapping[str, Any], interpreter: CalendarEventSemanticIn
         return False
     cache = cast(Mapping[str, object], raw_cache)
     status = raw.get("semantic_status")
-    intent_status = raw.get("intent_status")
-    if status not in {
-        CalendarEventSemanticStatus.VALID,
-        CalendarEventSemanticStatus.NOT_SUBSTANTIVE,
-        "valid",
-        "not_substantive",
-    } and intent_status not in {CalendarActivityIntentStatus.VALID, "valid"}:
+    if status not in {CalendarEventSemanticStatus.VALID, "valid"}:
         return False
     return bool(
         cache.get("source_fingerprint")
@@ -410,7 +405,11 @@ async def _refresh_calendar_semantics(
     ]
     loop = asyncio.get_running_loop()
     deadline = loop.time() + total_timeout_seconds
-    ready = connector is not None and interpreter is not None and ollama_runtime is not None
+    ready = (
+        interpreter is not None
+        and ollama_runtime is not None
+        and (connector is not None or any(raw.get("inline_evidence") for raw in pending))
+    )
     if ready and pending:
         try:
             await asyncio.wait_for(
@@ -442,11 +441,20 @@ async def _refresh_calendar_semantics(
                 ),
             )
             if item.semantic_status == CalendarEventSemanticStatus.VALID:
-                counts["valid_descriptions"] += 1
+                if item.semantic_description is None:
+                    counts["no_description_decisions"] += 1
+                else:
+                    counts["valid_descriptions"] += 1
             else:
-                counts["no_description_decisions"] += 1
+                counts["unavailable_semantics"] += 1
             continue
-        if not ready or connector is None or interpreter is None or loop.time() >= deadline:
+        inline_evidence = str(raw.get("inline_evidence") or "").strip()
+        if (
+            not ready
+            or interpreter is None
+            or (connector is None and not inline_evidence)
+            or loop.time() >= deadline
+        ):
             items.append(_scheduled_item(raw, status=CalendarEventSemanticStatus.UNAVAILABLE))
             counts["unavailable_semantics"] += 1
             _record_progress(
@@ -472,20 +480,34 @@ async def _refresh_calendar_semantics(
                     attempt=attempt,
                     diagnostic="collecting_event_evidence",
                 )
-                collected = await connector.retrieve_calendar_event_evidence(event_id)
-                if (
-                    getattr(collected, "event_id", None) != event_id
-                    or getattr(collected, "last_edited_at", None) != source_edit
-                ):
-                    raise ValueError("calendar source changed after metadata synchronization")
-                fragments = tuple(
-                    CalendarEventEvidenceFragment.model_validate(
-                        fragment.model_dump(mode="json")
-                        if callable(getattr(fragment, "model_dump", None))
-                        else fragment
+                if inline_evidence:
+                    fragments = (
+                        CalendarEventEvidenceFragment(
+                            fragment_id=f"{event_id}:google-ical:details",
+                            event_id=event_id,
+                            source_kind=CalendarEventSourceKind.PROPERTY,
+                            source_label="Google Calendar details",
+                            text=inline_evidence[:4_000],
+                            ordinal=0,
+                        ),
                     )
-                    for fragment in getattr(collected, "fragments", ())
-                )
+                else:
+                    if connector is None:
+                        raise ValueError("calendar evidence connector is unavailable")
+                    collected = await connector.retrieve_calendar_event_evidence(event_id)
+                    if (
+                        getattr(collected, "event_id", None) != event_id
+                        or getattr(collected, "last_edited_at", None) != source_edit
+                    ):
+                        raise ValueError("calendar source changed after metadata synchronization")
+                    fragments = tuple(
+                        CalendarEventEvidenceFragment.model_validate(
+                            fragment.model_dump(mode="json")
+                            if callable(getattr(fragment, "model_dump", None))
+                            else fragment
+                        )
+                        for fragment in getattr(collected, "fragments", ())
+                    )
                 fragments = with_title_evidence_fragment(
                     event_id=event_id,
                     title=str(raw["title"]),
@@ -495,7 +517,8 @@ async def _refresh_calendar_semantics(
                     (
                         fragment.text
                         for fragment in fragments
-                        if fragment.source_label.casefold() == "learn context"
+                        if fragment.source_label.casefold()
+                        in {"learn context", "google calendar details"}
                     ),
                     None,
                 )
@@ -556,15 +579,7 @@ async def _refresh_calendar_semantics(
         _record_progress(
             progress,
             semantic_phase,
-            (
-                "succeeded"
-                if outcome.status
-                in {
-                    CalendarEventSemanticStatus.VALID,
-                    CalendarEventSemanticStatus.NOT_SUBSTANTIVE,
-                }
-                else "failed"
-            ),
+            ("succeeded" if outcome.status == CalendarEventSemanticStatus.VALID else "failed"),
             attempt=attempt,
             diagnostic=(
                 f"semantic_status:{outcome.status.value};error_code:{outcome.error_code or 'none'}"
@@ -579,10 +594,7 @@ async def _refresh_calendar_semantics(
                 f"semantic_status:{outcome.status.value};error_code:{outcome.error_code or 'none'}"
             ),
         )
-        prose_available = outcome.status in {
-            CalendarEventSemanticStatus.VALID,
-            CalendarEventSemanticStatus.NOT_SUBSTANTIVE,
-        }
+        prose_available = outcome.status == CalendarEventSemanticStatus.VALID
         overview = result.overview if result is not None and prose_available else None
         description = result.description if result is not None and prose_available else None
         evidence_ids = (
@@ -606,9 +618,10 @@ async def _refresh_calendar_semantics(
         )
         items.append(item)
         if outcome.status == CalendarEventSemanticStatus.VALID:
-            counts["valid_descriptions"] += 1
-        elif outcome.status == CalendarEventSemanticStatus.NOT_SUBSTANTIVE:
-            counts["no_description_decisions"] += 1
+            if description is None:
+                counts["no_description_decisions"] += 1
+            else:
+                counts["valid_descriptions"] += 1
         elif outcome.status == CalendarEventSemanticStatus.INVALID:
             counts["invalid_semantics"] += 1
         else:
@@ -989,16 +1002,10 @@ async def execute_scheduled_morning_notification(
     job_items = tuple(item for item in calendar_items if item.source_area.value == "jobs")
     schedule_items = tuple(item for item in calendar_items if item.source_area.value == "learn")
 
-    course_composition = None
     job_composition = None
     misc_composition = None
     schedule_composition = None
     if morning_composer is not None:
-        if active_courses is not None and "course" not in unavailable_academic_roles:
-            with suppress(Exception):
-                course_composition = await morning_composer.compose_courses(
-                    active_courses, academic_items
-                )
         if career_condition is None and job_items:
             with suppress(Exception):
                 job_composition = await morning_composer.compose_event_digests(
@@ -1032,7 +1039,9 @@ async def execute_scheduled_morning_notification(
             category = role_categories.get(role)
             if category is not None:
                 unavailable[category] = (
-                    f"The fresh Notion {role} calendar did not validate completely."
+                    "The fresh Google iCal schedule did not validate completely."
+                    if role == "learn"
+                    else f"The fresh Notion {role} calendar did not validate completely."
                 )
     if career_condition is not None:
         unavailable[MorningCategory.JOBS] = career_condition
@@ -1065,7 +1074,6 @@ async def execute_scheduled_morning_notification(
             job_items=job_items,
             misc_items=misc_items,
             schedule_items=schedule_items,
-            course_composition=course_composition,
             job_composition=job_composition,
             misc_composition=misc_composition,
             schedule_composition=schedule_composition,
@@ -1211,6 +1219,18 @@ def _load_runtime(run_id: uuid.UUID) -> _Runtime:
             )
         except (LifeAgentError, ValueError):
             setup_condition = "notion_configuration_invalid"
+    schedule_connector = None
+    if settings.academic_schedule_ical_url is not None:
+        from app.connectors.google_calendar import GoogleCalendarConnector
+
+        try:
+            schedule_connector = GoogleCalendarConnector(
+                ical_url=settings.academic_schedule_ical_url,
+                timeout_seconds=settings.academic_schedule_ical_timeout_seconds,
+                max_response_bytes=settings.academic_schedule_ical_max_bytes,
+            )
+        except (LifeAgentError, ValueError):
+            schedule_connector = None
     syncer = AcademicNotionSync(
         connector=connector,
         store=store,
@@ -1220,6 +1240,9 @@ def _load_runtime(run_id: uuid.UUID) -> _Runtime:
         clarification_ttl_hours=settings.academic_confirmation_ttl_hours,
         setup_condition_code=setup_condition,
         material_enqueuer=None,
+        schedule_connector=schedule_connector,
+        schedule_lookback_days=settings.academic_sync_lookback_days,
+        schedule_horizon_days=max(11, settings.academic_plan_horizon_days),
     )
     career_store = SQLAlchemyJobInterviewStore(database.engine)
     career_syncer = JobInterviewNotionSync(

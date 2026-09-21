@@ -37,6 +37,9 @@ htmlcov/
 /prompts/implement-context-memory-architecture.md
 /prompts/implement-qwen3-14b-semantic-model-migration.md
 /prompts/implement-nightly-reflection-memory-and-runtime-restoration.md
+/prompts/implement-deterministic-model-tool-contracts.md
+/prompts/implement-grounded-morning-task-summaries.md
+/prompts/implement-rigid-semantic-evening-task-checkin.md
 
 /presentations/LifeAgent-Intern-Architecture.pptx
 

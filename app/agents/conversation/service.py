@@ -296,6 +296,7 @@ class NativeConversationService:
         prompt_config_version: str | None,
         proactive_kind: str,
         proactive_period: str,
+        initial_checkpoint: Mapping[str, Any] | None = None,
         now: datetime | None = None,
     ) -> NativeConversationBeginResult:
         """Open an artifact-backed host prompt that waits for the owner's reply.
@@ -327,22 +328,66 @@ class NativeConversationService:
             },
         )
 
-        with Session(self._engine) as session, session.begin():
-            NativeConversationRepository.expire_open_session_for_owner(
-                session,
-                discord_channel_id=discord_channel_id,
-                owner_discord_user_id=owner_discord_user_id,
-                now=current,
-            )
-            NativeConversationRepository.expire_open_sessions(session, now=current)
-            winner = NativeConversationRepository.lock_open_for_owner(
-                session,
-                discord_channel_id=discord_channel_id,
-                owner_discord_user_id=owner_discord_user_id,
-                now=current,
-            )
-            if winner is not None:
-                if winner.root_event_id != root_event_id:
+        cleanup_session_id: uuid.UUID | None = None
+        try:
+            with Session(self._engine) as session, session.begin():
+                NativeConversationRepository.expire_open_session_for_owner(
+                    session,
+                    discord_channel_id=discord_channel_id,
+                    owner_discord_user_id=owner_discord_user_id,
+                    now=current,
+                )
+                NativeConversationRepository.expire_open_sessions(session, now=current)
+                winner = NativeConversationRepository.lock_open_for_owner(
+                    session,
+                    discord_channel_id=discord_channel_id,
+                    owner_discord_user_id=owner_discord_user_id,
+                    now=current,
+                )
+                if winner is not None:
+                    if winner.root_event_id != root_event_id:
+                        return NativeConversationBeginResult(
+                            status="in_progress",
+                            session_id=winner.id,
+                            root_event_id=winner.root_event_id,
+                            state=winner.state,
+                            revision=winner.revision,
+                            response="Another conversation is already waiting for this owner.",
+                        )
+                    return self._finish_existing_proactive_prompt(
+                        session,
+                        row=winner,
+                        lifecycle=lifecycle,
+                        now=current,
+                    )
+
+                transcript = NativeTranscriptManifest.from_messages(
+                    (AIMessage(content=prompt),),
+                    revision=1,
+                    lifecycle_events=(lifecycle,),
+                )
+                transcript_key = self._store_transcript(transcript).key
+                try:
+                    row = NativeConversationRepository.create_session(
+                        session,
+                        root_event_id=root_event_id,
+                        discord_channel_id=discord_channel_id,
+                        owner_discord_user_id=owner_discord_user_id,
+                        transcript_artifact_key=transcript_key,
+                        started_at=current,
+                        expires_at=expiry,
+                        model_identity=model_identity,
+                        prompt_config_version=prompt_config_version,
+                    )
+                except IntegrityError:
+                    winner = NativeConversationRepository.lock_open_for_owner(
+                        session,
+                        discord_channel_id=discord_channel_id,
+                        owner_discord_user_id=owner_discord_user_id,
+                        now=current,
+                    )
+                    if winner is None:
+                        raise
                     return NativeConversationBeginResult(
                         status="in_progress",
                         session_id=winner.id,
@@ -351,76 +396,57 @@ class NativeConversationService:
                         revision=winner.revision,
                         response="Another conversation is already waiting for this owner.",
                     )
-                return self._finish_existing_proactive_prompt(
-                    session,
-                    row=winner,
-                    lifecycle=lifecycle,
-                    now=current,
+                if (
+                    row.root_event_id == root_event_id
+                    and row.transcript_artifact_key != transcript_key
+                ):
+                    return self._finish_existing_proactive_prompt(
+                        session,
+                        row=row,
+                        lifecycle=lifecycle,
+                        now=current,
+                    )
+                cleanup_session_id = row.id
+                transcript = transcript.model_copy(
+                    update={"conversation_id": row.id, "revision": row.revision + 1}
                 )
-
-            transcript = NativeTranscriptManifest.from_messages(
-                (AIMessage(content=prompt),),
-                revision=1,
-                lifecycle_events=(lifecycle,),
-            )
-            transcript_key = self._store_transcript(transcript).key
-            try:
-                row = NativeConversationRepository.create_session(
+                transcript_key = self._store_transcript(transcript).key
+                checkpoint: Mapping[str, Any] = {}
+                checkpoint_key: str | None = None
+                if initial_checkpoint is not None:
+                    checkpoint_manifest = NativeToolCheckpointManifest.from_mapping(
+                        initial_checkpoint,
+                        conversation_id=row.id,
+                        revision=row.revision + 1,
+                    )
+                    checkpoint_key = self._store_checkpoint(checkpoint_manifest).key
+                    checkpoint = checkpoint_manifest.checkpoint
+                row = NativeConversationRepository.update_artifacts(
                     session,
-                    root_event_id=root_event_id,
-                    discord_channel_id=discord_channel_id,
-                    owner_discord_user_id=owner_discord_user_id,
+                    conversation_id=row.id,
                     transcript_artifact_key=transcript_key,
-                    started_at=current,
-                    expires_at=expiry,
-                    model_identity=model_identity,
-                    prompt_config_version=prompt_config_version,
-                )
-            except IntegrityError:
-                winner = NativeConversationRepository.lock_open_for_owner(
-                    session,
-                    discord_channel_id=discord_channel_id,
-                    owner_discord_user_id=owner_discord_user_id,
+                    tool_checkpoint_artifact_key=checkpoint_key,
                     now=current,
+                    state="awaiting_user",
+                    last_disposition="awaiting_user",
                 )
-                if winner is None:
-                    raise
+                cleanup_session_id = None
                 return NativeConversationBeginResult(
-                    status="in_progress",
-                    session_id=winner.id,
-                    root_event_id=winner.root_event_id,
-                    state=winner.state,
-                    revision=winner.revision,
-                    response="Another conversation is already waiting for this owner.",
+                    status="started",
+                    session_id=row.id,
+                    root_event_id=row.root_event_id,
+                    state=row.state,
+                    revision=row.revision,
+                    transcript_messages=transcript.to_messages(),
+                    checkpoint=checkpoint,
                 )
-            if row.root_event_id == root_event_id and row.transcript_artifact_key != transcript_key:
-                return self._finish_existing_proactive_prompt(
-                    session,
-                    row=row,
-                    lifecycle=lifecycle,
-                    now=current,
+        except Exception:
+            if cleanup_session_id is not None:
+                self._delete_unfinished_proactive_open(
+                    session_id=cleanup_session_id,
+                    root_event_id=root_event_id,
                 )
-            transcript = transcript.model_copy(
-                update={"conversation_id": row.id, "revision": row.revision + 1}
-            )
-            transcript_key = self._store_transcript(transcript).key
-            row = NativeConversationRepository.update_artifacts(
-                session,
-                conversation_id=row.id,
-                transcript_artifact_key=transcript_key,
-                now=current,
-                state="awaiting_user",
-                last_disposition="awaiting_user",
-            )
-            return NativeConversationBeginResult(
-                status="started",
-                session_id=row.id,
-                root_event_id=row.root_event_id,
-                state=row.state,
-                revision=row.revision,
-                transcript_messages=transcript.to_messages(),
-                checkpoint={},
-            )
+            raise
 
     def checkpoint_messages(
         self,
@@ -927,6 +953,25 @@ class NativeConversationService:
             response=_last_lifecycle_content(transcript),
             duplicate=True,
         )
+
+    def _delete_unfinished_proactive_open(
+        self,
+        *,
+        session_id: uuid.UUID,
+        root_event_id: str,
+    ) -> None:
+        with Session(self._engine) as session, session.begin():
+            try:
+                row = NativeConversationRepository.lock_by_id(session, session_id)
+            except Exception:
+                return
+            if (
+                row.root_event_id == root_event_id
+                and row.state == "processing"
+                and row.last_disposition is None
+            ):
+                session.delete(row)
+                session.flush()
 
     def _load_transcript_for_row(
         self,

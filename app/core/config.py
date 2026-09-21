@@ -92,6 +92,7 @@ class Settings(BaseSettings):
     discord_host_handoff_secret: SecretValue = None
     learn_bridge_hmac_secret: SecretValue = None
     notion_token: SecretValue = None
+    academic_schedule_ical_url: SecretValue = None
     ops_console_username: SecretValue = None
     ops_console_password: SecretValue = None
     notion_courses_database_id: str | None = None
@@ -180,6 +181,8 @@ class Settings(BaseSettings):
     academic_memory_snooze_after_missed_checkins: Annotated[int, Field(ge=1, le=30)] = 2
     academic_memory_delete_after_missed_checkins: Annotated[int, Field(ge=1, le=30)] = 5
     academic_sync_lookback_days: Annotated[int, Field(ge=0, le=30)] = 2
+    academic_schedule_ical_timeout_seconds: Annotated[float, Field(gt=0, le=60)] = 10.0
+    academic_schedule_ical_max_bytes: Annotated[int, Field(ge=16_384, le=2_000_000)] = 1_048_576
     academic_confirmation_ttl_hours: Annotated[int, Field(gt=0, le=168)] = 24
     academic_morning_schedule: time = time(hour=8)
     academic_morning_catchup_grace_minutes: Annotated[int, Field(ge=1, le=180)] = 30
@@ -211,6 +214,7 @@ class Settings(BaseSettings):
         "discord_host_handoff_secret",
         "learn_bridge_hmac_secret",
         "notion_token",
+        "academic_schedule_ical_url",
         "ops_console_username",
         "ops_console_password",
         "dvids_api_key",
@@ -224,6 +228,27 @@ class Settings(BaseSettings):
     @classmethod
     def empty_secret_is_none(cls, value: Any) -> Any:
         return None if value == "" else value
+
+    @field_validator("academic_schedule_ical_url")
+    @classmethod
+    def academic_schedule_ical_url_is_google_https(cls, value: SecretValue) -> SecretValue:
+        if value is None:
+            return None
+        raw = value.get_secret_value().strip()
+        if not raw:
+            return None
+        parsed = urlsplit(raw)
+        path_parts = tuple(part for part in parsed.path.split("/") if part)
+        if (
+            parsed.scheme != "https"
+            or parsed.hostname != "calendar.google.com"
+            or len(path_parts) < 5
+            or path_parts[:2] != ("calendar", "ical")
+            or not path_parts[-2].startswith("private-")
+            or path_parts[-1] != "basic.ics"
+        ):
+            raise ValueError("ACADEMIC_SCHEDULE_ICAL_URL must be an HTTPS Google Calendar URL")
+        return SecretStr(raw)
 
     @field_validator(
         "github_app_id",
@@ -565,6 +590,9 @@ class Settings(BaseSettings):
             "notion_deprecated_database_metadata_count": sum(
                 value is not None for value in (self.notion_assessments_database_id,)
             ),
+            "academic_schedule_ical_configured": self.academic_schedule_ical_url is not None,
+            "academic_schedule_ical_timeout_seconds": (self.academic_schedule_ical_timeout_seconds),
+            "academic_schedule_ical_max_bytes": self.academic_schedule_ical_max_bytes,
             "github_app_configured": all(
                 (
                     self.github_app_id is not None,

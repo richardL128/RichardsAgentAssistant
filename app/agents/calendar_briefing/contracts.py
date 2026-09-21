@@ -29,7 +29,6 @@ class CalendarEventSourceKind(StrEnum):
 
 class CalendarEventSemanticStatus(StrEnum):
     VALID = "valid"
-    NOT_SUBSTANTIVE = "not_substantive"
     UNAVAILABLE = "unavailable"
     INVALID = "invalid"
 
@@ -206,17 +205,20 @@ class ScheduledMorningCalendarItem(CalendarBriefingModel):
         if self.semantic_status in {
             CalendarEventSemanticStatus.UNAVAILABLE,
             CalendarEventSemanticStatus.INVALID,
-        } and (self.semantic_overview is not None or self.semantic_description is not None):
-            raise ValueError("unavailable or invalid calendar semantics cannot carry prose")
-        if self.semantic_status == CalendarEventSemanticStatus.NOT_SUBSTANTIVE:
-            if self.semantic_overview is None:
-                raise ValueError("not_substantive calendar semantics require an overview")
-            if self.semantic_description is not None or self.semantic_description_fragment_ids:
-                raise ValueError("not_substantive calendar semantics cannot carry a description")
-        if self.semantic_status == CalendarEventSemanticStatus.VALID and (
-            self.semantic_overview is None or self.semantic_description is None
+        } and (
+            self.semantic_overview is not None
+            or self.semantic_description is not None
+            or self.semantic_evidence_fragment_ids
+            or self.semantic_description_fragment_ids
         ):
-            raise ValueError("valid calendar semantics require overview and description")
+            raise ValueError("unavailable or invalid calendar semantics cannot carry prose")
+        if self.semantic_status == CalendarEventSemanticStatus.VALID:
+            if self.semantic_overview is None or not self.semantic_evidence_fragment_ids:
+                raise ValueError("valid calendar semantics require a cited overview")
+            if self.semantic_description is None and self.semantic_description_fragment_ids:
+                raise ValueError("missing semantic descriptions cannot carry citations")
+            if self.semantic_description is not None and not self.semantic_description_fragment_ids:
+                raise ValueError("semantic descriptions require citations")
         if self.intent_status == CalendarActivityIntentStatus.VALID:
             if self.activity_intent is None:
                 raise ValueError("valid calendar intent requires an activity intent")

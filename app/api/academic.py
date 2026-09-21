@@ -58,6 +58,8 @@ class AcademicSyncResponse(BaseModel):
     material_job_count: int = 0
     invalid_calendar_count: int
     diagnostic_codes: list[str]
+    unavailable_roles: list[str] = Field(default_factory=list)
+    unavailable_course_page_ids: list[str] = Field(default_factory=list)
     synced_at: datetime | None = None
     error_code: str | None = None
     retryable: bool = False

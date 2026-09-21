@@ -17,6 +17,7 @@ from app.agents.harness import (
     AgentTranscriptCheckpoint,
     ConversationLifecycle,
     NativeTool,
+    ToolExecutionError,
     ToolExecutionResult,
     UserAbortRequested,
     _pending_elapsed_schedule,
@@ -218,6 +219,49 @@ async def test_tool_call_result_and_answer_events_are_ordered() -> None:
     assert events[2].result_json == '{"content":{"echo":"calendar"},"status":"succeeded"}'
     assert isinstance(result.messages[3], ToolMessage)
     assert result.messages[3].content == '{"content":{"echo":"calendar"},"status":"succeeded"}'
+    assert gateway.calls[1][-1].content == result.messages[3].content
+
+
+@pytest.mark.asyncio
+async def test_oversized_tool_result_is_model_facing_error_not_truncated_success() -> None:
+    events: list[AgentHarnessEvent] = []
+
+    async def lookup(_arguments: Mapping[str, object]) -> object:
+        return {"rows": ["x" * 5000]}
+
+    gateway = Gateway(
+        [
+            AIMessage(
+                content="I will look that up.",
+                tool_calls=[
+                    {
+                        "id": "call-1",
+                        "name": "lookup",
+                        "args": {},
+                    }
+                ],
+            ),
+            AIMessage(content="Please narrow the search."),
+        ]
+    )
+
+    result = await run_native_tool_loop(
+        gateway=gateway,
+        user_input="look up everything",
+        tools=(NativeTool(schema=tool_schema("lookup"), handler=lookup),),
+        event_sink=lambda event: collect(events, event),
+    )
+
+    assert result.status == "completed"
+    assert [event.kind for event in events[:3]] == [
+        "model_turn_started",
+        "tool_call",
+        "tool_error",
+    ]
+    assert isinstance(result.messages[3], ToolMessage)
+    assert result.messages[3].status == "error"
+    assert "tool_result_oversize" in str(result.messages[3].content)
+    assert "truncated" not in str(result.messages[3].content)
     assert gateway.calls[1][-1].content == result.messages[3].content
 
 
@@ -571,6 +615,37 @@ async def test_repeated_invalid_terminal_response_fails_closed() -> None:
         "The model did not produce a valid terminal conversation response. Please try again."
     )
     assert len(gateway.calls) == 2
+
+
+@pytest.mark.asyncio
+async def test_failed_tool_then_failed_lifecycle_repair_returns_actionable_host_error() -> None:
+    async def unavailable(_: Mapping[str, object]) -> object:
+        raise ToolExecutionError("The requested calendar is unavailable.")
+
+    gateway = Gateway(
+        [
+            AIMessage(
+                content="I will check the calendar.",
+                tool_calls=[{"id": "call-1", "name": "lookup", "args": {}}],
+            ),
+            AIMessage(content="The calendar is unavailable."),
+            AIMessage(content="It is still unavailable."),
+        ]
+    )
+
+    result = await run_native_tool_loop(
+        gateway=gateway,
+        user_input="What is due today?",
+        tools=(NativeTool(schema=tool_schema("lookup"), handler=unavailable),),
+        require_terminal_response=True,
+    )
+
+    assert result.status == "completed"
+    assert result.lifecycle_disposition == "completed"
+    assert result.final_response == (
+        "I couldn't complete that request because the required data was unavailable: "
+        "The requested calendar is unavailable. No change was made."
+    )
 
 
 @pytest.mark.asyncio

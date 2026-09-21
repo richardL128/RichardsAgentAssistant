@@ -16,7 +16,6 @@ from app.agents.calendar_briefing.contracts import (
     ScheduledMorningCalendarItem,
 )
 from app.agents.calendar_briefing.morning_composer import (
-    CourseComposition,
     EventDigestComposition,
     MorningCategory,
     ScheduleComposition,
@@ -81,7 +80,6 @@ def build_morning_briefing_manifest(
     job_items: Sequence[ScheduledMorningCalendarItem],
     misc_items: Sequence[ScheduledMorningCalendarItem],
     schedule_items: Sequence[ScheduledMorningCalendarItem],
-    course_composition: CourseComposition | None,
     job_composition: EventDigestComposition | None,
     misc_composition: EventDigestComposition | None,
     schedule_composition: ScheduleComposition | None,
@@ -95,7 +93,6 @@ def build_morning_briefing_manifest(
         MorningCategory.COURSES: _courses_description(
             active_courses,
             course_items,
-            course_composition,
             unavailable.get(MorningCategory.COURSES),
         ),
         MorningCategory.JOBS: _events_description(
@@ -153,7 +150,6 @@ def build_morning_briefing_manifest(
 def _courses_description(
     courses: Sequence[ActiveMorningCourse] | None,
     items: Sequence[ScheduledMorningCalendarItem],
-    composition: CourseComposition | None,
     unavailable: str | None,
 ) -> str:
     if unavailable is not None or courses is None:
@@ -163,25 +159,46 @@ def _courses_description(
     by_course: dict[str, list[ScheduledMorningCalendarItem]] = {}
     for item in items:
         by_course.setdefault(item.source_id, []).append(item)
-    paragraphs = (
-        {item.course_id: item.paragraph for item in composition.courses} if composition else {}
-    )
     lines: list[str] = []
-    if composition is None:
-        lines.append("⚠ **Facts only** — reasoned course prose was unavailable.")
     for course in courses:
         lines.append(f"**{_escape_markdown(course.course_code)}**")
-        paragraph = paragraphs.get(course.course_id)
-        if paragraph is None:
-            events = by_course.get(course.course_id, [])
-            if not events:
-                paragraph = "Nothing pressing today or in the following seven days."
-            else:
-                paragraph = "; ".join(f"{item.title} — {item.local_start_label}" for item in events)
-                paragraph = f"Calendar facts: {paragraph}."
-        lines.append(paragraph)
+        events = by_course.get(course.course_id, [])
+        if not events:
+            lines.append("Nothing pressing today or in the following seven days.")
+        else:
+            lines.extend(_course_event_line(item) for item in events)
         lines.append("")
     return "\n".join(lines).rstrip()
+
+
+def _course_event_line(item: ScheduledMorningCalendarItem) -> str:
+    due = _due_label(item)
+    if item.semantic_status is CalendarEventSemanticStatus.VALID and item.semantic_overview:
+        overview = _sentence(item.semantic_overview)
+        if item.semantic_description:
+            overview = f"{overview} {_sentence(item.semantic_description)}"
+        return f"• {overview} Due {due}.{_notion_link_suffix(item)}"
+    return f"• {_linked_title(item)} is due {due}. Additional interpretation was unavailable."
+
+
+def _due_label(item: ScheduledMorningCalendarItem) -> str:
+    start = (
+        item.local_start_label
+        if item.relative_date_label == item.local_start_label
+        else f"{item.relative_date_label} ({item.local_start_label})"
+    )
+    if item.local_end_label is None:
+        return start
+    return f"{start} through {item.local_end_label}"
+
+
+def _sentence(value: str) -> str:
+    text = " ".join(value.split()).rstrip()
+    if not text:
+        return "Details were unavailable."
+    if text[-1] in ".!?":
+        return text
+    return f"{text}."
 
 
 def _events_description(
@@ -278,6 +295,12 @@ def _linked_title(item: ScheduledMorningCalendarItem) -> str:
     if not _safe_notion_url(item.source_url):
         return title
     return f"[{title}]({item.source_url})"
+
+
+def _notion_link_suffix(item: ScheduledMorningCalendarItem) -> str:
+    if not _safe_notion_url(item.source_url):
+        return ""
+    return f" ([Notion]({item.source_url}))"
 
 
 def _safe_notion_url(value: str | None) -> bool:

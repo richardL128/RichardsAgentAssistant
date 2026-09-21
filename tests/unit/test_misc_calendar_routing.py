@@ -17,6 +17,7 @@ from app.agents.academic_planner.calendar_roles import (
     canonical_misc_task_title,
 )
 from app.agents.academic_planner.contracts import (
+    AcademicAssessmentQueryArgs,
     AcademicCourseOption,
     AssessmentType,
     CreateMiscTaskCall,
@@ -73,6 +74,7 @@ def _seed_calendar(
                 title_property_id="title-property" if status == "valid" else None,
                 date_property_id="date-property" if status == "valid" else None,
                 discovery_status=status,
+                last_synced_at=NOW if status == "valid" else None,
             ),
         )
         return course.id
@@ -117,7 +119,12 @@ def test_store_resolves_only_active_valid_misc_calendar_and_labels_items(engine)
     assert len(matches) == 1
     assert matches[0].course_id == str(misc_id)
     assert matches[0].calendar_role is AcademicCalendarRole.MISC
-    tasks = store.search_assessments("toilets", str(misc_id))
+    tasks = store.search_assessments(
+        AcademicAssessmentQueryArgs(query="toilets", course_id=str(misc_id)),
+        as_of=NOW,
+        timezone="America/Toronto",
+        owner_scope="owner:channel",
+    ).results
     assert len(tasks) == 1
     assert tasks[0].course_code.strip().casefold() == "misc"
     assert tasks[0].assessment_type is AssessmentType.TASK

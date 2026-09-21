@@ -3,7 +3,7 @@ from __future__ import annotations
 import hashlib
 from collections.abc import Sequence
 from dataclasses import dataclass
-from datetime import UTC, date, datetime
+from datetime import UTC, date, datetime, timedelta
 from types import SimpleNamespace
 from typing import Any, Literal, cast
 from uuid import UUID
@@ -440,6 +440,69 @@ async def test_confirmed_batch_applies_ordered_create_update_and_archive() -> No
     assert connector.calls[1][1]["expected_title"] == "Old assignment"
     assert connector.calls[2][1]["page_id"] == "page123"
     assert {row["state"] for row in targets.operations.values()} == {"applied"}
+
+
+@pytest.mark.asyncio
+async def test_update_assessment_passes_timed_range_to_guarded_notion_patch() -> None:
+    connector = _Connector()
+    targets = _Targets()
+    writer = DiscoveredAcademicNotionWriter(
+        connector=connector,  # type: ignore[arg-type]
+        target_store=targets,
+    )
+    starts_at = datetime(2026, 9, 20, 23, tzinfo=UTC)
+    ends_at = starts_at + timedelta(hours=2)
+
+    await writer.apply_confirmed_changes(
+        (
+            ProposedChange(
+                field="update_assessment",
+                value="Move review task",
+                assessment_id="assessment-1",
+                due_at=starts_at,
+                ends_at=ends_at,
+                expected_title="Old assignment",
+                expected_last_edited_at=EDITED_AT,
+            ),
+        ),
+        proposal_id=PROPOSAL_ID,
+        confirmation_event=f"confirm {PROPOSAL_ID}",
+    )
+
+    payload = connector.calls[0][1]
+    assert payload["due"] == starts_at
+    assert payload["ends_at"] == ends_at
+
+
+@pytest.mark.asyncio
+async def test_update_assessment_serializes_all_day_range_to_date_strings() -> None:
+    connector = _Connector()
+    targets = _Targets()
+    writer = DiscoveredAcademicNotionWriter(
+        connector=connector,  # type: ignore[arg-type]
+        target_store=targets,
+    )
+
+    await writer.apply_confirmed_changes(
+        (
+            ProposedChange(
+                field="update_assessment",
+                value="Move all-day review task",
+                assessment_id="assessment-1",
+                due_at=datetime(2026, 9, 20, 0, tzinfo=UTC),
+                ends_at=datetime(2026, 9, 22, 0, tzinfo=UTC),
+                is_all_day=True,
+                expected_title="Old assignment",
+                expected_last_edited_at=EDITED_AT,
+            ),
+        ),
+        proposal_id=PROPOSAL_ID,
+        confirmation_event=f"confirm {PROPOSAL_ID}",
+    )
+
+    payload = connector.calls[0][1]
+    assert payload["due"] == "2026-09-20"
+    assert payload["ends_at"] == "2026-09-22"
 
 
 @pytest.mark.asyncio

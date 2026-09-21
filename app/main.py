@@ -33,6 +33,7 @@ from app.api.operations import router as operations_router
 from app.api.pages import router as pages_router
 from app.artifacts.store import ArtifactStore
 from app.connectors.discord import DiscordAcademicPlannerAdapter
+from app.connectors.google_calendar import GoogleCalendarConnector
 from app.connectors.notion import NotionConnector
 from app.core.config import Settings, get_settings
 from app.core.errors import LifeAgentError
@@ -140,6 +141,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             base_url=app_settings.discord_api_url,
         )
     notion_connector = None
+    schedule_connector = None
     notion_setup_condition = "notion_configuration_missing"
     if (
         app_settings.notion_token is not None
@@ -153,6 +155,15 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             )
         except (LifeAgentError, ValueError):
             notion_setup_condition = "notion_configuration_invalid"
+    if app_settings.academic_schedule_ical_url is not None:
+        try:
+            schedule_connector = GoogleCalendarConnector(
+                ical_url=app_settings.academic_schedule_ical_url,
+                timeout_seconds=app_settings.academic_schedule_ical_timeout_seconds,
+                max_response_bytes=app_settings.academic_schedule_ical_max_bytes,
+            )
+        except (LifeAgentError, ValueError):
+            schedule_connector = None
 
     def build_material_ingestion() -> AssessmentMaterialIngestionService | None:
         if notion_connector is None:
@@ -187,6 +198,9 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         clarification_ttl_hours=app_settings.academic_confirmation_ttl_hours,
         setup_condition_code=notion_setup_condition,
         material_enqueuer=enqueue_academic_material if use_global_queue else None,
+        schedule_connector=schedule_connector,
+        schedule_lookback_days=app_settings.academic_sync_lookback_days,
+        schedule_horizon_days=max(11, app_settings.academic_plan_horizon_days),
     )
     job_interview_store = SQLAlchemyJobInterviewStore(database.engine)
     job_interview_syncer = JobInterviewNotionSync(
