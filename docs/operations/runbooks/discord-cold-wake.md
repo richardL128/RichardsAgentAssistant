@@ -13,11 +13,13 @@ The wake path never stores raw Discord content or interaction tokens in its
 host outbox, never builds an image, never pulls a model, and never sends a dummy
 generation. The first real conversational request loads the configured model.
 
-The native conversational agent allows up to 50 model turns per request. A
-turn may contain multiple tool calls; this is not a token/context limit. The
-agent can finish earlier, and reaching the limit produces an explicit failure
-without applying accumulated Notion proposals. Changing this source limit
-requires `deploy` to update the worker image and installed runtime together.
+The native conversational agent allows up to 12 model turns for an ordinary
+request and up to 4 for a nightly checklist reply. A turn may contain multiple
+tool calls; the host executes and checkpoints the complete batch before one
+lifecycle decision, so these are not token/context limits. Reaching a limit
+persists the stable `turn_limit` code without applying accumulated Notion
+proposals. Changing either source limit requires `deploy` to update the worker
+image and installed runtime together.
 
 The native runtime is installed under
 `~/Library/Application Support/LifeAgent/runtime`. Its source, Python environment,

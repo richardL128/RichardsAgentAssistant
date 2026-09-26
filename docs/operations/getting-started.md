@@ -12,8 +12,8 @@ Ollama runs on the host. Keep all credentials in `.env` or a secret manager;
 never commit them or paste them into logs, tickets, or chat.
 
 Qwen is configured for authorized private Discord conversations and bounded
-event interpretation plus non-course category composition in the automatic morning
-briefing. The native
+event interpretation plus critic-checked spoken task and schedule composition
+in the automatic morning briefing. The native
 macOS Discord wake LaunchAgent remains connected while the API is cold,
 acknowledges an allowlisted owner's message, starts the fixed local services as
 needed, and submits a signed reference to the backend. PostgreSQL and the
@@ -532,8 +532,9 @@ Courses, Jobs, Misc, and Classes + Tutorials + Labs. A category failure is
 disclosed in that category's embed and does not hide independently fresh
 categories. Missing sharing, stale data, malformed reserved calendars, or
 Discord delivery uncertainty remains fail-closed. Semantic model or critic
-failure produces visible facts-only event rows using trusted metadata and due
-labels; selected course work is not suppressed as a quiet course.
+failure degrades the affected task phrase to a trusted linked title and
+host-owned date instead of discarding independently valid phrases or categories;
+selected course work is not suppressed as a quiet course.
 
 ### Nightly academic check-in
 
@@ -736,14 +737,32 @@ response or proposal preview is authoritative and is delivered before the
 progress message reports successful completion.
 
 When facts are missing or ambiguous, the model asks a natural follow-up through
-the typed `emit_conversation_response` lifecycle tool. The owner's next
-private-channel message resumes the same durable owner/channel session with the
+the typed `emit_conversation_response` lifecycle tool, whose active contract is
+limited to `awaiting_user`. Ordinary answers complete as assistant text, while
+trusted query and proposal state is completed and rendered by the host after a
+whole checkpointed tool-call batch. The owner's next private-channel message
+resumes the same durable owner/channel session with the
 original request, assistant messages, native tool calls and matching results,
 private provider reasoning, prior clarification, and a host-trusted tool-state
 checkpoint in their original order. Raw content remains in private immutable
 artifacts; database rows and readiness diagnostics expose only metadata and
 artifact keys. There is no keyword or punctuation-based continuation router.
 Exact `cancel`, `start over`, and `never mind` controls close the open session.
+
+Dated academic, misc, and synchronized schedule reads use one native
+`search_calendar_items` contract. The model selects the semantic `tasks`,
+`schedule`, `agenda`, or explicit `all_items` view and supplies typed temporal
+and completion filters; the host resolves local date windows, queries canonical
+rows, and records a `calendar_items` evidence capability. `search_courses` is
+limited to course/source resolution and records `course_sources` evidence, so it
+cannot support an empty-task or empty-schedule conclusion. Final item titles,
+dates, completion state, source area, pagination, and freshness notices are
+rendered from host data. A broad read keeps trustworthy items from usable
+sources and reports unavailable sources as a deterministic `partial` caveat;
+it does not let an unavailable source consume the result page. If no requested
+source is trustworthy, the host returns one terminal unavailable result. Once
+terminal trusted state exists, model-written factual prose is ignored. Proposal
+and write flows remain confirmation-gated and fail closed on ambiguous outcomes.
 
 The worker reuses one lazily initialized Discord service and gateway, while
 Ollama `keep_alive` only controls model-weight residency. Session continuity is

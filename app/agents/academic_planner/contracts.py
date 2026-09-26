@@ -9,6 +9,14 @@ from uuid import UUID
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
+from app.agents.action_items import (
+    ActionItemDomain,
+    ActionItemKind,
+    ActionItemStatus,
+    DateOnlyValue,
+    DateTimeValue,
+    TemporalValue,
+)
 from app.agents.academic_planner.calendar_roles import AcademicCalendarRole
 from app.agents.query_contracts import (
     CompletionMode,
@@ -43,6 +51,15 @@ class UserCreatableAssessmentType(StrEnum):
     QUIZ = "quiz"
     TUTORIAL = "tutorial"
     LAB = "lab"
+
+
+class CalendarItemView(StrEnum):
+    """Model-selected semantic shape for one dated item query."""
+
+    TASKS = "tasks"
+    SCHEDULE = "schedule"
+    AGENDA = "agenda"
+    ALL_ITEMS = "all_items"
 
 
 class ValidatedMaterialPlanningSignals(PlannerModel):
@@ -284,9 +301,12 @@ class ProposedChange(PlannerModel):
         "new_task",
         "new_deadline",
         "new_event",
+        "create_action_item",
         "create_assessment",
         "attach_assessment_material",
+        "update_action_item",
         "update_assessment",
+        "archive_action_item",
         "archive_assessment",
         "create_learn_calendar_event",
         "enrich_learn_calendar_event",
@@ -300,6 +320,11 @@ class ProposedChange(PlannerModel):
     ends_at: datetime | None = None
     is_all_day: Literal[True] | None = None
     assessment_type: AssessmentType | None = None
+    action_domain: ActionItemDomain | None = None
+    action_status: ActionItemStatus | None = None
+    action_kind: ActionItemKind | None = None
+    action_temporal: TemporalValue | None = None
+    action_context: str | None = Field(default=None, min_length=1, max_length=500)
     expected_last_edited_at: datetime | None = None
     expected_title: str | None = Field(default=None, min_length=1, max_length=500)
     inbound_material_ids: tuple[UUID, ...] | None = Field(default=None, max_length=5)
@@ -332,6 +357,25 @@ class ProposedChange(PlannerModel):
         return value
 
     def model_post_init(self, __context: object) -> None:
+        if self.field in {"create_action_item", "update_action_item", "archive_action_item"}:
+            if self.action_domain is None:
+                raise ValueError("action-item proposal requires a trusted domain")
+            if self.field == "create_action_item":
+                if (
+                    self.title is None
+                    or self.action_status is None
+                    or self.action_kind is None
+                    or self.action_temporal is None
+                ):
+                    raise ValueError("action-item creation proposal is missing trusted fields")
+            else:
+                if (
+                    self.assessment_id is None
+                    or self.expected_title is None
+                    or self.expected_last_edited_at is None
+                    or self.action_status is None
+                ):
+                    raise ValueError("action-item mutation requires guarded target context")
         if self.field in {"create_learn_calendar_event", "enrich_learn_calendar_event"}:
             required = (
                 self.learn_source_id,
@@ -401,6 +445,8 @@ class AcademicAssessmentOption(PlannerModel):
     due_date_local: date | None = None
     is_all_day: bool = False
     assessment_type: AssessmentType
+    completed: bool = False
+    source_area: AcademicCalendarRole = AcademicCalendarRole.COURSE
     expected_last_edited_at: datetime | None = None
 
     @field_validator("due_at", "ends_at", "expected_last_edited_at")
@@ -426,6 +472,13 @@ class AcademicAssessmentSearchResult(PlannerModel):
     envelope: QueryEnvelope[AcademicAssessmentOption]
 
 
+class AcademicCalendarItemSearchResult(PlannerModel):
+    """Canonical dated-item results and their trusted grounding envelope."""
+
+    results: tuple[AcademicAssessmentOption, ...] = Field(max_length=20)
+    envelope: QueryEnvelope[AcademicAssessmentOption]
+
+
 class AcademicCourseQueryArgs(PlannerModel):
     """Deterministic course lookup selected by the model and enforced by the host."""
 
@@ -443,6 +496,19 @@ class AcademicAssessmentQueryArgs(PlannerModel):
     roles: tuple[AcademicCalendarRole, ...] = Field(default=(), max_length=3)
     temporal: TemporalQuery = Field(default_factory=TemporalQuery)
     completion: CompletionMode = CompletionMode.INCOMPLETE
+    limit: int = Field(default=10, ge=1, le=20)
+    cursor: str | None = Field(default=None, min_length=1, max_length=2_000)
+
+
+class AcademicCalendarItemQueryArgs(PlannerModel):
+    """Semantic dated-item query interpreted by the model and enforced by the host."""
+
+    view: CalendarItemView
+    temporal: TemporalQuery
+    completion: CompletionMode = CompletionMode.INCOMPLETE
+    query: str = Field(default="", max_length=300)
+    course_id: str | None = Field(default=None, min_length=1, max_length=255)
+    roles: tuple[AcademicCalendarRole, ...] = Field(default=(), max_length=3)
     limit: int = Field(default=10, ge=1, le=20)
     cursor: str | None = Field(default=None, min_length=1, max_length=2_000)
 
@@ -504,6 +570,32 @@ class CreateCourseEventCall(PlannerModel):
         return _aware(value)
 
 
+class CreateActionItemCall(PlannerModel):
+    """Canonical create proposal for a dated task/event across trusted owner areas."""
+
+    tool: Literal["create_action_item"]
+    domain: ActionItemDomain
+    course_id: str | None = Field(default=None, min_length=1, max_length=255)
+    title: str = Field(min_length=1, max_length=500)
+    temporal: TemporalValue
+    kind: ActionItemKind = ActionItemKind.TASK
+    inbound_material_ids: tuple[UUID, ...] = Field(default=(), max_length=5)
+    supersedes_proposal_id: UUID | None = None
+    context: str | None = Field(default=None, min_length=1, max_length=500)
+
+    def model_post_init(self, __context: object) -> None:
+        if self.domain == ActionItemDomain.ACADEMIC and self.course_id is None:
+            raise ValueError("academic action item creation requires course_id")
+        if self.domain is not ActionItemDomain.ACADEMIC and self.inbound_material_ids:
+            raise ValueError("only academic action item creation can attach materials")
+        if self.kind is ActionItemKind.EVENT:
+            if not isinstance(self.temporal, DateTimeValue) or self.temporal.end_at is None:
+                raise ValueError("event action item creation requires an end timestamp")
+            duration = self.temporal.end_at - self.temporal.start_at
+            if duration < timedelta(minutes=5) or duration > timedelta(minutes=240):
+                raise ValueError("event action item duration must be between 5 and 240 minutes")
+
+
 class AttachAssessmentMaterialCall(PlannerModel):
     """Propose attaching captured owner-scoped PDFs to one searched assessment."""
 
@@ -534,9 +626,32 @@ class UpdateAssessmentCall(PlannerModel):
                 raise ValueError("update_assessment end timestamp must be after due_at")
 
 
+class UpdateActionItemCall(PlannerModel):
+    """Canonical guarded update proposal for one searched action item."""
+
+    tool: Literal["update_action_item"]
+    item_id: str = Field(min_length=1, max_length=255)
+    title: str | None = Field(default=None, min_length=1, max_length=500)
+    temporal: TemporalValue | None = None
+    status: ActionItemStatus | None = None
+    context: str | None = Field(default=None, min_length=1, max_length=500)
+
+    def model_post_init(self, __context: object) -> None:
+        if self.title is None and self.temporal is None and self.status is None:
+            raise ValueError("update_action_item must include title, temporal, or status")
+
+
 class ArchiveAssessmentCall(PlannerModel):
     tool: Literal["archive_assessment"]
     assessment_id: str = Field(min_length=1, max_length=255)
+
+
+class ArchiveActionItemCall(PlannerModel):
+    """Canonical guarded archive proposal for one searched action item."""
+
+    tool: Literal["archive_action_item"]
+    item_id: str = Field(min_length=1, max_length=255)
+    context: str | None = Field(default=None, min_length=1, max_length=500)
 
 
 class LearningFocusStatus(StrEnum):
@@ -781,8 +896,13 @@ class CheckinExtraction(PlannerModel):
 
 
 __all__ = [
+    "ActionItemDomain",
+    "ActionItemKind",
+    "ActionItemStatus",
     "AcademicAssessmentOption",
     "AcademicAssessmentSearchResult",
+    "AcademicCalendarItemQueryArgs",
+    "AcademicCalendarItemSearchResult",
     "AcademicCourseOption",
     "AcademicCourseSearchResult",
     "AcademicDiscourseAction",
@@ -798,6 +918,7 @@ __all__ = [
     "AcademicSemanticCandidate",
     "AcademicSemanticSearchResult",
     "ArchiveAssessmentCall",
+    "ArchiveActionItemCall",
     "AssessmentMaterialDiagnostic",
     "AssessmentMaterialExtractionStatus",
     "AssessmentMaterialSource",
@@ -806,12 +927,16 @@ __all__ = [
     "AttachAssessmentMaterialCall",
     "AvailabilityWindow",
     "CalendarAvailabilityFacts",
+    "CalendarItemView",
     "CheckinExtraction",
     "CheckinProposal",
+    "CreateActionItemCall",
     "CreateAssessmentCall",
     "CreateCourseEventCall",
     "CreateLearningFocusAction",
     "CreateMiscTaskCall",
+    "DateOnlyValue",
+    "DateTimeValue",
     "DiscourseClarification",
     "DiscourseIntent",
     "DiscoursePartialFacts",
@@ -835,6 +960,8 @@ __all__ = [
     "SearchLearningFocusesCall",
     "SearchSemanticFocusesCall",
     "SnoozeLearningFocusAction",
+    "TemporalValue",
+    "UpdateActionItemCall",
     "UpdateAssessmentCall",
     "UserCreatableAssessmentType",
     "ValidatedMaterialPlanningSignals",

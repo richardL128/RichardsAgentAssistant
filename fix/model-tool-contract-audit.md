@@ -1,8 +1,11 @@
 # Model tool contract audit: stale dates, partial sync, and ungrounded answers
 
 Status: historical investigation findings from 2026-09-19. The replacement
-query-contract architecture described below was implemented on 2026-09-21;
-this document preserves the evidence that motivated it.
+query-contract architecture was implemented on 2026-09-21, followed by the
+host-owned batch lifecycle and source-scoped partial-result architecture on
+2026-09-22. This document preserves the evidence that motivated those changes;
+it is not an active runtime contract. Issue 10 is a subsequent design finding
+recorded alongside the original audit.
 
 ## Executive summary
 
@@ -214,6 +217,26 @@ arbitrary course/assessment queries returning inventory rows. There is no
 cross-tool contract test proving that “today” excludes past, tomorrow, or
 completed records, or that a final answer is a grounded subset of returned
 facts.
+
+### 10. Schedule composition is all-or-nothing — high
+
+A subsequent 2026-09-21 incident exposed the same overly broad failure-unit
+pattern in the morning `Classes + Tutorials + Labs` output. One
+`ECE201 - SEM 001` row could not be represented by the original session-type
+contract. The critic rejected the complete schedule, then incorrectly treated
+repeated course codes as duplicate event IDs during repair. The host consequently
+discarded valid course, type, and location results for every other row and
+rendered the entire table as `Unclear / Unclear / -`.
+
+The trust unit must be the independently identified event and field, not the
+whole schedule category. Multiple events for the same course and day are valid
+when their stable event IDs differ. Host code must own identity coverage and
+duplicate detection; a model critic must not override those deterministic
+checks or invalidate unrelated supported rows.
+
+The reproduced runtime evidence, design errors, and proposed row-level repair
+are documented in
+[`morning-schedule-composition-failure.md`](morning-schedule-composition-failure.md).
 
 ## Tool areas that are comparatively well guarded
 

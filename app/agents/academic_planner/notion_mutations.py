@@ -234,6 +234,12 @@ class DiscoveredAcademicNotionWriter:
                     "proposal operation is already in progress or uncertain",
                 )
             try:
+                if change.field in {
+                    "create_action_item",
+                    "update_action_item",
+                    "archive_action_item",
+                }:
+                    _raise_action_items_write_api_missing(change)
                 materials = self._load_materials_for_change(change, proposal_id=proposal_id)
                 if change.field == "create_assessment":
                     receipt = await self._create(change, operation_id, materials=materials)
@@ -667,12 +673,27 @@ def _requires_hitl_review(changes: Sequence[ProposedChange]) -> bool:
         getattr(change, "field", None)
         in {
             "create_assessment",
+            "create_action_item",
             "attach_assessment_material",
+            "update_action_item",
             "archive_assessment",
+            "archive_action_item",
             "create_learn_calendar_event",
             "enrich_learn_calendar_event",
         }
         for change in changes
+    )
+
+
+def _raise_action_items_write_api_missing(change: ProposedChange) -> None:
+    del change
+    raise permanent_error(
+        ErrorCode.SOURCE_SETUP_REQUIRED,
+        (
+            "ACTION_ITEMS_WRITE_API_MISSING: explicit guarded Action Items "
+            "create/update/archive connector APIs are not implemented yet; refusing to route "
+            "canonical action-item proposals through legacy course assessment calendars."
+        ),
     )
 
 

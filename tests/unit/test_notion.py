@@ -9,6 +9,13 @@ import httpx
 import pytest
 
 from app.agents.academic_planner.contracts import ProposedChange
+from app.agents.action_items import (
+    ActionItemDomain,
+    ActionItemKind,
+    ActionItemStatus,
+    DateOnlyValue,
+    DateTimeValue,
+)
 from app.connectors.notion import (
     MAX_NOTION_DIRECT_UPLOAD_BYTES,
     AcademicNotionWriter,
@@ -24,12 +31,80 @@ from app.core.errors import LifeAgentError
 IDS = {"courses": "courses-id", "assessments": "assessments-id"}
 EDITED = "2026-09-03T12:00:00.000Z"
 EDITED_AT = datetime(2026, 9, 3, 12, 0, tzinfo=UTC)
+EXPLICIT_IDS = {
+    "courses": "courses-db",
+    "action_items": "actions-db",
+    "applications": "applications-db",
+    "interviews": "interviews-db",
+}
 
 
-def _title_property(text: str, *, prop_id: str = "title-prop") -> dict[str, object]:
+def _configured_connector(client: httpx.AsyncClient) -> NotionConnector:
+    return NotionConnector(
+        token="secret",
+        courses_database_id=EXPLICIT_IDS["courses"],
+        action_items_database_id=EXPLICIT_IDS["action_items"],
+        applications_database_id=EXPLICIT_IDS["applications"],
+        interviews_database_id=EXPLICIT_IDS["interviews"],
+        client=client,
+    )
+
+
+def _legacy_connector(client: httpx.AsyncClient) -> NotionConnector:
+    return NotionConnector(
+        token="secret",
+        database_ids={"courses": "courses-db", "assessments": "assessments-db"},
+        client=client,
+    )
+
+
+def _schema_property(prop_id: str, name: str, prop_type: str) -> dict[str, object]:
+    return {"id": prop_id, "name": name, "type": prop_type, prop_type: {}}
+
+
+def _explicit_schema(database_id: str) -> dict[str, object]:
+    schemas = {
+        EXPLICIT_IDS["courses"]: {
+            "Course": _schema_property("course-title", "Course", "title"),
+            "Code": _schema_property("course-code", "Code", "rich_text"),
+            "Term": _schema_property("course-term", "Term", "select"),
+            "Status": _schema_property("course-status", "Status", "status"),
+        },
+        EXPLICIT_IDS["action_items"]: {
+            "Name": _schema_property("action-name", "Name", "title"),
+            "Domain": _schema_property("action-domain", "Domain", "select"),
+            "Item Type": _schema_property("action-type", "Item Type", "select"),
+            "Status": _schema_property("action-status", "Status", "status"),
+            "Date": _schema_property("action-date", "Date", "date"),
+            "Course": _schema_property("action-course", "Course", "relation"),
+            "Application": _schema_property("action-application", "Application", "relation"),
+            "Interview": _schema_property("action-interview", "Interview", "relation"),
+            "Origin": _schema_property("action-origin", "Origin", "select"),
+        },
+        EXPLICIT_IDS["applications"]: {
+            "Role": _schema_property("app-role", "Role", "title"),
+            "Company": _schema_property("app-company", "Company", "rich_text"),
+            "Pipeline Status": _schema_property("app-status", "Pipeline Status", "status"),
+            "Active": _schema_property("app-active", "Active", "checkbox"),
+        },
+        EXPLICIT_IDS["interviews"]: {
+            "Name": _schema_property("interview-name", "Name", "title"),
+            "Date": _schema_property("interview-date", "Date", "date"),
+            "Application": _schema_property("interview-application", "Application", "relation"),
+            "Stage": _schema_property("interview-stage", "Stage", "select"),
+            "Status": _schema_property("interview-status", "Status", "status"),
+            "Prep Status": _schema_property("interview-prep", "Prep Status", "status"),
+        },
+    }
+    return {"id": database_id, "properties": schemas[database_id]}
+
+
+def _title_property(
+    text: str, *, prop_id: str = "title-prop", name: str = "Name"
+) -> dict[str, object]:
     return {
         "id": prop_id,
-        "name": "Name",
+        "name": name,
         "type": "title",
         "title": [{"plain_text": text}],
     }
@@ -41,6 +116,63 @@ def _date_property(start: str, *, prop_id: str = "date-prop") -> dict[str, objec
         "name": "Date",
         "type": "date",
         "date": {"start": start, "end": None, "time_zone": None},
+    }
+
+
+def _action_item_page(page_id: str, *, last_edited_time: str = EDITED) -> dict[str, object]:
+    return {
+        "id": page_id,
+        "last_edited_time": last_edited_time,
+        "url": f"https://www.notion.so/{page_id}",
+        "archived": False,
+        "in_trash": False,
+        "parent": {"type": "database_id", "database_id": EXPLICIT_IDS["action_items"]},
+        "properties": {
+            "Name": _title_property("Current task", prop_id="action-name"),
+            "Domain": {
+                "id": "action-domain",
+                "name": "Domain",
+                "type": "select",
+                "select": {"name": "academic"},
+            },
+            "Item Type": {
+                "id": "action-type",
+                "name": "Item Type",
+                "type": "select",
+                "select": {"name": "task"},
+            },
+            "Status": {
+                "id": "action-status",
+                "name": "Status",
+                "type": "status",
+                "status": {"name": "to_do"},
+            },
+            "Date": _date_property("2026-09-24", prop_id="action-date"),
+            "Course": {
+                "id": "action-course",
+                "name": "Course",
+                "type": "relation",
+                "relation": [],
+            },
+            "Application": {
+                "id": "action-application",
+                "name": "Application",
+                "type": "relation",
+                "relation": [],
+            },
+            "Interview": {
+                "id": "action-interview",
+                "name": "Interview",
+                "type": "relation",
+                "relation": [],
+            },
+            "Origin": {
+                "id": "action-origin",
+                "name": "Origin",
+                "type": "select",
+                "select": {"name": "manual"},
+            },
+        },
     }
 
 
@@ -150,6 +282,433 @@ def _legacy_properties() -> dict[str, dict[str, str]]:
             },
         }.items()
     }
+
+
+@pytest.mark.asyncio
+async def test_explicit_notion_preflight_resolves_all_configured_databases() -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        database_id = request.url.path.rsplit("/", 1)[-1]
+        return httpx.Response(200, json=_explicit_schema(database_id))
+
+    transport = httpx.MockTransport(handler)
+    async with httpx.AsyncClient(transport=transport) as client:
+        connector = _configured_connector(client)
+        result = await connector.preflight_configured_databases()
+
+    assert result.diagnostics == ()
+    assert set(result.sources) == {"courses", "action_items", "applications", "interviews"}
+    assert result.sources["action_items"].property_ids["Domain"] == "action-domain"
+    assert result.sources["applications"].property_types["Pipeline Status"] == "status"
+
+
+@pytest.mark.asyncio
+async def test_explicit_action_item_read_preserves_raw_date_timezone_and_relations() -> None:
+    page = {
+        "id": "action-page-1",
+        "last_edited_time": EDITED,
+        "url": "https://www.notion.so/action-page-1",
+        "archived": False,
+        "in_trash": False,
+        "properties": {
+            "Name": _title_property("Follow up with recruiter", prop_id="action-name"),
+            "Domain": {
+                "id": "action-domain",
+                "name": "Domain",
+                "type": "select",
+                "select": {"name": "career"},
+            },
+            "Item Type": {
+                "id": "action-type",
+                "name": "Item Type",
+                "type": "select",
+                "select": {"name": "follow_up"},
+            },
+            "Status": {
+                "id": "action-status",
+                "name": "Status",
+                "type": "status",
+                "status": {"name": "Next"},
+            },
+            "Date": {
+                "id": "action-date",
+                "name": "Date",
+                "type": "date",
+                "date": {
+                    "start": "2026-09-24T09:30:00.000-04:00",
+                    "end": None,
+                    "time_zone": "America/Toronto",
+                },
+            },
+            "Course": {
+                "id": "action-course",
+                "name": "Course",
+                "type": "relation",
+                "relation": [],
+            },
+            "Application": {
+                "id": "action-application",
+                "name": "Application",
+                "type": "relation",
+                "relation": [{"id": "application-page-1"}],
+            },
+            "Interview": {
+                "id": "action-interview",
+                "name": "Interview",
+                "type": "relation",
+                "relation": [{"id": "interview-page-1"}],
+            },
+            "Origin": {
+                "id": "action-origin",
+                "name": "Origin",
+                "type": "select",
+                "select": {"name": "manual"},
+            },
+            "Review Reason": {
+                "id": "action-review",
+                "name": "Review Reason",
+                "type": "rich_text",
+                "rich_text": [{"plain_text": "needs domain review"}],
+            },
+        },
+    }
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.method == "GET":
+            database_id = request.url.path.rsplit("/", 1)[-1]
+            return httpx.Response(200, json=_explicit_schema(database_id))
+        assert request.method == "POST"
+        assert request.url.path == "/v1/databases/actions-db/query"
+        return httpx.Response(200, json={"results": [page], "has_more": False, "next_cursor": None})
+
+    transport = httpx.MockTransport(handler)
+    async with httpx.AsyncClient(transport=transport) as client:
+        connector = _configured_connector(client)
+        records = await connector.read_action_items()
+
+    assert len(records) == 1
+    item = records[0]
+    assert item.title == "Follow up with recruiter"
+    assert item.domain == "career"
+    assert item.item_type == "follow_up"
+    assert item.status == "Next"
+    assert item.origin == "manual"
+    assert item.review_reason == "needs domain review"
+    assert item.date is not None
+    assert item.date.start == "2026-09-24T09:30:00.000-04:00"
+    assert item.date.time_zone == "America/Toronto"
+    assert item.application_ids == ("application-page-1",)
+    assert item.interview_ids == ("interview-page-1",)
+    assert item.property_ids["Date"] == "action-date"
+
+
+@pytest.mark.asyncio
+async def test_explicit_reads_normalize_courses_applications_and_interviews() -> None:
+    course_page = {
+        "id": "course-page-1",
+        "last_edited_time": EDITED,
+        "url": "https://www.notion.so/course-page-1",
+        "archived": False,
+        "in_trash": False,
+        "properties": {
+            "Course": _title_property("Data Structures", prop_id="course-title", name="Course"),
+            "Code": {
+                "id": "course-code",
+                "name": "Code",
+                "type": "rich_text",
+                "rich_text": [{"plain_text": "ECE 250"}],
+            },
+            "Term": {
+                "id": "course-term",
+                "name": "Term",
+                "type": "select",
+                "select": {"name": "Fall 2026"},
+            },
+            "Status": {
+                "id": "course-status",
+                "name": "Status",
+                "type": "status",
+                "status": {"name": "Active"},
+            },
+        },
+    }
+    application_page = {
+        "id": "application-page-1",
+        "last_edited_time": EDITED,
+        "url": "https://www.notion.so/application-page-1",
+        "archived": False,
+        "in_trash": False,
+        "properties": {
+            "Role": _title_property("Software Intern", prop_id="app-role", name="Role"),
+            "Company": {
+                "id": "app-company",
+                "name": "Company",
+                "type": "rich_text",
+                "rich_text": [{"plain_text": "Example Co"}],
+            },
+            "Pipeline Status": {
+                "id": "app-status",
+                "name": "Pipeline Status",
+                "type": "status",
+                "status": {"name": "Applied"},
+            },
+            "Active": {"id": "app-active", "name": "Active", "type": "checkbox", "checkbox": True},
+            "Applied On": {
+                "id": "app-applied",
+                "name": "Applied On",
+                "type": "date",
+                "date": {"start": "2026-09-20", "end": None, "time_zone": None},
+            },
+            "Posting URL": {
+                "id": "app-posting",
+                "name": "Posting URL",
+                "type": "url",
+                "url": "https://example.com/job",
+            },
+        },
+    }
+    interview_page = {
+        "id": "interview-page-1",
+        "last_edited_time": EDITED,
+        "url": "https://www.notion.so/interview-page-1",
+        "archived": False,
+        "in_trash": False,
+        "properties": {
+            "Name": _title_property("Recruiter screen", prop_id="interview-name"),
+            "Date": {
+                "id": "interview-date",
+                "name": "Date",
+                "type": "date",
+                "date": {"start": "2026-09-24", "end": None, "time_zone": None},
+            },
+            "Application": {
+                "id": "interview-application",
+                "name": "Application",
+                "type": "relation",
+                "relation": [{"id": "application-page-1"}],
+            },
+            "Stage": {
+                "id": "interview-stage",
+                "name": "Stage",
+                "type": "select",
+                "select": {"name": "Recruiter"},
+            },
+            "Status": {
+                "id": "interview-status",
+                "name": "Status",
+                "type": "status",
+                "status": {"name": "Scheduled"},
+            },
+            "Prep Status": {
+                "id": "interview-prep",
+                "name": "Prep Status",
+                "type": "status",
+                "status": {"name": "Todo"},
+            },
+            "Meeting URL": {
+                "id": "interview-url",
+                "name": "Meeting URL",
+                "type": "url",
+                "url": "https://meet.example.com/private",
+            },
+        },
+    }
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.method == "GET":
+            database_id = request.url.path.rsplit("/", 1)[-1]
+            return httpx.Response(200, json=_explicit_schema(database_id))
+        pages = {
+            "/v1/databases/courses-db/query": [course_page],
+            "/v1/databases/applications-db/query": [application_page],
+            "/v1/databases/interviews-db/query": [interview_page],
+        }
+        return httpx.Response(
+            200,
+            json={"results": pages[request.url.path], "has_more": False, "next_cursor": None},
+        )
+
+    transport = httpx.MockTransport(handler)
+    async with httpx.AsyncClient(transport=transport) as client:
+        connector = _configured_connector(client)
+        courses = await connector.read_courses()
+        applications = await connector.read_applications()
+        interviews = await connector.read_interviews()
+
+    assert courses[0].title == "Data Structures"
+    assert courses[0].code == "ECE 250"
+    assert courses[0].term == "Fall 2026"
+    assert courses[0].status == "Active"
+    assert applications[0].title == "Software Intern"
+    assert applications[0].role == "Software Intern"
+    assert applications[0].company == "Example Co"
+    assert applications[0].pipeline_status == "Applied"
+    assert applications[0].active is True
+    assert applications[0].applied_on is not None
+    assert applications[0].applied_on.start == "2026-09-20"
+    assert applications[0].posting_url == "https://example.com/job"
+    assert interviews[0].stage == "Recruiter"
+    assert interviews[0].status == "Scheduled"
+    assert interviews[0].prep_status == "Todo"
+    assert interviews[0].application_ids == ("application-page-1",)
+    assert interviews[0].meeting_url == "https://meet.example.com/private"
+
+
+@pytest.mark.asyncio
+async def test_explicit_connector_disables_legacy_reserved_title_discovery() -> None:
+    transport = httpx.MockTransport(lambda request: httpx.Response(500))
+    async with httpx.AsyncClient(transport=transport) as client:
+        connector = _configured_connector(client)
+        academic = await connector.discover_course_assessments()
+        jobs = await connector.discover_jobs_workspace()
+
+    assert academic.courses == ()
+    assert academic.diagnostics[0].code == "legacy_course_assessment_discovery_disabled"
+    assert jobs.jobs_page_id is None
+    assert jobs.diagnostics[0].code == "legacy_jobs_workspace_discovery_disabled"
+
+
+@pytest.mark.asyncio
+async def test_create_action_item_uses_configured_source_property_ids_and_date_only() -> None:
+    requests: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        if request.method == "GET":
+            return httpx.Response(200, json=_explicit_schema(EXPLICIT_IDS["action_items"]))
+        body = json.loads(request.content)
+        assert request.method == "POST"
+        assert request.url.path == "/v1/pages"
+        assert body["parent"] == {"database_id": EXPLICIT_IDS["action_items"]}
+        properties = body["properties"]
+        assert properties["action-name"]["title"][0]["text"]["content"] == "Read chapter 5"
+        assert properties["action-domain"] == {"select": {"name": "academic"}}
+        assert properties["action-type"] == {"select": {"name": "assignment"}}
+        assert properties["action-status"] == {"status": {"name": "to_do"}}
+        assert properties["action-date"] == {"date": {"start": "2026-09-24"}}
+        assert properties["action-course"] == {"relation": [{"id": "course-page-1"}]}
+        assert properties["action-application"] == {"relation": []}
+        assert properties["action-interview"] == {"relation": []}
+        assert properties["action-origin"] == {"select": {"name": "manual"}}
+        return httpx.Response(
+            200,
+            json={"id": "created-action-1", "url": "https://www.notion.so/created-action-1"},
+        )
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+        connector = _configured_connector(client)
+        receipt = await connector.create_action_item(
+            proposal_id="proposal-1",
+            title="Read chapter 5",
+            domain=ActionItemDomain.ACADEMIC,
+            item_kind=ActionItemKind.ASSIGNMENT,
+            status=ActionItemStatus.TO_DO,
+            temporal=DateOnlyValue(start_date=datetime(2026, 9, 24, tzinfo=UTC).date()),
+            course_page_ids=("course-page-1",),
+            proposal_relation_page_ids=("course-page-1",),
+        )
+
+    assert receipt.page_id == "created-action-1"
+    assert [request.method for request in requests] == ["GET", "POST"]
+
+
+@pytest.mark.asyncio
+async def test_create_action_item_rejects_relation_not_from_current_proposal() -> None:
+    requests: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        return httpx.Response(200, json=_explicit_schema(EXPLICIT_IDS["action_items"]))
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+        connector = _configured_connector(client)
+        with pytest.raises(LifeAgentError, match="input_invalid"):
+            await connector.create_action_item(
+                proposal_id="proposal-1",
+                title="Follow up",
+                domain=ActionItemDomain.CAREER,
+                item_kind=ActionItemKind.APPLICATION_FOLLOW_UP,
+                status=ActionItemStatus.TO_DO,
+                temporal=DateOnlyValue(start_date=datetime(2026, 9, 24, tzinfo=UTC).date()),
+                application_page_ids=("application-page-1",),
+                proposal_relation_page_ids=("different-page",),
+            )
+
+    assert [request.method for request in requests] == ["GET"]
+
+
+@pytest.mark.asyncio
+async def test_guarded_update_action_item_enforces_edit_version_and_datetime_payload() -> None:
+    requests: list[httpx.Request] = []
+    starts_at = datetime(2026, 9, 24, 13, 30, tzinfo=UTC)
+    ends_at = datetime(2026, 9, 24, 14, 0, tzinfo=UTC)
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        if request.url.path == "/v1/databases/actions-db":
+            return httpx.Response(200, json=_explicit_schema(EXPLICIT_IDS["action_items"]))
+        if request.method == "GET":
+            return httpx.Response(200, json=_action_item_page("action-page-1"))
+        body = json.loads(request.content)
+        assert request.method == "PATCH"
+        assert request.url.path == "/v1/pages/action-page-1"
+        properties = body["properties"]
+        assert properties["action-status"] == {"status": {"name": "done"}}
+        assert properties["action-date"] == {
+            "date": {
+                "start": starts_at.isoformat(),
+                "end": ends_at.isoformat(),
+                "time_zone": "America/Toronto",
+            }
+        }
+        return httpx.Response(
+            200,
+            json={"id": "action-page-1", "url": "https://www.notion.so/action-page-1"},
+        )
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+        connector = _configured_connector(client)
+        receipt = await connector.guarded_update_action_item(
+            proposal_id="proposal-1",
+            page_id="action-page-1",
+            expected_last_edited_at=EDITED_AT,
+            status=ActionItemStatus.DONE,
+            temporal=DateTimeValue(
+                start_at=starts_at,
+                end_at=ends_at,
+                timezone="America/Toronto",
+            ),
+        )
+
+    assert receipt.page_id == "action-page-1"
+    assert [request.method for request in requests] == ["GET", "GET", "PATCH"]
+
+
+@pytest.mark.asyncio
+async def test_guarded_archive_action_item_rejects_stale_edit_version_without_patch() -> None:
+    requests: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        if request.url.path == "/v1/databases/actions-db":
+            return httpx.Response(200, json=_explicit_schema(EXPLICIT_IDS["action_items"]))
+        return httpx.Response(
+            200,
+            json=_action_item_page(
+                "action-page-1",
+                last_edited_time="2026-09-03T12:01:00.000Z",
+            ),
+        )
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+        connector = _configured_connector(client)
+        with pytest.raises(NotionWriteConflict):
+            await connector.guarded_archive_action_item(
+                proposal_id="proposal-1",
+                page_id="action-page-1",
+                expected_last_edited_at=EDITED_AT,
+            )
+
+    assert [request.method for request in requests] == ["GET", "GET"]
 
 
 def _text_block(
@@ -262,7 +821,7 @@ async def test_discovers_nested_assessments_with_pagination_and_normalization() 
         return httpx.Response(404, json={"message": "unexpected"})
 
     async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
-        connector = NotionConnector(token="secret", courses_database_id="courses-db", client=client)
+        connector = _legacy_connector(client)
         result = await connector.discover_course_assessments(page_size=1)
 
     assert [course.course_title for course in result.courses] == ["BIO 101", "HIST 202"]
@@ -359,7 +918,7 @@ async def test_missing_or_duplicate_child_calendar_is_a_diagnostic(
         return httpx.Response(404, json={"message": "unexpected"})
 
     async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
-        connector = NotionConnector(token="secret", courses_database_id="courses-db", client=client)
+        connector = _legacy_connector(client)
         result = await connector.discover_course_assessments()
 
     assert result.courses[0].assessments == ()
@@ -388,7 +947,7 @@ async def test_reserved_schedule_row_does_not_discover_seeded_assessments_databa
         return httpx.Response(404, json={"message": "child discovery must not run"})
 
     async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
-        connector = NotionConnector(token="secret", courses_database_id="courses-db", client=client)
+        connector = _legacy_connector(client)
         result = await connector.discover_course_assessments()
 
     assert len(result.courses) == 1
@@ -457,7 +1016,7 @@ async def test_invalid_assessment_schema_is_a_diagnostic(
         return httpx.Response(404, json={"message": "unexpected"})
 
     async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
-        connector = NotionConnector(token="secret", courses_database_id="courses-db", client=client)
+        connector = _legacy_connector(client)
         result = await connector.discover_course_assessments()
 
     assert result.courses[0].assessments == ()
@@ -477,7 +1036,7 @@ async def test_malformed_top_level_query_raises_safe_error_without_raw_body() ->
         return httpx.Response(404, json={"message": "RAW_VENDOR_BODY_SHOULD_NOT_LEAK"})
 
     async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
-        connector = NotionConnector(token="secret", courses_database_id="courses-db", client=client)
+        connector = _legacy_connector(client)
         with pytest.raises(LifeAgentError) as raised:
             await connector.discover_course_assessments()
 
@@ -496,7 +1055,7 @@ async def test_discovery_rejects_missing_or_repeated_pagination_cursor() -> None
         )
 
     async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
-        connector = NotionConnector(token="secret", courses_database_id="courses-db", client=client)
+        connector = _legacy_connector(client)
         with pytest.raises(LifeAgentError) as raised:
             await connector.discover_course_assessments()
 
@@ -509,7 +1068,7 @@ async def test_inaccessible_courses_database_returns_setup_diagnostic_without_ra
         return httpx.Response(403, json={"message": "RAW_VENDOR_BODY_SHOULD_NOT_LEAK"})
 
     async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
-        connector = NotionConnector(token="secret", courses_database_id="courses-db", client=client)
+        connector = _legacy_connector(client)
         result = await connector.discover_course_assessments()
 
     assert result.courses == ()
@@ -544,7 +1103,7 @@ async def test_one_course_discovery_failure_does_not_discard_other_courses() -> 
         return httpx.Response(404, json={"message": "unexpected"})
 
     async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
-        connector = NotionConnector(token="secret", courses_database_id="courses-db", client=client)
+        connector = _legacy_connector(client)
         result = await connector.discover_course_assessments()
 
     assert [course.course_page_id for course in result.courses] == ["course-valid"]
@@ -643,7 +1202,7 @@ async def test_retrieves_assessment_body_material_with_nesting_pagination_and_fi
         return httpx.Response(404, json={"message": "unexpected"})
 
     async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
-        connector = NotionConnector(token="secret", courses_database_id="courses-db", client=client)
+        connector = _legacy_connector(client)
         materials = await connector.retrieve_assessment_materials(
             "assessment-1",
             page_size=2,
@@ -707,7 +1266,7 @@ async def test_calendar_evidence_collects_all_text_without_description_field_rul
         return httpx.Response(404, json={"message": "unexpected"})
 
     async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
-        connector = NotionConnector(token="secret", courses_database_id="courses-db", client=client)
+        connector = _legacy_connector(client)
         evidence = await connector.retrieve_calendar_event_evidence("assessment-1")
 
     by_label = {fragment.source_label: fragment for fragment in evidence.fragments}
@@ -762,7 +1321,7 @@ async def test_refresh_assessment_material_file_refetches_current_signed_url() -
         return httpx.Response(404, json={"message": "unexpected"})
 
     async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
-        connector = NotionConnector(token="secret", courses_database_id="courses-db", client=client)
+        connector = _legacy_connector(client)
         original = await connector.retrieve_assessment_materials("assessment-1")
         refreshed = await connector.refresh_assessment_material_file(
             assessment_page_id="assessment-1",
@@ -797,7 +1356,7 @@ async def test_guarded_title_rename_patches_only_title_property() -> None:
         return httpx.Response(200, json={"id": "assessment-1", "url": "https://www.notion.so/a"})
 
     async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
-        connector = NotionConnector(token="secret", courses_database_id="courses-db", client=client)
+        connector = _legacy_connector(client)
         receipt = await connector.rename_assessment_title(
             page_id="assessment-1",
             title_property_id="title-prop",
@@ -841,7 +1400,7 @@ async def test_guarded_title_rename_already_desired_title_is_idempotent_success(
         return httpx.Response(500, json={"message": "PATCH should not be retried"})
 
     async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
-        connector = NotionConnector(token="secret", courses_database_id="courses-db", client=client)
+        connector = _legacy_connector(client)
         receipt = await connector.rename_assessment_title(
             page_id="assessment-1",
             title_property_id="title-prop",
@@ -872,7 +1431,7 @@ async def test_guarded_title_rename_rejects_concurrent_edit_without_patch() -> N
         )
 
     async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
-        connector = NotionConnector(token="secret", courses_database_id="courses-db", client=client)
+        connector = _legacy_connector(client)
         with pytest.raises(NotionWriteConflict):
             await connector.rename_assessment_title(
                 page_id="assessment-1",
@@ -893,7 +1452,7 @@ async def test_attachment_download_is_bounded_and_rejects_other_hosts() -> None:
         return httpx.Response(200, content=b"pdf")
 
     async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
-        connector = NotionConnector(token="secret", courses_database_id="courses-db", client=client)
+        connector = _legacy_connector(client)
         body = await connector.download_attachment(
             NotionAttachment(
                 name="outline.pdf",
@@ -1025,7 +1584,7 @@ async def test_direct_pdf_file_upload_create_and_send_use_notion_contract() -> N
         return httpx.Response(404, json={"message": "unexpected"})
 
     async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
-        connector = NotionConnector(token="secret", courses_database_id="courses-db", client=client)
+        connector = _legacy_connector(client)
         created = await connector.create_pdf_file_upload(filename="rubric.pdf")
         sent = await connector.send_pdf_file_upload(
             file_upload_id=created.file_upload_id,
@@ -1058,7 +1617,7 @@ async def test_create_assessment_page_can_include_uploaded_pdf_children() -> Non
         )
 
     async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
-        connector = NotionConnector(token="secret", courses_database_id="courses-db", client=client)
+        connector = _legacy_connector(client)
         receipt = await connector.create_assessment_page(
             proposal_id="proposal-1",
             data_source_id="assessments-source-1",
@@ -1104,7 +1663,7 @@ async def test_append_uploaded_pdf_blocks_is_guarded_and_returns_block_receipts(
         return httpx.Response(200, json={"results": [{"id": "pdf-block-1"}]})
 
     async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
-        connector = NotionConnector(token="secret", courses_database_id="courses-db", client=client)
+        connector = _legacy_connector(client)
         receipt = await connector.append_uploaded_pdf_blocks(
             proposal_id="proposal-2",
             page_id="assessment-1",
@@ -1143,7 +1702,7 @@ async def test_pdf_upload_validation_rejects_malformed_inputs_without_request() 
         return httpx.Response(200, json={"id": "upload-1"})
 
     async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
-        connector = NotionConnector(token="secret", courses_database_id="courses-db", client=client)
+        connector = _legacy_connector(client)
         with pytest.raises(LifeAgentError, match="input_invalid"):
             await connector.create_pdf_file_upload(filename="../rubric.pdf")
         with pytest.raises(LifeAgentError, match="input_invalid"):
@@ -1183,7 +1742,7 @@ async def test_send_pdf_file_upload_uses_safe_error_policy_for_rate_limits() -> 
         return httpx.Response(429, json={"message": "RAW_VENDOR_BODY_SHOULD_NOT_LEAK"})
 
     async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
-        connector = NotionConnector(token="secret", courses_database_id="courses-db", client=client)
+        connector = _legacy_connector(client)
         with pytest.raises(LifeAgentError) as raised:
             await connector.send_pdf_file_upload(
                 file_upload_id="upload-1",
@@ -1211,7 +1770,7 @@ async def test_direct_pdf_upload_rejects_malformed_vendor_receipt_without_url_le
         )
 
     async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
-        connector = NotionConnector(token="secret", courses_database_id="courses-db", client=client)
+        connector = _legacy_connector(client)
         with pytest.raises(LifeAgentError) as raised:
             await connector.create_pdf_file_upload(filename="rubric.pdf")
 

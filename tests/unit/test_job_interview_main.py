@@ -79,11 +79,17 @@ def test_career_http_boundary_never_invokes_writer_without_exact_confirmation(
     assert exact_but_unconfigured.json()["error_code"] == "career_notion_writer_unconfigured"
 
 
-def test_valid_notion_configuration_wires_scoped_career_writer(tmp_path: Path) -> None:
+def test_valid_notion_configuration_wires_explicit_connector_but_not_legacy_career_writer(
+    tmp_path: Path,
+) -> None:
     app = _app(
         tmp_path,
         notion_token="notion-secret",
         notion_courses_database_id="coursesDatabase123",
+        notion_action_items_database_id="actionsDatabase123",
+        notion_applications_database_id="applicationsDatabase123",
+        notion_interviews_database_id="interviewsDatabase123",
     )
-    assert app.state.job_interview_notion_writer is not None
+    assert app.state.job_interview_syncer._connector is not None
+    assert app.state.job_interview_notion_writer is None
     app.state.database.dispose()

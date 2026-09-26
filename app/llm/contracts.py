@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from datetime import datetime
 from enum import StrEnum
+from typing import Literal
 from uuid import UUID
 
 from langchain_core.messages import AIMessage
@@ -71,3 +72,30 @@ class NativeInvocationResult(BaseModel):
     telemetry: list[ModelCallTelemetry] = Field(default_factory=lambda: list[ModelCallTelemetry]())
     error_code: str | None = None
     error_diagnostic: str | None = None
+
+
+type GatewayFailurePhase = Literal[
+    "model_invocation",
+    "native_invocation",
+    "native_response_validation",
+]
+
+
+class GatewayFailure(RuntimeError):  # noqa: N818 - public contract uses failure terminology.
+    """Typed, privacy-safe model gateway failure for harness callers."""
+
+    def __init__(
+        self,
+        *,
+        code: str,
+        retryable: bool,
+        phase: GatewayFailurePhase,
+        request_id: UUID,
+        diagnostic: str | None = None,
+    ) -> None:
+        super().__init__(code)
+        self.code = code
+        self.retryable = retryable
+        self.phase = phase
+        self.request_id = request_id
+        self.diagnostic = diagnostic

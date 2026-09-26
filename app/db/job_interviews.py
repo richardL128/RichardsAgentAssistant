@@ -12,14 +12,17 @@ from datetime import UTC, date, datetime, timedelta
 from typing import Any, Literal, cast
 from zoneinfo import ZoneInfo
 
+from pydantic import TypeAdapter
 from sqlalchemy import Engine, and_, func, or_, select
 from sqlalchemy.exc import IntegrityError, NoResultFound
 from sqlalchemy.orm import Session
 
+from app.agents.action_items import DateOnlyValue, DateTimeValue, TemporalValue
 from app.agents.calendar_briefing.contracts import CalendarEventSemanticStatus
 from app.agents.job_interviews.contracts import (
     ApplicationInterpretation,
     ApplicationRowSnapshot,
+    CareerApplicationSnapshot,
     CareerClarificationRequest,
     InterviewApplicationLinkEvidence,
     InterviewEventSnapshot,
@@ -28,6 +31,7 @@ from app.agents.job_interviews.contracts import (
     UrlCandidate,
 )
 from app.db.models import (
+    CareerApplication,
     CareerApplicationInterpretation,
     CareerApplicationRow,
     CareerApplicationTable,
@@ -56,6 +60,9 @@ CareerReceiptStatus = Literal["ready", "already_applied", "in_progress", "uncert
 CalendarSemanticStatus = Literal["valid", "unavailable", "invalid"]
 _SHA256 = re.compile(r"^[0-9a-f]{64}$")
 _RECEIPT_FIELDS = frozenset(("proposal_id", "page_id", "url", "notion_request_id", "edited_at"))
+_TYPED_APPLICATION_TABLE_BLOCK_ID = "__typed_career_applications__"
+_TYPED_APPLICATION_MODEL_VERSION = "typed-career-application.v1"
+_TEMPORAL_VALUE_ADAPTER: TypeAdapter[TemporalValue] = TypeAdapter(TemporalValue)
 
 
 @dataclass(frozen=True, slots=True)
@@ -113,6 +120,29 @@ class ApplicationInterpretationInput:
 
 
 @dataclass(frozen=True, slots=True)
+class CareerApplicationInput:
+    application_id: str
+    content_fingerprint: str
+    last_edited_at: datetime
+    row_order: int = 0
+    applications_database_id: str | None = None
+    applications_data_source_id: str | None = None
+    company_name: str | None = None
+    role_title: str | None = None
+    status: str | None = None
+    next_action: str | None = None
+    next_action_temporal: TemporalValue | None = None
+    posting_url: str | None = None
+    applied_on: date | None = None
+    deadline: date | None = None
+    next_action_status: str | None = None
+    property_snapshot: Mapping[str, Any] | None = None
+    source_url: str | None = None
+    active: bool = True
+    archived: bool = False
+
+
+@dataclass(frozen=True, slots=True)
 class InterviewEventInput:
     interview_page_id: str
     title: str
@@ -122,6 +152,11 @@ class InterviewEventInput:
     date_start: datetime | None = None
     is_all_day: bool = False
     timezone: str = "America/Toronto"
+    temporal_value: TemporalValue | None = None
+    application_id: str | None = None
+    stage: str | None = None
+    interview_status: str | None = None
+    preparation_status: str | None = None
     interviews_database_id: str | None = None
     interviews_data_source_id: str | None = None
     source_url: str | None = None
@@ -540,12 +575,128 @@ class JobInterviewRepository:
         )
 
     @staticmethod
+    def upsert_career_application(
+        session: Session,
+        *,
+        workspace_id: uuid.UUID,
+        application: CareerApplicationInput,
+    ) -> CareerApplication:
+        values = {
+            "workspace_id": workspace_id,
+            "application_page_id": _bounded(application.application_id),
+            "applications_database_id": _bounded_optional(application.applications_database_id),
+            "applications_data_source_id": _bounded_optional(
+                application.applications_data_source_id
+            ),
+            "source_kind": "notion_applications",
+            "company_name": _bounded_optional(application.company_name),
+            "role_title": _bounded_optional(application.role_title, 500),
+            "status": _bounded_optional(application.status, 128),
+            "next_action": _bounded_optional(application.next_action, 1_000),
+            "next_action_status": _bounded_optional(application.next_action_status, 32),
+            "application_url": _bounded_optional(application.posting_url, 2_048),
+            "applied_on": application.applied_on,
+            "next_action_date": _temporal_start_date(application.next_action_temporal),
+            "last_activity_at": _temporal_start_at(application.next_action_temporal),
+            "notion_last_edited_at": _utc(application.last_edited_at, "last_edited_at"),
+            "source_url": _bounded_optional(application.source_url, 2_048),
+            "property_snapshot": {
+                **_bounded_mapping(application.property_snapshot),
+                "_lifeagent_career": {
+                    "next_action_temporal": (
+                        application.next_action_temporal.model_dump(mode="json")
+                        if application.next_action_temporal is not None
+                        else None
+                    ),
+                    "deadline": application.deadline.isoformat()
+                    if application.deadline is not None
+                    else None,
+                    "row_order": application.row_order,
+                },
+            },
+            "content_fingerprint": _bounded(application.content_fingerprint, 128),
+            "active": application.active,
+            "archived": application.archived,
+        }
+        return cast(
+            CareerApplication,
+            _upsert(
+                session,
+                CareerApplication,
+                [CareerApplication.application_page_id == values["application_page_id"]],
+                values,
+            ),
+        )
+
+    @staticmethod
+    def deactivate_missing_career_applications(
+        session: Session,
+        *,
+        workspace_id: uuid.UUID,
+        seen_application_ids: set[str],
+    ) -> int:
+        rows = list(
+            session.scalars(
+                select(CareerApplication).where(
+                    CareerApplication.workspace_id == workspace_id,
+                    CareerApplication.source_kind == "notion_applications",
+                    CareerApplication.active.is_(True),
+                )
+            )
+        )
+        count = 0
+        for row in rows:
+            if row.application_page_id not in seen_application_ids:
+                row.active = False
+                row.archived = True
+                count += 1
+        session.flush()
+        return count
+
+    @staticmethod
+    def list_typed_applications(session: Session) -> list[dict[str, Any]]:
+        rows = session.scalars(
+            select(CareerApplication)
+            .where(
+                CareerApplication.source_kind == "notion_applications",
+                CareerApplication.active.is_(True),
+                CareerApplication.archived.is_(False),
+            )
+            .order_by(CareerApplication.company_name, CareerApplication.role_title)
+        )
+        return [_typed_application_public(row) for row in rows]
+
+    @staticmethod
+    def list_typed_application_rows(session: Session) -> list[dict[str, Any]]:
+        return [
+            _typed_application_row_public(item)
+            for item in JobInterviewRepository.list_typed_applications(session)
+        ]
+
+    @staticmethod
     def upsert_interview_event(
         session: Session,
         *,
         workspace_id: uuid.UUID,
         event: InterviewEventInput,
     ) -> CareerInterviewEvent:
+        property_snapshot = _bounded_mapping(event.property_snapshot)
+        property_snapshot["_lifeagent_career"] = {
+            "temporal_value": (
+                event.temporal_value.model_dump(mode="json")
+                if event.temporal_value is not None
+                else _interview_temporal_value(
+                    local_date=event.local_date,
+                    date_start=event.date_start,
+                    is_all_day=event.is_all_day,
+                    timezone=event.timezone,
+                ).model_dump(mode="json")
+            ),
+            "application_id": event.application_id,
+            "stage": event.stage,
+            "interview_status": event.interview_status,
+            "preparation_status": event.preparation_status,
+        }
         values = {
             "workspace_id": workspace_id,
             "interview_page_id": _bounded(event.interview_page_id),
@@ -559,14 +710,14 @@ class JobInterviewRepository:
             "notion_last_edited_at": _utc(event.notion_last_edited_at, "notion_last_edited_at"),
             "source_url": _bounded_optional(event.source_url, 2_048),
             "tags": _bounded_string_list(event.tags, item_limit=255, count_limit=50),
-            "property_snapshot": _bounded_mapping(event.property_snapshot),
+            "property_snapshot": property_snapshot,
             "url_candidates": [dict(item) for item in event.url_candidates[:25]],
             "content_fingerprint": _bounded(event.content_fingerprint, 128),
             "content_artifact_key": _bounded_optional(event.content_artifact_key, 512),
             "active": event.active,
             "archived": event.archived,
         }
-        return cast(
+        interview = cast(
             CareerInterviewEvent,
             _upsert(
                 session,
@@ -575,6 +726,39 @@ class JobInterviewRepository:
                 values,
             ),
         )
+        if event.application_id:
+            application = _application_by_page(session, event.application_id)
+            if application is not None:
+                _upsert(
+                    session,
+                    CareerInterviewApplicationLink,
+                    [CareerInterviewApplicationLink.interview_id == interview.id],
+                    {
+                        "interview_id": interview.id,
+                        "application_row_id": None,
+                        "application_id": application.id,
+                        "state": "matched",
+                        "confidence": 1.0,
+                        "rationale": "Matched from explicit Notion Interview Application relation.",
+                        "evidence": [
+                            {
+                                "source": "notion_relation",
+                                "application_page_id": event.application_id,
+                            }
+                        ],
+                        "clarification_id": None,
+                        "interview_content_fingerprint": _bounded_optional(
+                            event.content_fingerprint, 128
+                        ),
+                        "application_content_fingerprint": _bounded_optional(
+                            application.content_fingerprint, 128
+                        ),
+                        "resolution_source": "model",
+                        "resolved_at": _utc(event.notion_last_edited_at, "notion_last_edited_at"),
+                        "active": True,
+                    },
+                )
+        return interview
 
     @staticmethod
     def deactivate_missing_interviews(
@@ -783,10 +967,14 @@ class JobInterviewRepository:
         if not 0 <= link.confidence <= 1:
             raise ValueError("interview/application link confidence must be between 0 and 1")
         interview = _interview_by_page(session, link.interview_page_id)
-        row = _application_row_by_block(session, link.row_block_id) if link.row_block_id else None
+        row = _application_row_by_block_optional(session, link.row_block_id)
+        application = (
+            _application_by_page(session, link.row_block_id) if link.row_block_id else None
+        )
         values = {
             "interview_id": interview.id,
             "application_row_id": row.id if row is not None else None,
+            "application_id": application.id if application is not None else None,
             "state": link.state,
             "confidence": link.confidence,
             "rationale": _bounded(link.rationale, 1_000),
@@ -831,10 +1019,20 @@ class JobInterviewRepository:
             if link.application_row_id
             else None
         )
+        application = (
+            session.get(CareerApplication, link.application_id) if link.application_id else None
+        )
         return {
             "id": link.id,
             "interview_page_id": interview.interview_page_id,
-            "row_block_id": row.row_block_id if row else None,
+            "row_block_id": (
+                row.row_block_id
+                if row is not None
+                else application.application_page_id
+                if application is not None
+                else None
+            ),
+            "application_id": application.application_page_id if application else None,
             "state": link.state,
             "confidence": link.confidence,
             "rationale": link.rationale,
@@ -1192,8 +1390,12 @@ class JobInterviewRepository:
         )
         active_rows = session.scalar(
             select(func.count())
-            .select_from(CareerApplicationRow)
-            .where(CareerApplicationRow.active.is_(True), CareerApplicationRow.is_header.is_(False))
+            .select_from(CareerApplication)
+            .where(
+                CareerApplication.source_kind == "notion_applications",
+                CareerApplication.active.is_(True),
+                CareerApplication.archived.is_(False),
+            )
         )
         active_interviews = session.scalar(
             select(func.count())
@@ -1370,6 +1572,78 @@ class SQLAlchemyJobInterviewStore:
                 ),
             )
             return str(stored.id)
+
+    def upsert_career_application(self, workspace_id: str, application: Any) -> str:
+        typed = (
+            application
+            if isinstance(application, CareerApplicationInput)
+            else CareerApplicationInput(
+                application_id=str(
+                    getattr(
+                        application,
+                        "application_id",
+                        getattr(application, "page_id", getattr(application, "id", "")),
+                    )
+                ),
+                company_name=_bounded_optional(
+                    getattr(application, "company_name", getattr(application, "company", None))
+                ),
+                role_title=_bounded_optional(
+                    getattr(application, "role_title", getattr(application, "role", None)), 500
+                ),
+                status=_bounded_optional(
+                    getattr(
+                        application,
+                        "status",
+                        getattr(application, "pipeline_status", None),
+                    )
+                ),
+                next_action=_bounded_optional(getattr(application, "next_action", None), 1_000),
+                next_action_temporal=getattr(application, "next_action_temporal", None),
+                posting_url=_bounded_optional(
+                    getattr(
+                        application,
+                        "posting_url",
+                        getattr(application, "application_url", None),
+                    ),
+                    2_048,
+                ),
+                source_url=_bounded_optional(getattr(application, "source_url", None), 2_048),
+                content_fingerprint=str(
+                    getattr(application, "content_fingerprint", None)
+                    or _hash_json(
+                        {
+                            "application": getattr(application, "application_id", None),
+                            "company": getattr(application, "company_name", None),
+                            "role": getattr(application, "role_title", None),
+                            "status": getattr(application, "pipeline_status", None),
+                        }
+                    )
+                ),
+                last_edited_at=getattr(application, "last_edited_at", datetime.now(UTC)),
+                row_order=int(getattr(application, "row_order", 0)),
+                active=bool(getattr(application, "active", True)),
+            )
+        )
+        with Session(self.engine) as session, session.begin():
+            row = JobInterviewRepository.upsert_career_application(
+                session,
+                workspace_id=uuid.UUID(str(workspace_id)),
+                application=typed,
+            )
+            return str(row.id)
+
+    def deactivate_missing_career_applications(
+        self,
+        workspace_id: str,
+        seen_application_ids: set[str],
+    ) -> int:
+        with Session(self.engine) as session, session.begin():
+            return JobInterviewRepository.deactivate_missing_career_applications(
+                session,
+                workspace_id=uuid.UUID(str(workspace_id)),
+                seen_application_ids=seen_application_ids,
+            )
 
     def reconcile_application_table(
         self,
@@ -1569,8 +1843,19 @@ class SQLAlchemyJobInterviewStore:
                 content_fingerprint=str(row["content_fingerprint"]),
                 last_seen_at=now,
             )
-            for row in self.list_active_application_rows()
+            for row in self.typed_application_rows()
         )
+
+    def typed_application_snapshots(self) -> tuple[CareerApplicationSnapshot, ...]:
+        with Session(self.engine) as session:
+            return tuple(
+                CareerApplicationSnapshot.model_validate(item)
+                for item in JobInterviewRepository.list_typed_applications(session)
+            )
+
+    def typed_application_rows(self) -> list[dict[str, Any]]:
+        with Session(self.engine) as session:
+            return JobInterviewRepository.list_typed_application_rows(session)
 
     def application_table_snapshots(self) -> tuple[ApplicationRowSnapshot, ...]:
         now = datetime.now(UTC)
@@ -1720,12 +2005,34 @@ class SQLAlchemyJobInterviewStore:
 
 
 def _application_row_by_block(session: Session, row_block_id: str) -> CareerApplicationRow:
-    row = session.scalar(
-        select(CareerApplicationRow).where(CareerApplicationRow.row_block_id == row_block_id)
-    )
+    row = _application_row_by_block_optional(session, row_block_id)
     if row is None:
         raise NoResultFound(f"career application row {row_block_id} was not found")
     return row
+
+
+def _application_row_by_block_optional(
+    session: Session,
+    row_block_id: str | None,
+) -> CareerApplicationRow | None:
+    if not row_block_id:
+        return None
+    return session.scalar(
+        select(CareerApplicationRow).where(CareerApplicationRow.row_block_id == row_block_id)
+    )
+
+
+def _application_by_page(
+    session: Session,
+    application_page_id: str | None,
+) -> CareerApplication | None:
+    if not application_page_id:
+        return None
+    return session.scalar(
+        select(CareerApplication).where(
+            CareerApplication.application_page_id == application_page_id
+        )
+    )
 
 
 def _interview_by_page(session: Session, interview_page_id: str) -> CareerInterviewEvent:
@@ -1778,6 +2085,211 @@ def _lock_write_receipt(
     if row.payload_hash != payload_hash:
         raise ValueError("career write payload hash changed")
     return row
+
+
+def _hash_json(payload: Mapping[str, Any]) -> str:
+    return hashlib.sha256(
+        json.dumps(payload, ensure_ascii=True, sort_keys=True, separators=(",", ":")).encode(
+            "utf-8"
+        )
+    ).hexdigest()
+
+
+def _typed_application_table(
+    session: Session,
+    *,
+    workspace_id: uuid.UUID,
+) -> CareerApplicationTable:
+    now = datetime.now(UTC)
+    return cast(
+        CareerApplicationTable,
+        _upsert(
+            session,
+            CareerApplicationTable,
+            [CareerApplicationTable.table_block_id == _TYPED_APPLICATION_TABLE_BLOCK_ID],
+            {
+                "workspace_id": workspace_id,
+                "table_block_id": _TYPED_APPLICATION_TABLE_BLOCK_ID,
+                "table_order": 0,
+                "has_column_header": False,
+                "row_count": 0,
+                "column_count": 7,
+                "content_fingerprint": _hash_json({"table": _TYPED_APPLICATION_TABLE_BLOCK_ID}),
+                "last_seen_at": now,
+                "active": True,
+            },
+        ),
+    )
+
+
+def _typed_application_cells(application: CareerApplicationInput) -> list[str]:
+    temporal = (
+        application.next_action_temporal.model_dump(mode="json")
+        if application.next_action_temporal is not None
+        else None
+    )
+    return [
+        application.company_name or "",
+        application.role_title or "",
+        application.status or "",
+        application.next_action or "",
+        json.dumps(temporal, ensure_ascii=True, sort_keys=True) if temporal is not None else "",
+        application.posting_url or "",
+        application.source_url or "",
+    ]
+
+
+def _typed_application_temporal(value: object) -> TemporalValue | None:
+    if not isinstance(value, str) or not value.strip():
+        return None
+    try:
+        raw: object = json.loads(value)
+    except json.JSONDecodeError:
+        return None
+    if not isinstance(raw, Mapping):
+        return None
+    try:
+        return _TEMPORAL_VALUE_ADAPTER.validate_python(raw)
+    except ValueError:
+        return None
+
+
+def _typed_application_public(row: CareerApplication) -> dict[str, Any]:
+    temporal = _career_application_temporal(row)
+    return {
+        "application_id": row.application_page_id or str(row.id),
+        "company_name": row.company_name,
+        "role_title": row.role_title,
+        "pipeline_status": row.status,
+        "next_action": row.next_action,
+        "next_action_temporal": temporal,
+        "timezone": _temporal_timezone(temporal),
+        "posting_url": row.application_url,
+        "source_url": row.source_url,
+        "content_fingerprint": row.content_fingerprint or _hash_json({"application": str(row.id)}),
+        "last_edited_at": _aware_db(row.notion_last_edited_at or row.updated_at),
+        "active": row.active,
+    }
+
+
+def _typed_application_row_public(item: Mapping[str, Any]) -> dict[str, Any]:
+    cells = [
+        str(item.get("company_name") or ""),
+        str(item.get("role_title") or ""),
+        str(item.get("pipeline_status") or ""),
+        str(item.get("next_action") or ""),
+        _temporal_label(item.get("next_action_temporal")),
+        str(item.get("posting_url") or ""),
+    ]
+    return {
+        "id": item["application_id"],
+        "row_block_id": item["application_id"],
+        "table_id": None,
+        "table_block_id": _TYPED_APPLICATION_TABLE_BLOCK_ID,
+        "row_order": 0,
+        "is_header": False,
+        "cells": cells,
+        "normalized_cells": [cell.casefold() for cell in cells],
+        "content_fingerprint": item["content_fingerprint"],
+        "interpretation": {
+            "company_name": item.get("company_name"),
+            "role_title": item.get("role_title"),
+            "status": item.get("pipeline_status"),
+            "confidence": 1.0,
+            "evidence": [],
+            "model_version": _TYPED_APPLICATION_MODEL_VERSION,
+            "interpreted_at": item.get("last_edited_at"),
+        },
+    }
+
+
+def _temporal_label(value: object) -> str:
+    if isinstance(value, DateOnlyValue):
+        return value.start_date.isoformat()
+    if isinstance(value, DateTimeValue):
+        return value.start_at.isoformat()
+    return ""
+
+
+def _interview_temporal_value(
+    *,
+    local_date: date,
+    date_start: datetime | None,
+    is_all_day: bool,
+    timezone: str,
+) -> TemporalValue:
+    if is_all_day or date_start is None:
+        return DateOnlyValue(start_date=local_date)
+    return DateTimeValue(
+        start_at=_aware_db(date_start),
+        timezone=timezone,
+    )
+
+
+def _career_meta(row: Mapping[str, Any]) -> Mapping[str, Any]:
+    properties = row.get("property_snapshot")
+    if not isinstance(properties, Mapping):
+        return {}
+    meta = cast(Mapping[str, Any], properties).get("_lifeagent_career")
+    return cast(Mapping[str, Any], meta) if isinstance(meta, Mapping) else {}
+
+
+def _career_meta_temporal(row: Mapping[str, Any]) -> TemporalValue:
+    meta = _career_meta(row)
+    raw = meta.get("temporal_value")
+    if isinstance(raw, Mapping):
+        try:
+            return _TEMPORAL_VALUE_ADAPTER.validate_python(raw)
+        except ValueError:
+            pass
+    local_date = row.get("local_date")
+    if not isinstance(local_date, date):
+        raise ValueError("interview is missing local date")
+    return _interview_temporal_value(
+        local_date=local_date,
+        date_start=cast(datetime | None, row.get("date_start")),
+        is_all_day=bool(row.get("is_all_day", False)),
+        timezone=str(row.get("timezone") or "America/Toronto"),
+    )
+
+
+def _career_application_temporal(row: CareerApplication) -> TemporalValue | None:
+    meta = _career_application_meta(row)
+    raw = meta.get("next_action_temporal")
+    if isinstance(raw, Mapping):
+        try:
+            return _TEMPORAL_VALUE_ADAPTER.validate_python(raw)
+        except ValueError:
+            pass
+    if row.last_activity_at is not None:
+        return DateTimeValue(
+            start_at=_aware_db(row.last_activity_at),
+            timezone="America/Toronto",
+        )
+    if row.next_action_date is not None:
+        return DateOnlyValue(start_date=row.next_action_date)
+    return None
+
+
+def _career_application_meta(row: CareerApplication) -> Mapping[str, Any]:
+    meta = row.property_snapshot.get("_lifeagent_career") if row.property_snapshot else None
+    return cast(Mapping[str, Any], meta) if isinstance(meta, Mapping) else {}
+
+
+def _temporal_start_date(value: TemporalValue | None) -> date | None:
+    if isinstance(value, DateOnlyValue):
+        return value.start_date
+    if isinstance(value, DateTimeValue):
+        return value.start_at.astimezone(ZoneInfo(value.timezone)).date()
+    return None
+
+
+def _temporal_start_at(value: TemporalValue | None) -> datetime | None:
+    return value.start_at if isinstance(value, DateTimeValue) else None
+
+
+def _temporal_timezone(value: TemporalValue | None) -> str:
+    return value.timezone if isinstance(value, DateTimeValue) else "America/Toronto"
 
 
 def _application_interpretation_public(row: CareerApplicationInterpretation) -> dict[str, Any]:
@@ -2005,6 +2517,10 @@ def _interview_public(session: Session, row: CareerInterviewEvent) -> dict[str, 
             CareerInterviewApplicationLink.interview_id == row.id
         )
     )
+    public: dict[str, Any] = {
+        "property_snapshot": row.property_snapshot,
+    }
+    meta = _career_meta(public)
     return {
         "id": row.id,
         "interview_page_id": row.interview_page_id,
@@ -2013,6 +2529,19 @@ def _interview_public(session: Session, row: CareerInterviewEvent) -> dict[str, 
         "local_date": row.local_date,
         "is_all_day": row.is_all_day,
         "timezone": row.timezone,
+        "temporal_value": _career_meta_temporal(
+            {
+                "property_snapshot": row.property_snapshot,
+                "local_date": row.local_date,
+                "date_start": row.date_start,
+                "is_all_day": row.is_all_day,
+                "timezone": row.timezone,
+            }
+        ),
+        "application_id": meta.get("application_id"),
+        "stage": meta.get("stage"),
+        "interview_status": meta.get("interview_status"),
+        "preparation_status": meta.get("preparation_status"),
         "notion_last_edited_at": row.notion_last_edited_at,
         "source_url": row.source_url,
         "tags": row.tags,
@@ -2146,6 +2675,11 @@ def _interview_contract(row: Mapping[str, Any]) -> InterviewEventSnapshot:
         local_date=cast(date, local_date),
         is_all_day=bool(row.get("is_all_day", False)),
         timezone=str(row.get("timezone") or "America/Toronto"),
+        temporal_value=_career_meta_temporal(row),
+        application_id=cast(str | None, _career_meta(row).get("application_id")),
+        stage=cast(str | None, _career_meta(row).get("stage")),
+        interview_status=cast(str | None, _career_meta(row).get("interview_status")),
+        preparation_status=cast(str | None, _career_meta(row).get("preparation_status")),
         last_edited_at=_aware_db(cast(datetime, row["notion_last_edited_at"])),
         source_url=cast(str | None, row.get("source_url")),
         tags=tuple(cast(Sequence[str], row.get("tags") or ())),

@@ -30,6 +30,10 @@
 2. Qwen may perform bounded read-only course, assessment, active-focus, and semantic
    searches. It returns a typed create, reinforce, resolve, or snooze action, or one
    clarification question.
+   The assessment search in this specialized memory workflow resolves context for a
+   learning-focus action only. It is not an alternate dated-item list path and cannot
+   answer task, schedule, or agenda questions; ordinary Discord item lists use the
+   host-grounded `search_calendar_items` contract exclusively.
 3. A clarification and its verified partial facts are persisted against the Discord
    channel and user. The next authorized reply resumes that session without requiring
    another mention.

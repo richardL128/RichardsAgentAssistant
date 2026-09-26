@@ -96,7 +96,9 @@ class Settings(BaseSettings):
     ops_console_username: SecretValue = None
     ops_console_password: SecretValue = None
     notion_courses_database_id: str | None = None
-    notion_assessments_database_id: str | None = None
+    notion_action_items_database_id: str | None = None
+    notion_applications_database_id: str | None = None
+    notion_interviews_database_id: str | None = None
     finance_source_allowlist_version: str = "finance-sources-2026.09-v2"
     finance_eia_mode: Literal["bulk", "api"] = "bulk"
     sec_user_agent: str = "LifeAgent/0.1 contact@example.com"
@@ -267,7 +269,9 @@ class Settings(BaseSettings):
         "discord_finance_channel_id",
         "discord_application_id",
         "notion_courses_database_id",
-        "notion_assessments_database_id",
+        "notion_action_items_database_id",
+        "notion_applications_database_id",
+        "notion_interviews_database_id",
         "embedding_model_digest",
         mode="before",
     )
@@ -582,13 +586,29 @@ class Settings(BaseSettings):
                 value is not None
                 for value in (
                     self.notion_courses_database_id,
-                    self.notion_assessments_database_id,
+                    self.notion_action_items_database_id,
+                    self.notion_applications_database_id,
+                    self.notion_interviews_database_id,
                 )
             ),
             "notion_token_configured": self.notion_token is not None,
-            "notion_courses_database_configured": self.notion_courses_database_id is not None,
-            "notion_deprecated_database_metadata_count": sum(
-                value is not None for value in (self.notion_assessments_database_id,)
+            "notion_configured_database_count": sum(
+                value is not None
+                for value in (
+                    self.notion_courses_database_id,
+                    self.notion_action_items_database_id,
+                    self.notion_applications_database_id,
+                    self.notion_interviews_database_id,
+                )
+            ),
+            "notion_all_databases_configured": all(
+                value is not None
+                for value in (
+                    self.notion_courses_database_id,
+                    self.notion_action_items_database_id,
+                    self.notion_applications_database_id,
+                    self.notion_interviews_database_id,
+                )
             ),
             "academic_schedule_ical_configured": self.academic_schedule_ical_url is not None,
             "academic_schedule_ical_timeout_seconds": (self.academic_schedule_ical_timeout_seconds),

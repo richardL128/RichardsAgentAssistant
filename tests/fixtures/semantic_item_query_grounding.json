@@ -1,0 +1,48 @@
+[
+  {
+    "prompt": "What are my to do's today",
+    "tool": "search_calendar_items",
+    "view": "tasks",
+    "temporal_scope": "today"
+  },
+  {
+    "prompt": "What do I need to get done today?",
+    "tool": "search_calendar_items",
+    "view": "tasks",
+    "temporal_scope": "today"
+  },
+  {
+    "prompt": "Show me today's tasks.",
+    "tool": "search_calendar_items",
+    "view": "tasks",
+    "temporal_scope": "today"
+  },
+  {
+    "prompt": "Anything on my plate today?",
+    "tool": "search_calendar_items",
+    "view": "tasks",
+    "temporal_scope": "today"
+  },
+  {
+    "prompt": "Do I have anything due today?",
+    "tool": "search_calendar_items",
+    "view": "tasks",
+    "temporal_scope": "today"
+  },
+  {
+    "prompt": "What's my schedule today?",
+    "tool": "search_calendar_items",
+    "view": "schedule",
+    "temporal_scope": "today"
+  },
+  {
+    "prompt": "Give me my full agenda today",
+    "tool": "search_calendar_items",
+    "view": "agenda",
+    "temporal_scope": "today"
+  },
+  {
+    "prompt": "Which courses am I taking?",
+    "tool": "search_courses"
+  }
+]

@@ -21,10 +21,10 @@ from app.agents.calendar_briefing.contracts import (
     with_title_evidence_fragment,
 )
 from app.agents.calendar_briefing.morning_composer import (
-    EventDigestComposition,
     MorningBriefingComposer,
     MorningCategory,
     ScheduleComposition,
+    SpokenTaskComposition,
 )
 from app.agents.calendar_briefing.morning_manifest import (
     MorningBriefingDeliveryManifest,
@@ -62,7 +62,6 @@ __all__ = [
     "CalendarEventSourceKind",
     "CalendarSemanticCacheDecision",
     "CalendarSemanticCacheRecord",
-    "EventDigestComposition",
     "MorningBriefingComposer",
     "MorningBriefingDeliveryManifest",
     "MorningCategory",
@@ -70,6 +69,7 @@ __all__ = [
     "MorningManifestEntry",
     "ScheduleComposition",
     "ScheduledMorningCalendarItem",
+    "SpokenTaskComposition",
     "build_calendar_briefing_manifest",
     "build_morning_briefing_manifest",
     "calendar_title_evidence_fragment",

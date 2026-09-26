@@ -60,8 +60,8 @@ def test_settings_diagnostics_redact_credentials(tmp_path: Path) -> None:
     assert diagnostics["finance_source_credentials_configured"] == 2
     assert diagnostics["discord_finance_channel_configured"] is True
     assert diagnostics["notion_token_configured"] is False
-    assert diagnostics["notion_courses_database_configured"] is False
-    assert diagnostics["notion_deprecated_database_metadata_count"] == 0
+    assert diagnostics["notion_configured_database_count"] == 0
+    assert diagnostics["notion_all_databases_configured"] is False
     assert diagnostics["academic_schedule_ical_configured"] is True
     assert diagnostics["academic_schedule_ical_timeout_seconds"] == 10
     assert diagnostics["academic_schedule_ical_max_bytes"] == 1_048_576
@@ -200,6 +200,11 @@ def test_default_compose_enables_only_discord_mention_model_triggers() -> None:
     assert "USER_MEMORY_ENABLED: ${USER_MEMORY_ENABLED:-true}" in compose
     assert "USER_MEMORY_RETRIEVAL_LIMIT: ${USER_MEMORY_RETRIEVAL_LIMIT:-8}" in compose
     assert "ACADEMIC_SCHEDULE_ICAL_URL: ${ACADEMIC_SCHEDULE_ICAL_URL:-}" in compose
+    assert "NOTION_COURSES_DATABASE_ID: ${NOTION_COURSES_DATABASE_ID:-}" in compose
+    assert "NOTION_ACTION_ITEMS_DATABASE_ID: ${NOTION_ACTION_ITEMS_DATABASE_ID:-}" in compose
+    assert "NOTION_APPLICATIONS_DATABASE_ID: ${NOTION_APPLICATIONS_DATABASE_ID:-}" in compose
+    assert "NOTION_INTERVIEWS_DATABASE_ID: ${NOTION_INTERVIEWS_DATABASE_ID:-}" in compose
+    assert "NOTION_ASSESSMENTS_DATABASE_ID" not in compose
     assert (
         "ACADEMIC_SCHEDULE_ICAL_TIMEOUT_SECONDS: "
         "${ACADEMIC_SCHEDULE_ICAL_TIMEOUT_SECONDS:-10}" in compose
@@ -242,24 +247,29 @@ def test_default_api_does_not_mount_legacy_model_queue_ingress(tmp_path) -> None
 
 def test_academic_notion_settings_are_setup_not_startup_requirements() -> None:
     token_only = Settings(_env_file=None, notion_token="notion-secret")
-    deprecated_only = Settings(
+    partial_database_only = Settings(
         _env_file=None,
         notion_token="",
-        notion_assessments_database_id="old-assessments",
+        notion_courses_database_id="old",
     )
     configured = Settings(
         _env_file=None,
         notion_token="notion-secret",
         notion_courses_database_id="courses",
+        notion_action_items_database_id="actions",
+        notion_applications_database_id="applications",
+        notion_interviews_database_id="interviews",
         discord_academic_authorized_user_ids=[123456789],
         discord_academic_message_content_enabled=True,
         discord_host_handoff_secret="handoff-secret",
     )
 
     assert token_only.notion_courses_database_id is None
-    assert deprecated_only.notion_token is None
-    assert deprecated_only.safe_diagnostics()["notion_deprecated_database_metadata_count"] == 1
-    assert configured.safe_diagnostics()["notion_deprecated_database_metadata_count"] == 0
+    assert partial_database_only.notion_token is None
+    assert partial_database_only.safe_diagnostics()["notion_configured_database_count"] == 1
+    assert partial_database_only.safe_diagnostics()["notion_all_databases_configured"] is False
+    assert configured.safe_diagnostics()["notion_configured_database_count"] == 4
+    assert configured.safe_diagnostics()["notion_all_databases_configured"] is True
     assert configured.safe_diagnostics()["discord_academic_authorized_user_count"] == 1
     assert configured.safe_diagnostics()["discord_host_handoff_configured"] is True
     assert "notion-secret" not in str(configured.safe_diagnostics())
@@ -333,7 +343,8 @@ def test_connector_configuration_fails_when_a_target_has_no_credential() -> None
     assert incomplete.diagnostic.endswith("discord")
     assert complete.state is HealthState.HEALTHY
     assert "discord-secret" not in complete.diagnostic
-    assert notion_setup.state is HealthState.HEALTHY
+    assert notion_setup.state is HealthState.FAILED
+    assert notion_setup.diagnostic.endswith("notion")
 
 
 def test_academic_notion_missing_config_is_attention() -> None:
@@ -345,6 +356,9 @@ def test_academic_notion_missing_config_is_attention() -> None:
             _env_file=None,
             notion_token="notion-secret",
             notion_courses_database_id="courses",
+            notion_action_items_database_id="actions",
+            notion_applications_database_id="applications",
+            notion_interviews_database_id="interviews",
         )
     )
     invalid = check_academic_notion_status(
@@ -352,6 +366,9 @@ def test_academic_notion_missing_config_is_attention() -> None:
             _env_file=None,
             notion_token="notion-secret",
             notion_courses_database_id="not valid",
+            notion_action_items_database_id="actions",
+            notion_applications_database_id="applications",
+            notion_interviews_database_id="interviews",
         )
     )
 

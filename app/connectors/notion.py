@@ -6,13 +6,21 @@ import hashlib
 import json
 import re
 from collections.abc import AsyncIterator, Mapping, Sequence
-from datetime import UTC, date, datetime
+from datetime import UTC, date, datetime, timedelta
 from typing import Any, Final, Literal, Protocol, cast
 from urllib.parse import quote, urlsplit
 
 import httpx
 from pydantic import BaseModel, ConfigDict, Field, SecretStr, ValidationError
 
+from app.agents.action_items import (
+    ActionItemDomain,
+    ActionItemKind,
+    ActionItemStatus,
+    DateOnlyValue,
+    DateTimeValue,
+    TemporalValue,
+)
 from app.core.errors import (
     ErrorCategory,
     ErrorCode,
@@ -26,10 +34,52 @@ from app.core.errors import (
 NOTION_API_BASE_URL: Final[str] = "https://api.notion.com/v1"
 NOTION_API_VERSION: Final[str] = "2025-09-03"
 DatabaseName = Literal["courses", "assessments"]
+ConfiguredNotionDatabase = Literal["courses", "action_items", "applications", "interviews"]
 NotionSourceType = Literal["database", "data_source"]
 DiagnosticSeverity = Literal["info", "warning", "error"]
 NotionMaterialSourceKind = Literal["notion_page_body", "notion_property_file", "notion_block_file"]
 _DATABASES: Final[frozenset[str]] = frozenset({"courses", "assessments"})
+_CONFIGURED_DATABASES: Final[tuple[ConfiguredNotionDatabase, ...]] = (
+    "courses",
+    "action_items",
+    "applications",
+    "interviews",
+)
+_CONFIGURED_REQUIRED_PROPERTIES: Final[
+    dict[ConfiguredNotionDatabase, dict[str, frozenset[str]]]
+] = {
+    "courses": {
+        "Course": frozenset({"title"}),
+        "Code": frozenset({"rich_text"}),
+        "Term": frozenset({"select"}),
+        "Status": frozenset({"status"}),
+    },
+    "action_items": {
+        "Name": frozenset({"title"}),
+        "Domain": frozenset({"select"}),
+        "Item Type": frozenset({"select"}),
+        "Status": frozenset({"status"}),
+        "Date": frozenset({"date"}),
+        "Course": frozenset({"relation"}),
+        "Application": frozenset({"relation"}),
+        "Interview": frozenset({"relation"}),
+        "Origin": frozenset({"select"}),
+    },
+    "applications": {
+        "Role": frozenset({"title"}),
+        "Company": frozenset({"rich_text"}),
+        "Pipeline Status": frozenset({"status"}),
+        "Active": frozenset({"checkbox"}),
+    },
+    "interviews": {
+        "Name": frozenset({"title"}),
+        "Date": frozenset({"date"}),
+        "Application": frozenset({"relation"}),
+        "Stage": frozenset({"select"}),
+        "Status": frozenset({"status"}),
+        "Prep Status": frozenset({"status"}),
+    },
+}
 _REQUIRED_PROPERTIES: Final[dict[str, frozenset[str]]] = {
     "courses": frozenset({"course", "term", "priority", "outline", "policy"}),
     "assessments": frozenset(
@@ -128,6 +178,91 @@ class NotionDateValue(BaseModel):
     time_zone: str | None = Field(default=None, max_length=128)
 
 
+class NotionConfiguredSource(BaseModel):
+    """Resolved data source and guarded property IDs for one configured database."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    database: ConfiguredNotionDatabase
+    database_id: str = Field(pattern=_ID_PATTERN.pattern)
+    source_id: str = Field(pattern=_ID_PATTERN.pattern)
+    source_type: NotionSourceType
+    property_ids: Mapping[str, str]
+    property_types: Mapping[str, str]
+
+
+class NotionTypedPageRecord(BaseModel):
+    """Typed page envelope preserving Notion source metadata and raw values."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    page_id: str = Field(pattern=_ID_PATTERN.pattern)
+    database: ConfiguredNotionDatabase
+    database_id: str = Field(pattern=_ID_PATTERN.pattern)
+    source_id: str = Field(pattern=_ID_PATTERN.pattern)
+    source_type: NotionSourceType
+    source_url: str | None = Field(default=None, max_length=4_096)
+    title: str = Field(max_length=1_024)
+    last_edited_at: datetime
+    archived: bool = False
+    in_trash: bool = False
+    property_ids: Mapping[str, str]
+    properties: Mapping[str, Any]
+    date: NotionDateValue | None = None
+    relation_ids: Mapping[str, tuple[str, ...]] = Field(default_factory=dict)
+
+
+class NotionCourseRecord(NotionTypedPageRecord):
+    database: Literal["courses"] = "courses"
+    code: str | None = Field(default=None, max_length=128)
+    term: str | None = Field(default=None, max_length=128)
+    status: str | None = Field(default=None, max_length=128)
+
+
+class NotionActionItemRecord(NotionTypedPageRecord):
+    database: Literal["action_items"] = "action_items"
+    domain: str | None = Field(default=None, max_length=128)
+    item_type: str | None = Field(default=None, max_length=128)
+    status: str | None = Field(default=None, max_length=128)
+    origin: str | None = Field(default=None, max_length=128)
+    priority: str | None = Field(default=None, max_length=128)
+    estimated_minutes: float | int | None = None
+    weight_percent: float | int | None = None
+    external_url: str | None = Field(default=None, max_length=4_096)
+    notes: str | None = Field(default=None, max_length=10_000)
+    review_reason: str | None = Field(default=None, max_length=1_000)
+    course_ids: tuple[str, ...] = ()
+    application_ids: tuple[str, ...] = ()
+    interview_ids: tuple[str, ...] = ()
+
+
+class NotionApplicationRecord(NotionTypedPageRecord):
+    database: Literal["applications"] = "applications"
+    company: str | None = Field(default=None, max_length=255)
+    role: str | None = Field(default=None, max_length=500)
+    pipeline_status: str | None = Field(default=None, max_length=128)
+    active: bool | None = None
+    applied_on: NotionDateValue | None = None
+    deadline: NotionDateValue | None = None
+    next_action: str | None = Field(default=None, max_length=500)
+    next_action_due: NotionDateValue | None = None
+    posting_url: str | None = Field(default=None, max_length=4_096)
+    location: str | None = Field(default=None, max_length=255)
+    source: str | None = Field(default=None, max_length=255)
+    contact: str | None = Field(default=None, max_length=255)
+    notes: str | None = Field(default=None, max_length=10_000)
+
+
+class NotionInterviewRecord(NotionTypedPageRecord):
+    database: Literal["interviews"] = "interviews"
+    stage: str | None = Field(default=None, max_length=128)
+    status: str | None = Field(default=None, max_length=128)
+    prep_status: str | None = Field(default=None, max_length=128)
+    meeting_url: str | None = Field(default=None, max_length=4_096)
+    notes: str | None = Field(default=None, max_length=10_000)
+    application_ids: tuple[str, ...] = ()
+
+
 class NotionDiscoveryDiagnostic(BaseModel):
     """Bounded, non-secret discovery diagnostic."""
 
@@ -143,6 +278,16 @@ class NotionDiscoveryDiagnostic(BaseModel):
     property_id: str | None = Field(default=None, max_length=128)
     property_name: str | None = Field(default=None, max_length=128)
     count: int | None = Field(default=None, ge=0, le=100)
+
+
+class NotionPreflightResult(BaseModel):
+    """Read-only validation result for all configured Notion sources."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    sources: Mapping[ConfiguredNotionDatabase, NotionConfiguredSource]
+    diagnostics: tuple[NotionDiscoveryDiagnostic, ...] = Field(default=(), max_length=1_000)
+    synced_at: datetime
 
 
 class NotionAssessment(BaseModel):
@@ -528,6 +673,18 @@ class NotionWriteReceipt(BaseModel):
     property_id: str | None = None
     file_upload_ids: tuple[str, ...] = Field(default=(), max_length=MAX_UPLOADED_PDF_BLOCKS)
     block_ids: tuple[str, ...] = Field(default=(), max_length=MAX_UPLOADED_PDF_BLOCKS)
+
+
+class NotionActionItemWritePrecondition(BaseModel):
+    """Current Action Items page state used by guarded explicit writes."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    page_id: str = Field(pattern=_ID_PATTERN.pattern)
+    last_edited_at: datetime
+    source_url: str | None = Field(default=None, max_length=4_096)
+    archived: bool = False
+    in_trash: bool = False
 
 
 class NotionWriteConflict(LifeAgentError):  # noqa: N818
@@ -1096,6 +1253,42 @@ def _date_property_value(
     return {"date": date_value}
 
 
+def _notion_option_name(value: ActionItemDomain | ActionItemKind | ActionItemStatus | str) -> str:
+    if isinstance(value, ActionItemDomain | ActionItemKind | ActionItemStatus):
+        name = str(value.value)
+    else:
+        name = str(value)
+    if not name.strip() or len(name) > 128:
+        raise permanent_error(ErrorCode.INPUT_INVALID, "Notion option name is invalid")
+    return name
+
+
+def _action_item_temporal_property_value(value: TemporalValue) -> dict[str, Any]:
+    if isinstance(value, DateOnlyValue):
+        date_value: dict[str, Any] = {"start": value.start_date.isoformat()}
+        if value.end_date_exclusive is not None:
+            date_value["end"] = (value.end_date_exclusive - timedelta(days=1)).isoformat()
+        return {"date": date_value}
+    if isinstance(value, DateTimeValue):
+        start_at = value.start_at
+        if start_at.tzinfo is None or start_at.utcoffset() is None:
+            raise permanent_error(
+                ErrorCode.INPUT_INVALID, "Notion action item timestamp must be aware"
+            )
+        date_value = {
+            "start": start_at.isoformat(),
+            "time_zone": value.timezone,
+        }
+        if value.end_at is not None:
+            if value.end_at.tzinfo is None or value.end_at.utcoffset() is None:
+                raise permanent_error(
+                    ErrorCode.INPUT_INVALID, "Notion action item end timestamp must be aware"
+                )
+            date_value["end"] = value.end_at.isoformat()
+        return {"date": date_value}
+    raise permanent_error(ErrorCode.INPUT_INVALID, "Notion action item date is invalid")
+
+
 def _uploaded_pdf_block_payload(uploaded_pdf: NotionUploadedPdf) -> dict[str, Any]:
     upload_id = _validate_id(uploaded_pdf.file_upload_id, "file upload ID")
     _validate_pdf_upload_filename(uploaded_pdf.filename)
@@ -1426,6 +1619,64 @@ def _schema_property(
     return None
 
 
+def _schema_named_property(
+    properties: Mapping[str, Any], *, expected_name: str, allowed_types: frozenset[str]
+) -> tuple[str, str] | None:
+    normalized_expected = _normalized_name(expected_name)
+    candidates: list[tuple[str, str]] = []
+    for key, value in properties.items():
+        if not isinstance(value, Mapping):
+            continue
+        value_map = cast(Mapping[str, Any], value)
+        prop_type = value_map.get("type")
+        display_name = _property_name(key, value_map)
+        if (
+            isinstance(prop_type, str)
+            and prop_type in allowed_types
+            and _normalized_name(display_name) == normalized_expected
+        ):
+            candidates.append((_property_id(key, value_map), prop_type))
+    if len(candidates) == 1:
+        return candidates[0]
+    return None
+
+
+def _relation_ids(value: Mapping[str, Any]) -> tuple[str, ...]:
+    if value.get("type") != "relation":
+        return ()
+    relation = value.get("relation")
+    if not isinstance(relation, list):
+        return ()
+    ids: list[str] = []
+    for item in cast(list[Any], relation):
+        if not isinstance(item, Mapping):
+            continue
+        item_id = cast(Mapping[str, Any], item).get("id")
+        if isinstance(item_id, str):
+            ids.append(item_id)
+    return tuple(ids)
+
+
+def _string_or_none(value: Any) -> str | None:
+    if isinstance(value, str) and value:
+        return value
+    return None
+
+
+def _number_or_none(value: Any) -> float | int | None:
+    if isinstance(value, int | float) and not isinstance(value, bool):
+        return value
+    return None
+
+
+def _bool_or_none(value: Any) -> bool | None:
+    return value if isinstance(value, bool) else None
+
+
+def _date_or_none(value: Any) -> NotionDateValue | None:
+    return value if isinstance(value, NotionDateValue) else None
+
+
 def _notion_value_for_change(change: PlannerProposedChange) -> Any:
     if change.field == "completed":
         normalized = change.value.strip().casefold()
@@ -1446,6 +1697,9 @@ class NotionConnector:
         *,
         token: SecretStr | str,
         courses_database_id: str | None = None,
+        action_items_database_id: str | None = None,
+        applications_database_id: str | None = None,
+        interviews_database_id: str | None = None,
         database_ids: Mapping[str, str] | None = None,
         data_source_ids: Mapping[str, str] | None = None,
         property_ids: Mapping[str, Mapping[str, str]] | None = None,
@@ -1454,9 +1708,22 @@ class NotionConnector:
     ) -> None:
         if timeout_seconds <= 0 or timeout_seconds > 120:
             raise ValueError("Notion timeout must be between 0 and 120 seconds")
+        explicit_ids = {
+            "courses": courses_database_id,
+            "action_items": action_items_database_id,
+            "applications": applications_database_id,
+            "interviews": interviews_database_id,
+        }
+        explicit_count = sum(value is not None for value in explicit_ids.values())
         selected_ids = database_ids if database_ids is not None else data_source_ids
+        if explicit_count not in {0, len(_CONFIGURED_DATABASES)}:
+            raise ValueError(
+                "Notion must configure Courses, Action Items, Applications, and Interviews"
+            )
+        if explicit_count and selected_ids is not None:
+            raise ValueError("Notion explicit database IDs cannot be combined with legacy mappings")
         if courses_database_id is None and selected_ids is None:
-            raise ValueError("Notion must configure a Courses database ID")
+            raise ValueError("Notion must configure explicit database IDs")
         if (
             courses_database_id is None
             and selected_ids is not None
@@ -1467,6 +1734,12 @@ class NotionConnector:
             "data_sources" if data_source_ids is not None and database_ids is None else "databases"
         )
         self._token = token
+        self._configured_database_ids: dict[ConfiguredNotionDatabase, str] = {}
+        if explicit_count:
+            self._configured_database_ids = {
+                name: _validate_id(cast(str, value), "database ID")
+                for name, value in explicit_ids.items()
+            }
         self._courses_database_id = _validate_id(
             courses_database_id or cast(Mapping[str, str], selected_ids)["courses"], "database ID"
         )
@@ -1496,9 +1769,234 @@ class NotionConnector:
             }
         return normalized
 
+    async def preflight_configured_databases(self) -> NotionPreflightResult:
+        """Resolve and validate all explicitly configured Notion databases read-only."""
+
+        self._require_explicit_databases()
+        diagnostics: list[NotionDiscoveryDiagnostic] = []
+        sources: dict[ConfiguredNotionDatabase, NotionConfiguredSource] = {}
+        for database in _CONFIGURED_DATABASES:
+            source = await self._configured_source(database, diagnostics=diagnostics)
+            if source is not None:
+                sources[database] = source
+        return NotionPreflightResult(
+            sources=sources,
+            diagnostics=tuple(diagnostics[:1_000]),
+            synced_at=datetime.now(UTC),
+        )
+
+    async def read_courses(self, *, page_size: int = 100) -> tuple[NotionCourseRecord, ...]:
+        """Read typed Course rows from the explicit Courses database."""
+
+        return cast(
+            tuple[NotionCourseRecord, ...],
+            await self._read_typed_database("courses", NotionCourseRecord, page_size=page_size),
+        )
+
+    async def read_action_items(
+        self, *, page_size: int = 100
+    ) -> tuple[NotionActionItemRecord, ...]:
+        """Read typed Action Item rows without deriving domain or status from titles."""
+
+        return cast(
+            tuple[NotionActionItemRecord, ...],
+            await self._read_typed_database(
+                "action_items", NotionActionItemRecord, page_size=page_size
+            ),
+        )
+
+    async def create_action_item(
+        self,
+        *,
+        proposal_id: str,
+        title: str,
+        domain: ActionItemDomain,
+        item_kind: ActionItemKind,
+        status: ActionItemStatus,
+        temporal: TemporalValue,
+        origin: str = "manual",
+        course_page_ids: Sequence[str] = (),
+        application_page_ids: Sequence[str] = (),
+        interview_page_ids: Sequence[str] = (),
+        proposal_relation_page_ids: Sequence[str] = (),
+    ) -> NotionWriteReceipt:
+        """Create one page in the configured Action Items source only."""
+
+        receipt_id = _validate_proposal_id(proposal_id)
+        source = await self._action_items_configured_source()
+        properties = self._action_item_payload_properties(
+            source,
+            title=title,
+            domain=domain,
+            item_kind=item_kind,
+            status=status,
+            temporal=temporal,
+            origin=origin,
+            course_page_ids=course_page_ids,
+            application_page_ids=application_page_ids,
+            interview_page_ids=interview_page_ids,
+            proposal_relation_page_ids=proposal_relation_page_ids,
+        )
+        parent_key = "data_source_id" if source.source_type == "data_source" else "database_id"
+        response = await self._request(
+            "POST",
+            "/pages",
+            json_body={
+                "parent": {parent_key: source.source_id},
+                "properties": properties,
+            },
+        )
+        data = self._json_object(response, "Notion action item create")
+        page_id = data.get("id")
+        if not isinstance(page_id, str):
+            raise transient_error(
+                ErrorCode.CONNECTOR_TRANSIENT,
+                "Notion returned invalid action item write receipt",
+            )
+        return NotionWriteReceipt(
+            proposal_id=receipt_id,
+            page_id=_validate_page_id(page_id),
+            url=data.get("url") if isinstance(data.get("url"), str) else None,
+        )
+
+    async def guarded_update_action_item(
+        self,
+        *,
+        proposal_id: str,
+        page_id: str,
+        expected_last_edited_at: datetime,
+        title: str | None = None,
+        domain: ActionItemDomain | None = None,
+        item_kind: ActionItemKind | None = None,
+        status: ActionItemStatus | None = None,
+        temporal: TemporalValue | None = None,
+        origin: str | None = None,
+        course_page_ids: Sequence[str] | None = None,
+        application_page_ids: Sequence[str] | None = None,
+        interview_page_ids: Sequence[str] | None = None,
+        proposal_relation_page_ids: Sequence[str] = (),
+    ) -> NotionWriteReceipt:
+        """Patch only Action Items properties after an exact edit-version check."""
+
+        receipt_id = _validate_proposal_id(proposal_id)
+        source = await self._action_items_configured_source()
+        current = await self._action_item_write_precondition(page_id=page_id, source=source)
+        self._enforce_action_item_edit_version(
+            current,
+            expected_last_edited_at=expected_last_edited_at,
+        )
+        properties = self._action_item_payload_properties(
+            source,
+            title=title,
+            domain=domain,
+            item_kind=item_kind,
+            status=status,
+            temporal=temporal,
+            origin=origin,
+            course_page_ids=course_page_ids,
+            application_page_ids=application_page_ids,
+            interview_page_ids=interview_page_ids,
+            proposal_relation_page_ids=proposal_relation_page_ids,
+        )
+        if not properties:
+            raise permanent_error(
+                ErrorCode.INPUT_INVALID, "Notion action item update is empty"
+            )
+        response = await self._request(
+            "PATCH",
+            f"/pages/{quote(current.page_id, safe='')}",
+            json_body={"properties": properties},
+        )
+        data = self._json_object(response, "Notion action item update")
+        patched_id = data.get("id")
+        if not isinstance(patched_id, str):
+            raise transient_error(
+                ErrorCode.CONNECTOR_TRANSIENT,
+                "Notion returned invalid action item write receipt",
+            )
+        return NotionWriteReceipt(
+            proposal_id=receipt_id,
+            page_id=_validate_page_id(patched_id),
+            url=data.get("url") if isinstance(data.get("url"), str) else None,
+        )
+
+    async def guarded_archive_action_item(
+        self,
+        *,
+        proposal_id: str,
+        page_id: str,
+        expected_last_edited_at: datetime,
+    ) -> NotionWriteReceipt:
+        """Archive one Action Items page after an exact edit-version check."""
+
+        receipt_id = _validate_proposal_id(proposal_id)
+        source = await self._action_items_configured_source()
+        current = await self._action_item_write_precondition(page_id=page_id, source=source)
+        self._enforce_action_item_edit_version(
+            current,
+            expected_last_edited_at=expected_last_edited_at,
+        )
+        response = await self._request(
+            "PATCH",
+            f"/pages/{quote(current.page_id, safe='')}",
+            json_body={"archived": True},
+        )
+        data = self._json_object(response, "Notion action item archive")
+        patched_id = data.get("id")
+        if not isinstance(patched_id, str):
+            raise transient_error(
+                ErrorCode.CONNECTOR_TRANSIENT,
+                "Notion returned invalid action item write receipt",
+            )
+        return NotionWriteReceipt(
+            proposal_id=receipt_id,
+            page_id=_validate_page_id(patched_id),
+            url=data.get("url") if isinstance(data.get("url"), str) else None,
+        )
+
+    async def read_applications(
+        self, *, page_size: int = 100
+    ) -> tuple[NotionApplicationRecord, ...]:
+        """Read typed career Application rows from the explicit Applications database."""
+
+        return cast(
+            tuple[NotionApplicationRecord, ...],
+            await self._read_typed_database(
+                "applications", NotionApplicationRecord, page_size=page_size
+            ),
+        )
+
+    async def read_interviews(self, *, page_size: int = 100) -> tuple[NotionInterviewRecord, ...]:
+        """Read typed Interview rows from the explicit Interviews database."""
+
+        return cast(
+            tuple[NotionInterviewRecord, ...],
+            await self._read_typed_database(
+                "interviews", NotionInterviewRecord, page_size=page_size
+            ),
+        )
+
     async def discover_course_assessments(self, *, page_size: int = 100) -> NotionDiscoveryResult:
         """Discover course rows and their seeded inline Assessments databases."""
 
+        if self._configured_database_ids:
+            return NotionDiscoveryResult(
+                courses_database_id=self._courses_database_id,
+                courses=(),
+                diagnostics=(
+                    NotionDiscoveryDiagnostic(
+                        code="legacy_course_assessment_discovery_disabled",
+                        severity="error",
+                        message=(
+                            "Explicit Notion databases are configured; nested Assessments "
+                            "discovery is disabled"
+                        ),
+                        source_id=self._courses_database_id,
+                        source_type="database",
+                    ),
+                ),
+                synced_at=datetime.now(UTC),
+            )
         if page_size < 1 or page_size > 100:
             raise permanent_error(ErrorCode.INPUT_INVALID, "Notion page size is invalid")
         diagnostics: list[NotionDiscoveryDiagnostic] = []
@@ -1587,6 +2085,23 @@ class NotionConnector:
     async def discover_jobs_workspace(self, *, page_size: int = 100) -> NotionJobsDiscoveryResult:
         """Discover the reserved Jobs page, application tables, and Interviews database."""
 
+        if self._configured_database_ids:
+            return NotionJobsDiscoveryResult(
+                courses_database_id=self._courses_database_id,
+                diagnostics=(
+                    NotionDiscoveryDiagnostic(
+                        code="legacy_jobs_workspace_discovery_disabled",
+                        severity="error",
+                        message=(
+                            "Explicit Notion databases are configured; reserved Jobs page "
+                            "discovery is disabled"
+                        ),
+                        source_id=self._courses_database_id,
+                        source_type="database",
+                    ),
+                ),
+                synced_at=datetime.now(UTC),
+            )
         if page_size < 1 or page_size > 100:
             raise permanent_error(ErrorCode.INPUT_INVALID, "Notion page size is invalid")
         diagnostics: list[NotionDiscoveryDiagnostic] = []
@@ -4004,6 +4519,428 @@ class NotionConnector:
             )
             return None
 
+    def _require_explicit_databases(self) -> None:
+        if not self._configured_database_ids:
+            raise permanent_error(
+                ErrorCode.SOURCE_SETUP_REQUIRED,
+                "Notion explicit database configuration is missing",
+            )
+
+    async def _configured_source(
+        self,
+        database: ConfiguredNotionDatabase,
+        *,
+        diagnostics: list[NotionDiscoveryDiagnostic],
+    ) -> NotionConfiguredSource | None:
+        database_id = self._configured_database_ids[database]
+        try:
+            container = await self._retrieve_database(database_id)
+            source = self._unique_source(
+                container,
+                source_id=database_id,
+                context=f"Notion {database.replace('_', ' ')} database",
+                diagnostics=diagnostics,
+            )
+            if source is None:
+                return None
+            source_schema = (
+                await self._retrieve_data_source(source[0])
+                if source[1] == "data_source"
+                else container
+            )
+        except LifeAgentError:
+            diagnostics.append(
+                NotionDiscoveryDiagnostic(
+                    code=f"{database}_database_unavailable",
+                    severity="error",
+                    message=f"Notion {database.replace('_', ' ')} database is inaccessible",
+                    source_id=database_id,
+                    source_type="database",
+                )
+            )
+            return None
+        properties = source_schema.get("properties")
+        if not isinstance(properties, Mapping):
+            diagnostics.append(
+                NotionDiscoveryDiagnostic(
+                    code=f"{database}_schema_malformed",
+                    severity="error",
+                    message=f"Notion {database.replace('_', ' ')} database schema is malformed",
+                    source_id=source[0],
+                    source_type=source[1],
+                )
+            )
+            return None
+        property_ids: dict[str, str] = {}
+        property_types: dict[str, str] = {}
+        for expected_name, allowed_types in _CONFIGURED_REQUIRED_PROPERTIES[database].items():
+            found = _schema_named_property(
+                cast(Mapping[str, Any], properties),
+                expected_name=expected_name,
+                allowed_types=allowed_types,
+            )
+            if found is None:
+                diagnostics.append(
+                    NotionDiscoveryDiagnostic(
+                        code=f"{database}_{_normalized_name(expected_name)}_property_invalid",
+                        severity="error",
+                        message=(
+                            f"Notion {database.replace('_', ' ')} database must have exactly "
+                            f"one {expected_name} property of type "
+                            f"{', '.join(sorted(allowed_types))}"
+                        ),
+                        source_id=source[0],
+                        source_type=source[1],
+                        property_name=expected_name,
+                    )
+                )
+                continue
+            property_ids[expected_name] = found[0]
+            property_types[expected_name] = found[1]
+        if any(
+            diagnostic.severity == "error"
+            and diagnostic.source_id == source[0]
+            and diagnostic.code.startswith(f"{database}_")
+            for diagnostic in diagnostics
+        ):
+            return None
+        return NotionConfiguredSource(
+            database=database,
+            database_id=database_id,
+            source_id=source[0],
+            source_type=source[1],
+            property_ids=property_ids,
+            property_types=property_types,
+        )
+
+    async def _read_typed_database(
+        self,
+        database: ConfiguredNotionDatabase,
+        record_type: type[NotionTypedPageRecord],
+        *,
+        page_size: int,
+    ) -> tuple[NotionTypedPageRecord, ...]:
+        if page_size < 1 or page_size > 100:
+            raise permanent_error(ErrorCode.INPUT_INVALID, "Notion page size is invalid")
+        diagnostics: list[NotionDiscoveryDiagnostic] = []
+        source = await self._configured_source(database, diagnostics=diagnostics)
+        if source is None:
+            raise permanent_error(
+                ErrorCode.SOURCE_SETUP_REQUIRED,
+                f"Notion {database.replace('_', ' ')} database schema is invalid",
+            )
+        records = [
+            self._typed_page_record(raw_page, source=source, record_type=record_type)
+            async for raw_page in self._query_all_source_pages(
+                source.source_id, source_type=source.source_type, page_size=page_size
+            )
+        ]
+        return tuple(records)
+
+    def _typed_page_record(
+        self,
+        raw_page: Mapping[str, Any],
+        *,
+        source: NotionConfiguredSource,
+        record_type: type[NotionTypedPageRecord],
+    ) -> NotionTypedPageRecord:
+        page_id = raw_page.get("id")
+        properties = raw_page.get("properties")
+        if not isinstance(page_id, str) or not isinstance(properties, Mapping):
+            raise transient_error(ErrorCode.CONNECTOR_TRANSIENT, "Notion returned invalid page")
+        property_map = cast(Mapping[str, Any], properties)
+        normalized = _normalize_properties(property_map)
+        property_ids = dict(source.property_ids)
+        title = self._configured_text_property(
+            property_map, source, self._title_property_name(source)
+        )
+        date_value = self._configured_date_property(property_map, source)
+        relation_ids = {
+            name: self._configured_relation_property(property_map, source, name)
+            for name in ("Course", "Application", "Interview")
+            if name in source.property_ids
+        }
+        common: dict[str, Any] = {
+            "page_id": _validate_page_id(page_id),
+            "database": source.database,
+            "database_id": source.database_id,
+            "source_id": source.source_id,
+            "source_type": source.source_type,
+            "source_url": raw_page.get("url") if isinstance(raw_page.get("url"), str) else None,
+            "title": title,
+            "last_edited_at": _parse_edited(raw_page.get("last_edited_time")),
+            "archived": raw_page.get("archived") is True,
+            "in_trash": raw_page.get("in_trash") is True,
+            "property_ids": property_ids,
+            "properties": normalized,
+            "date": date_value,
+            "relation_ids": relation_ids,
+        }
+        if source.database == "action_items":
+            common.update(
+                {
+                    "domain": _string_or_none(normalized.get("Domain")),
+                    "item_type": _string_or_none(normalized.get("Item Type")),
+                    "status": _string_or_none(normalized.get("Status")),
+                    "origin": _string_or_none(normalized.get("Origin")),
+                    "priority": _string_or_none(normalized.get("Priority")),
+                    "estimated_minutes": _number_or_none(normalized.get("Estimated Minutes")),
+                    "weight_percent": _number_or_none(normalized.get("Weight %")),
+                    "external_url": _string_or_none(normalized.get("External URL")),
+                    "notes": _string_or_none(normalized.get("Notes")),
+                    "review_reason": _string_or_none(normalized.get("Review Reason")),
+                    "course_ids": relation_ids.get("Course", ()),
+                    "application_ids": relation_ids.get("Application", ()),
+                    "interview_ids": relation_ids.get("Interview", ()),
+                }
+            )
+        elif source.database == "courses":
+            common.update(
+                {
+                    "code": _string_or_none(normalized.get("Code")),
+                    "term": _string_or_none(normalized.get("Term")),
+                    "status": _string_or_none(normalized.get("Status")),
+                }
+            )
+        elif source.database == "applications":
+            common.update(
+                {
+                    "company": _string_or_none(normalized.get("Company")),
+                    "role": title,
+                    "pipeline_status": _string_or_none(normalized.get("Pipeline Status")),
+                    "active": _bool_or_none(normalized.get("Active")),
+                    "applied_on": _date_or_none(normalized.get("Applied On")),
+                    "deadline": _date_or_none(normalized.get("Deadline")),
+                    "next_action": _string_or_none(normalized.get("Next Action")),
+                    "next_action_due": _date_or_none(normalized.get("Next Action Due")),
+                    "posting_url": _string_or_none(normalized.get("Posting URL")),
+                    "location": _string_or_none(normalized.get("Location")),
+                    "source": _string_or_none(normalized.get("Source")),
+                    "contact": _string_or_none(normalized.get("Contact")),
+                    "notes": _string_or_none(normalized.get("Notes")),
+                }
+            )
+        elif source.database == "interviews":
+            common.update(
+                {
+                    "stage": _string_or_none(normalized.get("Stage")),
+                    "status": _string_or_none(normalized.get("Status")),
+                    "prep_status": _string_or_none(normalized.get("Prep Status")),
+                    "meeting_url": _string_or_none(normalized.get("Meeting URL")),
+                    "notes": _string_or_none(normalized.get("Notes")),
+                    "application_ids": relation_ids.get("Application", ()),
+                }
+            )
+        try:
+            return record_type.model_validate(common)
+        except ValidationError:
+            raise transient_error(
+                ErrorCode.CONNECTOR_TRANSIENT, "Notion returned invalid page"
+            ) from None
+
+    async def _action_items_configured_source(self) -> NotionConfiguredSource:
+        diagnostics: list[NotionDiscoveryDiagnostic] = []
+        source = await self._configured_source("action_items", diagnostics=diagnostics)
+        if source is None:
+            raise permanent_error(
+                ErrorCode.SOURCE_SETUP_REQUIRED,
+                "Notion action items database schema is invalid",
+            )
+        return source
+
+    async def _action_item_write_precondition(
+        self, *, page_id: str, source: NotionConfiguredSource
+    ) -> NotionActionItemWritePrecondition:
+        _validate_page_id(page_id)
+        response = await self._request("GET", f"/pages/{quote(page_id, safe='')}", json_body=None)
+        data = self._json_object(response, "Notion action item page")
+        self._validate_action_item_page_parent(data, source=source)
+        properties = data.get("properties")
+        if not isinstance(properties, Mapping):
+            raise transient_error(
+                ErrorCode.CONNECTOR_TRANSIENT, "Notion returned invalid action item page"
+            )
+        for property_name, property_id in source.property_ids.items():
+            if self._property_by_id(cast(Mapping[str, Any], properties), property_id) is None:
+                raise permanent_error(
+                    ErrorCode.INPUT_INVALID,
+                    f"Notion page is missing Action Items property {property_name}",
+                )
+        page_id_value = data.get("id")
+        if not isinstance(page_id_value, str):
+            raise transient_error(
+                ErrorCode.CONNECTOR_TRANSIENT, "Notion returned invalid action item page"
+            )
+        try:
+            return NotionActionItemWritePrecondition(
+                page_id=_validate_page_id(page_id_value),
+                last_edited_at=_parse_edited(data.get("last_edited_time")),
+                source_url=data.get("url") if isinstance(data.get("url"), str) else None,
+                archived=data.get("archived") is True,
+                in_trash=data.get("in_trash") is True,
+            )
+        except (ValueError, ValidationError, LifeAgentError):
+            raise transient_error(
+                ErrorCode.CONNECTOR_TRANSIENT, "Notion returned invalid action item page"
+            ) from None
+
+    @staticmethod
+    def _validate_action_item_page_parent(
+        data: Mapping[str, Any], *, source: NotionConfiguredSource
+    ) -> None:
+        parent = data.get("parent")
+        if not isinstance(parent, Mapping):
+            return
+        parent_type = parent.get("type")
+        if parent_type == "data_source_id":
+            parent_id = parent.get("data_source_id")
+        elif parent_type == "database_id":
+            parent_id = parent.get("database_id")
+        else:
+            parent_id = None
+        if isinstance(parent_id, str) and parent_id not in {source.source_id, source.database_id}:
+            raise permanent_error(
+                ErrorCode.INPUT_INVALID,
+                "Notion action item page is outside the configured Action Items source",
+            )
+
+    @staticmethod
+    def _enforce_action_item_edit_version(
+        current: NotionActionItemWritePrecondition,
+        *,
+        expected_last_edited_at: datetime,
+    ) -> None:
+        expected = expected_last_edited_at
+        if expected.tzinfo is None or expected.utcoffset() is None:
+            raise permanent_error(
+                ErrorCode.INPUT_INVALID,
+                "Notion action item edit version must be timezone-aware",
+            )
+        if (
+            current.archived
+            or current.in_trash
+            or current.last_edited_at != expected.astimezone(UTC)
+        ):
+            raise NotionWriteConflict("Action item changed since proposal preview")
+
+    def _action_item_payload_properties(
+        self,
+        source: NotionConfiguredSource,
+        *,
+        title: str | None = None,
+        domain: ActionItemDomain | None = None,
+        item_kind: ActionItemKind | None = None,
+        status: ActionItemStatus | None = None,
+        temporal: TemporalValue | None = None,
+        origin: str | None = None,
+        course_page_ids: Sequence[str] | None = None,
+        application_page_ids: Sequence[str] | None = None,
+        interview_page_ids: Sequence[str] | None = None,
+        proposal_relation_page_ids: Sequence[str] = (),
+    ) -> dict[str, Any]:
+        properties: dict[str, Any] = {}
+        if title is not None:
+            properties[source.property_ids["Name"]] = {
+                "title": _title_segments(_validate_title_text(title))
+            }
+        if domain is not None:
+            properties[source.property_ids["Domain"]] = {
+                "select": {"name": _notion_option_name(domain)}
+            }
+        if item_kind is not None:
+            properties[source.property_ids["Item Type"]] = {
+                "select": {"name": _notion_option_name(item_kind)}
+            }
+        if status is not None:
+            properties[source.property_ids["Status"]] = {
+                "status": {"name": _notion_option_name(status)}
+            }
+        if temporal is not None:
+            properties[source.property_ids["Date"]] = _action_item_temporal_property_value(temporal)
+        if origin is not None:
+            properties[source.property_ids["Origin"]] = {
+                "select": {"name": _notion_option_name(origin)}
+            }
+        relation_inputs = (
+            ("Course", course_page_ids),
+            ("Application", application_page_ids),
+            ("Interview", interview_page_ids),
+        )
+        for property_name, page_ids in relation_inputs:
+            if page_ids is None:
+                continue
+            properties[source.property_ids[property_name]] = {
+                "relation": [
+                    {"id": page_id}
+                    for page_id in self._validated_action_item_relation_targets(
+                        page_ids,
+                        proposal_relation_page_ids=proposal_relation_page_ids,
+                    )
+                ]
+            }
+        return properties
+
+    @staticmethod
+    def _validated_action_item_relation_targets(
+        page_ids: Sequence[str],
+        *,
+        proposal_relation_page_ids: Sequence[str],
+    ) -> tuple[str, ...]:
+        normalized_page_ids = tuple(_validate_page_id(page_id) for page_id in page_ids)
+        if not normalized_page_ids:
+            return ()
+        allowed = frozenset(_validate_page_id(page_id) for page_id in proposal_relation_page_ids)
+        if not allowed or any(page_id not in allowed for page_id in normalized_page_ids):
+            raise permanent_error(
+                ErrorCode.INPUT_INVALID,
+                "Notion action item relation target is not in the current proposal",
+            )
+        return normalized_page_ids
+
+    @staticmethod
+    def _title_property_name(source: NotionConfiguredSource) -> str:
+        if source.database == "applications":
+            return "Role"
+        if source.database == "courses":
+            return "Course"
+        return "Name"
+
+    def _configured_text_property(
+        self,
+        properties: Mapping[str, Any],
+        source: NotionConfiguredSource,
+        property_name: str,
+    ) -> str:
+        found = self._property_by_id(properties, source.property_ids[property_name])
+        if found is None:
+            return ""
+        value = _normalize_value(found[1])
+        return value[:1_024] if isinstance(value, str) else ""
+
+    def _configured_date_property(
+        self,
+        properties: Mapping[str, Any],
+        source: NotionConfiguredSource,
+    ) -> NotionDateValue | None:
+        date_property_id = source.property_ids.get("Date")
+        if date_property_id is None:
+            return None
+        found = self._property_by_id(properties, date_property_id)
+        if found is None:
+            return None
+        return _date_value(found[1].get("date"))
+
+    def _configured_relation_property(
+        self,
+        properties: Mapping[str, Any],
+        source: NotionConfiguredSource,
+        property_name: str,
+    ) -> tuple[str, ...]:
+        found = self._property_by_id(properties, source.property_ids[property_name])
+        if found is None:
+            return ()
+        return _relation_ids(found[1])
+
     async def _retrieve_database(self, database_id: str) -> dict[str, Any]:
         response = await self._request(
             "GET", f"/databases/{quote(database_id, safe='')}", json_body=None
@@ -4451,20 +5388,26 @@ __all__ = [
     "AcademicNotionWriter",
     "ConfirmedPropertyChange",
     "DatabaseName",
+    "NotionActionItemRecord",
+    "NotionActionItemWritePrecondition",
     "NotionAppConnector",
+    "NotionApplicationRecord",
     "NotionAssessment",
     "NotionAssessmentMaterials",
     "NotionAttachment",
     "NotionBlockBatch",
     "NotionCalendarEventEvidence",
     "NotionCalendarEvidenceFragment",
+    "NotionConfiguredSource",
     "NotionConnector",
     "NotionCourse",
+    "NotionCourseRecord",
     "NotionDateValue",
     "NotionDiscoveryDiagnostic",
     "NotionDiscoveryResult",
     "NotionFileUploadReceipt",
     "NotionInterviewEvent",
+    "NotionInterviewRecord",
     "NotionInterviewUrlCandidate",
     "NotionJobApplicationTable",
     "NotionJobTableRow",

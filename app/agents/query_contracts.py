@@ -6,6 +6,7 @@ import base64
 import hashlib
 import hmac
 import json
+from collections.abc import Sequence
 from datetime import UTC, date, datetime, time, timedelta
 from enum import StrEnum
 from typing import TypeVar, cast
@@ -49,8 +50,19 @@ class FreshnessState(StrEnum):
 class CompletenessState(StrEnum):
     COMPLETE = "complete"
     MORE_AVAILABLE = "more_available"
+    PARTIAL = "partial"
     CACHED_STALE = "cached_stale"
     UNAVAILABLE = "unavailable"
+
+
+class QueryResultKind(StrEnum):
+    """Host-owned capability carried by a trusted query envelope."""
+
+    UNKNOWN = "unknown"
+    CALENDAR_ITEMS = "calendar_items"
+    COURSE_SOURCES = "course_sources"
+    JOBS = "jobs"
+    LEARN_CONTENT = "learn_content"
 
 
 class TemporalQuery(QueryContractModel):
@@ -103,6 +115,7 @@ class ResolvedTemporalWindow(QueryContractModel):
 class NormalizedQueryFilters(QueryContractModel):
     temporal: ResolvedTemporalWindow
     completion: CompletionMode = CompletionMode.INCOMPLETE
+    view: str | None = Field(default=None, max_length=32)
     text: str = Field(default="", max_length=300)
     roles: tuple[str, ...] = Field(default=(), max_length=10)
     source_ids: tuple[str, ...] = Field(default=(), max_length=50)
@@ -130,6 +143,23 @@ class SourceFreshness(QueryContractModel):
         return value
 
 
+def resolve_query_completeness(
+    *,
+    freshness: Sequence[SourceFreshness],
+    has_more: bool,
+) -> CompletenessState:
+    """Resolve query completeness with source freshness taking precedence."""
+
+    freshness_states = tuple(item.state for item in freshness)
+    if freshness_states and all(state is FreshnessState.UNAVAILABLE for state in freshness_states):
+        return CompletenessState.UNAVAILABLE
+    if any(state is FreshnessState.UNAVAILABLE for state in freshness_states):
+        return CompletenessState.PARTIAL
+    if any(state is FreshnessState.CACHED_STALE for state in freshness_states):
+        return CompletenessState.CACHED_STALE
+    return CompletenessState.MORE_AVAILABLE if has_more else CompletenessState.COMPLETE
+
+
 ItemT = TypeVar("ItemT")
 
 
@@ -137,6 +167,7 @@ class QueryEnvelope[ItemT](QueryContractModel):
     query_id: str = Field(min_length=1, max_length=128)
     as_of: datetime
     timezone: str = Field(min_length=1, max_length=64)
+    result_kind: QueryResultKind = QueryResultKind.UNKNOWN
     applied_filters: NormalizedQueryFilters
     freshness: tuple[SourceFreshness, ...] = Field(min_length=1, max_length=50)
     items: tuple[ItemT, ...] = Field(default=(), max_length=MAX_QUERY_PAGE_SIZE)
@@ -158,12 +189,10 @@ class QueryEnvelope[ItemT](QueryContractModel):
             raise ValueError("result_count must equal the number of items")
         if self.has_more != (self.next_cursor is not None):
             raise ValueError("has_more and next_cursor must agree")
-        expected = CompletenessState.MORE_AVAILABLE if self.has_more else CompletenessState.COMPLETE
-        freshness_states = {item.state for item in self.freshness}
-        if FreshnessState.UNAVAILABLE in freshness_states:
-            expected = CompletenessState.UNAVAILABLE
-        elif FreshnessState.CACHED_STALE in freshness_states:
-            expected = CompletenessState.CACHED_STALE
+        expected = resolve_query_completeness(
+            freshness=self.freshness,
+            has_more=self.has_more,
+        )
         if self.completeness is not expected:
             raise ValueError("completeness does not match pagination and freshness")
         return self
@@ -320,10 +349,12 @@ __all__ = [
     "FreshnessState",
     "NormalizedQueryFilters",
     "QueryEnvelope",
+    "QueryResultKind",
     "ResolvedTemporalWindow",
     "SourceFreshness",
     "TemporalQuery",
     "TemporalScope",
     "model_json_size",
+    "resolve_query_completeness",
     "resolve_temporal_window",
 ]

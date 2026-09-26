@@ -1002,11 +1002,51 @@ class Course(TimestampMixin, Base):
 
 
 class Assessment(TimestampMixin, Base):
-    """A typed assessment fact with citation and uncertainty state."""
+    """Canonical action item store preserving legacy assessment identities."""
 
     __tablename__ = "assessments"
     __table_args__ = (
         UniqueConstraint("notion_id", name="uq_assessments_notion_id"),
+        CheckConstraint(
+            "domain IS NULL OR domain IN "
+            "('academic','career','personal','administrative','project')",
+            name="action_domain_valid",
+        ),
+        CheckConstraint(
+            "item_kind IN "
+            "('task','assignment','quiz','exam','lab','tutorial','meeting','event',"
+            "'application_follow_up','interview_prep','deadline','needs_review')",
+            name="item_kind_valid",
+        ),
+        CheckConstraint(
+            "status IN "
+            "('inbox','needs_review','to_do','in_progress','waiting','done','canceled')",
+            name="action_status_valid",
+        ),
+        CheckConstraint(
+            "source_kind IN "
+            "('notion_action_items','notion_applications','notion_interviews','learn',"
+            "'google_calendar','manual','legacy_notion_course_assessment')",
+            name="action_source_kind_valid",
+        ),
+        CheckConstraint(
+            "date_precision IS NULL OR date_precision IN ('date','datetime')",
+            name="action_date_precision_valid",
+        ),
+        CheckConstraint(
+            "("
+            "date_precision IS NULL AND start_date IS NULL AND end_date_exclusive IS NULL "
+            "AND start_at IS NULL AND end_at IS NULL"
+            ") OR ("
+            "date_precision = 'date' AND start_date IS NOT NULL AND start_at IS NULL "
+            "AND end_at IS NULL AND (end_date_exclusive IS NULL OR end_date_exclusive > start_date)"
+            ") OR ("
+            "date_precision = 'datetime' AND start_date IS NULL AND end_date_exclusive IS NULL "
+            "AND start_at IS NOT NULL AND timezone IS NOT NULL "
+            "AND (end_at IS NULL OR end_at > start_at)"
+            ")",
+            name="action_temporal_shape_valid",
+        ),
         CheckConstraint("confidence >= 0 AND confidence <= 1", name="confidence_valid"),
         CheckConstraint(
             "fact_state IN ('unconfirmed','confirmed','ambiguous','rejected')",
@@ -1063,17 +1103,35 @@ class Assessment(TimestampMixin, Base):
         ),
         Index("ix_assessments_fact_state", "fact_state", "due_at"),
         Index("ix_assessments_source_active", "source_id", "active"),
+        Index(
+            "ix_assessments_domain_status_temporal",
+            "domain",
+            "status",
+            "start_date",
+            "start_at",
+        ),
+        Index("ix_assessments_application", "application_id", "status"),
+        Index("ix_assessments_interview", "interview_id", "status"),
     )
 
     id: Mapped[uuid.UUID] = mapped_column(primary_key=True, default=uuid.uuid4)
-    course_id: Mapped[uuid.UUID] = mapped_column(
-        ForeignKey("courses.id", ondelete="CASCADE"), nullable=False
+    course_id: Mapped[uuid.UUID | None] = mapped_column(
+        ForeignKey("courses.id", ondelete="CASCADE")
     )
     notion_id: Mapped[str] = mapped_column(String(255), nullable=False)
     title: Mapped[str] = mapped_column(String(255), nullable=False)
     assessment_type: Mapped[str] = mapped_column(String(64), nullable=False)
+    domain: Mapped[str | None] = mapped_column(String(32))
+    item_kind: Mapped[str] = mapped_column(String(64), nullable=False, default="needs_review")
+    status: Mapped[str] = mapped_column(String(32), nullable=False, default="to_do")
     due_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     ends_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    start_date: Mapped[date | None] = mapped_column(Date)
+    end_date_exclusive: Mapped[date | None] = mapped_column(Date)
+    start_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    end_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    date_precision: Mapped[str | None] = mapped_column(String(32))
+    timezone: Mapped[str | None] = mapped_column(String(64))
     grade_weight_percent: Mapped[float | None] = mapped_column(Float)
     estimated_minutes: Mapped[int] = mapped_column(nullable=False, default=60)
     confidence_gap: Mapped[float] = mapped_column(Float, nullable=False, default=0.5)
@@ -1087,8 +1145,27 @@ class Assessment(TimestampMixin, Base):
     source_url: Mapped[str | None] = mapped_column(String(1_000))
     completed: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
     is_all_day: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+    source_kind: Mapped[str] = mapped_column(
+        String(64), nullable=False, default="legacy_notion_course_assessment"
+    )
+    source_label: Mapped[str | None] = mapped_column(String(255))
+    context: Mapped[dict[str, Any]] = mapped_column(JSON, nullable=False, default=dict)
     source_id: Mapped[str | None] = mapped_column(String(255))
     source_scope: Mapped[str | None] = mapped_column(String(255))
+    notion_database_id: Mapped[str | None] = mapped_column(String(255))
+    notion_data_source_id: Mapped[str | None] = mapped_column(String(255))
+    notion_page_id: Mapped[str | None] = mapped_column(String(255))
+    notion_title_property_id: Mapped[str | None] = mapped_column(String(255))
+    notion_date_property_id: Mapped[str | None] = mapped_column(String(255))
+    notion_domain_property_id: Mapped[str | None] = mapped_column(String(255))
+    notion_status_property_id: Mapped[str | None] = mapped_column(String(255))
+    notion_kind_property_id: Mapped[str | None] = mapped_column(String(255))
+    application_id: Mapped[uuid.UUID | None] = mapped_column(
+        ForeignKey("career_applications.id", ondelete="SET NULL")
+    )
+    interview_id: Mapped[uuid.UUID | None] = mapped_column(
+        ForeignKey("career_interview_events.id", ondelete="SET NULL")
+    )
     notion_last_edited_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     title_property_id: Mapped[str | None] = mapped_column(String(255))
     label_source: Mapped[str | None] = mapped_column(String(255))
@@ -1607,6 +1684,100 @@ class CareerApplicationInterpretation(TimestampMixin, Base):
     interpreted_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
 
 
+class CareerApplication(TimestampMixin, Base):
+    """Typed Notion application row while preserving legacy table snapshots."""
+
+    __tablename__ = "career_applications"
+    __table_args__ = (
+        UniqueConstraint("application_page_id", name="uq_career_applications_page"),
+        CheckConstraint(
+            "source_kind IN ('notion_applications','manual')",
+            name="source_kind_valid",
+        ),
+        CheckConstraint(
+            "status IS NULL OR length(status) > 0",
+            name="status_nonempty",
+        ),
+        CheckConstraint(
+            "next_action_status IS NULL OR "
+            "next_action_status IN ('inbox','needs_review','to_do','in_progress','waiting',"
+            "'done','canceled')",
+            name="next_action_status_valid",
+        ),
+        CheckConstraint(
+            "("
+            "deadline_date_precision IS NULL AND deadline_start_date IS NULL "
+            "AND deadline_start_at IS NULL AND deadline_timezone IS NULL"
+            ") OR ("
+            "deadline_date_precision = 'date' AND deadline_start_date IS NOT NULL "
+            "AND deadline_start_at IS NULL"
+            ") OR ("
+            "deadline_date_precision = 'datetime' AND deadline_start_date IS NULL "
+            "AND deadline_start_at IS NOT NULL AND deadline_timezone IS NOT NULL"
+            ")",
+            name="deadline_temporal_shape_valid",
+        ),
+        CheckConstraint(
+            "("
+            "next_action_date_precision IS NULL AND next_action_start_date IS NULL "
+            "AND next_action_start_at IS NULL AND next_action_timezone IS NULL"
+            ") OR ("
+            "next_action_date_precision = 'date' AND next_action_start_date IS NOT NULL "
+            "AND next_action_start_at IS NULL"
+            ") OR ("
+            "next_action_date_precision = 'datetime' AND next_action_start_date IS NULL "
+            "AND next_action_start_at IS NOT NULL AND next_action_timezone IS NOT NULL"
+            ")",
+            name="next_action_temporal_shape_valid",
+        ),
+        Index("ix_career_applications_company_active", "company_name", "active"),
+        Index("ix_career_applications_status_active", "status", "active"),
+        Index("ix_career_applications_legacy_row", "legacy_application_row_id"),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(primary_key=True, default=uuid.uuid4)
+    workspace_id: Mapped[uuid.UUID | None] = mapped_column(
+        ForeignKey("career_jobs_workspaces.id", ondelete="SET NULL")
+    )
+    legacy_application_row_id: Mapped[uuid.UUID | None] = mapped_column(
+        ForeignKey("career_application_rows.id", ondelete="SET NULL")
+    )
+    application_page_id: Mapped[str | None] = mapped_column(String(255))
+    applications_database_id: Mapped[str | None] = mapped_column(String(255))
+    applications_data_source_id: Mapped[str | None] = mapped_column(String(255))
+    source_kind: Mapped[str] = mapped_column(
+        String(64), nullable=False, default="notion_applications"
+    )
+    company_name: Mapped[str | None] = mapped_column(String(255))
+    role_title: Mapped[str | None] = mapped_column(String(500))
+    status: Mapped[str | None] = mapped_column(String(128))
+    deadline_date_precision: Mapped[str | None] = mapped_column(String(32))
+    deadline_start_date: Mapped[date | None] = mapped_column(Date)
+    deadline_start_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    deadline_timezone: Mapped[str | None] = mapped_column(String(64))
+    next_action: Mapped[str | None] = mapped_column(String(1_000))
+    next_action_status: Mapped[str | None] = mapped_column(String(32))
+    next_action_date_precision: Mapped[str | None] = mapped_column(String(32))
+    next_action_start_date: Mapped[date | None] = mapped_column(Date)
+    next_action_start_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    next_action_timezone: Mapped[str | None] = mapped_column(String(64))
+    posting_url: Mapped[str | None] = mapped_column(String(2_048))
+    applied_on: Mapped[date | None] = mapped_column(Date)
+    next_action_date: Mapped[date | None] = mapped_column(Date)
+    last_activity_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    notion_last_edited_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    source_url: Mapped[str | None] = mapped_column(String(2_048))
+    source: Mapped[str | None] = mapped_column(String(255))
+    location: Mapped[str | None] = mapped_column(String(255))
+    contact_name: Mapped[str | None] = mapped_column(String(255))
+    contact_email: Mapped[str | None] = mapped_column(String(255))
+    notes: Mapped[str | None] = mapped_column(Text)
+    property_snapshot: Mapped[dict[str, Any]] = mapped_column(JSON, nullable=False, default=dict)
+    content_fingerprint: Mapped[str | None] = mapped_column(String(128))
+    active: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
+    archived: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+
+
 class CareerInterviewEvent(TimestampMixin, Base):
     """One Notion Interviews page, with deterministic scheduling fields."""
 
@@ -1692,6 +1863,7 @@ class CareerInterviewApplicationLink(TimestampMixin, Base):
         CheckConstraint("confidence >= 0 AND confidence <= 1", name="confidence_valid"),
         CheckConstraint("resolution_source IN ('model','user')", name="resolution_source_valid"),
         Index("ix_career_interview_links_row", "application_row_id", "state"),
+        Index("ix_career_interview_links_application", "application_id", "state"),
     )
 
     id: Mapped[uuid.UUID] = mapped_column(primary_key=True, default=uuid.uuid4)
@@ -1700,6 +1872,9 @@ class CareerInterviewApplicationLink(TimestampMixin, Base):
     )
     application_row_id: Mapped[uuid.UUID | None] = mapped_column(
         ForeignKey("career_application_rows.id", ondelete="SET NULL")
+    )
+    application_id: Mapped[uuid.UUID | None] = mapped_column(
+        ForeignKey("career_applications.id", ondelete="SET NULL")
     )
     state: Mapped[str] = mapped_column(String(32), nullable=False)
     confidence: Mapped[float] = mapped_column(Float, nullable=False, default=0.0)

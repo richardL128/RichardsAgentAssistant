@@ -125,16 +125,22 @@ def test_invalid_courses_database_id_is_setup_condition_not_startup_crash(
     assert response.json()["diagnostic_codes"] == ["notion_configuration_invalid"]
 
 
-def test_valid_notion_configuration_wires_discovered_calendar_writer(tmp_path: Path) -> None:
+def test_valid_notion_configuration_wires_explicit_connector_but_not_legacy_writer(
+    tmp_path: Path,
+) -> None:
     settings = Settings(
         _env_file=None,
         database_url=f"sqlite+pysqlite:///{tmp_path / 'academic-writer.db'}",
         artifact_root=tmp_path / "artifacts",
         notion_token="notion-secret",
         notion_courses_database_id="coursesDatabase123",
+        notion_action_items_database_id="actionsDatabase123",
+        notion_applications_database_id="applicationsDatabase123",
+        notion_interviews_database_id="interviewsDatabase123",
     )
 
     app = create_app(settings)
 
-    assert app.state.notion_writer is not None
+    assert app.state.academic_syncer.connector is not None
+    assert app.state.notion_writer is None
     app.state.database.dispose()

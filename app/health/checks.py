@@ -16,7 +16,7 @@ from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.orm import Session
 
 from app.connectors.github import GitHubAppConnector, InstallationToken
-from app.connectors.notion import NOTION_API_BASE_URL, NOTION_API_VERSION
+from app.connectors.notion import NOTION_API_BASE_URL, NOTION_API_VERSION, NotionConnector
 from app.core.config import Settings
 from app.core.errors import ErrorCategory, LifeAgentError
 from app.db.session import Database
@@ -48,6 +48,17 @@ class HealthResponse(BaseModel):
     status: HealthState
     checks: list[HealthCheck] = Field(default_factory=lambda: list[HealthCheck]())
     version: str
+
+
+def _notion_database_ids(
+    settings: Settings,
+) -> tuple[str | None, str | None, str | None, str | None]:
+    return (
+        settings.notion_courses_database_id,
+        settings.notion_action_items_database_id,
+        settings.notion_applications_database_id,
+        settings.notion_interviews_database_id,
+    )
 
 
 class OllamaModelRecord(BaseModel):
@@ -241,6 +252,13 @@ def check_connector_configuration(settings: Settings) -> HealthCheck:
         value is not None for value in github_parts
     ):
         missing.append("github")
+    notion_database_ids = _notion_database_ids(settings)
+    if any(value is not None for value in notion_database_ids) and settings.notion_token is None:
+        missing.append("notion")
+    if settings.notion_token is not None and not all(
+        value is not None for value in notion_database_ids
+    ):
+        missing.append("notion databases")
     if missing:
         return HealthCheck(
             name="connector_configuration",
@@ -268,24 +286,30 @@ def check_academic_notion_status(
     """Report non-secret academic Notion setup and persisted sync state."""
 
     token_configured = settings.notion_token is not None
-    courses_configured = settings.notion_courses_database_id is not None
-    if not token_configured or not courses_configured:
+    database_ids = _notion_database_ids(settings)
+    all_databases_configured = all(value is not None for value in database_ids)
+    if not token_configured or not all_databases_configured:
         return HealthCheck(
             name="academic_notion",
             state=HealthState.ATTENTION,
             diagnostic=(
                 "Academic Notion setup incomplete; "
                 f"token configured={token_configured}; "
-                f"courses database configured={courses_configured}; "
+                "explicit databases configured="
+                f"{sum(value is not None for value in database_ids)}/4; "
                 "no Notion changes were made"
             ),
         )
-    assert settings.notion_courses_database_id is not None
-    if _NOTION_ID_PATTERN.fullmatch(settings.notion_courses_database_id) is None:
+    invalid_ids = [
+        value
+        for value in database_ids
+        if value is None or _NOTION_ID_PATTERN.fullmatch(value) is None
+    ]
+    if invalid_ids:
         return HealthCheck(
             name="academic_notion",
             state=HealthState.ATTENTION,
-            diagnostic="Academic Notion Courses database configuration is invalid",
+            diagnostic="Academic Notion explicit database configuration is invalid",
         )
     if database is None:
         return HealthCheck(
@@ -789,6 +813,69 @@ async def check_notion_authentication(
             await client.aclose()
 
 
+async def check_notion_schema_preflight(
+    settings: Settings,
+    client: httpx.AsyncClient | None = None,
+) -> HealthCheck:
+    """Validate configured Notion database schemas without writing to Notion."""
+
+    token = settings.notion_token
+    database_ids = _notion_database_ids(settings)
+    if token is None and not any(value is not None for value in database_ids):
+        return HealthCheck(
+            name="notion_schema_preflight",
+            state=HealthState.HEALTHY,
+            diagnostic="Notion connector is not configured",
+        )
+    if token is None or not all(value is not None for value in database_ids):
+        return HealthCheck(
+            name="notion_schema_preflight",
+            state=HealthState.ATTENTION,
+            diagnostic="Notion schema preflight requires token and all four explicit database IDs",
+        )
+    owns_client = client is None
+    if client is None:
+        client = httpx.AsyncClient(timeout=httpx.Timeout(settings.connector_timeout_seconds))
+    try:
+        assert settings.notion_courses_database_id is not None
+        assert settings.notion_action_items_database_id is not None
+        assert settings.notion_applications_database_id is not None
+        assert settings.notion_interviews_database_id is not None
+        connector = NotionConnector(
+            token=token,
+            courses_database_id=settings.notion_courses_database_id,
+            action_items_database_id=settings.notion_action_items_database_id,
+            applications_database_id=settings.notion_applications_database_id,
+            interviews_database_id=settings.notion_interviews_database_id,
+            client=client,
+            timeout_seconds=settings.connector_timeout_seconds,
+        )
+        result = await connector.preflight_configured_databases()
+    except (LifeAgentError, ValueError) as exc:
+        return HealthCheck(
+            name="notion_schema_preflight",
+            state=HealthState.ATTENTION,
+            diagnostic=f"Notion schema preflight unavailable ({exc.__class__.__name__})",
+        )
+    finally:
+        if owns_client:
+            await client.aclose()
+    errors = [
+        diagnostic.code for diagnostic in result.diagnostics if diagnostic.severity == "error"
+    ]
+    if errors:
+        return HealthCheck(
+            name="notion_schema_preflight",
+            state=HealthState.FAILED,
+            diagnostic=f"Notion schema preflight failed: {', '.join(sorted(set(errors)))}",
+        )
+    return HealthCheck(
+        name="notion_schema_preflight",
+        state=HealthState.HEALTHY,
+        diagnostic=f"Notion schema preflight passed for {len(result.sources)}/4 databases",
+    )
+
+
 async def check_connector_liveness(
     settings: Settings,
     client: httpx.AsyncClient | None = None,
@@ -804,11 +891,12 @@ async def check_connector_liveness(
         token_fetcher=github_token_fetcher,
         now=now,
     )
-    discord, notion = await asyncio.gather(
+    discord, notion, notion_schema = await asyncio.gather(
         check_discord_authentication(settings, client),
         check_notion_authentication(settings, client),
+        check_notion_schema_preflight(settings, client),
     )
-    return (github, discord, notion)
+    return (github, discord, notion, notion_schema)
 
 
 def _authentication_response_check(

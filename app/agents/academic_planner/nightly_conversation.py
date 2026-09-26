@@ -12,9 +12,12 @@ from zoneinfo import ZoneInfo
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
+from app.agents.harness import ConversationLifecycle
+
 TORONTO_TIMEZONE = "America/Toronto"
 NIGHTLY_CHECKPOINT_VERSION = "academic-nightly-checkin-v2"
 NIGHTLY_CHECKPOINT_ROOT_KEY = "nightly_checkin"
+_NIGHTLY_SKIP_RESPONSE = "Skipped tonight's check-in. No additional tasks were changed."
 
 NightlyPhase = Literal[
     "awaiting_completion",
@@ -608,6 +611,16 @@ def render_summary(checkpoint: NightlyChecklistCheckpoint) -> str:
     return f"Evening check-in complete: {', '.join(pieces)}."
 
 
+def reconstruct_nightly_lifecycle(checkpoint: NightlyChecklistCheckpoint) -> ConversationLifecycle:
+    """Rebuild the current owner-visible nightly response from trusted checkpoint state."""
+
+    terminal = checkpoint.phase in {"completed", "cancelled"}
+    return ConversationLifecycle(
+        disposition="completed" if terminal else "awaiting_user",
+        content=_render_checkpoint_response(checkpoint),
+    )
+
+
 def _stable_id(prefix: str, *parts: object) -> str:
     payload = json.dumps(parts, sort_keys=True, separators=(",", ":"), default=str)
     digest = hashlib.sha256(payload.encode("utf-8")).hexdigest()[:32]
@@ -628,6 +641,42 @@ def _aware_datetime(value: datetime, field: str) -> datetime:
 
 def _format_date_label(value: date) -> str:
     return f"{value.strftime('%B')} {value.day}"
+
+
+def _render_checkpoint_response(checkpoint: NightlyChecklistCheckpoint) -> str:
+    if checkpoint.phase == "cancelled":
+        return _NIGHTLY_SKIP_RESPONSE
+    if checkpoint.phase == "completed":
+        return _with_latest_detail(checkpoint, render_summary(checkpoint))
+    if checkpoint.phase == "awaiting_move_confirmation":
+        proof = checkpoint.pending_preview_proof
+        preview = render_move_preview(
+            checkpoint,
+            shifted_range=proof.new_date_range if proof is not None else None,
+        )
+        audit = checkpoint.pending_reply_semantic_audit
+        if audit is not None and audit.action == "incomplete":
+            return f"I understand. {preview}"
+        return preview
+    question = render_completion_question(checkpoint)
+    detail = _latest_outcome_detail(checkpoint)
+    return f"{detail} Next, {question}" if detail is not None else question
+
+
+def _with_latest_detail(checkpoint: NightlyChecklistCheckpoint, fallback: str) -> str:
+    detail = _latest_outcome_detail(checkpoint)
+    return f"{detail} {fallback}" if detail is not None else fallback
+
+
+def _latest_outcome_detail(checkpoint: NightlyChecklistCheckpoint) -> str | None:
+    previous_index = checkpoint.current_index - 1
+    if previous_index < 0 or previous_index >= len(checkpoint.items):
+        return None
+    outcome = checkpoint.outcomes.get(checkpoint.items[previous_index].item_id)
+    if outcome is None or outcome.detail is None:
+        return None
+    detail = outcome.detail.strip()
+    return detail or None
 
 
 def _replace_checkpoint(
@@ -664,6 +713,7 @@ __all__ = [
     "nightly_move_preview_fingerprint",
     "ordered_nightly_items",
     "parse_nightly_checkpoint",
+    "reconstruct_nightly_lifecycle",
     "render_completion_question",
     "render_move_preview",
     "render_summary",

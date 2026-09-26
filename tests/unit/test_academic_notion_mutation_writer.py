@@ -10,7 +10,15 @@ from uuid import UUID
 
 import pytest
 
-from app.agents.academic_planner.contracts import AssessmentType, CheckinProposal, ProposedChange
+from app.agents.academic_planner.contracts import (
+    ActionItemDomain,
+    ActionItemKind,
+    ActionItemStatus,
+    AssessmentType,
+    CheckinProposal,
+    DateTimeValue,
+    ProposedChange,
+)
 from app.agents.academic_planner.notion_mutations import (
     AcademicInboundMaterialSnapshot,
     DiscoveredAcademicNotionWriter,
@@ -341,6 +349,40 @@ def _learn_create_change() -> ProposedChange:
             "Source: https://learn.uwaterloo.ca/d2l/le/calendar/1/7"
         ),
     )
+
+
+@pytest.mark.asyncio
+async def test_confirmed_action_item_create_fails_closed_without_explicit_write_api() -> None:
+    connector = _Connector()
+    targets = _Targets()
+    writer = DiscoveredAcademicNotionWriter(
+        connector=connector,  # type: ignore[arg-type]
+        target_store=targets,
+    )
+    change = ProposedChange(
+        field="create_action_item",
+        value="Pick up printer paper",
+        title="Pick up printer paper",
+        action_domain=ActionItemDomain.PERSONAL,
+        action_status=ActionItemStatus.TO_DO,
+        action_kind=ActionItemKind.TASK,
+        action_temporal=DateTimeValue(
+            start_at=datetime(2026, 9, 11, 13, tzinfo=UTC),
+            timezone="America/Toronto",
+        ),
+    )
+
+    with pytest.raises(LifeAgentError) as raised:
+        await writer.apply_confirmed_changes(
+            (change,),
+            proposal_id=PROPOSAL_ID,
+            confirmation_event=f"confirm {PROPOSAL_ID}",
+            review=_review((change,)),
+        )
+
+    assert "ACTION_ITEMS_WRITE_API_MISSING" in str(raised.value)
+    assert connector.calls == []
+    assert targets.operations[(PROPOSAL_ID, 0)]["state"] == "uncertain"
 
 
 @pytest.mark.asyncio

@@ -20,9 +20,7 @@ from app.agents.academic_planner.material_planning import (
     AssessmentMaterialPlanningProfileService,
     MaterialPlanningModelIdentity,
 )
-from app.agents.academic_planner.notion_mutations import DiscoveredAcademicNotionWriter
 from app.agents.academic_planner.sync import AcademicNotionSync
-from app.agents.job_interviews.notion_mutations import DiscoveredCareerNotionWriter
 from app.agents.job_interviews.sync import JobInterviewNotionSync
 from app.api.academic import router as academic_router
 from app.api.discord_handoff import router as discord_handoff_router
@@ -78,20 +76,6 @@ class SecurityHeadersMiddleware(BaseHTTPMiddleware):
         return response
 
 
-class _LazyArtifactLoader:
-    """Avoid touching the artifact filesystem until a confirmed write needs bytes."""
-
-    def __init__(self, root: Path, *, retention_days: int) -> None:
-        self._root = root
-        self._retention_days = retention_days
-
-    def get(self, key: str) -> bytes:
-        return ArtifactStore(
-            self._root,
-            default_retention_days=self._retention_days,
-        ).get(key)
-
-
 def format_toronto_time(value: datetime | None) -> str:
     """Render an exact Toronto timestamp for server-rendered console pages."""
 
@@ -143,18 +127,34 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     notion_connector = None
     schedule_connector = None
     notion_setup_condition = "notion_configuration_missing"
-    if (
-        app_settings.notion_token is not None
-        and app_settings.notion_courses_database_id is not None
+    notion_database_ids = (
+        app_settings.notion_courses_database_id,
+        app_settings.notion_action_items_database_id,
+        app_settings.notion_applications_database_id,
+        app_settings.notion_interviews_database_id,
+    )
+    if app_settings.notion_token is not None and all(
+        value is not None for value in notion_database_ids
     ):
         try:
+            assert app_settings.notion_courses_database_id is not None
+            assert app_settings.notion_action_items_database_id is not None
+            assert app_settings.notion_applications_database_id is not None
+            assert app_settings.notion_interviews_database_id is not None
             notion_connector = NotionConnector(
                 token=app_settings.notion_token,
                 courses_database_id=app_settings.notion_courses_database_id,
+                action_items_database_id=app_settings.notion_action_items_database_id,
+                applications_database_id=app_settings.notion_applications_database_id,
+                interviews_database_id=app_settings.notion_interviews_database_id,
                 timeout_seconds=app_settings.connector_timeout_seconds,
             )
         except (LifeAgentError, ValueError):
             notion_setup_condition = "notion_configuration_invalid"
+    elif app_settings.notion_token is not None or any(
+        value is not None for value in notion_database_ids
+    ):
+        notion_setup_condition = "notion_configuration_invalid"
     if app_settings.academic_schedule_ical_url is not None:
         try:
             schedule_connector = GoogleCalendarConnector(
@@ -234,11 +234,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     app.state.academic_material_ingestion_factory = build_material_ingestion
     app.state.job_interview_store = job_interview_store
     app.state.job_interview_syncer = job_interview_syncer
-    app.state.job_interview_notion_writer = (
-        DiscoveredCareerNotionWriter(engine=database.engine, connector=notion_connector)
-        if notion_connector is not None
-        else None
-    )
+    app.state.job_interview_notion_writer = None
     # Discord Gateway ingress is a native macOS LaunchAgent. The API owns only
     # authenticated durable handoff processing and never opens a Gateway session.
     app.state.discord_host_ingress_state = "external"
@@ -246,21 +242,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         database.engine,
         allowlist_version=app_settings.finance_source_allowlist_version,
     )
-    # Writes resolve only synchronized, valid per-course calendar mappings and
-    # still require the proposal's exact confirmation event.
-    app.state.notion_writer = (
-        DiscoveredAcademicNotionWriter(
-            connector=notion_connector,
-            target_store=academic_store,
-            artifact_loader=_LazyArtifactLoader(
-                app_settings.artifact_root,
-                retention_days=app_settings.artifact_retention_days,
-            ),
-            post_seed_syncer=academic_syncer,
-        )
-        if notion_connector is not None
-        else None
-    )
+    app.state.notion_writer = None
     app.mount("/static", StaticFiles(directory=str(_APP_ROOT / "static")), name="static")
     app.include_router(health_router)
     app.include_router(academic_router)

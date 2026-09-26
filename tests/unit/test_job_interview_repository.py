@@ -10,11 +10,13 @@ import pytest
 from sqlalchemy import create_engine, func, select
 from sqlalchemy.orm import Session
 
+from app.agents.action_items import DateOnlyValue
 from app.agents.job_interviews.contracts import PreparationPlanSnapshot
 from app.db.job_interviews import (
     ApplicationRowInput,
     ApplicationTableInput,
     CalendarSemanticResultInput,
+    CareerApplicationInput,
     CareerWriteProposalInput,
     InterviewEventInput,
     InterviewLinkInput,
@@ -25,6 +27,7 @@ from app.db.job_interviews import (
 )
 from app.db.models import (
     Base,
+    CareerApplication,
     CareerApplicationRow,
     CareerPreparationPlanRevision,
     CareerWriteReceipt,
@@ -167,6 +170,78 @@ def test_application_rows_soft_deactivate_and_links_are_replay_safe(engine) -> N
         assert persisted["application_content_fingerprint"] == "row-hash"
 
 
+def test_typed_applications_are_active_surface_and_legacy_rows_are_history(engine) -> None:
+    with Session(engine) as session, session.begin():
+        _seed_sources(session)
+
+    store = SQLAlchemyJobInterviewStore(engine)
+    workspace_id = store.upsert_jobs_workspace(
+        JobsWorkspaceInput(
+            jobs_page_id="jobs-page",
+            jobs_page_title="Jobs",
+            discovery_status="valid",
+            discovered_at=datetime(2026, 9, 10, tzinfo=UTC),
+            synced_at=datetime(2026, 9, 10, tzinfo=UTC),
+        )
+    )
+    store.upsert_career_application(
+        workspace_id,
+        CareerApplicationInput(
+            application_id="application-typed",
+            applications_database_id="applications-db",
+            applications_data_source_id="applications-source",
+            company_name="Shopify",
+            role_title="Backend Developer",
+            status="Interviewing",
+            next_action="Send follow-up note",
+            next_action_temporal=DateOnlyValue(start_date=date(2026, 9, 22)),
+            posting_url="https://jobs.example/posting",
+            source_url="https://notion.test/application-typed",
+            content_fingerprint="typed-hash",
+            last_edited_at=datetime(2026, 9, 10, tzinfo=UTC),
+        ),
+    )
+    store.upsert_interview_event(
+        workspace_id,
+        InterviewEventInput(
+            interview_page_id="typed-interview",
+            title="Shopify Backend Technical",
+            local_date=date(2026, 9, 24),
+            notion_last_edited_at=datetime(2026, 9, 10, tzinfo=UTC),
+            content_fingerprint="typed-interview-hash",
+            application_id="application-typed",
+        ),
+    )
+
+    typed = store.typed_application_snapshots()
+    model_rows = store.application_row_snapshots()
+
+    assert [item.application_id for item in typed] == ["application-typed"]
+    assert typed[0].next_action_temporal is not None
+    assert typed[0].next_action_temporal.start_date == date(2026, 9, 22)
+    assert [row.row_block_id for row in model_rows] == ["application-typed"]
+    assert {row["row_block_id"] for row in store.list_active_application_rows()} == {
+        "row-shopify",
+    }
+    assert store.health_summary()["active_application_row_count"] == 1
+    with Session(engine) as session:
+        persisted = session.scalar(
+            select(CareerApplication).where(
+                CareerApplication.application_page_id == "application-typed"
+            )
+        )
+        assert persisted is not None
+        assert persisted.status == "Interviewing"
+        assert persisted.application_url == "https://jobs.example/posting"
+        relation = JobInterviewRepository.get_interview_link(
+            session,
+            interview_page_id="typed-interview",
+        )
+        assert relation is not None
+        assert relation["application_id"] == "application-typed"
+        assert relation["row_block_id"] == "application-typed"
+
+
 def test_sqlalchemy_store_exposes_application_table_headers_for_read_only_context(engine) -> None:
     with Session(engine) as session, session.begin():
         _seed_sources(session)
@@ -176,7 +251,7 @@ def test_sqlalchemy_store_exposes_application_table_headers_for_read_only_contex
     matching_rows = store.application_row_snapshots()
     table_rows = store.application_table_snapshots()
 
-    assert [row.row_block_id for row in matching_rows] == ["row-shopify"]
+    assert matching_rows == ()
     assert [row.row_block_id for row in table_rows] == ["header", "row-shopify"]
     assert table_rows[0].is_header is True
     assert table_rows[0].cells == ("Company", "Job")

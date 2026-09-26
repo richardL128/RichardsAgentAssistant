@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import json
 from collections.abc import Mapping, Sequence
 from datetime import datetime
 from typing import Any, cast
@@ -12,14 +13,19 @@ from zoneinfo import ZoneInfo
 import httpx
 from pydantic import BaseModel, ConfigDict, Field
 
+from app.agents.action_items import DateOnlyValue, DateTimeValue, TemporalValue
 from app.agents.harness import (
+    ConversationLifecycle,
+    HostLifecycleResolution,
     NativeTool,
+    PostToolLifecycleContext,
     TerminalGrounding,
     ToolExecutionError,
     ToolSideEffectClass,
 )
 from app.agents.job_interviews.contracts import (
     ApplicationInterpretation,
+    CareerApplicationSnapshot,
     CareerClarificationRequest,
     ClarificationKind,
     InterviewEventSnapshot,
@@ -43,6 +49,7 @@ from app.agents.query_contracts import (
     FreshnessState,
     NormalizedQueryFilters,
     QueryEnvelope,
+    QueryResultKind,
     SourceFreshness,
     TemporalQuery,
     TemporalScope,
@@ -240,7 +247,7 @@ class CareerAgentToolState:
         return (
             self._tool(
                 "search_jobs_context",
-                "Search the owner's Jobs application table rows and upcoming interview calendar "
+                "Search the owner's typed job applications and upcoming interview calendar "
                 "events together. Use first for Jobs/career questions about dates, interviews, "
                 "applications, companies, roles, or statuses.",
                 _SearchJobsContextArgs,
@@ -349,13 +356,15 @@ class CareerAgentToolState:
     async def _search_jobs_context(self, arguments: Mapping[str, object]) -> object:
         args = _SearchJobsContextArgs.model_validate(arguments)
         cached_interviews = self._load_interview_context()
-        cached_rows = self._load_application_table_context()
-        await self._ensure_synced(cached_available=bool(cached_interviews or cached_rows))
+        cached_applications = self._load_application_context()
+        await self._ensure_synced(
+            cached_available=bool(cached_interviews or cached_applications)
+        )
         interviews = self._load_interview_context()
-        rows = self._load_application_table_context()
+        applications = self._load_application_context()
         terms = _career_query_terms(args.query)
         filtered_interviews = tuple(item for item in interviews if _interview_matches(item, terms))
-        filtered_rows = _application_row_payloads(rows, terms)
+        filtered_applications = _application_payloads(applications, terms)
         items_with_keys: list[
             tuple[tuple[str, ...], dict[str, object], InterviewEventSnapshot | None]
         ]
@@ -369,11 +378,11 @@ class CareerAgentToolState:
         ]
         items_with_keys.extend(
             (
-                _application_row_sort_key(item),
+                _application_sort_key(item),
                 item,
                 None,
             )
-            for item in filtered_rows
+            for item in filtered_applications
         )
         envelope = self._query_envelope(
             tool_name="search_jobs_context",
@@ -488,8 +497,10 @@ class CareerAgentToolState:
                 )
             row_id = matched.row_block_id
         row = row_by_id[row_id]
+        typed_rows = getattr(self._store, "typed_application_rows", None)
+        raw_rows = typed_rows() if callable(typed_rows) else ()
         stored_rows: dict[str, Mapping[str, Any]] = {
-            str(item["row_block_id"]): item for item in self._store.list_active_application_rows()
+            str(item["row_block_id"]): item for item in raw_rows
         }
         stored_row = stored_rows.get(row_id, {})
         stored_interpretation_value = stored_row.get("interpretation")
@@ -693,6 +704,8 @@ class CareerAgentToolState:
         envelope = self._query_envelopes.get(grounding.query_id)
         if envelope is None:
             return "grounding query_id was not returned by a current trusted career query"
+        if envelope.result_kind is not QueryResultKind.JOBS:
+            return "grounding query does not contain career evidence"
         known_ids = {_career_item_id(item) for item in envelope.items}
         if not set(grounding.item_ids).issubset(known_ids):
             return "grounding item_ids contain an unknown or out-of-scope career item"
@@ -721,23 +734,65 @@ class CareerAgentToolState:
                     date_label += f" at {item['time']}"
                 lines.append(f"- {item.get('title', 'Interview')} — {date_label}")
             else:
-                cells = item.get("cells")
-                cell_values = (
-                    cast(Sequence[object], cells)
-                    if isinstance(cells, Sequence) and not isinstance(cells, str | bytes)
-                    else ()
-                )
-                summary = (
-                    " | ".join(str(value) for value in cell_values[:4])
-                    if cell_values
-                    else "Application row"
-                )
+                company = str(item.get("company_name") or "Unknown company")
+                role = str(item.get("role_title") or "Unknown role")
+                status = str(item.get("pipeline_status") or "status unavailable")
+                next_action = item.get("next_action")
+                summary = f"{company} — {role} [{status}]"
+                if next_action:
+                    summary += f"; next: {next_action}"
                 lines.append(f"- {summary}")
         if envelope.has_more:
             lines.append("More matching career items are available; ask me for the next page.")
         if envelope.completeness is CompletenessState.CACHED_STALE:
             lines.append("Jobs sync was unavailable, so these career results are cached and stale.")
         return "\n".join(lines)
+
+    def resolve_post_tool_lifecycle(
+        self,
+        context: PostToolLifecycleContext,
+    ) -> HostLifecycleResolution | None:
+        """Expose one trusted career query or proposal candidate to the root resolver."""
+
+        if context.trigger == "tool_result":
+            return None
+        if self.has_prepared_proposal:
+            return HostLifecycleResolution(
+                disposition="complete",
+                content="I prepared the interview change for review. Please confirm it below.",
+            )
+        query_ids = _current_turn_query_ids(
+            context.messages,
+            tool_names={"search_jobs_context", "search_job_interviews"},
+        )
+        envelopes = [
+            envelope
+            for query_id in query_ids
+            if (envelope := self.query_envelope(query_id)) is not None
+            and envelope.result_kind is QueryResultKind.JOBS
+        ]
+        if len(envelopes) > 1:
+            return HostLifecycleResolution(
+                disposition="awaiting_user",
+                content="Which career result set should I use for the answer?",
+            )
+        if not envelopes:
+            return HostLifecycleResolution(disposition="continue_model")
+        envelope = envelopes[0]
+        grounding = TerminalGrounding(
+            query_id=envelope.query_id,
+            item_ids=tuple(_career_item_id(item) for item in envelope.items),
+            acknowledge_incomplete=envelope.has_more,
+            acknowledge_stale=envelope.completeness is CompletenessState.CACHED_STALE,
+        )
+        return HostLifecycleResolution(
+            disposition="complete",
+            lifecycle=ConversationLifecycle(
+                disposition="completed",
+                content="The host completed this answer from trusted career results.",
+                grounding=grounding,
+            ),
+        )
 
     def _selected(self, interview_page_id: str) -> InterviewEventSnapshot:
         interview = self._known_interviews.get(interview_page_id)
@@ -749,18 +804,20 @@ class CareerAgentToolState:
         return interview
 
     def _interview_payload(self, item: InterviewEventSnapshot) -> Mapping[str, object]:
+        temporal = _interview_temporal(item)
         return {
             "stable_id": item.interview_page_id,
             "interview_page_id": item.interview_page_id,
             "title": item.title,
-            "date": item.local_date.isoformat(),
-            "time": (
-                item.date_start.isoformat(timespec="minutes")
-                if item.date_start is not None
-                else None
-            ),
+            "date": _temporal_date_label(temporal, item.timezone),
+            "time": _temporal_time_label(temporal, item.timezone),
+            "temporal": temporal.model_dump(mode="json"),
             "timezone": item.timezone,
             "is_all_day": item.is_all_day,
+            "application_id": item.application_id,
+            "stage": item.stage,
+            "interview_status": item.interview_status,
+            "preparation_status": item.preparation_status,
             "tags": list(item.tags),
             "calendar_semantic_overview": item.calendar_semantic_overview,
             "calendar_semantic_description": item.calendar_semantic_description,
@@ -776,14 +833,19 @@ class CareerAgentToolState:
             return ()
         return tuple(self._store.search_interviews("", now=self._now))
 
-    def _load_application_table_context(self) -> tuple[Any, ...]:
-        loader = getattr(self._store, "application_table_snapshots", None)
+    def _load_application_context(self) -> tuple[CareerApplicationSnapshot, ...]:
+        loader = getattr(self._store, "typed_application_snapshots", None)
         if callable(loader):
             loaded = loader()
             if isinstance(loaded, Sequence):
-                return tuple(cast(Sequence[Any], loaded))
+                return tuple(
+                    item
+                    if isinstance(item, CareerApplicationSnapshot)
+                    else CareerApplicationSnapshot.model_validate(item)
+                    for item in cast(Sequence[object], loaded)
+                )
             return ()
-        return tuple(self._store.application_row_snapshots())
+        return ()
 
     def _query_envelope(
         self,
@@ -843,6 +905,7 @@ class CareerAgentToolState:
             query_id=_query_id(tool_name, self._external_event_id, query, cursor),
             as_of=self._now,
             timezone=self._timezone,
+            result_kind=QueryResultKind.JOBS,
             applied_filters=filters,
             freshness=freshness,
             items=tuple(item[1] for item in page),
@@ -927,7 +990,12 @@ def _optional_text(value: object) -> str | None:
 
 
 def _career_item_id(item: Mapping[str, object]) -> str:
-    value = item.get("stable_id") or item.get("interview_page_id") or item.get("row_block_id")
+    value = (
+        item.get("stable_id")
+        or item.get("interview_page_id")
+        or item.get("application_id")
+        or item.get("row_block_id")
+    )
     return str(value or "")
 
 
@@ -959,6 +1027,39 @@ def _diagnostic_codes(value: object) -> tuple[str, ...]:
     if not isinstance(value, Sequence) or isinstance(value, str | bytes):
         return ()
     return tuple(str(item) for item in cast(Sequence[object], value))
+
+
+def _current_turn_query_ids(
+    messages: Sequence[object],
+    *,
+    tool_names: set[str],
+) -> tuple[str, ...]:
+    query_ids: list[str] = []
+    for message in reversed(messages):
+        if getattr(message, "type", None) == "human":
+            break
+        if (
+            getattr(message, "type", None) != "tool"
+            or getattr(message, "status", None) != "success"
+            or str(getattr(message, "name", "")) not in tool_names
+        ):
+            continue
+        try:
+            decoded: object = json.loads(str(getattr(message, "content", "")))
+        except (TypeError, ValueError, json.JSONDecodeError):
+            continue
+        if not isinstance(decoded, Mapping):
+            continue
+        payload = cast(Mapping[str, object], decoded)
+        content = payload.get("content")
+        query_id = (
+            cast(Mapping[str, object], content).get("query_id")
+            if isinstance(content, Mapping)
+            else None
+        )
+        if isinstance(query_id, str) and query_id and query_id not in query_ids:
+            query_ids.append(query_id)
+    return tuple(reversed(query_ids))
 
 
 def _query_id(tool_name: str, event_id: str, query: str, cursor: str | None) -> str:
@@ -999,59 +1100,84 @@ def _interview_sort_key(item: InterviewEventSnapshot) -> tuple[str, ...]:
     )
 
 
-def _application_row_sort_key(item: Mapping[str, object]) -> tuple[str, ...]:
+def _application_sort_key(item: Mapping[str, object]) -> tuple[str, ...]:
     return (
         "1",
-        str(item["table_block_id"]),
-        f"{int(cast(int, item['row_order'])):012d}",
-        str(item["row_block_id"]),
+        str(item.get("company_name") or "").casefold(),
+        str(item.get("role_title") or "").casefold(),
+        str(item["application_id"]),
     )
 
 
-def _application_row_payloads(
-    rows: tuple[Any, ...],
+def _application_payloads(
+    applications: tuple[CareerApplicationSnapshot, ...],
     terms: tuple[str, ...],
 ) -> tuple[dict[str, object], ...]:
-    grouped: dict[str, list[Any]] = {}
-    for row in rows:
-        grouped.setdefault(str(row.table_block_id), []).append(row)
     payloads: list[dict[str, object]] = []
-    for table_block_id, table_rows in grouped.items():
-        ordered = sorted(table_rows, key=lambda row: int(getattr(row, "row_order", 0)))
-        header = next((row for row in ordered if bool(getattr(row, "is_header", False))), None)
-        headers = tuple(str(cell) for cell in getattr(header, "cells", ()) if str(cell).strip())
-        data_rows = [row for row in ordered if not bool(getattr(row, "is_header", False))]
-        max_columns = max((len(tuple(getattr(row, "cells", ()))) for row in ordered), default=0)
-        columns = [
-            headers[index] if index < len(headers) else f"column_{index + 1}"
-            for index in range(max_columns)
-        ]
-        for row in data_rows:
-            column_values = {
-                str(columns[index]): cell for index, cell in enumerate(row.cells[: len(columns)])
-            }
-            haystack = " ".join(
-                (
-                    " ".join(str(cell) for cell in getattr(row, "cells", ())),
-                    " ".join(str(cell) for cell in getattr(row, "normalized_cells", ())),
-                    " ".join(column_values),
-                    " ".join(str(value) for value in column_values.values()),
-                )
-            ).casefold()
-            if terms and not all(term in haystack for term in terms):
-                continue
-            payloads.append(
-                {
-                    "kind": "application_row",
-                    "stable_id": row.row_block_id,
-                    "table_block_id": table_block_id,
-                    "row_block_id": row.row_block_id,
-                    "row_order": row.row_order,
-                    "cells": list(row.cells),
-                    "column_values": column_values,
-                }
+    for application in applications:
+        haystack = " ".join(
+            (
+                application.company_name or "",
+                application.role_title or "",
+                application.pipeline_status or "",
+                application.next_action or "",
+                _temporal_date_label(application.next_action_temporal, application.timezone)
+                if application.next_action_temporal
+                else "",
+                application.posting_url or "",
             )
-    return tuple(sorted(payloads, key=_application_row_sort_key))
+        ).casefold()
+        if terms and not all(term in haystack for term in terms):
+            continue
+        payloads.append(
+            {
+                "kind": "application",
+                "stable_id": application.application_id,
+                "application_id": application.application_id,
+                "company_name": application.company_name,
+                "role_title": application.role_title,
+                "pipeline_status": application.pipeline_status,
+                "next_action": application.next_action,
+                "next_action_date": (
+                    _temporal_date_label(application.next_action_temporal, application.timezone)
+                    if application.next_action_temporal
+                    else None
+                ),
+                "next_action_temporal": (
+                    application.next_action_temporal.model_dump(mode="json")
+                    if application.next_action_temporal
+                    else None
+                ),
+                "posting_url": application.posting_url,
+                "source_url": application.source_url,
+            }
+        )
+    return tuple(sorted(payloads, key=_application_sort_key))
+
+
+def _interview_temporal(item: InterviewEventSnapshot) -> TemporalValue:
+    if item.temporal_value is not None:
+        return item.temporal_value
+    if item.is_all_day or item.date_start is None:
+        return DateOnlyValue(start_date=item.local_date)
+    return DateTimeValue(
+        start_at=item.date_start,
+        timezone=item.timezone,
+    )
+
+
+def _temporal_date_label(value: TemporalValue | None, timezone: str) -> str | None:
+    if value is None:
+        return None
+    if isinstance(value, DateOnlyValue):
+        return value.start_date.isoformat()
+    return value.start_at.astimezone(ZoneInfo(timezone)).date().isoformat()
+
+
+def _temporal_time_label(value: TemporalValue | None, timezone: str) -> str | None:
+    if value is None or isinstance(value, DateOnlyValue):
+        return None
+    return value.start_at.astimezone(ZoneInfo(timezone)).strftime("%H:%M %Z")
 
 
 __all__ = ["CareerAgentToolState"]

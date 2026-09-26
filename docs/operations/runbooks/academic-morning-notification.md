@@ -15,10 +15,11 @@ The combined planner morning notification is the only executable automatic
 agenda schedule. Host code owns source refresh, Toronto-local day boundaries,
 coverage, dates, links, ordering, rendering, and delivery. Qwen receives bounded
 text from each selected event and produces a grounded event overview plus an
-optional description. Courses are then rendered deterministically from those
-event overviews and host-owned due labels. Jobs, Misc, and the schedule table
-may still use the bounded category composer for short digests or schedule
-inferences. Model stages are critic-checked with one repair attempt.
+optional description. A second critic-checked stage composes one bounded spoken
+task phrase per eligible Courses, Jobs, and Misc item; the schedule table uses
+separate bounded field inference. Host code adds authoritative dates and links,
+preserves accepted phrases independently, and falls back to the trusted title
+when an individual phrase is unavailable. Model stages use one repair attempt.
 
 The schedule is configured by:
 
@@ -93,10 +94,11 @@ ORDER BY created_at;"'
 
 Expected safe phase names include `source_refresh`,
 `event_001.evidence_collection`, `event_001.semantic_interpretation`,
-`event_001.semantic_validation`, `manifest_creation`, and `delivery`, with the
-event ordinal increasing per selected event. Diagnostics contain phase/count
-state, semantic status, and safe error codes only, never event source text,
-model prompts, or responses.
+`event_001.semantic_validation`, `spoken_composition.courses`,
+`spoken_composition.jobs`, `spoken_composition.misc`, `manifest_creation`, and
+`delivery`, with the event ordinal increasing per selected event. Diagnostics
+contain phase/count state, semantic status, and safe error codes only, never
+event source text, model prompts, or responses.
 
 ```bash
 docker compose exec -T postgres sh -lc 'psql -U "$POSTGRES_USER" -d "$POSTGRES_DB" -c "
@@ -144,12 +146,15 @@ after semantic interpretation from synchronized host data.
 The critic validates activity intent independently from overview/description, so
 one rejected component does not erase another supported component.
 
-A cached result is reusable only when the event fingerprint, Notion edit time,
-model identity, model configuration version, and prompt version all match. If
-Ollama is unavailable, the deadline expires, output is invalid, or the critic
-rejects the repair, every selected course event still appears with its trusted
-title and host-owned due label; it must not become a quiet course. Do not
-recover by guessing schedule fields or applying keyword rules.
+A cached event-semantic result is reusable only when the event fingerprint,
+Notion edit time, model identity, model configuration version, and prompt
+version all match. If Ollama is unavailable, the deadline expires, output is
+invalid, or the critic rejects the repair, every selected course event still
+appears with its trusted title and host-owned date; it must not become a quiet
+course. Spoken task
+composition records accepted and degraded items separately so one rejected
+phrase does not erase accepted phrases for other events. Do not recover by
+guessing schedule fields or applying keyword rules.
 
 The grounded morning-summary migration removes the legacy
 `not_substantive` runtime status. Rows with that legacy semantic/cache payload
@@ -196,9 +201,10 @@ Use a controlled trigger in a non-production or explicitly approved live window:
    DST transition. Verify interval overlap, the seven-following-days course
    horizon, and completed-item exclusion.
 8. Exercise a validated description, a title-only valid overview with no
-   description, and an Ollama failure. Verify Qwen prose appears only for
-   accepted citations, every course event includes its host-owned due label, and
-   metadata survives the failure.
+   description, one rejected spoken phrase, and an Ollama failure. Verify Qwen
+   prose appears only for accepted citations, the rejected item falls back to
+   its trusted linked title, every course event includes its host-owned date,
+   and independently valid phrases survive the failure.
 9. Force a failure after one category, replay the same period, and verify
    delivery resumes at the next category from the stored manifest.
 10. Restore the real Notion sharing and iCal source, then confirm the next

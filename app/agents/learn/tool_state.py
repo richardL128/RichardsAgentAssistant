@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+import json
 import uuid
 from collections.abc import Mapping, Sequence
 from datetime import UTC, date, datetime, time, timedelta
@@ -16,7 +17,10 @@ from sqlalchemy.orm import Session
 
 from app.agents.academic_planner.contracts import ProposedChange
 from app.agents.harness import (
+    ConversationLifecycle,
+    HostLifecycleResolution,
     NativeTool,
+    PostToolLifecycleContext,
     TerminalGrounding,
     ToolExecutionError,
     ToolResultOversizeError,
@@ -43,6 +47,7 @@ from app.agents.query_contracts import (
     FreshnessState,
     NormalizedQueryFilters,
     QueryEnvelope,
+    QueryResultKind,
     ResolvedTemporalWindow,
     SourceFreshness,
     TemporalScope,
@@ -453,6 +458,8 @@ class LearnToolState:
         envelope = self._query_envelopes.get(grounding.query_id)
         if envelope is None:
             return "grounding query_id was not returned by a current trusted LEARN query"
+        if envelope.result_kind is not QueryResultKind.LEARN_CONTENT:
+            return "grounding query does not contain LEARN evidence"
         known_ids = {_learn_item_id(item) for item in envelope.items}
         if not set(grounding.item_ids).issubset(known_ids):
             return "grounding item_ids contain an unknown or out-of-scope LEARN item"
@@ -476,6 +483,52 @@ class LearnToolState:
         if envelope.has_more:
             lines.append("More matching LEARN items are available; ask me for the next page.")
         return "\n".join(lines)
+
+    def resolve_post_tool_lifecycle(
+        self,
+        context: PostToolLifecycleContext,
+    ) -> HostLifecycleResolution | None:
+        """Expose one trusted terminal LEARN lookup or proposal to the root resolver."""
+
+        if context.trigger == "tool_result":
+            return None
+        if self.has_prepared_proposal:
+            return HostLifecycleResolution(
+                disposition="complete",
+                content="I prepared the LEARN calendar change for review. Please confirm it below.",
+            )
+        query_ids = _current_turn_query_ids(
+            context.messages,
+            tool_names={"get_learn_scheduled_items", "get_learn_announcements"},
+        )
+        envelopes = [
+            envelope
+            for query_id in query_ids
+            if (envelope := self.query_envelope(query_id)) is not None
+            and envelope.result_kind is QueryResultKind.LEARN_CONTENT
+        ]
+        if len(envelopes) > 1:
+            return HostLifecycleResolution(
+                disposition="awaiting_user",
+                content="Which LEARN result set should I use for the answer?",
+            )
+        if not envelopes:
+            return HostLifecycleResolution(disposition="continue_model")
+        envelope = envelopes[0]
+        grounding = TerminalGrounding(
+            query_id=envelope.query_id,
+            item_ids=tuple(_learn_item_id(item) for item in envelope.items),
+            acknowledge_incomplete=envelope.has_more,
+            acknowledge_stale=False,
+        )
+        return HostLifecycleResolution(
+            disposition="complete",
+            lifecycle=ConversationLifecycle(
+                disposition="completed",
+                content="The host completed this answer from trusted LEARN results.",
+                grounding=grounding,
+            ),
+        )
 
     async def _propose_calendar_change(self, arguments: Mapping[str, object]) -> object:
         args = _ProposeLearnCalendarChangeArgs.model_validate(arguments)
@@ -831,6 +884,7 @@ def _envelope_payload(
             query_id=f"{kind}:{uuid.uuid4()}",
             as_of=as_of,
             timezone=timezone,
+            result_kind=QueryResultKind.LEARN_CONTENT,
             applied_filters=filters,
             freshness=freshness,
             items=page,
@@ -848,12 +902,45 @@ def _envelope_payload(
         ):
             return payload
         page_size -= 1
-    raise ToolResultOversizeError
+    raise ToolResultOversizeError("LEARN query result exceeded the safe payload budget")
 
 
 def _learn_item_id(item: Mapping[str, object]) -> str:
     value = item.get("stable_id") or item.get("course_id") or item.get("source_id")
     return str(value or "")
+
+
+def _current_turn_query_ids(
+    messages: Sequence[object],
+    *,
+    tool_names: set[str],
+) -> tuple[str, ...]:
+    query_ids: list[str] = []
+    for message in reversed(messages):
+        if getattr(message, "type", None) == "human":
+            break
+        if (
+            getattr(message, "type", None) != "tool"
+            or getattr(message, "status", None) != "success"
+            or str(getattr(message, "name", "")) not in tool_names
+        ):
+            continue
+        try:
+            decoded: object = json.loads(str(getattr(message, "content", "")))
+        except (TypeError, ValueError, json.JSONDecodeError):
+            continue
+        if not isinstance(decoded, Mapping):
+            continue
+        payload = cast(Mapping[str, object], decoded)
+        content = payload.get("content")
+        query_id = (
+            cast(Mapping[str, object], content).get("query_id")
+            if isinstance(content, Mapping)
+            else None
+        )
+        if isinstance(query_id, str) and query_id and query_id not in query_ids:
+            query_ids.append(query_id)
+    return tuple(reversed(query_ids))
 
 
 def _scheduled_item_payload(item: LearnScheduledItem) -> dict[str, object]:

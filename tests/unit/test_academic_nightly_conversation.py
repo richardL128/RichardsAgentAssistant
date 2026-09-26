@@ -19,6 +19,7 @@ from app.agents.academic_planner.nightly_conversation import (
     export_nightly_checkpoint,
     export_nightly_root_checkpoint,
     parse_nightly_checkpoint,
+    reconstruct_nightly_lifecycle,
     render_completion_question,
     render_move_preview,
     render_summary,
@@ -220,6 +221,171 @@ def test_advance_move_and_summary_helpers_enforce_current_item_protocol() -> Non
 
     assert completed.phase == "completed"
     assert render_summary(completed) == "Evening check-in complete: 1 marked completed, 1 moved."
+
+
+def test_reconstruct_lifecycle_renders_initial_question_from_checkpoint() -> None:
+    item = _item(
+        course="ECE 250",
+        title="Review merge sort",
+        source_id="merge-sort",
+        start=NightlyTaskDateRange(all_day=True, start_date=date(2026, 9, 20)),
+    )
+    checkpoint = parse_nightly_checkpoint(
+        export_nightly_root_checkpoint(
+            build_nightly_checkpoint(
+                period_key=PERIOD,
+                local_date=date(2026, 9, 20),
+                items=(item,),
+            )
+        )
+    )
+
+    lifecycle = reconstruct_nightly_lifecycle(checkpoint)
+
+    assert lifecycle.disposition == "awaiting_user"
+    assert lifecycle.content == (
+        'Evening check-in - ECE 250 (1/1): Did you complete "Review merge sort" today?'
+    )
+
+
+def test_reconstruct_lifecycle_renders_pending_move_preview_from_proof() -> None:
+    item = _item(
+        course="ECE 250",
+        title="Review assignment feedback",
+        source_id="feedback",
+        start=NightlyTaskDateRange(all_day=True, start_date=date(2026, 9, 20)),
+    )
+    checkpoint = build_nightly_checkpoint(
+        period_key=PERIOD,
+        local_date=date(2026, 9, 20),
+        items=(item,),
+    )
+    proposal_id = stable_nightly_proposal_id(
+        period_key=PERIOD,
+        item_id=item.item_id,
+        operation="move_one_day",
+    )
+    proof = build_move_preview_proof(
+        checkpoint,
+        proposal_id=proposal_id,
+        shifted_range=NightlyTaskDateRange(all_day=True, start_date=date(2026, 9, 22)),
+    )
+    awaiting_move = with_pending_move_proposal(
+        checkpoint,
+        proposal_id=proposal_id,
+        preview_proof=proof,
+        reply_semantic_audit=NightlyReplySemanticAudit(
+            owner_event_id="discord-event-1",
+            action="incomplete",
+            model_identity="qwen-test",
+            prompt_version="nightly-reply-v1",
+            occurred_at=datetime(2026, 9, 21, 1, 1, tzinfo=UTC),
+        ),
+    )
+
+    lifecycle = reconstruct_nightly_lifecycle(awaiting_move)
+
+    assert lifecycle.disposition == "awaiting_user"
+    assert lifecycle.content == (
+        'I understand. Do you want me to move "ECE 250 - Review assignment feedback" '
+        "from September 20 to September 22?"
+    )
+
+
+def test_reconstruct_lifecycle_renders_result_detail_plus_next_question_or_summary() -> None:
+    start = NightlyTaskDateRange(all_day=True, start_date=date(2026, 9, 20))
+    first = _item(course="ECE 250", title="Review merge sort", source_id="1", start=start)
+    second = _item(
+        course="MATH 239",
+        title="Practice recurrence proofs",
+        source_id="2",
+        start=start,
+    )
+    checkpoint = build_nightly_checkpoint(
+        period_key=PERIOD,
+        local_date=date(2026, 9, 20),
+        items=(first, second),
+    )
+
+    after_first = advance_nightly_checkpoint(
+        checkpoint,
+        NightlyItemOutcome(
+            item_id=first.item_id,
+            status="completed",
+            detail='Marked it as "Completed - Review merge sort".',
+        ),
+    )
+    first_lifecycle = reconstruct_nightly_lifecycle(after_first)
+
+    assert first_lifecycle.disposition == "awaiting_user"
+    assert first_lifecycle.content == (
+        'Marked it as "Completed - Review merge sort". Next, '
+        'Evening check-in - MATH 239 (2/2): Did you complete "Practice recurrence proofs" today?'
+    )
+
+    completed = advance_nightly_checkpoint(
+        after_first,
+        NightlyItemOutcome(
+            item_id=second.item_id,
+            status="failed",
+            detail="I couldn't safely mark that task completed. It was left unchanged.",
+        ),
+    )
+    terminal_lifecycle = reconstruct_nightly_lifecycle(completed)
+
+    assert terminal_lifecycle.disposition == "completed"
+    assert terminal_lifecycle.content == (
+        "I couldn't safely mark that task completed. It was left unchanged. "
+        "Evening check-in complete: 1 marked completed, 1 not changed."
+    )
+
+
+def test_reconstruct_lifecycle_renders_cancelled_skip_deterministically() -> None:
+    item = _item(
+        course="ECE 250",
+        title="Review merge sort",
+        source_id="merge-sort",
+        start=NightlyTaskDateRange(all_day=True, start_date=date(2026, 9, 20)),
+    )
+    checkpoint = build_nightly_checkpoint(
+        period_key=PERIOD,
+        local_date=date(2026, 9, 20),
+        items=(item,),
+    ).model_copy(update={"phase": "cancelled"})
+
+    lifecycle = reconstruct_nightly_lifecycle(checkpoint)
+
+    assert lifecycle.disposition == "completed"
+    assert lifecycle.content == "Skipped tonight's check-in. No additional tasks were changed."
+
+
+def test_reconstruct_lifecycle_keeps_legacy_v2_checkpoint_without_result_detail_resumable() -> None:
+    start = NightlyTaskDateRange(all_day=True, start_date=date(2026, 9, 20))
+    first = _item(course="ECE 250", title="Review merge sort", source_id="1", start=start)
+    second = _item(
+        course="MATH 239",
+        title="Practice recurrence proofs",
+        source_id="2",
+        start=start,
+    )
+    checkpoint = build_nightly_checkpoint(
+        period_key=PERIOD,
+        local_date=date(2026, 9, 20),
+        items=(first, second),
+    )
+    legacy_after_first = advance_nightly_checkpoint(
+        checkpoint,
+        NightlyItemOutcome(item_id=first.item_id, status="completed"),
+    )
+
+    lifecycle = reconstruct_nightly_lifecycle(
+        parse_nightly_checkpoint(legacy_after_first.model_dump(mode="json"))
+    )
+
+    assert lifecycle.disposition == "awaiting_user"
+    assert lifecycle.content == (
+        'Evening check-in - MATH 239 (2/2): Did you complete "Practice recurrence proofs" today?'
+    )
 
 
 def test_shift_toronto_local_calendar_day_preserves_all_day_timed_range_and_dst_wall_time() -> None:

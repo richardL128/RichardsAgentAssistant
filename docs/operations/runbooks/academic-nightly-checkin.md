@@ -38,6 +38,19 @@ and check its exact title and edit version. Timed items preserve wall-clock time
 all-day precision and start/end duration are preserved. The bot acknowledges
 before calling Notion, then reports the actual outcome and next task.
 
+After one successful nightly action, the host reconstructs the exact response
+from the durable checkpoint and ends the turn without asking the model for a
+second formatting call. Move previews come from the stored preview proof;
+completion, move, decline, and failure text comes from the stored item outcome;
+and the next question or summary comes from the checkpoint state. Model-authored
+dates, titles, previews, and write claims are never used for this response.
+
+Action checkpointing and Discord delivery are separate durable boundaries. A
+crash after the action's successful tool result can replay the checkpointed
+assistant/tool tail and publish the same host response without rerunning the
+nightly action. The final Discord delivery key is stable for the inbound event,
+so a transport retry does not create a second visible response.
+
 ## Required configuration
 
 ```dotenv
@@ -82,6 +95,27 @@ LIMIT 10;"'
 For proposal/write state, inspect only stable IDs and statuses. Do not print the
 proposal payload because it contains private task titles.
 
+```bash
+docker compose exec -T postgres sh -lc 'psql -U "$POSTGRES_USER" -d "$POSTGRES_DB" -c "
+SELECT id, state, last_disposition, error_code, revision
+FROM native_conversation_sessions
+WHERE root_event_id = '\''<stable-period-id>'\'';
+"'
+```
+
+```bash
+docker compose exec -T postgres sh -lc 'psql -U "$POSTGRES_USER" -d "$POSTGRES_DB" -c "
+SELECT id, state, idempotency_key, applied_at, expires_at
+FROM academic_proposed_changes
+WHERE idempotency_key = '\''academic-proposal:<stable-proposal-id>'\'';
+"'
+```
+
+Use the actual schema's stable status columns if a deployment predates these
+names. Do not select `payload`, transcript keys, checkpoint artifacts, task
+titles, owner replies, or connector request/response bodies during routine
+diagnosis.
+
 ## Failure and recovery
 
 - **Catalog refresh failed or stale:** no checklist is built from cached data and
@@ -103,9 +137,21 @@ proposal payload because it contains private task titles.
 - **Timeout or uncertain connector result:** no automatic second write is issued.
   Inspect the Notion page and proposal-operation receipt before any operator
   action.
-- **Duplicate Discord delivery/reply or worker replay:** stable delivery,
-  proposal, and operation keys return the existing result. Do not delete those
-  records; they are the idempotency proof.
+- **Duplicate Discord delivery/reply or worker replay:** a checkpointed successful
+  action is not executed again. Stable final-response, proposal, and operation
+  keys return the existing result. Do not delete those records; they are the
+  idempotency proof.
+- **Failure after preparing a move but before exposing its preview:** the host
+  rejects the exact checkpoint-bound pending proposal through the domain API,
+  clears the pending preview state, saves the cleaned checkpoint, and then fails
+  the session. It does not delete proposal or audit history and does not write to
+  Notion. If the proposal is applied, in progress, expired, or otherwise
+  uncertain, stop and inspect its operation receipt instead of retrying or
+  rewriting state.
+- **Discord final-response delivery is retryable:** once the conversation has a
+  valid awaiting-user lifecycle, keep its pending move proposal. A response
+  transport failure alone is not a reason to reject the proposal; retry with the
+  same delivery key.
 - **Discord delivery failed after session creation:** retrying the same period
   reuses the checkpoint and idempotent delivery key. Never create a second
   session manually.

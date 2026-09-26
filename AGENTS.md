@@ -36,11 +36,19 @@
 - If the user explicitly requires temporary legacy compatibility, keep it
   isolated, label it as exceptional, and never make it the default.
 
+## Output degradation policy
+
+- When producing multi-item outputs, one degraded, ambiguous, or invalid item
+  must not make the otherwise useful output unusable. Preserve valid independent
+  results, degrade at the smallest safe unit, and surface item-level uncertainty.
+- Do not collapse repeated same-entity events into one item when their event
+  identities are distinct, including multiple course events on the same day.
+
 ## Repository evidence grounding
 
 - Before answering repository-specific questions about the technology stack,
   feature or implementation status, runtime wiring, or agent configuration and
-  specifications, read and follow `skills/codebase-grounding/SKILL.md`.
+  specifications, read and follow `.codex/skills/codebase-grounding/SKILL.md`.
 - Do not use implementation plans, prompts, legacy Markdown, or assumptions as
   evidence of the repository's current behavior or status.
 

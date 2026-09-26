@@ -11,7 +11,7 @@ from langchain_core.messages import AIMessage, BaseMessage, HumanMessage, System
 from pydantic import BaseModel, ValidationError, model_validator
 
 from app.core.config import Settings
-from app.llm.contracts import InvocationStatus
+from app.llm.contracts import GatewayFailure, InvocationStatus
 from app.llm.gateway import LLMGateway
 
 
@@ -436,3 +436,18 @@ async def test_native_timeout_returns_safe_failure() -> None:
     assert result.error_diagnostic == "Model request timed out."
     assert len(result.telemetry) == 1
     assert result.telemetry[0].error_code == "model_timeout"
+
+
+@pytest.mark.asyncio
+async def test_invoke_tools_raises_typed_gateway_failure() -> None:
+    fake = NativeFakeChatModel([AIMessage(content="late")], delay=0.05)
+    gateway = LLMGateway(Settings(ollama_timeout_seconds=0.001), chat_model=fake)
+
+    with pytest.raises(GatewayFailure) as exc_info:
+        await gateway.invoke_tools([HumanMessage(content="answer")], [])
+
+    exc = exc_info.value
+    assert exc.code == "model_timeout"
+    assert exc.retryable is True
+    assert exc.phase == "native_invocation"
+    assert exc.diagnostic == "Model request timed out."

@@ -39,7 +39,11 @@ htmlcov/
 /prompts/implement-nightly-reflection-memory-and-runtime-restoration.md
 /prompts/implement-deterministic-model-tool-contracts.md
 /prompts/implement-grounded-morning-task-summaries.md
+/prompts/implement-natural-language-morning-briefing.md
 /prompts/implement-rigid-semantic-evening-task-checkin.md
+/prompts/implement-nightly-checkin-host-finalization.md
+/prompts/implement-native-tool-call-reliability.md
+/prompts/implement-notion-action-items-and-date-contract.md
 
 /presentations/LifeAgent-Intern-Architecture.pptx
 

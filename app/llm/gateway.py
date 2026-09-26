@@ -18,6 +18,7 @@ from pydantic import BaseModel, ValidationError
 
 from app.core.config import Settings, get_settings
 from app.llm.contracts import (
+    GatewayFailure,
     InvocationResult,
     InvocationStatus,
     ModelCallTelemetry,
@@ -237,7 +238,21 @@ class LLMGateway:
 
         result = await self.invoke_native(messages=messages, tools=tools)
         if result.output is None:
-            raise RuntimeError(result.error_code or "model_error")
+            code = result.error_code or "model_error"
+            if code == "input_token_budget_exceeded":
+                code = "model_input_token_budget_exceeded"
+            phase = (
+                "native_response_validation"
+                if code == "invalid_native_response"
+                else "native_invocation"
+            )
+            raise GatewayFailure(
+                code=code,
+                retryable=code in {"model_timeout", "model_error"},
+                phase=phase,
+                request_id=result.request_id,
+                diagnostic=result.error_diagnostic,
+            )
         return result.output
 
     async def _invoke_once(

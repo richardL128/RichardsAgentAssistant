@@ -135,7 +135,7 @@ DISCORD_WAKE_TOOL_NAMES: frozenset[str] = frozenset(
         "propose_interview_date",
         "propose_interview_plan_save",
         "search_assessment_materials",
-        "search_assessments",
+        "search_calendar_items",
         "search_courses",
         "search_job_interviews",
         "search_jobs_context",

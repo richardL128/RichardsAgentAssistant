@@ -14,6 +14,18 @@ from zoneinfo import ZoneInfo
 
 from sqlalchemy.exc import NoResultFound
 
+from app.agents.action_items import (
+    ActionItemContext,
+    ActionItemDomain,
+    ActionItemKind,
+    ActionItemSource,
+    ActionItemSourceKind,
+    ActionItemStatus,
+    CanonicalActionItem,
+    DateOnlyValue,
+    DateTimeValue,
+    parse_notion_temporal_value,
+)
 from app.agents.academic_planner.calendar_roles import (
     AcademicCalendarRole,
     academic_calendar_role,
@@ -36,7 +48,9 @@ from app.connectors.discord_gateway import (
 )
 from app.connectors.notion import (
     NotionAssessment,
+    NotionActionItemRecord,
     NotionConnector,
+    NotionCourseRecord,
     NotionCourse,
     NotionDiscoveryDiagnostic,
     NotionWriteConflict,
@@ -89,6 +103,10 @@ class AcademicSyncStore(Protocol):
     """Durable persistence required by the synchronization boundary."""
 
     def save_sync_cursor(self, database: str, cursor: str | None) -> None: ...
+
+    def upsert_synced_course(self, course: Any) -> str: ...
+
+    def upsert_canonical_action_item(self, item: CanonicalActionItem) -> str: ...
 
     def upsert_course_calendar(
         self,
@@ -343,12 +361,14 @@ class AcademicNotionSync:
                 error_code=ErrorCode.SOURCE_SETUP_REQUIRED.value,
             )
         try:
-            result = await self._connector.discover_course_assessments()
+            preflight = await self._connector.preflight_configured_databases()
+            courses = await self._connector.read_courses()
+            action_items = await self._connector.read_action_items()
         except LifeAgentError as exc:
             diagnostic = NotionDiscoveryDiagnostic(
                 code="notion_sync_failed",
                 severity="error",
-                message="Courses database synchronization failed",
+                message="Explicit Notion action-item synchronization failed",
             )
             await self._deliver_setup_conditions((diagnostic,), current)
             return AcademicNotionSyncResult(
@@ -358,11 +378,11 @@ class AcademicNotionSync:
                 error_code=exc.record.code.value,
                 retryable=exc.record.retryable,
             )
-        except (ValueError, TypeError):
+        except (AttributeError, ValueError, TypeError):
             diagnostic = NotionDiscoveryDiagnostic(
                 code="notion_sync_failed",
                 severity="error",
-                message="Courses database synchronization failed",
+                message="Explicit Notion action-item synchronization failed",
             )
             await self._deliver_setup_conditions((diagnostic,), current)
             return AcademicNotionSyncResult(
@@ -372,85 +392,10 @@ class AcademicNotionSync:
                 error_code=ErrorCode.SOURCE_SETUP_REQUIRED.value,
             )
 
-        diagnostics = list(result.diagnostics)
-        active_misc_courses = tuple(
-            course
-            for course in result.courses
-            if not (course.archived or course.in_trash)
-            and academic_calendar_role(course.course_title) is AcademicCalendarRole.MISC
-        )
-        active_schedule_courses = tuple(
-            course
-            for course in result.courses
-            if not (course.archived or course.in_trash)
-            and academic_calendar_role(course.course_title) is AcademicCalendarRole.LEARN
-        )
-        if len(active_misc_courses) > 1:
-            diagnostics.extend(
-                NotionDiscoveryDiagnostic(
-                    code="misc_calendar_duplicate",
-                    severity="error",
-                    message="Courses database must contain at most one active misc row",
-                    source_id=result.courses_source_id,
-                    source_type=result.courses_source_type,
-                    course_page_id=course.course_page_id,
-                    course_title=course.course_title,
-                    count=min(len(active_misc_courses), 100),
-                )
-                for course in active_misc_courses
-            )
-        schedule_snapshot: Any | None = None
-        if len(active_schedule_courses) > 1:
-            diagnostics.extend(
-                NotionDiscoveryDiagnostic(
-                    code="academic_schedule_row_duplicate",
-                    severity="error",
-                    message=(
-                        "Courses database must contain exactly one active "
-                        "Classes + Tutorials + Labs row"
-                    ),
-                    source_id=result.courses_source_id,
-                    source_type=result.courses_source_type,
-                    course_page_id=course.course_page_id,
-                    course_title=course.course_title,
-                    count=min(len(active_schedule_courses), 100),
-                )
-                for course in active_schedule_courses
-            )
-        elif len(active_schedule_courses) == 1:
-            schedule_course = active_schedule_courses[0]
-            if self._schedule_connector is None:
-                diagnostics.append(
-                    NotionDiscoveryDiagnostic(
-                        code="academic_schedule_ical_configuration_missing",
-                        severity="error",
-                        message="Academic schedule requires a configured secret iCal URL",
-                        course_page_id=schedule_course.course_page_id,
-                        course_title=schedule_course.course_title,
-                    )
-                )
-            else:
-                try:
-                    schedule_snapshot = await self._schedule_connector.fetch_events(
-                        window_start=current - timedelta(days=self._schedule_lookback_days),
-                        window_end=current + timedelta(days=self._schedule_horizon_days),
-                    )
-                except (LifeAgentError, TypeError, ValueError):
-                    diagnostics.append(
-                        NotionDiscoveryDiagnostic(
-                            code="academic_schedule_ical_unavailable",
-                            severity="error",
-                            message="Academic schedule iCal feed could not be synchronized",
-                            course_page_id=schedule_course.course_page_id,
-                            course_title=schedule_course.course_title,
-                        )
-                    )
-        if result.courses_source_id is not None:
-            self._store.save_sync_cursor(
-                result.courses_source_id,
-                result.synced_at.isoformat(),
-            )
-        course_diagnostics = _diagnostics_by_course(diagnostics)
+        diagnostics = list(preflight.diagnostics)
+        course_records = {
+            course.page_id: _explicit_course_record(course) for course in courses
+        }
         valid_courses = 0
         assessment_count = 0
         archived_count = 0
@@ -459,139 +404,68 @@ class AcademicNotionSync:
         invalid_calendars = 0
         unavailable_roles: set[AcademicCalendarRole] = set()
         unavailable_course_page_ids: set[str] = set()
-        if len(active_misc_courses) > 1:
-            unavailable_roles.add(AcademicCalendarRole.MISC)
-        if len(active_schedule_courses) > 1:
-            unavailable_roles.add(AcademicCalendarRole.LEARN)
-        for course in result.courses:
-            course_record = _course_record(course)
-            course_role = academic_calendar_role(course.course_title)
-            invalid = _course_setup_diagnostic(
-                course,
-                course_diagnostics.get(course.course_page_id, ()),
-            )
-            try:
-                if invalid is not None:
-                    invalid_calendars += 1
-                    unavailable_roles.add(course_role)
-                    unavailable_course_page_ids.add(course.course_page_id)
-                    self._store.upsert_course_calendar(
-                        course_record,
-                        status=_calendar_status(invalid.code),
-                        diagnostic_code=invalid.code,
-                        schema_fingerprint=_diagnostic_fingerprint(invalid),
-                    )
-                    continue
-                if course_role is AcademicCalendarRole.LEARN:
-                    source_id = str(getattr(schedule_snapshot, "source_id", ""))
-                    course_record = replace(
-                        course_record,
-                        source_kind="google_ical",
-                        external_source_id=source_id,
-                    )
-                self._store.upsert_course_calendar(course_record)
-                valid_courses += 1
-                seen: list[str] = []
-                synchronized_assessments: Sequence[Any] = (
-                    tuple(getattr(schedule_snapshot, "events", ()))
-                    if course_role is AcademicCalendarRole.LEARN
-                    else course.assessments
-                )
-                for assessment in synchronized_assessments:
-                    if course_role is AcademicCalendarRole.LEARN:
-                        record = _schedule_assessment_record(
-                            assessment,
-                            source_id=course_record.external_source_id or "",
-                        )
-                        classification: Any = _ResolvedClassification(
-                            kind="event",
-                            source="reserved_learn_google_ical",
-                        )
-                        seen.append(record.notion_id)
-                        self._store.upsert_synced_assessment(
-                            course_record,
-                            record,
-                            kind="event",
-                            label_source=classification.source,
-                        )
-                        assessment_count += 1
-                        continue
-                    seen.append(assessment.page_id)
-                    record, classification = _assessment_record(
-                        assessment,
-                        calendar_role=academic_calendar_role(course_record.title),
-                        timezone=self._timezone,
-                    )
-                    assessment_row_id = self._store.upsert_synced_assessment(
-                        course_record,
-                        record,
-                        kind=_synced_kind_value(classification.kind),
-                        label_source=classification.source,
-                    )
-                    assessment_count += 1
-                    if self._material_enqueuer is not None and record.active:
-                        from app.agents.academic_planner.material_ingestion import (
-                            assessment_material_fingerprint,
-                        )
 
-                        try:
-                            await self._material_enqueuer(
-                                assessment.page_id,
-                                assessment_material_fingerprint(
-                                    assessment.page_id,
-                                    assessment.last_edited_at,
-                                ),
-                            )
-                            material_job_count += 1
-                        except Exception:
-                            diagnostics.append(
-                                NotionDiscoveryDiagnostic(
-                                    code="assessment_material_enqueue_failed",
-                                    severity="warning",
-                                    message="Assessment material ingestion could not be queued",
-                                    course_page_id=course.course_page_id,
-                                    course_title=course.course_title,
-                                )
-                            )
-                    if (
-                        _classification_kind_value(classification.kind)
-                        == AssessmentKind.UNKNOWN.value
-                        and record.active
-                        and record.current_title
-                    ):
-                        created = await self._create_and_deliver_clarification(
-                            course=course_record,
-                            assessment=assessment,
-                            assessment_row_id=assessment_row_id,
-                            now=current,
-                        )
-                        clarification_count += int(created)
-                source_id = (
-                    course_record.external_source_id
-                    if course_role is AcademicCalendarRole.LEARN
-                    else course.assessments_source_id or course_record.child_data_source_id
-                )
-                if source_id:
-                    archived_count += self._store.reconcile_assessment_source(
-                        source_id,
-                        seen,
-                        synced_at=result.synced_at,
-                    )
-                    self._store.save_sync_cursor(source_id, result.synced_at.isoformat())
+        for course_record in course_records.values():
+            try:
+                self._store.upsert_synced_course(course_record)
+                valid_courses += int(course_record.active)
             except Exception:
                 invalid_calendars += 1
-                unavailable_roles.add(course_role)
-                unavailable_course_page_ids.add(course.course_page_id)
+                unavailable_course_page_ids.add(course_record.course_page_id)
                 diagnostics.append(
                     NotionDiscoveryDiagnostic(
                         code="course_persistence_failed",
                         severity="error",
-                        message="A discovered course could not be persisted",
-                        course_page_id=course.course_page_id,
-                        course_title=course.course_title,
+                        message="A configured Course row could not be persisted",
+                        course_page_id=course_record.course_page_id,
+                        course_title=course_record.course_title,
                     )
                 )
-                continue
+
+        action_item_source = preflight.sources.get("action_items")
+        seen_action_item_ids: list[str] = []
+        for action_item in action_items:
+            canonical_item, item_diagnostics = _canonical_action_item_record(
+                action_item,
+                courses_by_page_id=course_records,
+                synced_at=preflight.synced_at,
+                default_timezone=self._timezone.key,
+            )
+            diagnostics.extend(item_diagnostics)
+            try:
+                self._store.upsert_canonical_action_item(canonical_item)
+                assessment_count += 1
+                seen_action_item_ids.append(action_item.page_id)
+            except Exception:
+                diagnostics.append(
+                    NotionDiscoveryDiagnostic(
+                        code="action_item_persistence_failed",
+                        severity="error",
+                        message="A configured Action Item row could not be persisted",
+                        source_id=(
+                            action_item_source.source_id
+                            if action_item_source is not None
+                            else action_item.source_id
+                        ),
+                        source_type=action_item.source_type,
+                        course_page_id=canonical_item.context.course_id,
+                        course_title=canonical_item.context.course_code,
+                    )
+                )
+
+        courses_source = preflight.sources.get("courses")
+        if courses_source is not None:
+            self._store.save_sync_cursor(courses_source.source_id, preflight.synced_at.isoformat())
+        if action_item_source is not None:
+            archived_count += self._store.reconcile_assessment_source(
+                action_item_source.source_id,
+                seen_action_item_ids,
+                synced_at=preflight.synced_at,
+            )
+            self._store.save_sync_cursor(
+                action_item_source.source_id,
+                preflight.synced_at.isoformat(),
+            )
 
         await self._deliver_setup_conditions(tuple(diagnostics), current)
         codes = tuple(sorted({item.code for item in diagnostics if item.severity == "error"}))
@@ -604,7 +478,7 @@ class AcademicNotionSync:
             }
             for code in codes
         )
-        if top_level_setup_failure or (not result.courses and codes):
+        if top_level_setup_failure or (not courses and codes):
             status: Literal["succeeded", "partial", "setup_required"] = "setup_required"
         elif invalid_calendars or codes:
             status = "partial"
@@ -612,7 +486,7 @@ class AcademicNotionSync:
             status = "succeeded"
         return AcademicNotionSyncResult(
             status=status,
-            course_count=len(result.courses),
+            course_count=len(courses),
             valid_course_count=valid_courses,
             assessment_count=assessment_count,
             archived_count=archived_count,
@@ -622,7 +496,7 @@ class AcademicNotionSync:
             diagnostic_codes=codes,
             unavailable_roles=tuple(sorted(unavailable_roles, key=lambda role: role.value)),
             unavailable_course_page_ids=tuple(sorted(unavailable_course_page_ids)),
-            synced_at=result.synced_at,
+            synced_at=preflight.synced_at,
             error_code=(ErrorCode.SOURCE_SYNC_PARTIAL.value if status == "partial" else None),
         )
 
@@ -917,6 +791,210 @@ def _course_record(course: NotionCourse) -> _CourseRecord:
     )
 
 
+def _explicit_course_record(course: NotionCourseRecord) -> _CourseRecord:
+    title = " ".join(course.title.split()) or "Untitled course"
+    course_code = " ".join((course.code or title).split())[:80] or title[:80]
+    active = not (course.archived or course.in_trash) and (course.status or "").casefold() not in {
+        "archived",
+        "inactive",
+    }
+    return _CourseRecord(
+        course_id=course.page_id,
+        notion_id=course.page_id,
+        course_page_id=course.page_id,
+        course_code=course_code,
+        course_title=title,
+        title=title,
+        term=" ".join((course.term or "unspecified").split()) or "unspecified",
+        priority=50,
+        active=active,
+        child_database_id=None,
+        child_data_source_id=None,
+        assessments_database_id=None,
+        assessments_source_id=None,
+        title_property_id=course.property_ids.get("Name"),
+        title_property_name="Name",
+        date_property_id=None,
+        date_property_name=None,
+        learn_context_property_id=None,
+        learn_context_property_name=None,
+        source_kind="notion",
+        external_source_id=course.source_id,
+    )
+
+
+def _canonical_action_item_record(
+    item: NotionActionItemRecord,
+    *,
+    courses_by_page_id: Mapping[str, _CourseRecord],
+    synced_at: datetime,
+    default_timezone: str,
+) -> tuple[CanonicalActionItem, tuple[NotionDiscoveryDiagnostic, ...]]:
+    diagnostics: list[NotionDiscoveryDiagnostic] = []
+
+    domain = _enum_value(
+        ActionItemDomain,
+        item.domain,
+        field_label="Domain",
+        code="action_item_invalid_domain",
+        diagnostics=diagnostics,
+        item=item,
+        default=ActionItemDomain.ACADEMIC,
+    )
+    kind = _enum_value(
+        ActionItemKind,
+        item.item_type,
+        field_label="Item Type",
+        code="action_item_invalid_kind",
+        diagnostics=diagnostics,
+        item=item,
+        default=ActionItemKind.NEEDS_REVIEW,
+    )
+    status = _enum_value(
+        ActionItemStatus,
+        item.status,
+        field_label="Status",
+        code="action_item_invalid_status",
+        diagnostics=diagnostics,
+        item=item,
+        default=ActionItemStatus.NEEDS_REVIEW,
+    )
+
+    temporal: DateOnlyValue | DateTimeValue | None = None
+    if item.date is not None and item.date.start is not None:
+        try:
+            temporal = parse_notion_temporal_value(
+                item.date.start,
+                item.date.end,
+                item.date.time_zone,
+                default_timezone=default_timezone,
+            )
+        except ValueError:
+            diagnostics.append(
+                _action_item_diagnostic(
+                    item,
+                    code="action_item_invalid_temporal",
+                    message="Action Item has an invalid Notion Date value",
+                )
+            )
+    elif item.date is not None:
+        diagnostics.append(
+            _action_item_diagnostic(
+                item,
+                code="action_item_missing_start_date",
+                message="Action Item Date is missing a start value",
+            )
+        )
+
+    related_course: _CourseRecord | None = None
+    if item.course_ids:
+        related_course = courses_by_page_id.get(item.course_ids[0])
+        if related_course is None or len(item.course_ids) != 1:
+            diagnostics.append(
+                _action_item_diagnostic(
+                    item,
+                    code="action_item_invalid_course_relation",
+                    message="Academic Action Item must relate to exactly one configured Course",
+                )
+            )
+    elif domain is ActionItemDomain.ACADEMIC:
+        diagnostics.append(
+            _action_item_diagnostic(
+                item,
+                code="action_item_missing_course_relation",
+                message="Academic Action Item must relate to one configured Course",
+            )
+        )
+
+    if diagnostics:
+        status = ActionItemStatus.NEEDS_REVIEW
+        kind = ActionItemKind.NEEDS_REVIEW
+
+    diagnostic_codes = tuple(dict.fromkeys(diagnostic.code for diagnostic in diagnostics))
+    return (
+        CanonicalActionItem(
+            item_id=item.page_id,
+            title=(" ".join(item.title.split()) or "Untitled action item")[:500],
+            domain=domain,
+            item_kind=kind,
+            status=status,
+            temporal=temporal,
+            source=ActionItemSource(
+                kind=ActionItemSourceKind.NOTION_ACTION_ITEMS,
+                source_id=item.source_id,
+                source_label="Notion Action Items",
+                notion_database_id=item.database_id,
+                notion_data_source_id=item.source_id,
+                notion_page_id=item.page_id,
+                property_ids=dict(item.property_ids),
+            ),
+            context=ActionItemContext(
+                course_id=related_course.course_page_id if related_course is not None else None,
+                course_code=related_course.course_code if related_course is not None else None,
+                context_label=";".join(diagnostic_codes) if diagnostic_codes else item.notes,
+            ),
+            freshness_as_of=synced_at,
+            edit_version=item.last_edited_at,
+        ),
+        tuple(diagnostics),
+    )
+
+
+def _enum_value(
+    enum_type: Any,
+    raw_value: str | None,
+    *,
+    field_label: str,
+    code: str,
+    diagnostics: list[NotionDiscoveryDiagnostic],
+    item: NotionActionItemRecord,
+    default: Any,
+) -> Any:
+    normalized = _canonical_enum_token(raw_value)
+    aliases = {
+        "completed": "done",
+        "todo": "to_do",
+        "to_do": "to_do",
+        "midterm": "exam",
+        "final": "exam",
+        "course": "academic",
+        "misc": "academic",
+    }
+    normalized = aliases.get(normalized, normalized)
+    try:
+        return enum_type(normalized)
+    except ValueError:
+        diagnostics.append(
+            _action_item_diagnostic(
+                item,
+                code=code,
+                message=f"Action Item has invalid {field_label}",
+            )
+        )
+        return default
+
+
+def _canonical_enum_token(value: str | None) -> str:
+    return re.sub(r"[^a-z0-9]+", "_", (value or "").strip().casefold()).strip("_")
+
+
+def _action_item_diagnostic(
+    item: NotionActionItemRecord,
+    *,
+    code: str,
+    message: str,
+) -> NotionDiscoveryDiagnostic:
+    return NotionDiscoveryDiagnostic(
+        code=code,
+        severity="warning",
+        message=message,
+        source_id=item.source_id,
+        source_type=item.source_type,
+        course_page_id=item.course_ids[0] if item.course_ids else None,
+        course_title=item.title,
+    )
+
+
 def _assessment_record(
     assessment: NotionAssessment,
     *,
@@ -1114,7 +1192,7 @@ def _parse_due(assessment: NotionAssessment, *, timezone: ZoneInfo) -> datetime 
     try:
         if "T" not in raw:
             parsed_date = date.fromisoformat(raw)
-            return datetime.combine(parsed_date, time(23, 59), tzinfo=timezone).astimezone(UTC)
+            return datetime.combine(parsed_date, time.min, tzinfo=UTC)
         parsed = datetime.fromisoformat(raw.replace("Z", "+00:00"))
         if parsed.tzinfo is None or parsed.utcoffset() is None:
             parsed = parsed.replace(tzinfo=timezone)
@@ -1135,7 +1213,7 @@ def _parse_end(assessment: NotionAssessment, *, timezone: ZoneInfo) -> datetime 
     try:
         if "T" not in raw:
             parsed_date = date.fromisoformat(raw)
-            return datetime.combine(parsed_date, time(23, 59), tzinfo=timezone).astimezone(UTC)
+            return datetime.combine(parsed_date, time.min, tzinfo=UTC)
         parsed = datetime.fromisoformat(raw.replace("Z", "+00:00"))
         if parsed.tzinfo is None or parsed.utcoffset() is None:
             parsed = parsed.replace(tzinfo=timezone)

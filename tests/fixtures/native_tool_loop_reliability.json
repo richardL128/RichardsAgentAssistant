@@ -1,0 +1,362 @@
+[
+  {
+    "case_id": "direct_text",
+    "category": "direct_text",
+    "prompt": "Reply with a short synthetic acknowledgement.",
+    "expected_status": "completed",
+    "expected_tools": [],
+    "terminal_after": [],
+    "fake_model_turns": [
+      {
+        "content": "Synthetic acknowledgement complete."
+      }
+    ]
+  },
+  {
+    "case_id": "read_then_prose",
+    "category": "grounded_read",
+    "prompt": "What synthetic academic items are due soon?",
+    "expected_status": "completed",
+    "expected_tools": ["search_calendar_items"],
+    "terminal_after": [],
+    "require_terminal_response": true,
+    "fake_model_turns": [
+      {
+        "content": "I will check the synthetic calendar.",
+        "tool_calls": [
+          {
+            "id": "call-read-1",
+            "name": "search_calendar_items",
+            "args": {
+              "query": "due soon",
+              "view": "tasks",
+              "temporal": {"scope": "upcoming"},
+              "limit": 5
+            }
+          }
+        ]
+      },
+      {
+        "content": "The model prose mentions synthetic item alpha."
+      }
+    ]
+  },
+  {
+    "case_id": "preparatory_then_terminal_read",
+    "category": "preparatory_read",
+    "prompt": "Using the academic planner (not LEARN), find the synthetic course first, then search academic calendar items for its next task.",
+    "expected_status": "completed",
+    "expected_tools": ["search_courses", "search_calendar_items"],
+    "terminal_after": ["search_calendar_items"],
+    "require_terminal_response": true,
+    "fake_model_turns": [
+      {
+        "content": "I will resolve the course.",
+        "tool_calls": [
+          {
+            "id": "call-course-1",
+            "name": "search_courses",
+            "args": {"query": "synthetic course", "limit": 3}
+          }
+        ]
+      },
+      {
+        "content": "I found the course and will read its items.",
+        "tool_calls": [
+          {
+            "id": "call-calendar-2",
+            "name": "search_calendar_items",
+            "args": {
+              "query": "synthetic course",
+              "view": "tasks",
+              "temporal": {"scope": "upcoming"},
+              "roles": ["course"],
+              "limit": 5
+            }
+          }
+        ]
+      }
+    ]
+  },
+  {
+    "case_id": "source_unavailable",
+    "category": "unavailable",
+    "prompt": "Search academic calendar items from the unavailable synthetic academic source.",
+    "expected_status": "completed",
+    "expected_tools": ["search_calendar_items"],
+    "terminal_after": ["search_calendar_items"],
+    "require_terminal_response": true,
+    "fake_model_turns": [
+      {
+        "content": "I will query the requested source.",
+        "tool_calls": [
+          {
+            "id": "call-unavailable-1",
+            "name": "search_calendar_items",
+            "args": {
+              "query": "unavailable source",
+              "view": "tasks",
+              "temporal": {"scope": "upcoming"},
+              "roles": ["unavailable"],
+              "limit": 5
+            }
+          }
+        ]
+      }
+    ]
+  },
+  {
+    "case_id": "partial_result",
+    "category": "partial",
+    "prompt": "Search academic calendar items broadly across the synthetic academic sources, including the unavailable source.",
+    "expected_status": "completed",
+    "expected_tools": ["search_calendar_items"],
+    "terminal_after": ["search_calendar_items"],
+    "require_terminal_response": true,
+    "fake_model_turns": [
+      {
+        "content": "I will run a broad synthetic calendar query.",
+        "tool_calls": [
+          {
+            "id": "call-partial-1",
+            "name": "search_calendar_items",
+            "args": {
+              "query": "broad partial",
+              "view": "all_items",
+              "temporal": {"scope": "upcoming"},
+              "limit": 10
+            }
+          }
+        ]
+      }
+    ]
+  },
+  {
+    "case_id": "identical_failed_loop",
+    "category": "repeated_failure",
+    "prompt": "Retry the same synthetic failing read if it fails.",
+    "expected_status": "failed",
+    "expected_tools": ["failing_source_read", "failing_source_read"],
+    "expected_outcome_code": "repeated_failed_tool_call",
+    "terminal_after": [],
+    "require_terminal_response": true,
+    "fake_model_turns": [
+      {
+        "content": "I will try the synthetic failing source.",
+        "tool_calls": [
+          {
+            "id": "call-fail-1",
+            "name": "failing_source_read",
+            "args": {"query": "stable failure"}
+          }
+        ]
+      },
+      {
+        "content": "I will try the same synthetic failing source again.",
+        "tool_calls": [
+          {
+            "id": "call-fail-2",
+            "name": "failing_source_read",
+            "args": {"query": "stable failure"}
+          }
+        ]
+      },
+      {
+        "content": "The source still failed."
+      }
+    ]
+  },
+  {
+    "case_id": "mixed_batch",
+    "category": "mixed_batch",
+    "prompt": "In one tool-call batch, search synthetic academic calendar items and synthetic LEARN scheduled items together.",
+    "expected_status": "completed",
+    "expected_tools": ["search_calendar_items", "get_learn_scheduled_items"],
+    "terminal_after": ["get_learn_scheduled_items"],
+    "require_terminal_response": true,
+    "fake_model_turns": [
+      {
+        "content": "I will read both synthetic sources.",
+        "tool_calls": [
+          {
+            "id": "call-mixed-1",
+            "name": "search_calendar_items",
+            "args": {
+              "query": "mixed batch",
+              "view": "tasks",
+              "temporal": {"scope": "upcoming"},
+              "limit": 5
+            }
+          },
+          {
+            "id": "call-mixed-2",
+            "name": "get_learn_scheduled_items",
+            "args": {
+              "course_ids": ["course-synthetic"],
+              "start_date": "2026-09-21",
+              "end_date": "2026-09-28",
+              "limit": 5
+            }
+          }
+        ]
+      }
+    ]
+  },
+  {
+    "case_id": "proposal_review",
+    "category": "proposal",
+    "prompt": "Prepare a synthetic calendar task for review.",
+    "expected_status": "completed",
+    "expected_tools": ["create_action_item"],
+    "terminal_after": ["create_action_item"],
+    "require_terminal_response": true,
+    "fake_model_turns": [
+      {
+        "content": "I will prepare a review-only proposal.",
+        "tool_calls": [
+          {
+            "id": "call-proposal-1",
+            "name": "create_action_item",
+            "args": {
+              "domain": "personal",
+              "title": "Synthetic proposal",
+              "temporal": {
+                "precision": "datetime",
+                "start_at": "2026-09-22T09:00:00-04:00",
+                "timezone": "America/Toronto"
+              },
+              "kind": "task"
+            }
+          }
+        ]
+      }
+    ]
+  },
+  {
+    "case_id": "ambiguous_write_result",
+    "category": "ambiguous_write",
+    "prompt": "Attempt a synthetic external write with an ambiguous result.",
+    "expected_status": "awaiting_user",
+    "expected_tools": ["ambiguous_external_write"],
+    "terminal_after": ["ambiguous_external_write"],
+    "require_terminal_response": true,
+    "fake_model_turns": [
+      {
+        "content": "I will attempt the synthetic external write.",
+        "tool_calls": [
+          {
+            "id": "call-ambiguous-1",
+            "name": "ambiguous_external_write",
+            "args": {"operation": "synthetic_write"}
+          }
+        ]
+      }
+    ]
+  },
+  {
+    "case_id": "replay_boundary",
+    "category": "replay",
+    "prompt": "Search synthetic academic calendar items, then recover that read after a checkpoint crash.",
+    "expected_status": "completed",
+    "expected_tools": ["search_calendar_items"],
+    "terminal_after": ["search_calendar_items"],
+    "require_terminal_response": true,
+    "replay_boundary": "tool_result",
+    "fake_model_turns": [
+      {
+        "content": "I will read the synthetic calendar once.",
+        "tool_calls": [
+          {
+            "id": "call-replay-1",
+            "name": "search_calendar_items",
+            "args": {
+              "query": "replay",
+              "view": "tasks",
+              "temporal": {"scope": "upcoming"},
+              "limit": 5
+            }
+          }
+        ]
+      }
+    ]
+  },
+  {
+    "case_id": "nightly_finalization",
+    "category": "nightly",
+    "prompt": "Finalize the synthetic nightly checklist.",
+    "expected_status": "completed",
+    "expected_tools": ["finalize_nightly_checklist"],
+    "terminal_after": ["finalize_nightly_checklist"],
+    "require_terminal_response": true,
+    "max_turns": 4,
+    "fake_model_turns": [
+      {
+        "content": "I will finalize the synthetic nightly checklist.",
+        "tool_calls": [
+          {
+            "id": "call-nightly-1",
+            "name": "finalize_nightly_checklist",
+            "args": {"completed_keys": ["synthetic-task"]}
+          }
+        ]
+      }
+    ]
+  },
+  {
+    "case_id": "career_grounded_read",
+    "category": "career",
+    "prompt": "Show the next synthetic interview.",
+    "expected_status": "completed",
+    "expected_tools": ["search_job_interviews"],
+    "terminal_after": ["search_job_interviews"],
+    "require_terminal_response": true,
+    "fake_model_turns": [
+      {
+        "content": "I will search synthetic interviews.",
+        "tool_calls": [
+          {
+            "id": "call-career-1",
+            "name": "search_job_interviews",
+            "args": {"query": "next interview", "limit": 5}
+          }
+        ]
+      }
+    ]
+  },
+  {
+    "case_id": "learn_grounded_read",
+    "category": "learn",
+    "prompt": "Show synthetic LEARN scheduled items.",
+    "expected_status": "completed",
+    "expected_tools": ["get_learn_scheduled_items"],
+    "terminal_after": ["get_learn_scheduled_items"],
+    "require_terminal_response": true,
+    "fake_model_turns": [
+      {
+        "content": "I will find the synthetic LEARN course.",
+        "tool_calls": [
+          {
+            "id": "call-learn-course-1",
+            "name": "search_learn_courses",
+            "args": {"query": "synthetic learn", "limit": 5}
+          }
+        ]
+      },
+      {
+        "content": "I will read the synthetic LEARN schedule.",
+        "tool_calls": [
+          {
+            "id": "call-learn-items-2",
+            "name": "get_learn_scheduled_items",
+            "args": {
+              "course_ids": ["course-synthetic"],
+              "start_date": "2026-09-21",
+              "end_date": "2026-09-28",
+              "limit": 5
+            }
+          }
+        ]
+      }
+    ]
+  }
+]

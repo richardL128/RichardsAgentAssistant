@@ -50,6 +50,66 @@ class _Connector:
     async def discover_course_assessments(self) -> NotionDiscoveryResult:
         return self.result
 
+    async def preflight_configured_databases(self) -> Any:
+        return SimpleNamespace(
+            sources={
+                "courses": SimpleNamespace(source_id=self.result.courses_source_id or "courses"),
+                "action_items": SimpleNamespace(source_id="action-items-source"),
+            },
+            diagnostics=self.result.diagnostics,
+            synced_at=self.result.synced_at,
+        )
+
+    async def read_courses(self) -> tuple[Any, ...]:
+        return tuple(
+            SimpleNamespace(
+                page_id=course.course_page_id,
+                title=course.course_title,
+                code=course.course_title,
+                term=course.term,
+                status=None,
+                archived=course.archived,
+                in_trash=course.in_trash,
+                source_id=course.courses_source_id,
+                property_ids={"Name": course.title_property_id or "title-prop"},
+            )
+            for course in self.result.courses
+        )
+
+    async def read_action_items(self) -> tuple[Any, ...]:
+        rows: list[Any] = []
+        for course in self.result.courses:
+            for assessment in course.assessments:
+                rows.append(
+                    SimpleNamespace(
+                        page_id=assessment.page_id,
+                        title=assessment.current_title,
+                        domain="academic",
+                        item_type=_item_type_for_title(assessment.current_title),
+                        status=assessment.status or "to_do",
+                        date=assessment.due,
+                        course_ids=(course.course_page_id,),
+                        application_ids=(),
+                        interview_ids=(),
+                        source_id="action-items-source",
+                        source_type="data_source",
+                        database_id="action-items-db",
+                        source_url=assessment.source_url,
+                        last_edited_at=assessment.last_edited_at,
+                        archived=assessment.archived,
+                        in_trash=assessment.in_trash,
+                        property_ids={
+                            "Name": assessment.title_property_id,
+                            "Date": assessment.date_property_id or "date-prop",
+                            "Domain": "domain-prop",
+                            "Status": "status-prop",
+                            "Item Type": "kind-prop",
+                        },
+                        notes=None,
+                    )
+                )
+        return tuple(rows)
+
     async def rename_assessment_title(self, **kwargs: Any) -> object:
         self.renames.append(kwargs)
         if self.transient_failures:
@@ -131,6 +191,31 @@ class _Store:
     ) -> str:
         self.assessments.append((assessment, kind, label_source))
         return str(uuid.uuid5(uuid.NAMESPACE_URL, assessment.notion_id))
+
+    def upsert_synced_course(self, course: Any) -> str:
+        self.calendars.append((course, "course", None))
+        return str(uuid.uuid5(uuid.NAMESPACE_URL, course.notion_id))
+
+    def upsert_canonical_action_item(self, item: Any) -> str:
+        temporal = item.temporal
+        due_at = getattr(temporal, "start_at", None)
+        ends_at = getattr(temporal, "end_at", None)
+        record = SimpleNamespace(
+            notion_id=item.source.notion_page_id or item.item_id,
+            page_id=item.source.notion_page_id or item.item_id,
+            title=item.title,
+            current_title=item.title,
+            due_at=due_at,
+            ends_at=ends_at,
+            start_date=getattr(temporal, "start_date", None),
+            end_date_exclusive=getattr(temporal, "end_date_exclusive", None),
+            fact_state="ambiguous" if item.status.value == "needs_review" else "confirmed",
+            ambiguity_reason=item.context.context_label,
+            is_all_day=getattr(temporal, "precision", None) == "date",
+            active=item.status.value != "canceled",
+        )
+        self.assessments.append((record, item.item_kind.value, "explicit_action_items"))
+        return str(uuid.uuid5(uuid.NAMESPACE_URL, record.notion_id))
 
     def reconcile_assessment_source(
         self,
@@ -287,6 +372,19 @@ def _assessment(
         last_edited_at=NOW,
         properties={"Private Notes": "never send this to a model"},
     )
+
+
+def _item_type_for_title(title: str) -> str:
+    lowered = title.casefold()
+    if "quiz" in lowered:
+        return "quiz"
+    if "tutorial" in lowered:
+        return "tutorial"
+    if "lab" in lowered:
+        return "lab"
+    if "assignment" in lowered:
+        return "assignment"
+    return "event"
 
 
 def _course(
@@ -481,6 +579,9 @@ async def test_sync_preserves_date_only_assessment_granularity() -> None:
 
     assert result.status == "succeeded"
     assessment = store.assessments[0][0]
+    assert assessment.due_at is None
+    assert assessment.start_date.isoformat() == "2026-09-20"
+    assert assessment.end_date_exclusive is None
     assert assessment.is_all_day is True
 
 

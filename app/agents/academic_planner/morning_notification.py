@@ -1002,20 +1002,76 @@ async def execute_scheduled_morning_notification(
     job_items = tuple(item for item in calendar_items if item.source_area.value == "jobs")
     schedule_items = tuple(item for item in calendar_items if item.source_area.value == "learn")
 
+    course_composition = None
     job_composition = None
     misc_composition = None
     schedule_composition = None
     if morning_composer is not None:
-        if career_condition is None and job_items:
-            with suppress(Exception):
-                job_composition = await morning_composer.compose_event_digests(
-                    MorningCategory.JOBS, job_items
+        task_categories = (
+            (
+                MorningCategory.COURSES,
+                academic_items,
+                academic_available and "course" not in unavailable_academic_roles,
+            ),
+            (MorningCategory.JOBS, job_items, career_condition is None),
+            (
+                MorningCategory.MISC,
+                misc_items,
+                academic_available and "misc" not in unavailable_academic_roles,
+            ),
+        )
+        task_compositions: dict[MorningCategory, object] = {}
+        for category, items, source_available in task_categories:
+            eligible = tuple(
+                item
+                for item in items
+                if item.semantic_status is CalendarEventSemanticStatus.VALID
+                and item.semantic_overview is not None
+            )
+            if not source_available or not eligible:
+                continue
+            phase = f"spoken_composition.{category.value}"
+            _record_progress(
+                progress,
+                phase,
+                "running",
+                attempt=attempt,
+                diagnostic=f"spoken_task_generation_started:{len(eligible)}",
+            )
+            try:
+                composition = await morning_composer.compose_spoken_tasks(category, eligible)
+            except Exception:
+                composition = None
+            if composition is None:
+                _record_progress(
+                    progress,
+                    phase,
+                    "failed",
+                    attempt=attempt,
+                    diagnostic=f"spoken_task_generation_unavailable:{len(eligible)}",
                 )
-        if academic_available and "misc" not in unavailable_academic_roles and misc_items:
-            with suppress(Exception):
-                misc_composition = await morning_composer.compose_event_digests(
-                    MorningCategory.MISC, misc_items
+                continue
+            task_compositions[category] = composition
+            accepted_count = len(
+                tuple(
+                    clause
+                    for clause in composition.clauses
+                    if clause.action_phrase is not None
                 )
+            )
+            _record_progress(
+                progress,
+                phase,
+                "succeeded",
+                attempt=attempt,
+                diagnostic=(
+                    f"spoken_tasks_accepted:{accepted_count};"
+                    f"spoken_tasks_total:{len(eligible)}"
+                ),
+            )
+        course_composition = task_compositions.get(MorningCategory.COURSES)
+        job_composition = task_compositions.get(MorningCategory.JOBS)
+        misc_composition = task_compositions.get(MorningCategory.MISC)
         if academic_available and "learn" not in unavailable_academic_roles and schedule_items:
             with suppress(Exception):
                 schedule_composition = await morning_composer.compose_schedule(schedule_items)
@@ -1074,6 +1130,7 @@ async def execute_scheduled_morning_notification(
             job_items=job_items,
             misc_items=misc_items,
             schedule_items=schedule_items,
+            course_composition=course_composition,
             job_composition=job_composition,
             misc_composition=misc_composition,
             schedule_composition=schedule_composition,

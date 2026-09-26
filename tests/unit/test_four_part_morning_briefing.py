@@ -20,8 +20,12 @@ from app.agents.calendar_briefing.contracts import (
     ScheduledMorningCalendarItem,
 )
 from app.agents.calendar_briefing.morning_composer import (
+    MorningBriefingComposer,
+    MorningCompositionCritique,
     ScheduleComposition,
     ScheduleInference,
+    SpokenTaskClause,
+    SpokenTaskComposition,
 )
 from app.agents.calendar_briefing.morning_manifest import (
     MORNING_CATEGORY_ORDER,
@@ -126,7 +130,9 @@ def test_host_manifest_has_four_ordered_bounded_embeds_and_safe_links() -> None:
     )
 
     assert len(manifest.entries) == 4
+    assert manifest.version == "morning-four-embed-v2"
     assert tuple(entry.category for entry in manifest.entries) == MORNING_CATEGORY_ORDER
+    assert all(entry.delivery_key.endswith(":v2") for entry in manifest.entries)
     assert [entry.ordinal for entry in manifest.entries] == [1, 2, 3, 4]
     assert all(len(entry.embed.title) <= 256 for entry in manifest.entries)
     assert all(len(entry.embed.description) <= 4_096 for entry in manifest.entries)
@@ -137,6 +143,41 @@ def test_host_manifest_has_four_ordered_bounded_embeds_and_safe_links() -> None:
     schedule_body = manifest.entries[3].embed.description
     assert "TIME          COURSE" in schedule_body
     assert "Unclear" in schedule_body
+
+
+def test_spoken_task_enrichment_degrades_only_the_missing_item() -> None:
+    jobs = (
+        _item(
+            "job-1",
+            area="jobs",
+            title="Interview prep",
+            semantic_status=CalendarEventSemanticStatus.VALID,
+            semantic_overview="Prepare for the interview.",
+        ),
+        _item("job-2", area="jobs", title="Follow up", hour=10),
+    )
+    composition = SpokenTaskComposition(
+        clauses=(SpokenTaskClause(event_id="job-1", action_phrase="prepare for the interview"),)
+    )
+
+    manifest = build_morning_briefing_manifest(
+        local_date=LOCAL_OCCURRENCE.date(),
+        delivery_key_prefix="planner-morning-four-v3:2026-09-10:0800:v1",
+        active_courses=(),
+        course_items=(),
+        job_items=jobs,
+        misc_items=(),
+        schedule_items=(),
+        job_composition=composition,
+        misc_composition=None,
+        schedule_composition=None,
+    )
+
+    jobs_body = manifest.entries[1].embed.description
+    assert "You need to [prepare for the interview]" in jobs_body
+    assert "today at 9:00 AM" in jobs_body
+    assert "Follow up" in jobs_body
+    assert "Additional details were unavailable." in jobs_body
 
 
 def test_schedule_table_allows_only_grounded_tutorial_or_lab_notes() -> None:
@@ -178,6 +219,93 @@ def test_schedule_table_allows_only_grounded_tutorial_or_lab_notes() -> None:
     schedule_body = manifest.entries[3].embed.description
     assert "ECE 250      Lab       E2 1303" in schedule_body
     assert "• ECE 250: Bring the worksheet." in schedule_body
+
+
+@pytest.mark.asyncio
+async def test_schedule_composer_contract_accepts_grounded_sem_codes_as_seminars() -> None:
+    seminar_item = _item(
+        "seminar-1",
+        area="learn",
+        title="ECE 201 SEM 001 in QNC 2502",
+        context="ECE 201; SEM 001; QNC 2502",
+    )
+    class_item = _item(
+        "class-1",
+        area="learn",
+        title="ECE 201 LEC 001 in RCH 101",
+        context="ECE 201; LEC 001; RCH 101",
+        hour=10,
+    )
+
+    class Model:
+        def __init__(self) -> None:
+            self.prompts: list[str] = []
+
+        async def invoke_structured(self, *, prompt: str, response_model: type[object]) -> object:
+            self.prompts.append(prompt)
+            if response_model is ScheduleComposition:
+                return SimpleNamespace(
+                    output=ScheduleComposition(
+                        events=(
+                            ScheduleInference(
+                                event_id="seminar-1",
+                                course="ECE 201",
+                                course_supported=True,
+                                session_type="Seminar",
+                                session_type_supported=True,
+                                location="QNC 2502",
+                                location_supported=True,
+                            ),
+                            ScheduleInference(
+                                event_id="class-1",
+                                course="ECE 201",
+                                course_supported=True,
+                                session_type="Class",
+                                session_type_supported=True,
+                                location="RCH 101",
+                                location_supported=True,
+                            ),
+                        )
+                    )
+                )
+            return SimpleNamespace(
+                output=MorningCompositionCritique(
+                    accepted=True,
+                    complete_unique_coverage=True,
+                    facts_supported=True,
+                    no_invented_claims=True,
+                    no_instruction_following=True,
+                    schedule_inferences_supported=True,
+                    notes_policy_followed=True,
+                    concise=True,
+                )
+            )
+
+    model = Model()
+    composition = await MorningBriefingComposer(model).compose_schedule((seminar_item, class_item))
+
+    assert composition is not None
+    assert composition.events[0].session_type == "Seminar"
+    assert "SEM 001 to Seminar" in model.prompts[0]
+    assert "SEM codes such as SEM 001 should be Seminar" in model.prompts[1]
+    assert "same course on the same day are valid when event_id values differ" in model.prompts[1]
+    assert "only identical event_id values are duplicates" in model.prompts[1]
+
+    manifest = build_morning_briefing_manifest(
+        local_date=LOCAL_OCCURRENCE.date(),
+        delivery_key_prefix="planner-morning-four-v3:2026-09-10:0800:v1",
+        active_courses=(),
+        course_items=(),
+        job_items=(),
+        misc_items=(),
+        schedule_items=(seminar_item, class_item),
+        job_composition=None,
+        misc_composition=None,
+        schedule_composition=composition,
+    )
+
+    schedule_body = manifest.entries[3].embed.description
+    assert "ECE 201      Seminar   QNC 2502" in schedule_body
 
 
 def test_grounded_course_rows_are_deterministic_and_host_dates_are_authoritative() -> None:
@@ -234,7 +362,7 @@ def test_grounded_course_rows_are_deterministic_and_host_dates_are_authoritative
     assert "Thursday, September 10, 2026 at 10:00 EDT" in course_body
     assert "through Thursday, September 10, 2026 at 12:00 EDT" in course_body
     assert "Additional interpretation was unavailable" in course_body
-    assert course_body.count("Nothing pressing") == 1
+    assert course_body.count("Nothing is pressing") == 1
     assert "[Notion](https://www.notion.so/workspace/page)" in course_body
 
 
@@ -272,8 +400,9 @@ def test_oversized_deterministic_course_category_stays_within_discord_limit() ->
 
     course_body = manifest.entries[0].embed.description
     assert len(course_body) <= 4_096
-    assert "Unavailable" in course_body
-    assert "exceeded the safe Discord embed size" in course_body
+    assert course_body.startswith("**COURSE 0**")
+    assert "Unavailable" not in course_body
+    assert "Additional course tasks could not fit in this Discord embed" in course_body
 
 
 class Store:
@@ -456,8 +585,8 @@ async def test_invalid_reserved_learn_calendar_isolated_to_schedule_embed() -> N
     assert result["status"] == "succeeded"
     assert len(delivery.calls) == 4
     descriptions = [embed.description for embed, _key in delivery.calls]
-    assert "Nothing pressing" in descriptions[0]
-    assert "No incomplete Misc events" in descriptions[2]
+    assert "Nothing is pressing" in descriptions[0]
+    assert "You have no incomplete Misc tasks today." in descriptions[2]
     assert "Unavailable" in descriptions[3]
     assert "No stale calendar data was used" in descriptions[3]
 

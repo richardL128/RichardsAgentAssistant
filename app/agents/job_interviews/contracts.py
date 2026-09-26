@@ -8,6 +8,8 @@ from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
+from app.agents.action_items import TemporalValue
+
 
 class CareerModel(BaseModel):
     model_config = ConfigDict(extra="forbid", str_strip_whitespace=True)
@@ -142,6 +144,29 @@ class UrlCandidate(CareerModel):
     label: str | None = Field(default=None, max_length=255)
 
 
+CareerTemporalValue = TemporalValue
+
+
+class CareerApplicationSnapshot(CareerModel):
+    application_id: str = Field(min_length=1, max_length=255)
+    company_name: str | None = Field(default=None, max_length=255)
+    role_title: str | None = Field(default=None, max_length=500)
+    pipeline_status: str | None = Field(default=None, max_length=255)
+    next_action: str | None = Field(default=None, max_length=1_000)
+    next_action_temporal: TemporalValue | None = None
+    timezone: str = Field(default="America/Toronto", min_length=1, max_length=64)
+    posting_url: str | None = Field(default=None, max_length=2_048)
+    source_url: str | None = Field(default=None, max_length=2_048)
+    content_fingerprint: str = Field(min_length=1, max_length=128)
+    last_edited_at: datetime
+    active: bool = True
+
+    @field_validator("last_edited_at")
+    @classmethod
+    def last_edited_at_aware(cls, value: datetime) -> datetime:
+        return _aware(value)
+
+
 class InterviewEventSnapshot(CareerModel):
     interview_page_id: str = Field(min_length=1, max_length=255)
     title: str = Field(min_length=1, max_length=500)
@@ -149,6 +174,11 @@ class InterviewEventSnapshot(CareerModel):
     local_date: date
     is_all_day: bool
     timezone: str = Field(min_length=1, max_length=64, default="America/Toronto")
+    temporal_value: TemporalValue | None = None
+    application_id: str | None = Field(default=None, max_length=255)
+    stage: str | None = Field(default=None, max_length=255)
+    interview_status: str | None = Field(default=None, max_length=255)
+    preparation_status: str | None = Field(default=None, max_length=255)
     last_edited_at: datetime
     source_url: str | None = Field(default=None, max_length=2_048)
     tags: tuple[str, ...] = Field(default=(), max_length=50)

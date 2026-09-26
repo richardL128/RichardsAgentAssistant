@@ -63,6 +63,9 @@ def _notion_settings(**overrides: object) -> Settings:
     defaults: dict[str, object] = {
         "notion_token": "notion-secret",
         "notion_courses_database_id": "courses",
+        "notion_action_items_database_id": "actions",
+        "notion_applications_database_id": "applications",
+        "notion_interviews_database_id": "interviews",
     }
     defaults.update(overrides)
     return Settings(**defaults)
@@ -804,12 +807,14 @@ def test_notion_authentication_unauthenticated_fails() -> None:
     assert "notion-secret" not in result.diagnostic
 
 
-def test_connector_liveness_aggregates_all_three_checks() -> None:
+def test_connector_liveness_aggregates_all_connector_checks() -> None:
     settings = _github_settings(
         discord_bot_token="discord-secret",
         notion_token="notion-secret",
         notion_courses_database_id="courses",
-        notion_assessments_database_id="assessments",
+        notion_action_items_database_id="actions",
+        notion_applications_database_id="applications",
+        notion_interviews_database_id="interviews",
     )
 
     async def fetcher() -> InstallationToken:
@@ -829,6 +834,12 @@ def test_connector_liveness_aggregates_all_three_checks() -> None:
         "github_installation_token",
         "discord_authentication",
         "notion_authentication",
+        "notion_schema_preflight",
     }
     assert names.isdisjoint(_AGENT_CHECK_NAMES)
-    assert all(check.state is HealthState.HEALTHY for check in checks)
+    assert {check.name: check.state for check in checks} == {
+        "github_installation_token": HealthState.HEALTHY,
+        "discord_authentication": HealthState.HEALTHY,
+        "notion_authentication": HealthState.HEALTHY,
+        "notion_schema_preflight": HealthState.FAILED,
+    }

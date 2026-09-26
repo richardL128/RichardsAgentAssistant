@@ -10,19 +10,24 @@ from datetime import UTC, date, datetime
 from typing import Any, Literal, Protocol, cast
 from zoneinfo import ZoneInfo
 
+from pydantic import TypeAdapter
+
+from app.agents.action_items import DateOnlyValue, DateTimeValue, TemporalValue
 from app.connectors.notion import (
+    NotionApplicationRecord,
     NotionConnector,
+    NotionDateValue,
     NotionDiscoveryDiagnostic,
-    NotionInterviewEvent,
-    NotionJobsDiscoveryResult,
+    NotionInterviewRecord,
 )
 from app.core.errors import ErrorCode, LifeAgentError
 from app.db.job_interviews import (
-    ApplicationRowInput,
-    ApplicationTableInput,
+    CareerApplicationInput,
     InterviewEventInput,
     JobsWorkspaceInput,
 )
+
+_TEMPORAL_VALUE_ADAPTER: TypeAdapter[TemporalValue] = TypeAdapter(TemporalValue)
 
 
 class JobInterviewSyncStore(Protocol):
@@ -32,7 +37,17 @@ class JobInterviewSyncStore(Protocol):
 
     def upsert_jobs_workspace(self, workspace: JobsWorkspaceInput) -> Any: ...
 
-    def upsert_application_table(self, workspace_id: Any, table: ApplicationTableInput) -> Any: ...
+    def upsert_career_application(
+        self,
+        workspace_id: Any,
+        application: CareerApplicationInput,
+    ) -> Any: ...
+
+    def deactivate_missing_career_applications(
+        self,
+        workspace_id: Any,
+        seen_application_ids: set[str],
+    ) -> int: ...
 
     def upsert_interview_event(self, workspace_id: Any, interview: InterviewEventInput) -> Any: ...
 
@@ -103,12 +118,13 @@ class JobInterviewNotionSync:
                 synced_at=current,
             )
         try:
-            result = await self._connector.discover_jobs_workspace()
+            applications = await self._connector.read_applications()
+            interviews = await self._connector.read_interviews()
         except LifeAgentError as exc:
             diagnostic = NotionDiscoveryDiagnostic(
                 code="jobs_notion_sync_failed",
                 severity="error",
-                message="Jobs workspace synchronization failed",
+                message="Career Applications/Interviews synchronization failed",
             )
             _record_diagnostic(self._store, diagnostic, synced_at=current)
             return JobInterviewSyncResult(
@@ -122,7 +138,7 @@ class JobInterviewNotionSync:
             diagnostic = NotionDiscoveryDiagnostic(
                 code="jobs_notion_sync_failed",
                 severity="error",
-                message="Jobs workspace synchronization failed",
+                message="Career Applications/Interviews synchronization failed",
             )
             _record_diagnostic(self._store, diagnostic, synced_at=current)
             return JobInterviewSyncResult(
@@ -131,40 +147,36 @@ class JobInterviewNotionSync:
                 error_code=ErrorCode.SOURCE_SETUP_REQUIRED.value,
                 synced_at=current,
             )
-        return self._persist_result(result)
+        return self._persist_records(applications, interviews, synced_at=current)
 
-    def _persist_result(self, result: NotionJobsDiscoveryResult) -> JobInterviewSyncResult:
-        diagnostics = list(result.diagnostics)
-        for diagnostic in diagnostics:
-            _record_diagnostic(self._store, diagnostic, synced_at=result.synced_at)
-        if result.courses_source_id is not None:
-            self._store.save_sync_cursor(result.courses_source_id, result.synced_at.isoformat())
-        if result.jobs_page_id is None:
-            codes = _error_codes(diagnostics)
-            self._store.upsert_jobs_workspace(
-                _workspace_record(result, status=_workspace_status(diagnostics))
-            )
-            return JobInterviewSyncResult(
-                status="setup_required",
-                diagnostic_codes=codes,
-                synced_at=result.synced_at,
-                error_code=ErrorCode.SOURCE_SETUP_REQUIRED.value,
-            )
-
-        workspace = _workspace_record(result, status=_workspace_status(diagnostics))
+    def _persist_records(
+        self,
+        applications: Sequence[NotionApplicationRecord],
+        interviews: Sequence[NotionInterviewRecord],
+        *,
+        synced_at: datetime,
+    ) -> JobInterviewSyncResult:
+        diagnostics: list[NotionDiscoveryDiagnostic] = []
+        workspace = _workspace_record(interviews, synced_at=synced_at)
         workspace_result = self._store.upsert_jobs_workspace(workspace)
         workspace_id = _store_identity(workspace_result)
 
         application_row_count = 0
-        for table in result.application_tables:
-            table_input = _table_record(table)
-            self._store.upsert_application_table(workspace_id, table_input)
-            application_row_count += sum(1 for row in table_input.rows if not row.is_header)
+        seen_application_ids: set[str] = set()
+        for index, application in enumerate(applications):
+            record = _application_record(application, row_order=index)
+            self._store.upsert_career_application(workspace_id, record)
+            seen_application_ids.add(record.application_id)
+            application_row_count += 1
+        inactive_application_row_count = self._store.deactivate_missing_career_applications(
+            workspace_id,
+            seen_application_ids,
+        )
 
         interview_count = 0
         unscheduled_interview_count = 0
         seen_interview_ids: set[str] = set()
-        for interview in result.interviews:
+        for interview in interviews:
             record, schedule_diagnostic = _interview_record(
                 interview,
                 timezone=self._timezone,
@@ -172,7 +184,7 @@ class JobInterviewNotionSync:
             if schedule_diagnostic is not None or record is None:
                 if schedule_diagnostic is not None:
                     diagnostics.append(schedule_diagnostic)
-                    _record_diagnostic(self._store, schedule_diagnostic, synced_at=result.synced_at)
+                    _record_diagnostic(self._store, schedule_diagnostic, synced_at=synced_at)
                 unscheduled_interview_count += 1
                 continue
             self._store.upsert_interview_event(workspace_id, record)
@@ -182,82 +194,108 @@ class JobInterviewNotionSync:
             workspace_id,
             seen_interview_ids,
         )
-        if result.interviews_source_id is not None:
-            self._store.save_sync_cursor(result.interviews_source_id, result.synced_at.isoformat())
+        for source_id in _source_ids(applications, interviews):
+            self._store.save_sync_cursor(source_id, synced_at.isoformat())
 
-        codes = _error_codes(diagnostics)
         warning_codes = _warning_codes(diagnostics)
-        if codes:
-            status: Literal["succeeded", "partial", "setup_required"] = "setup_required"
-        elif warning_codes or unscheduled_interview_count:
-            status = "partial"
-        else:
-            status = "succeeded"
+        status = "partial" if warning_codes or unscheduled_interview_count else "succeeded"
         return JobInterviewSyncResult(
             status=status,
-            table_count=len(result.application_tables),
+            table_count=0,
             application_row_count=application_row_count,
             interview_count=interview_count,
             unscheduled_interview_count=unscheduled_interview_count,
-            inactive_application_row_count=0,
+            inactive_application_row_count=inactive_application_row_count,
             inactive_interview_count=inactive_interview_count,
-            diagnostic_codes=tuple(sorted(set(codes + warning_codes))),
-            synced_at=result.synced_at,
+            diagnostic_codes=warning_codes,
+            synced_at=synced_at,
             error_code=(ErrorCode.SOURCE_SYNC_PARTIAL.value if status == "partial" else None),
         )
 
 
-def _workspace_record(result: NotionJobsDiscoveryResult, *, status: str) -> JobsWorkspaceInput:
-    primary_diagnostic = next(
-        (item for item in result.diagnostics if item.severity == "error"),
-        next(iter(result.diagnostics), None),
-    )
+def _workspace_record(
+    interviews: Sequence[NotionInterviewRecord],
+    *,
+    synced_at: datetime,
+) -> JobsWorkspaceInput:
+    interview = next(iter(interviews), None)
     return JobsWorkspaceInput(
-        jobs_page_id=result.jobs_page_id,
-        jobs_page_title=result.jobs_title or "Jobs",
-        discovery_status=status,
-        diagnostic_code=primary_diagnostic.code if primary_diagnostic is not None else None,
-        diagnostic_fingerprint=(
-            _diagnostic_fingerprint(primary_diagnostic) if primary_diagnostic is not None else None
+        jobs_page_title="Jobs",
+        discovery_status="valid",
+        interviews_database_id=interview.database_id if interview is not None else None,
+        interviews_data_source_id=interview.source_id if interview is not None else None,
+        title_property_id=interview.property_ids.get("Name") if interview is not None else None,
+        title_property_name="Name" if interview is not None else None,
+        date_property_id=interview.property_ids.get("Date") if interview is not None else None,
+        date_property_name="Date" if interview is not None else None,
+        discovered_at=synced_at,
+        synced_at=synced_at,
+    )
+
+
+def _application_record(
+    application: NotionApplicationRecord,
+    *,
+    row_order: int,
+) -> CareerApplicationInput:
+    timezone = (
+        application.next_action_due.time_zone
+        if application.next_action_due is not None and application.next_action_due.time_zone
+        else "America/Toronto"
+    )
+    temporal = _temporal_value(
+        application.next_action_due,
+        timezone=timezone,
+    )
+    content_fingerprint = _content_fingerprint(
+        application.page_id,
+        application.company,
+        application.role,
+        application.pipeline_status,
+        application.next_action,
+        temporal.model_dump(mode="json") if temporal else None,
+        application.posting_url,
+        application.last_edited_at.isoformat(),
+    )
+    return CareerApplicationInput(
+        application_id=application.page_id,
+        applications_database_id=application.database_id,
+        applications_data_source_id=application.source_id,
+        company_name=application.company,
+        role_title=application.role,
+        status=application.pipeline_status,
+        next_action=application.next_action,
+        next_action_temporal=temporal,
+        posting_url=application.posting_url,
+        applied_on=_date_value_start(application.applied_on),
+        deadline=_date_value_start(application.deadline),
+        property_snapshot=_jsonable_mapping(application.properties),
+        source_url=application.source_url,
+        content_fingerprint=content_fingerprint,
+        last_edited_at=application.last_edited_at,
+        row_order=row_order,
+        active=(
+            (application.active is not False)
+            and not application.archived
+            and not application.in_trash
         ),
-        interviews_database_id=result.interviews_database_id,
-        interviews_data_source_id=result.interviews_source_id,
-        title_property_id=result.interview_title_property_id,
-        title_property_name=result.interview_title_property_name,
-        date_property_id=result.interview_date_property_id,
-        date_property_name=result.interview_date_property_name,
-        discovered_at=result.synced_at,
-        synced_at=result.synced_at,
+        archived=application.archived or application.in_trash,
     )
 
 
-def _table_record(table: Any) -> ApplicationTableInput:
-    rows = tuple(_row_record(row) for row in table.rows)
-    return ApplicationTableInput(
-        table_block_id=table.table_block_id,
-        table_order=table.table_order,
-        has_column_header=table.has_column_header,
-        content_fingerprint=table.content_fingerprint,
-        last_seen_at=table.last_seen_at,
-        rows=rows,
+def _date_value_start(value: NotionDateValue | None) -> date | None:
+    temporal = (
+        _temporal_value(value, timezone=value.time_zone or "America/Toronto") if value else None
     )
-
-
-def _row_record(row: Any) -> ApplicationRowInput:
-    return ApplicationRowInput(
-        row_block_id=row.row_block_id,
-        row_order=row.row_order,
-        cells=row.cells,
-        normalized_cells=row.cells,
-        content_fingerprint=row.content_fingerprint,
-        last_seen_at=row.last_seen_at,
-        is_header=row.is_header,
-        active=True,
-    )
+    if isinstance(temporal, DateOnlyValue):
+        return temporal.start_date
+    if isinstance(temporal, DateTimeValue):
+        return temporal.start_at.astimezone(ZoneInfo(temporal.timezone)).date()
+    return None
 
 
 def _interview_record(
-    interview: NotionInterviewEvent,
+    interview: NotionInterviewRecord,
     *,
     timezone: ZoneInfo,
 ) -> tuple[InterviewEventInput | None, NotionDiscoveryDiagnostic | None]:
@@ -267,12 +305,12 @@ def _interview_record(
             code=f"interview_{state}",
             severity="warning",
             message=reason or "Interview date needs attention",
-            source_id=interview.interviews_source_id,
-            source_type=interview.interviews_source_type,
-            course_page_id=interview.jobs_page_id,
+            source_id=interview.source_id,
+            source_type=interview.source_type,
+            course_page_id=interview.page_id,
             course_title=interview.title[:255] or None,
-            property_id=interview.date_property_id,
-            property_name=interview.date_property_name,
+            property_id=interview.property_ids.get("Date"),
+            property_name="Date",
         )
     archived = interview.archived or interview.in_trash
     return (
@@ -285,15 +323,22 @@ def _interview_record(
             date_start=starts_at,
             is_all_day=all_day,
             timezone=str(timezone),
-            interviews_database_id=interview.interviews_database_id,
-            interviews_data_source_id=interview.interviews_source_id,
+            temporal_value=_interview_temporal_value(
+                local_day=local_day,
+                starts_at=starts_at,
+                all_day=all_day,
+                timezone=str(timezone),
+            ),
+            application_id=interview.application_ids[0] if interview.application_ids else None,
+            stage=interview.stage,
+            interview_status=interview.status,
+            preparation_status=interview.prep_status,
+            interviews_database_id=interview.database_id,
+            interviews_data_source_id=interview.source_id,
             source_url=interview.source_url,
-            tags=_tags(interview.properties),
+            tags=(),
             property_snapshot=_jsonable_mapping(interview.properties),
             url_candidates=_url_candidates(interview),
-            evidence_fragments=tuple(
-                fragment.model_dump(mode="json") for fragment in interview.evidence_fragments
-            ),
             active=not archived,
             archived=archived,
         ),
@@ -302,7 +347,7 @@ def _interview_record(
 
 
 def _parse_interview_date(
-    interview: NotionInterviewEvent,
+    interview: NotionInterviewRecord,
     timezone: ZoneInfo,
 ) -> tuple[
     datetime | None,
@@ -333,6 +378,92 @@ def _parse_interview_date(
         )
 
 
+def _first_text(source: Any, *names: str) -> str | None:
+    for name in names:
+        value = getattr(source, name, None)
+        if value is None and isinstance(source, Mapping):
+            value = source.get(name)
+        if value is None:
+            continue
+        text = str(value).strip()
+        if text:
+            return text[:2_048]
+    return None
+
+
+def _first_datetime(source: Any, *names: str) -> datetime | None:
+    for name in names:
+        value = getattr(source, name, None)
+        if value is None and isinstance(source, Mapping):
+            value = source.get(name)
+        if isinstance(value, datetime):
+            return _aware(value)
+        if isinstance(value, str) and value.strip():
+            try:
+                return _aware(datetime.fromisoformat(value.replace("Z", "+00:00")))
+            except ValueError:
+                continue
+    return None
+
+
+def _temporal_value(value: Any, *, timezone: str) -> TemporalValue | None:
+    if value is None:
+        return None
+    if isinstance(value, DateOnlyValue | DateTimeValue):
+        return value
+    if isinstance(value, NotionDateValue):
+        return _temporal_value(value.start, timezone=value.time_zone or timezone)
+    if isinstance(value, Mapping):
+        try:
+            return _TEMPORAL_VALUE_ADAPTER.validate_python(value)
+        except ValueError:
+            return None
+    if isinstance(value, date) and not isinstance(value, datetime):
+        return DateOnlyValue(start_date=value)
+    if isinstance(value, datetime):
+        parsed = (
+            value.replace(tzinfo=ZoneInfo(timezone))
+            if value.tzinfo is None or value.utcoffset() is None
+            else value
+        )
+        return DateTimeValue(
+            start_at=_aware(parsed),
+            timezone=timezone,
+        )
+    if isinstance(value, str):
+        text = value.strip()
+        if not text:
+            return None
+        try:
+            if "T" not in text:
+                return DateOnlyValue(start_date=date.fromisoformat(text))
+            parsed = datetime.fromisoformat(text.replace("Z", "+00:00"))
+            if parsed.tzinfo is None or parsed.utcoffset() is None:
+                parsed = parsed.replace(tzinfo=ZoneInfo(timezone))
+            return DateTimeValue(
+                start_at=parsed,
+                timezone=timezone,
+            )
+        except ValueError:
+            return None
+    return None
+
+
+def _interview_temporal_value(
+    *,
+    local_day: date,
+    starts_at: datetime | None,
+    all_day: bool,
+    timezone: str,
+) -> TemporalValue:
+    if all_day or starts_at is None:
+        return DateOnlyValue(start_date=local_day)
+    return DateTimeValue(
+        start_at=starts_at,
+        timezone=timezone,
+    )
+
+
 def _workspace_status(diagnostics: Sequence[NotionDiscoveryDiagnostic]) -> str:
     codes = {item.code for item in diagnostics if item.severity == "error"}
     if "jobs_page_duplicate" in codes:
@@ -354,15 +485,16 @@ def _tags(properties: Mapping[str, Any]) -> tuple[str, ...]:
     return tuple(item[:255] for item in items if isinstance(item, str) and item.strip())[:50]
 
 
-def _url_candidates(interview: NotionInterviewEvent) -> tuple[Mapping[str, Any], ...]:
-    return tuple(
+def _url_candidates(interview: NotionInterviewRecord) -> tuple[Mapping[str, Any], ...]:
+    if not interview.meeting_url:
+        return ()
+    return (
         {
-            "url": candidate.url,
-            "source_kind": "block" if candidate.source_kind == "page_body" else "property",
-            "source_id": candidate.source_id,
-            "label": candidate.source_name,
-        }
-        for candidate in interview.url_candidates[:25]
+            "url": interview.meeting_url,
+            "source_kind": "property",
+            "source_id": interview.property_ids.get("Meeting URL") or interview.page_id,
+            "label": "Meeting URL",
+        },
     )
 
 
@@ -388,25 +520,29 @@ def _jsonable(value: Any) -> Any:
     return str(value)
 
 
-def _interview_fingerprint(interview: NotionInterviewEvent) -> str:
+def _interview_fingerprint(interview: NotionInterviewRecord) -> str:
     payload = {
         "page_id": interview.page_id,
         "title": interview.title,
         "date": interview.date.model_dump(mode="python") if interview.date else None,
+        "application_ids": interview.application_ids,
+        "stage": interview.stage,
+        "interview_status": interview.status,
+        "preparation_status": interview.prep_status,
+        "meeting_url": interview.meeting_url,
         "last_edited_at": interview.last_edited_at.isoformat(),
-        "url_candidates": [item.url for item in interview.url_candidates],
-        "evidence_fragments": [
-            {
-                "fragment_id": item.fragment_id,
-                "source_kind": item.source_kind,
-                "source_label": item.source_label,
-                "text": item.text,
-                "ordinal": item.ordinal,
-            }
-            for item in interview.evidence_fragments
-        ],
     }
     body = json.dumps(payload, ensure_ascii=True, sort_keys=True, separators=(",", ":"))
+    return hashlib.sha256(body.encode("utf-8")).hexdigest()
+
+
+def _content_fingerprint(*values: Any) -> str:
+    body = json.dumps(
+        _jsonable(values),
+        ensure_ascii=True,
+        sort_keys=True,
+        separators=(",", ":"),
+    )
     return hashlib.sha256(body.encode("utf-8")).hexdigest()
 
 
@@ -436,6 +572,17 @@ def _record_diagnostic(
 
 def _store_identity(value: Any) -> Any:
     return getattr(value, "id", value)
+
+
+def _source_ids(
+    applications: Sequence[NotionApplicationRecord],
+    interviews: Sequence[NotionInterviewRecord],
+) -> tuple[str, ...]:
+    seen: list[str] = []
+    for record in (*applications, *interviews):
+        if record.source_id not in seen:
+            seen.append(record.source_id)
+    return tuple(seen)
 
 
 def _error_codes(diagnostics: Sequence[NotionDiscoveryDiagnostic]) -> tuple[str, ...]:

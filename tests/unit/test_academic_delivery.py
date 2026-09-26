@@ -171,7 +171,7 @@ async def test_scheduled_academic_notification_delivers_exact_content_once(
 
 @pytest.mark.asyncio
 async def test_scheduled_morning_embed_uses_nonce_mentions_and_idempotency(engine: Engine) -> None:
-    key = "planner-morning-four-v3:2026-09-10:0800:jobs:v1"
+    key = "planner-morning-four-v3:2026-09-10:0800:jobs:v2"
     with Session(engine) as session, session.begin():
         run = RunRepository.create_or_get(
             session,

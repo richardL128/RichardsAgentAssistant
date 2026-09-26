@@ -69,7 +69,7 @@ _SAFE_TOOL_ACTIVITY_LABELS = {
     "propose_interview_date": "proposal_drafting",
     "propose_interview_plan_save": "proposal_drafting",
     "search_assessment_materials": "assessment_data",
-    "search_assessments": "assessment_data",
+    "search_calendar_items": "calendar_item_data",
     "search_courses": "course_data",
     "search_job_interviews": "interview_data",
     "search_jobs_context": "interview_data",

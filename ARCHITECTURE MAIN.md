@@ -13,7 +13,7 @@ The local Qwen model performs reading, reasoning, prioritization, and explanatio
 
 The configured runtime permits Qwen in two bounded paths: an authorized message
 in the private academic Discord channel, and bounded event interpretation plus
-non-course category composition for the automatic morning calendar briefing. A native
+spoken task composition for the automatic morning calendar briefing. A native
 macOS LaunchAgent owns the
 sole Discord Gateway connection, acknowledges interactive messages, wakes the
 fixed Compose services and Ollama API, and submits an HMAC-signed reference to
@@ -36,10 +36,14 @@ Every model boundary receives a host-budgeted working set: current policy and
 owner input, an adjacency-safe recent tail, a validated cumulative session
 summary, relevant active generic owner memories, and current tool-loop state.
 The full append-only transcript remains the recovery and audit source and is
-never replaced by summary or memory prompt blocks. The model terminates each
-turn with the typed `emit_conversation_response` control tool, selecting
-`awaiting_user` or `completed`; host code does not infer continuity from prose.
-Exact cancel, confirmation, and rejection commands remain model-free controls.
+never replaced by summary or memory prompt blocks. Ordinary assistant text is
+the normal completion path. When the model calls tools, the host checkpoints
+every result in the assistant's complete tool-call batch before running one
+priority-aware lifecycle resolution over trusted academic, career, LEARN,
+memory, proposal, and conversation state. The model-facing
+`emit_conversation_response` control tool is limited to an explicit
+`awaiting_user` clarification; it is not a completion protocol. Exact cancel,
+confirmation, and rejection commands remain model-free controls.
 
 The worker lazily reuses one Discord service and model gateway across wakes, but
 durability never depends on that process or on Ollama residency. No inference or
@@ -60,10 +64,11 @@ The host-controlled morning agenda runs from `ACADEMIC_MORNING_SCHEDULE` in
 `APP_TIMEZONE` and uses `ACADEMIC_MORNING_CATCHUP_GRACE_MINUTES` as its bounded
 catch-up window. Host code selects course work due today and over the following
 seven local dates, plus Jobs, misc, and reserved schedule events that overlap
-the intended local day. Qwen interprets bounded event evidence and composes
-bounded non-course category prose, while host code owns authorization, coverage,
-dates, links, ordering, validation, deterministic Courses rendering, cache
-reuse, and delivery. Each period is keyed as
+the intended local day. Qwen interprets bounded event evidence, composes
+critic-checked spoken task phrases for Courses, Jobs, and Misc, and infers
+bounded schedule fields. Host code owns authorization, coverage, dates, links,
+ordering, validation, fallback rendering, cache reuse, and delivery. Each
+period is keyed as
 `academic-morning:YYYY-MM-DD:HHMM:v1`; the persisted four-embed manifest uses
 `planner-morning-four-v3:YYYY-MM-DD:HHMM:v1:<category>:v1`.
 
@@ -99,12 +104,17 @@ prefix.
 
 Temporal list answers select only IDs from a current trusted envelope. The host
 validates completeness and stale-data acknowledgements and renders canonical
-titles and owner-local dates beneath `emit_conversation_response`. Academic
-freshness is scoped to the requested calendars, while the intentional career
-cache fallback is marked `cached_stale` and always disclosed. Root and domain
-tool checkpoints use the v2 contract and include enabled LEARN capabilities;
-incompatible v1 checkpoints restart safely instead of reactivating inventory
-reads.
+titles and owner-local dates, ignoring factual model prose once terminal
+trusted query state exists. Broad academic reads search every usable source,
+preserve healthy rows when adjacent sources are unavailable, and mark the
+envelope `partial`; an all-unavailable requested scope is terminal and returns
+no rows. The intentional career cache fallback is marked `cached_stale` and is
+always disclosed. Proposal tools prepare review-only state and cannot narrate a
+committed write. Repeated identical failed reads stop on the second occurrence,
+ordinary and nightly flows use separate bounded model-turn budgets, and every
+terminal failure carries a stable privacy-safe code. Completed historical
+lifecycle-tool messages remain replayable records but are not exposed as an
+active runtime path.
 
 The system should use Toronto local time unless explicitly configured otherwise.
 
@@ -415,7 +425,7 @@ Neutral agenda, ordinary event proposals, and confirmation-gated writes
 ```
 
 The automatic morning path keeps source truth and delivery host-owned while
-using Qwen for bounded event semantics plus non-course category composition:
+using Qwen for bounded event semantics plus spoken task and schedule composition:
 
 ```text
 ACADEMIC_MORNING_SCHEDULE in APP_TIMEZONE
@@ -426,7 +436,7 @@ course work due today + seven dates; today-overlap Jobs, misc, and schedule even
                     ↓
 bounded event evidence → Qwen interpreter + critic → exact semantic cache
                     ↓
-deterministic Courses rendering + critic-checked Jobs/Misc/Schedule composition
+critic-checked Courses/Jobs/Misc task phrases + schedule-field composition
                     ↓
 retry-safe four-embed Discord briefing
 ```
@@ -556,11 +566,12 @@ harness and requires exact owner confirmation before a scoped Notion write.
 The automatic morning notification is the executable agenda schedule. It
 performs fresh academic and Jobs syncs, selects course work due today and over
 the following seven dates, and selects Jobs, misc, and reserved schedule events
-that overlap today. Qwen adds only validated event semantics and bounded
-Jobs, Misc, and schedule prose/inferences. Courses are rendered
-deterministically from validated per-event overviews and host-owned due labels;
-a title-only valid overview can omit description, and model failure falls back
-to trusted title-plus-date rows instead of hiding course work. The complete
+that overlap today. Qwen adds only validated event semantics, critic-checked
+spoken task phrases for Courses, Jobs, and Misc, and bounded schedule
+inferences. Host code renders trusted titles when an individual task phrase is
+unavailable and keeps dates, links, ordering, and completion state authoritative;
+a title-only valid overview can omit description, and model failure does not
+hide independently valid course work. The complete
 four-embed manifest is persisted before delivery so retries resume missing
 categories without duplicating delivered content. Courses, Jobs, Misc, and
 Classes + Tutorials + Labs remain separate categories. If a source is

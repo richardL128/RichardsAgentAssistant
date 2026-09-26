@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 from collections.abc import Mapping, Sequence
 from datetime import UTC, date, datetime, time
 from types import SimpleNamespace
@@ -16,7 +17,7 @@ from sqlalchemy.orm import Session
 from app.agents.academic_planner.calendar_roles import AcademicCalendarRole
 from app.agents.academic_planner.contracts import (
     AcademicAssessmentOption,
-    AcademicAssessmentSearchResult,
+    AcademicCalendarItemSearchResult,
     AcademicCourseOption,
     AcademicCourseSearchResult,
     AssessmentType,
@@ -27,6 +28,7 @@ from app.agents.academic_planner.discord_harness import (
     _assessment_result_for_model,
     _current_turn_has_grounded_query,
     _localize_wall_time,
+    _NightlyConversationToolState,
     _progress_for_harness_event,
     _proposal_has_inbound_material,
     _render_event,
@@ -40,6 +42,7 @@ from app.agents.academic_planner.nightly_conversation import (
     export_nightly_checkpoint,
     stable_nightly_item_id,
 )
+from app.agents.action_items import ActionItemDomain, ActionItemKind, ActionItemStatus
 from app.agents.calendar_briefing import (
     CalendarActivityIntent,
     CalendarActivityIntentStatus,
@@ -55,15 +58,21 @@ from app.agents.harness import (
     TerminalGrounding,
     ToolExecutionError,
     UserAbortRequested,
+    run_native_tool_loop,
 )
 from app.agents.job_interviews.agent_loop import CareerAgentToolState
-from app.agents.job_interviews.contracts import ApplicationRowSnapshot, InterviewEventSnapshot
+from app.agents.job_interviews.contracts import (
+    ApplicationRowSnapshot,
+    CareerApplicationSnapshot,
+    InterviewEventSnapshot,
+)
 from app.agents.memory import UserMemoryOwnerScope, UserMemoryService
 from app.agents.query_contracts import (
     CompletenessState,
     FreshnessState,
     NormalizedQueryFilters,
     QueryEnvelope,
+    QueryResultKind,
     SourceFreshness,
     TemporalQuery,
     resolve_temporal_window,
@@ -117,6 +126,45 @@ def test_academic_tool_checkpoint_round_trips_trusted_capabilities() -> None:
     assert restored._assessments == {assessment.assessment_id: assessment}
 
 
+def test_action_item_tool_schema_uses_shared_canonical_enums_and_temporal_union() -> None:
+    state = _AcademicToolState(catalog=None, now=NOW, timezone=ZoneInfo("America/Toronto"))
+    tools = {tool.name: tool for tool in state.tools()}
+
+    create_schema = tools["create_action_item"].schema["function"]["parameters"]
+    update_schema = tools["update_action_item"].schema["function"]["parameters"]
+
+    assert create_schema["$defs"]["ActionItemDomain"]["enum"] == [
+        item.value for item in ActionItemDomain
+    ]
+    assert create_schema["$defs"]["ActionItemKind"]["enum"] == [
+        item.value for item in ActionItemKind
+    ]
+    assert update_schema["$defs"]["ActionItemStatus"]["enum"] == [
+        item.value for item in ActionItemStatus
+    ]
+    assert create_schema["properties"]["temporal"]["discriminator"] == {
+        "propertyName": "precision",
+        "mapping": {
+            "date": "#/$defs/DateOnlyValue",
+            "datetime": "#/$defs/DateTimeValue",
+        },
+    }
+
+
+def test_legacy_assessment_tool_checkpoint_is_safely_invalidated() -> None:
+    state = _AcademicToolState(
+        catalog=None,
+        now=NOW,
+        timezone=ZoneInfo("America/Toronto"),
+    )
+
+    with pytest.raises(ValueError, match="checkpoint version is unsupported"):
+        state.restore_checkpoint({"version": "academic-native-tools.v2"})
+
+    with pytest.raises(ValueError, match="checkpoint version is unsupported"):
+        state.restore_checkpoint({"version": "academic-native-tools.v4"})
+
+
 def test_academic_grounding_rejects_unknown_id_and_host_renders_canonical_date() -> None:
     state = _AcademicToolState(catalog=None, now=NOW, timezone=ZoneInfo("America/Toronto"))
     assessment = AcademicAssessmentOption(
@@ -136,6 +184,17 @@ def test_academic_grounding_rejects_unknown_id_and_host_renders_canonical_date()
 
     unknown = TerminalGrounding(query_id=envelope.query_id, item_ids=("outside",))
     assert "unknown or out-of-scope" in str(state.validate_grounding(unknown))
+    empty = TerminalGrounding(query_id=envelope.query_id, item_ids=())
+    assert "must select returned item_ids" in str(state.validate_grounding(empty))
+
+    mixed = TerminalGrounding(
+        query_id=envelope.query_id,
+        item_ids=("assessment-1", "outside"),
+    )
+    assert state.validate_grounding(mixed) is None
+    mixed_rendered = state.render_grounding(mixed)
+    assert "Lab report" in mixed_rendered
+    assert "omitted 1 invalid" in mixed_rendered
 
     selected = TerminalGrounding(query_id=envelope.query_id, item_ids=("assessment-1",))
     rendered = state.render_lifecycle(
@@ -169,7 +228,7 @@ def test_grounding_requirement_survives_later_read_tools_but_ignores_failed_quer
         ToolMessage(
             content='{"status":"succeeded"}',
             tool_call_id="query-1",
-            name="search_assessments",
+            name="search_calendar_items",
             status="success",
         ),
         ToolMessage(
@@ -185,7 +244,7 @@ def test_grounding_requirement_survives_later_read_tools_but_ignores_failed_quer
         ToolMessage(
             content='{"status":"error","error":"unavailable"}',
             tool_call_id="query-1",
-            name="search_assessments",
+            name="search_calendar_items",
             status="error",
         ),
         AIMessage(content="", tool_calls=[]),
@@ -357,6 +416,7 @@ def _test_envelope(items, *, query: str, timezone: str):
         query_id=f"test:{query or 'all'}",
         as_of=NOW,
         timezone=timezone,
+        result_kind=QueryResultKind.CALENDAR_ITEMS,
         applied_filters=filters,
         freshness=(
             SourceFreshness(
@@ -375,9 +435,11 @@ def _test_envelope(items, *, query: str, timezone: str):
 
 def _assessment_search_result(items, args, *, timezone: str):
     values = tuple(items)
-    return AcademicAssessmentSearchResult(
+    return AcademicCalendarItemSearchResult(
         results=values,
-        envelope=_test_envelope(values, query=args.query, timezone=timezone),
+        envelope=_test_envelope(values, query=args.query, timezone=timezone).model_copy(
+            update={"result_kind": QueryResultKind.CALENDAR_ITEMS}
+        ),
     )
 
 
@@ -403,11 +465,11 @@ class _Catalog:
             envelope=_test_envelope(results, query=args.query, timezone=timezone),
         )
 
-    def search_assessments(self, args, *, as_of, timezone, owner_scope):
+    def search_calendar_items(self, args, *, as_of, timezone, owner_scope):
         assert as_of == NOW
         assert owner_scope
         if self.events is not None:
-            self.events.append("search_assessments")
+            self.events.append("search_calendar_items")
         return _assessment_search_result((), args, timezone=timezone)
 
 
@@ -463,14 +525,20 @@ async def test_partial_sync_blocks_only_requested_academic_role() -> None:
         ),
     )
     course_tool = {tool.name: tool for tool in healthy_course_state.tools()}["search_courses"]
-    result = await course_tool.handler({"query": "ECE 202"})
+    result = await course_tool.handler({"query": "ECE 202", "roles": ["course"]})
+    assert result["result_kind"] == "course_sources"
     assert result["freshness"][0]["state"] == "fresh_partial_for_unrequested_sources"
     assert result["items"][0]["stable_id"] == "course-1"
     assessment_tool = {tool.name: tool for tool in healthy_course_state.tools()}[
-        "search_assessments"
+        "search_calendar_items"
     ]
     assessment_result = await assessment_tool.handler(
-        {"query": "today", "roles": ["course"], "temporal": {"scope": "today"}}
+        {
+            "view": "tasks",
+            "query": "",
+            "roles": ["course"],
+            "temporal": {"scope": "today"},
+        }
     )
     rendered = healthy_course_state.render_grounding(
         TerminalGrounding(query_id=assessment_result["query_id"], item_ids=())
@@ -490,8 +558,25 @@ async def test_partial_sync_blocks_only_requested_academic_role() -> None:
     unavailable_tool = {tool.name: tool for tool in unavailable_course_state.tools()}[
         "search_courses"
     ]
-    with pytest.raises(ToolExecutionError, match="unavailable or stale"):
-        await unavailable_tool.handler({"query": "ECE 202"})
+    unavailable_result = await unavailable_tool.handler({"query": "ECE 202", "roles": ["course"]})
+    assert unavailable_result["completeness"] == "unavailable"
+    assert unavailable_result["items"] == []
+
+
+@pytest.mark.asyncio
+async def test_calendar_item_query_allows_one_concrete_schema_repair() -> None:
+    state = _AcademicToolState(
+        catalog=_Catalog(),
+        now=NOW,
+        timezone=ZoneInfo("America/Toronto"),
+        syncer=_Syncer(),
+    )
+    tool = {item.name: item for item in state.tools()}["search_calendar_items"]
+
+    with pytest.raises(ToolExecutionError, match="invalid at view"):
+        await tool.handler({"temporal": {"scope": "today"}})
+    with pytest.raises(ToolExecutionError, match="repair limit reached"):
+        await tool.handler({"view": "tasks", "temporal": {"scope": "not-a-scope"}})
 
 
 class _IdempotentProposalStore(_Store):
@@ -618,6 +703,18 @@ def _message(
     )
 
 
+def _load_tool_checkpoint(engine, artifact_store: ArtifactStore) -> Mapping[str, object]:
+    with Session(engine) as session:
+        row = session.scalar(select(NativeConversationSession))
+        assert row is not None
+        key = row.tool_checkpoint_artifact_key
+        assert key is not None
+    payload = json.loads(artifact_store.get(key).decode("utf-8"))
+    checkpoint = payload["checkpoint"]
+    assert isinstance(checkpoint, Mapping)
+    return checkpoint
+
+
 class _MaterialIntake:
     def __init__(self, material_id):
         self.material_id = material_id
@@ -692,6 +789,349 @@ def _handler(
 
 
 @pytest.mark.asyncio
+async def test_incident_todos_today_recovers_plain_text_from_trusted_task_query(tmp_path) -> None:
+    engine = create_engine(f"sqlite+pysqlite:///{tmp_path / 'semantic-items.db'}")
+    Base.metadata.create_all(engine)
+    artifacts = ArtifactStore(tmp_path / "semantic-items-artifacts")
+    task = AcademicAssessmentOption(
+        assessment_id="task-1",
+        course_id="misc-1",
+        course_code="misc",
+        title="Submit parking form",
+        due_at=datetime(2026, 9, 9, 18, tzinfo=UTC),
+        due_at_local="2026-09-09T14:00:00-04:00",
+        due_date_local=date(2026, 9, 9),
+        assessment_type=AssessmentType.TASK,
+        source_area=AcademicCalendarRole.MISC,
+    )
+
+    class Catalog(_Catalog):
+        def search_calendar_items(self, args, *, as_of, timezone, owner_scope):
+            assert args.view.value == "tasks"
+            assert args.temporal.scope.value == "today"
+            assert args.completion.value == "incomplete"
+            return _assessment_search_result((task,), args, timezone=timezone)
+
+    gateway = _Gateway(
+        [
+            AIMessage(
+                content="I'll check today's unfinished tasks.",
+                tool_calls=[
+                    {
+                        "id": "items-1",
+                        "name": "search_calendar_items",
+                        "args": {
+                            "view": "tasks",
+                            "temporal": {"scope": "today"},
+                            "completion": "incomplete",
+                        },
+                    }
+                ],
+            ),
+            AIMessage(content="You have one item today: a model-written guess."),
+        ]
+    )
+    delivery = _Delivery()
+    conversation_service = NativeConversationService(engine=engine, artifact_store=artifacts)
+
+    result = await _handler(
+        gateway,
+        _Store(),
+        delivery,
+        catalog=Catalog(),
+        conversation_service=conversation_service,
+    )(_message("What are my to do's today"))
+
+    assert result.status == "handled"
+    assert delivery.responses[-1] == (
+        "Here are the matching academic items:\n"
+        "- misc: Submit parking form — Wednesday, September 9, 2026 at 2:00 PM "
+        "[incomplete; source: misc]"
+    )
+    assert "model-written guess" not in delivery.responses[-1]
+    assert len(gateway.inputs) == 1
+    checkpoint = _load_tool_checkpoint(engine, artifacts)
+    assert checkpoint["batch_resolution"] == {
+        "version": "native-batch-resolution.v1",
+        "turn": 1,
+        "disposition": "completed",
+        "calls": [{"call_id": "items-1", "name": "search_calendar_items", "status": "success"}],
+    }
+
+
+@pytest.mark.asyncio
+async def test_broad_calendar_partial_preserves_usable_sources_without_retry(tmp_path) -> None:
+    engine = create_engine(f"sqlite+pysqlite:///{tmp_path / 'calendar-partial.db'}")
+    Base.metadata.create_all(engine)
+    artifacts = ArtifactStore(tmp_path / "calendar-partial-artifacts")
+    task = AcademicAssessmentOption(
+        assessment_id="task-1",
+        course_id="course-1",
+        course_code="ECE 250",
+        title="Review merge sort",
+        due_at=datetime(2026, 9, 9, 20, tzinfo=UTC),
+        due_at_local="2026-09-09T16:00:00-04:00",
+        due_date_local=date(2026, 9, 9),
+        assessment_type=AssessmentType.TASK,
+        source_area=AcademicCalendarRole.COURSE,
+    )
+
+    class Catalog(_Catalog):
+        def academic_source_freshness(self, **_kwargs):
+            return (
+                {
+                    "course_page_id": "course-page",
+                    "source_id": "source-course",
+                    "role": "course",
+                    "discovery_status": "valid",
+                    "last_synced_at": NOW,
+                },
+                {
+                    "course_page_id": "misc-page",
+                    "source_id": "source-misc",
+                    "role": "misc",
+                    "discovery_status": "valid",
+                    "last_synced_at": NOW,
+                },
+            )
+
+        def search_calendar_items(self, args, *, as_of, timezone, owner_scope):
+            assert args.roles == ()
+            return _assessment_search_result((task,), args, timezone=timezone)
+
+    gateway = _Gateway(
+        [
+            AIMessage(
+                content="I will search every usable academic source.",
+                tool_calls=[
+                    {
+                        "id": "items-partial",
+                        "name": "search_calendar_items",
+                        "args": {"view": "tasks", "temporal": {"scope": "today"}},
+                    }
+                ],
+            ),
+            AIMessage(content="This model answer must not be used."),
+        ]
+    )
+    delivery = _Delivery()
+
+    result = await _handler(
+        gateway,
+        _Store(),
+        delivery,
+        catalog=Catalog(),
+        syncer=_Syncer(status="partial", unavailable_roles=(AcademicCalendarRole.MISC,)),
+        conversation_service=NativeConversationService(engine=engine, artifact_store=artifacts),
+    )(_message("What are all my tasks today?"))
+
+    assert result.status == "handled"
+    assert len(gateway.inputs) == 1
+    assert "Review merge sort" in delivery.responses[-1]
+    assert "Some requested academic sources were unavailable" in delivery.responses[-1]
+    checkpoint = _load_tool_checkpoint(engine, artifacts)
+    envelope = checkpoint["academic"]["query_envelopes"][0]
+    assert envelope["completeness"] == "partial"
+
+
+@pytest.mark.asyncio
+async def test_explicit_unavailable_calendar_source_completes_without_second_model_turn(
+    tmp_path,
+) -> None:
+    engine = create_engine(f"sqlite+pysqlite:///{tmp_path / 'calendar-unavailable.db'}")
+    Base.metadata.create_all(engine)
+    artifacts = ArtifactStore(tmp_path / "calendar-unavailable-artifacts")
+
+    class Catalog(_Catalog):
+        def academic_source_freshness(self, **_kwargs):
+            return (
+                {
+                    "course_page_id": "misc-page",
+                    "source_id": "source-misc",
+                    "role": "misc",
+                    "discovery_status": "valid",
+                    "last_synced_at": NOW,
+                },
+            )
+
+        def search_calendar_items(self, *_args, **_kwargs):
+            raise AssertionError("unavailable explicit source must not read cached rows")
+
+    gateway = _Gateway(
+        [
+            AIMessage(
+                content="I will check misc tasks.",
+                tool_calls=[
+                    {
+                        "id": "items-unavailable",
+                        "name": "search_calendar_items",
+                        "args": {
+                            "view": "tasks",
+                            "temporal": {"scope": "today"},
+                            "roles": ["misc"],
+                        },
+                    }
+                ],
+            ),
+            AIMessage(content="This second turn must not happen."),
+        ]
+    )
+    delivery = _Delivery()
+
+    result = await _handler(
+        gateway,
+        _Store(),
+        delivery,
+        catalog=Catalog(),
+        syncer=_Syncer(status="partial", unavailable_roles=(AcademicCalendarRole.MISC,)),
+        conversation_service=NativeConversationService(engine=engine, artifact_store=artifacts),
+    )(_message("What misc tasks are due today?"))
+
+    assert result.status == "handled"
+    assert len(gateway.inputs) == 1
+    assert delivery.responses[-1] == (
+        "The requested academic source is unavailable right now, so I could not safely "
+        "list those items. No change was made."
+    )
+    checkpoint = _load_tool_checkpoint(engine, artifacts)
+    envelope = checkpoint["academic"]["query_envelopes"][0]
+    assert envelope["completeness"] == "unavailable"
+
+
+@pytest.mark.asyncio
+async def test_mixed_batch_renders_successful_terminal_result_with_safe_caveat(tmp_path) -> None:
+    engine = create_engine(f"sqlite+pysqlite:///{tmp_path / 'mixed-batch.db'}")
+    Base.metadata.create_all(engine)
+    artifacts = ArtifactStore(tmp_path / "mixed-batch-artifacts")
+    task = AcademicAssessmentOption(
+        assessment_id="task-1",
+        course_id="misc-1",
+        course_code="misc",
+        title="Submit parking form",
+        due_at=datetime(2026, 9, 9, 18, tzinfo=UTC),
+        due_at_local="2026-09-09T14:00:00-04:00",
+        due_date_local=date(2026, 9, 9),
+        assessment_type=AssessmentType.TASK,
+        source_area=AcademicCalendarRole.MISC,
+    )
+
+    class Catalog(_Catalog):
+        def search_calendar_items(self, args, *, as_of, timezone, owner_scope):
+            return _assessment_search_result((task,), args, timezone=timezone)
+
+        async def search_semantic_assessment_materials(self, *_args, **_kwargs):
+            raise AssertionError("invalid assessment id should fail before semantic search")
+
+    gateway = _Gateway(
+        [
+            AIMessage(
+                content="I will search tasks and related material.",
+                tool_calls=[
+                    {
+                        "id": "items-1",
+                        "name": "search_calendar_items",
+                        "args": {"view": "tasks", "temporal": {"scope": "today"}},
+                    },
+                    {
+                        "id": "materials-1",
+                        "name": "search_assessment_materials",
+                        "args": {"assessment_id": "missing", "query": "details"},
+                    },
+                ],
+            ),
+            AIMessage(content="This model answer must not be used."),
+        ]
+    )
+    delivery = _Delivery()
+
+    result = await _handler(
+        gateway,
+        _Store(),
+        delivery,
+        catalog=Catalog(),
+        conversation_service=NativeConversationService(engine=engine, artifact_store=artifacts),
+    )(_message("What are my tasks today and any related details?"))
+
+    assert result.status == "handled"
+    assert len(gateway.inputs) == 1
+    assert "Submit parking form" in delivery.responses[-1]
+    assert (
+        "One requested tool result was unavailable, so only the successful portion is shown."
+        in delivery.responses[-1]
+    )
+    checkpoint = _load_tool_checkpoint(engine, artifacts)
+    assert checkpoint["batch_resolution"] == {
+        "version": "native-batch-resolution.v1",
+        "turn": 1,
+        "disposition": "completed",
+        "calls": [
+            {"call_id": "items-1", "name": "search_calendar_items", "status": "success"},
+            {
+                "call_id": "materials-1",
+                "name": "search_assessment_materials",
+                "status": "error",
+                "error_code": "tool_execution_failed",
+            },
+        ],
+    }
+
+
+@pytest.mark.asyncio
+async def test_course_source_search_cannot_ground_nothing_due_claim(tmp_path) -> None:
+    engine = create_engine(f"sqlite+pysqlite:///{tmp_path / 'source-only-grounding.db'}")
+    Base.metadata.create_all(engine)
+    artifacts = ArtifactStore(tmp_path / "source-only-grounding-artifacts")
+    gateway = _Gateway(
+        [
+            AIMessage(
+                content="I'll identify the course source.",
+                tool_calls=[
+                    {
+                        "id": "courses-1",
+                        "name": "search_courses",
+                        "args": {"query": "ECE 202"},
+                    }
+                ],
+            ),
+            AIMessage(content="You have nothing due today."),
+            AIMessage(
+                content="",
+                tool_calls=[
+                    {
+                        "id": "terminal-1",
+                        "name": "emit_conversation_response",
+                        "args": {
+                            "disposition": "awaiting_user",
+                            "content": (
+                                "I only resolved the course source. Should I search today's "
+                                "unfinished tasks?"
+                            ),
+                        },
+                    }
+                ],
+            ),
+        ]
+    )
+    delivery = _Delivery()
+
+    result = await _handler(
+        gateway,
+        _Store(),
+        delivery,
+        catalog=_Catalog(),
+        conversation_service=NativeConversationService(engine=engine, artifact_store=artifacts),
+    )(_message("What do I have due today for ECE 202?"))
+
+    assert result.status == "handled"
+    assert delivery.responses[-1] == (
+        "I only resolved the course source. Should I search the matching academic calendar "
+        "items next?"
+    )
+    assert all("nothing due" not in response for response in delivery.responses)
+    assert len(gateway.inputs) == 2
+
+
+@pytest.mark.asyncio
 async def test_durable_checkpoint_restores_enabled_learn_capabilities(tmp_path) -> None:
     engine = create_engine(f"sqlite+pysqlite:///{tmp_path / 'learn-checkpoint.db'}")
     Base.metadata.create_all(engine)
@@ -758,23 +1198,7 @@ async def test_durable_checkpoint_restores_enabled_learn_capabilities(tmp_path) 
 
     assert first.status == "handled"
     second = await _handler(
-        _Gateway(
-            [
-                AIMessage(
-                    content="",
-                    tool_calls=[
-                        {
-                            "id": "terminal-2",
-                            "name": "emit_conversation_response",
-                            "args": {
-                                "disposition": "completed",
-                                "content": "I kept the verified LEARN course capability.",
-                            },
-                        }
-                    ],
-                )
-            ]
-        ),
+        _Gateway([AIMessage(content="I kept the verified LEARN course capability.")]),
         _Store(),
         _Delivery(),
         learn_tool_state_factory=lambda _message: LearnState(),
@@ -914,26 +1338,12 @@ async def test_durable_two_wake_clarification_replays_native_context_and_tool_st
                 tool_calls=[
                     {
                         "id": "assessment-1",
-                        "name": "search_assessments",
-                        "args": {"query": "lab", "course_id": "course-1"},
-                    }
-                ],
-            ),
-            AIMessage(
-                content="",
-                tool_calls=[
-                    {
-                        "id": "terminal-2",
-                        "name": "emit_conversation_response",
+                        "name": "search_calendar_items",
                         "args": {
-                            "disposition": "completed",
-                            "content": "I found no matching lab, so no change was proposed.",
-                            "grounding": {
-                                "query_id": "test:lab",
-                                "item_ids": [],
-                                "acknowledge_incomplete": False,
-                                "acknowledge_stale": False,
-                            },
+                            "view": "all_items",
+                            "temporal": {"scope": "all"},
+                            "query": "lab",
+                            "course_id": "course-1",
                         },
                     }
                 ],
@@ -957,7 +1367,7 @@ async def test_durable_two_wake_clarification_replays_native_context_and_tool_st
     )
 
     assert second.status == "handled"
-    assert second_catalog_events == ["search_assessments"]
+    assert second_catalog_events == ["search_calendar_items"]
     replay = second_gateway.inputs[0]
     assert [message.type for message in replay] == [
         "system",
@@ -1051,23 +1461,7 @@ async def test_durable_session_supports_two_clarifications_and_owner_topic_pivot
     )(_message("ECE 202.", message_id="111111111111111112"))
     assert second.status == "handled"
 
-    pivot_gateway = _Gateway(
-        [
-            AIMessage(
-                content="",
-                tool_calls=[
-                    {
-                        "id": "terminal-3",
-                        "name": "emit_conversation_response",
-                        "args": {
-                            "disposition": "completed",
-                            "content": "Sure—here is a concise summary instead.",
-                        },
-                    }
-                ],
-            )
-        ]
-    )
+    pivot_gateway = _Gateway([AIMessage(content="Sure—here is a concise summary instead.")])
     pivot = await _handler(
         pivot_gateway,
         store,
@@ -1145,6 +1539,190 @@ async def test_nightly_proactive_skip_closes_before_runtime_model_or_tools(tmp_p
         "human",
     ]
     engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_nightly_failed_pre_preview_cleanup_rejects_exact_bound_proposal() -> None:
+    period = "academic-end-of-day:2026-09-09:2100:v2"
+    date_range = NightlyTaskDateRange(
+        all_day=True,
+        start_date=date(2026, 9, 9),
+    )
+    item_id = stable_nightly_item_id(
+        period_key=period,
+        source_kind="notion_assessment",
+        source_id="assessment-1",
+        title="Review merge sort",
+        date_range=date_range,
+    )
+    checkpoint = build_nightly_checkpoint(
+        period_key=period,
+        local_date=date(2026, 9, 9),
+        items=(
+            NightlyChecklistItem(
+                item_id=item_id,
+                course_id="course-1",
+                course_code="ECE 250",
+                source_kind="notion_assessment",
+                source_id="assessment-1",
+                expected_last_edited_at=NOW,
+                title="Review merge sort",
+                date_range=date_range,
+                semantic_decision=NightlySemanticDecision(
+                    kind="movable_work_task",
+                    accepted_by_critic=True,
+                    evidence_citations=("title",),
+                    rationale="Owner-performable review work.",
+                    model_identity="qwen@test",
+                    prompt_version="eligibility-v2",
+                    critic_version="critic-v2",
+                    source_fingerprint="source-fingerprint",
+                ),
+                source_fingerprint="source-fingerprint",
+            ),
+        ),
+    )
+
+    class CleanupStore(_IdempotentProposalStore):
+        def __init__(self) -> None:
+            super().__init__()
+            self.rejected_ids = []
+
+        def reject_checkin_proposal(self, proposal_id, **_kwargs):
+            self.rejected_ids.append(proposal_id)
+            proposal = self._by_id.get(proposal_id)
+            return ("rejected", proposal) if proposal is not None else ("not_found", None)
+
+    store = CleanupStore()
+    delivery = _Delivery()
+    state = _NightlyConversationToolState(
+        checkpoint=checkpoint,
+        store=store,
+        writer_provider=lambda: pytest.fail("cleanup must not issue a Notion write"),
+        delivery=delivery,
+        message=_message("I didn't finish it.", timestamp=NOW),
+        model_identity="qwen@test",
+    )
+    action = {tool.name: tool for tool in state.tools()}["nightly_record_task_result"]
+
+    await action.handler({"result": "incomplete"})
+    pending_id = state.checkpoint.pending_proposal_id
+    assert state.checkpoint.pending_reply_semantic_audit is not None
+    assert (
+        state.checkpoint.pending_reply_semantic_audit.prompt_version
+        == "academic-nightly-reply-semantics-v2"
+    )
+    recovery_gateway = _Gateway([])
+    recovery_state = _NightlyConversationToolState(
+        checkpoint=state.checkpoint,
+        store=store,
+        writer_provider=lambda: pytest.fail("recovery must not issue a Notion write"),
+        delivery=_Delivery(),
+        message=_message("I didn't finish it.", timestamp=NOW),
+        model_identity="qwen@test",
+    )
+    recovered = await run_native_tool_loop(
+        gateway=recovery_gateway,
+        user_input=None,
+        restored_messages=(
+            HumanMessage(content="I didn't finish it."),
+            AIMessage(
+                content="",
+                tool_calls=[
+                    {
+                        "id": "nightly-incomplete-recovery",
+                        "name": "nightly_record_task_result",
+                        "args": {"result": "incomplete"},
+                    }
+                ],
+            ),
+            ToolMessage(
+                content=(
+                    '{"content":{"status":"awaiting_move_confirmation"},"status":"succeeded"}'
+                ),
+                tool_call_id="nightly-incomplete-recovery",
+                name="nightly_record_task_result",
+                status="success",
+            ),
+        ),
+        tools=recovery_state.tools(),
+        require_terminal_response=True,
+        lifecycle_validator=lambda lifecycle, _messages: recovery_state.lifecycle_error(lifecycle),
+        lifecycle_renderer=lambda lifecycle, _messages: recovery_state.render_lifecycle(lifecycle),
+        post_tool_lifecycle_resolver=recovery_state.resolve_post_tool_lifecycle,
+    )
+
+    assert recovered.status == "awaiting_user"
+    assert recovered.final_response == (
+        'I understand. Do you want me to move "ECE 250 - Review merge sort" '
+        "from September 9 to September 10?"
+    )
+    assert recovery_gateway.inputs == []
+    assert len(store.proposals) == 1
+
+    cleanup_status = state.reject_unexposed_pending_move()
+
+    assert cleanup_status == "rejected"
+    assert [str(proposal_id) for proposal_id in store.rejected_ids] == [pending_id]
+    assert state.checkpoint.phase == "cancelled"
+    assert state.checkpoint.pending_proposal_id is None
+    assert state.checkpoint.pending_preview_proof is None
+    assert delivery.responses == []
+
+    decline_store = CleanupStore()
+    incomplete_state = _NightlyConversationToolState(
+        checkpoint=checkpoint,
+        store=decline_store,
+        writer_provider=lambda: pytest.fail("decline must not issue a Notion write"),
+        delivery=_Delivery(),
+        message=_message("I didn't finish it.", timestamp=NOW),
+        model_identity="qwen@test",
+    )
+    incomplete_action = {tool.name: tool for tool in incomplete_state.tools()}[
+        "nightly_record_task_result"
+    ]
+    await incomplete_action.handler({"result": "incomplete"})
+    decline_state = _NightlyConversationToolState(
+        checkpoint=incomplete_state.checkpoint,
+        store=decline_store,
+        writer_provider=lambda: pytest.fail("decline must not issue a Notion write"),
+        delivery=_Delivery(),
+        message=_message(
+            "No thanks, leave it there.",
+            message_id="111111111111111112",
+            timestamp=NOW.replace(minute=1),
+        ),
+        model_identity="qwen@test",
+    )
+    decline_action = {tool.name: tool for tool in decline_state.tools()}["nightly_resolve_move"]
+
+    decline_result = await decline_action.handler({"decision": "decline"})
+
+    assert decline_result["response"] == (
+        "Okay — I left that task in place. Evening check-in complete: 1 left in place."
+    )
+    assert decline_state.checkpoint.phase == "completed"
+
+    skip_state = _NightlyConversationToolState(
+        checkpoint=checkpoint,
+        store=CleanupStore(),
+        writer_provider=lambda: pytest.fail("skip must not issue a Notion write"),
+        delivery=_Delivery(),
+        message=_message(
+            "I'm done for tonight.",
+            message_id="111111111111111113",
+            timestamp=NOW.replace(minute=2),
+        ),
+        model_identity="qwen@test",
+    )
+    skip_action = {tool.name: tool for tool in skip_state.tools()}["nightly_skip"]
+
+    skip_result = await skip_action.handler({"action": "skip"})
+
+    assert skip_result["response"] == (
+        "Skipped tonight's check-in. No additional tasks were changed."
+    )
+    assert skip_state.checkpoint.phase == "cancelled"
 
 
 @pytest.mark.asyncio
@@ -1309,9 +1887,12 @@ async def test_nightly_incomplete_natural_confirmation_acknowledges_writes_and_a
                 content="",
                 tool_calls=[
                     {
-                        "id": "nightly-preview-final",
+                        "id": "nightly-repeat-preview",
                         "name": "emit_conversation_response",
-                        "args": {"disposition": "awaiting_user", "content": "preview"},
+                        "args": {
+                            "disposition": "awaiting_user",
+                            "content": "Could you clarify?",
+                        },
                     }
                 ],
             ),
@@ -1329,29 +1910,9 @@ async def test_nightly_incomplete_natural_confirmation_acknowledges_writes_and_a
                 content="",
                 tool_calls=[
                     {
-                        "id": "nightly-complete-final",
-                        "name": "emit_conversation_response",
-                        "args": {"disposition": "awaiting_user", "content": "next"},
-                    }
-                ],
-            ),
-            AIMessage(
-                content="",
-                tool_calls=[
-                    {
                         "id": "nightly-completed",
                         "name": "nightly_record_task_result",
                         "args": {"result": "completed"},
-                    }
-                ],
-            ),
-            AIMessage(
-                content="",
-                tool_calls=[
-                    {
-                        "id": "nightly-summary-final",
-                        "name": "emit_conversation_response",
-                        "args": {"disposition": "awaiting_user", "content": "next"},
                     }
                 ],
             ),
@@ -1365,20 +1926,11 @@ async def test_nightly_incomplete_natural_confirmation_acknowledges_writes_and_a
                     }
                 ],
             ),
-            AIMessage(
-                content="",
-                tool_calls=[
-                    {
-                        "id": "nightly-failure-summary-final",
-                        "name": "emit_conversation_response",
-                        "args": {"disposition": "completed", "content": "summary"},
-                    }
-                ],
-            ),
         ]
     )
     store = NightlyStore()
-    delivery = _Delivery(events=events)
+    ambiguous_final_key = "academic-discord-message:111111111111111112:final-response:v1"
+    delivery = _Delivery(events=events, fail_once_keys=(ambiguous_final_key,))
     writer = Writer()
     handler = _handler(
         gateway,
@@ -1396,11 +1948,51 @@ async def test_nightly_incomplete_natural_confirmation_acknowledges_writes_and_a
     ]
     assert len(store.proposals) == 1
     assert store.proposals[0].changes[0].ends_at is None
+    checkpoint_after_first = _load_tool_checkpoint(engine, artifacts)
+    assert checkpoint_after_first["batch_resolution"] == {
+        "version": "native-batch-resolution.v1",
+        "turn": 2,
+        "disposition": "awaiting_user",
+        "calls": [
+            {
+                "call_id": "nightly-incomplete",
+                "name": "nightly_record_task_result",
+                "status": "success",
+            }
+        ],
+    }
+
+    duplicate_first = await handler(_message("I didn't finish it.", timestamp=NOW))
+    assert duplicate_first.status == "duplicate"
+    assert len(gateway.inputs) == 1
+    assert len(store.proposals) == 1
+    assert delivery.responses == [
+        'I understand. Do you want me to move "ECE 250 - Review merge sort" '
+        "from September 9 to September 10?"
+    ]
+
+    ambiguous_message = _message(
+        "Could you repeat that?",
+        message_id="111111111111111112",
+        timestamp=NOW.replace(second=30),
+    )
+    with pytest.raises(RuntimeError, match="connector_transient"):
+        await handler(ambiguous_message)
+    ambiguous_retry = await handler(ambiguous_message)
+    assert ambiguous_retry.status == "duplicate"
+    assert delivery.responses[-1] == (
+        'I understand. Do you want me to move "ECE 250 - Review merge sort" '
+        "from September 9 to September 10?"
+    )
+    assert delivery.response_keys[-1] == ambiguous_final_key
+    assert len(store.proposals) == 1
+    assert writer.calls == 0
+    assert len(gateway.inputs) == 2
 
     second = await handler(
         _message(
             "Yeah sure.",
-            message_id="111111111111111112",
+            message_id="111111111111111113",
             timestamp=NOW.replace(minute=1),
         )
     )
@@ -1415,7 +2007,7 @@ async def test_nightly_incomplete_natural_confirmation_acknowledges_writes_and_a
     third = await handler(
         _message(
             "Yes, I finished it.",
-            message_id="111111111111111113",
+            message_id="111111111111111114",
             timestamp=NOW.replace(minute=2),
         )
     )
@@ -1429,7 +2021,7 @@ async def test_nightly_incomplete_natural_confirmation_acknowledges_writes_and_a
     fourth = await handler(
         _message(
             "Finished that too.",
-            message_id="111111111111111114",
+            message_id="111111111111111115",
             timestamp=NOW.replace(minute=3),
         )
     )
@@ -1440,6 +2032,7 @@ async def test_nightly_incomplete_natural_confirmation_acknowledges_writes_and_a
         "Evening check-in complete: 1 marked completed, 1 moved, 1 not changed.",
     ]
     assert len(store.proposals) == 3
+    assert len(gateway.inputs) == 5
     with Session(engine) as session:
         row = session.scalar(select(NativeConversationSession))
         assert row is not None
@@ -1477,12 +2070,17 @@ async def test_completed_proposal_replay_recovers_confirmation_without_duplicate
                 tool_calls=[
                     {
                         "id": "create-1",
-                        "name": "create_assessment",
+                        "name": "create_action_item",
                         "args": {
+                            "domain": "academic",
                             "course_id": "course-1",
                             "title": "Lab 2",
-                            "due_at": "2026-09-12T17:00:00",
-                            "assessment_type": "lab",
+                            "temporal": {
+                                "precision": "datetime",
+                                "start_at": "2026-09-12T17:00:00-04:00",
+                                "timezone": "America/Toronto",
+                            },
+                            "kind": "lab",
                         },
                     }
                 ],
@@ -1567,7 +2165,7 @@ async def test_context_capacity_failure_preserves_open_session(tmp_path) -> None
         row = session.scalar(select(NativeConversationSession))
         assert row is not None
         assert row.state == "awaiting_user"
-        assert row.error_code == "input_token_budget_exceeded"
+        assert row.error_code == "context_capacity_exceeded"
         assert conversation_service.load_messages(session_id=row.id)[0].content == (
             "A request whose active transcript is too large."
         )
@@ -1650,14 +2248,8 @@ async def test_explicit_generic_memory_round_trips_through_discord_boundary(tmp_
     )(_message("Please remember that I prefer concise replies."))
 
     assert result.status == "handled"
-    assert delivery.responses[-1] == "I'll remember that you prefer concise replies."
-    assert len(gateway.inputs) == 2
-    assert any(
-        "untrusted_owner_memory" in str(item.content)
-        and "prefer concise replies" in str(item.content)
-        for item in gateway.inputs[1]
-        if isinstance(item, SystemMessage)
-    )
+    assert delivery.responses[-1] == "Remembered: I prefer concise replies."
+    assert len(gateway.inputs) == 1
     retrieval = await user_memory_service.retrieve(
         owner_scope=UserMemoryOwnerScope(
             owner_user_id="333333333333333333",
@@ -1789,23 +2381,7 @@ async def test_long_discord_conversation_uses_summary_tail_but_preserves_transcr
                 ),
             )
 
-    gateway = CompactingGateway(
-        [
-            AIMessage(
-                content="",
-                tool_calls=[
-                    {
-                        "id": "long-terminal",
-                        "name": "emit_conversation_response",
-                        "args": {
-                            "disposition": "completed",
-                            "content": "The long conversation is still available.",
-                        },
-                    }
-                ],
-            )
-        ]
-    )
+    gateway = CompactingGateway([AIMessage(content="The long conversation is still available.")])
     settings = SimpleNamespace(
         conversation_compaction_trigger_tokens=11_000,
         conversation_compaction_target_tokens=10_000,
@@ -2127,6 +2703,20 @@ async def test_career_date_question_uses_jobs_context_tool_and_answers_with_prog
                 ),
             )
 
+        def typed_application_snapshots(self):
+            return (
+                CareerApplicationSnapshot(
+                    application_id="jobs-row",
+                    company_name="Shopify",
+                    role_title="Backend Developer",
+                    pipeline_status="Interviewing",
+                    posting_url="https://jobs.example/posting",
+                    source_url="https://notion.test/application",
+                    content_fingerprint="row-fingerprint",
+                    last_edited_at=NOW,
+                ),
+            )
+
         def application_row_snapshots(self):
             return self.application_table_snapshots()[1:]
 
@@ -2150,12 +2740,14 @@ async def test_career_date_question_uses_jobs_context_tool_and_answers_with_prog
 
     assert result.status == "handled"
     assert career_syncer.calls == 1
-    assert delivery.responses == ["Your Shopify technical interview is on September 20, 2026."]
+    assert delivery.responses == [
+        "Here are the matching career items:\n"
+        "- Shopify Technical Interview — 2026-09-20\n"
+        "- Shopify — Backend Developer [Interviewing]"
+    ]
     assert {"phase": "tool_activity", "tool_activity": "interview_data"} in reporter.updates
-    tool_result = str(gateway.inputs[1][-1].content)
-    assert "2026-09-20" in tool_result
-    assert "Company" in tool_result
-    assert "Role" in tool_result
+    assert len(gateway.inputs) == 1
+    assert "September 20, 2026" not in delivery.responses[-1]
 
 
 @pytest.mark.asyncio
@@ -2284,13 +2876,12 @@ async def test_worker_shutdown_cancellation_is_not_reported_as_user_abort() -> N
     ("tool_name", "activity"),
     [
         ("search_courses", "course_data"),
-        ("search_assessments", "assessment_data"),
-        ("create_assessment", "proposal_drafting"),
+        ("search_calendar_items", "calendar_item_data"),
+        ("create_action_item", "proposal_drafting"),
         ("find_course_event_slots", "availability_data"),
-        ("create_course_event", "proposal_drafting"),
         ("manage_academic_memory", "memory_data"),
-        ("update_assessment", "proposal_drafting"),
-        ("archive_assessment", "proposal_drafting"),
+        ("update_action_item", "proposal_drafting"),
+        ("archive_action_item", "proposal_drafting"),
         ("search_jobs_context", "interview_data"),
         ("search_job_interviews", "interview_data"),
         ("prepare_job_interview", "interview_preparation"),
@@ -2321,12 +2912,34 @@ def test_unknown_tool_does_not_generate_progress_copy() -> None:
     )
 
 
-def test_course_event_progress_uses_semantic_validation_when_required() -> None:
+@pytest.mark.parametrize(
+    ("view", "activity"),
+    [
+        ("tasks", "task_data"),
+        ("schedule", "schedule_data"),
+        ("agenda", "agenda_data"),
+        ("all_items", "calendar_item_data"),
+    ],
+)
+def test_validated_calendar_view_drives_specific_progress(view: str, activity: str) -> None:
     progress = _progress_for_harness_event(
         AgentHarnessEvent(
             kind="tool_call",
             turn=1,
-            tool_name="create_course_event",
+            tool_name="search_calendar_items",
+            args_json=json.dumps({"view": view, "temporal": {"scope": "today"}}),
+        )
+    )
+
+    assert progress == {"phase": "tool_activity", "tool_activity": activity}
+
+
+def test_action_item_event_progress_uses_semantic_validation_when_required() -> None:
+    progress = _progress_for_harness_event(
+        AgentHarnessEvent(
+            kind="tool_call",
+            turn=1,
+            tool_name="create_action_item",
             args_json='{"requires_study_intent":true,"title":"Review filters"}',
         )
     )
@@ -2340,7 +2953,7 @@ def test_course_event_progress_uses_semantic_validation_when_required() -> None:
     [
         ("inspect_inbound_pdf", "attachment_inspection"),
         ("search_courses", "catalog_matching"),
-        ("search_assessments", "catalog_matching"),
+        ("search_calendar_items", "catalog_matching"),
         ("search_pending_assessment_creates", "catalog_matching"),
     ],
 )
@@ -2402,6 +3015,7 @@ async def test_system_message_supplies_current_owner_local_time() -> None:
     system_content = str(gateway.inputs[0][0].content)
     assert "America/Toronto" in system_content
     assert "2026-09-09T10:00:00-04:00" in system_content
+    assert "send temporal as the shared discriminated object" in system_content
     assert "without Z or a UTC offset" in system_content
     assert "due_at values are already expressed in the owner's timezone" in system_content
     assert "next matching date that is not in the past" in system_content
@@ -2488,12 +3102,18 @@ async def test_struggle_turn_stores_memory_and_proposes_next_safe_course_event()
                 tool_calls=[
                     {
                         "id": "create-1",
-                        "name": "create_course_event",
+                        "name": "create_action_item",
                         "args": {
+                            "domain": "academic",
                             "course_id": "course-1",
                             "title": "Review ECE 202 filters",
-                            "starts_at": "2026-09-09T11:00:00",
-                            "duration_minutes": 30,
+                            "temporal": {
+                                "precision": "datetime",
+                                "start_at": "2026-09-09T11:00:00-04:00",
+                                "end_at": "2026-09-09T11:30:00-04:00",
+                                "timezone": "America/Toronto",
+                            },
+                            "kind": "event",
                             "requires_study_intent": True,
                         },
                     }
@@ -2524,8 +3144,9 @@ async def test_struggle_turn_stores_memory_and_proposes_next_safe_course_event()
     change = delivery.confirmations[0].changes[0]
     assert change.title == "Review ECE 202 filters"
     assert change.assessment_type is AssessmentType.EVENT
-    assert change.due_at == datetime(2026, 9, 9, 15, tzinfo=UTC)
-    assert change.ends_at == datetime(2026, 9, 9, 15, 30, tzinfo=UTC)
+    assert change.action_temporal is not None
+    assert change.action_temporal.start_at == datetime(2026, 9, 9, 15, tzinfo=UTC)
+    assert change.action_temporal.end_at == datetime(2026, 9, 9, 15, 30, tzinfo=UTC)
     assert delivery.responses == [
         "I understand--you're struggling with filters. I'll remember that and find a focused "
         "review slot.",
@@ -2533,7 +3154,8 @@ async def test_struggle_turn_stores_memory_and_proposes_next_safe_course_event()
         "I'll check your calendar for a conflict-free time.",
         "I found a safe time and will validate the natural event title.",
         "Local academic memory: Added filters as an active ECE 202 learning focus.\n\n"
-        "Pending calendar proposal: Your review event is ready for confirmation.",
+        "Pending calendar proposal: I prepared the requested change for review. "
+        "Please confirm it below.",
     ]
     tool_activities = {
         str(update.get("tool_activity"))
@@ -2563,12 +3185,18 @@ async def test_course_event_semantic_unavailability_clarifies_without_proposal()
                 tool_calls=[
                     {
                         "id": "create-1",
-                        "name": "create_course_event",
+                        "name": "create_action_item",
                         "args": {
+                            "domain": "academic",
                             "course_id": "course-1",
                             "title": "Review ECE 202 filters",
-                            "starts_at": "2026-09-15T18:00:00",
-                            "duration_minutes": 60,
+                            "temporal": {
+                                "precision": "datetime",
+                                "start_at": "2026-09-15T18:00:00-04:00",
+                                "end_at": "2026-09-15T19:00:00-04:00",
+                                "timezone": "America/Toronto",
+                            },
+                            "kind": "event",
                             "requires_study_intent": True,
                         },
                     }
@@ -2622,12 +3250,18 @@ async def test_course_event_wall_time_is_converted_from_owner_timezone() -> None
                 tool_calls=[
                     {
                         "id": "create-1",
-                        "name": "create_course_event",
+                        "name": "create_action_item",
                         "args": {
+                            "domain": "academic",
                             "course_id": "course-1",
                             "title": "Review filters",
-                            "starts_at": "2026-09-15T18:00:00",
-                            "duration_minutes": 60,
+                            "temporal": {
+                                "precision": "datetime",
+                                "start_at": "2026-09-15T18:00:00-04:00",
+                                "end_at": "2026-09-15T19:00:00-04:00",
+                                "timezone": "America/Toronto",
+                            },
+                            "kind": "event",
                             "requires_study_intent": True,
                         },
                     }
@@ -2650,8 +3284,9 @@ async def test_course_event_wall_time_is_converted_from_owner_timezone() -> None
     assert len(semantic.events) == 1
     assert semantic.events[0].title == "Review filters"
     change = delivery.confirmations[0].changes[0]
-    assert change.due_at == datetime(2026, 9, 15, 22, tzinfo=UTC)
-    assert change.ends_at == datetime(2026, 9, 15, 23, tzinfo=UTC)
+    assert change.action_temporal is not None
+    assert change.action_temporal.start_at == datetime(2026, 9, 15, 22, tzinfo=UTC)
+    assert change.action_temporal.end_at == datetime(2026, 9, 15, 23, tzinfo=UTC)
     assert change.title == "Review filters"
     assert change.assessment_type is AssessmentType.EVENT
 
@@ -2678,23 +3313,35 @@ async def test_multi_lesson_request_can_propose_separate_ordered_course_events()
                 tool_calls=[
                     {
                         "id": "create-1",
-                        "name": "create_course_event",
+                        "name": "create_action_item",
                         "args": {
+                            "domain": "academic",
                             "course_id": "course-1",
                             "title": "Review ECE 202 lesson 3",
-                            "starts_at": "2026-09-15T18:00:00",
-                            "duration_minutes": 30,
+                            "temporal": {
+                                "precision": "datetime",
+                                "start_at": "2026-09-15T18:00:00-04:00",
+                                "end_at": "2026-09-15T18:30:00-04:00",
+                                "timezone": "America/Toronto",
+                            },
+                            "kind": "event",
                             "requires_study_intent": True,
                         },
                     },
                     {
                         "id": "create-2",
-                        "name": "create_course_event",
+                        "name": "create_action_item",
                         "args": {
+                            "domain": "academic",
                             "course_id": "course-1",
                             "title": "Review ECE 202 lesson 4",
-                            "starts_at": "2026-09-15T19:00:00",
-                            "duration_minutes": 30,
+                            "temporal": {
+                                "precision": "datetime",
+                                "start_at": "2026-09-15T19:00:00-04:00",
+                                "end_at": "2026-09-15T19:30:00-04:00",
+                                "timezone": "America/Toronto",
+                            },
+                            "kind": "event",
                             "requires_study_intent": True,
                         },
                     },
@@ -2741,12 +3388,18 @@ async def test_course_event_semantic_failure_allows_one_title_repair() -> None:
                 tool_calls=[
                     {
                         "id": "create-1",
-                        "name": "create_course_event",
+                        "name": "create_action_item",
                         "args": {
+                            "domain": "academic",
                             "course_id": "course-1",
                             "title": "Thing",
-                            "starts_at": "2026-09-15T18:00:00",
-                            "duration_minutes": 60,
+                            "temporal": {
+                                "precision": "datetime",
+                                "start_at": "2026-09-15T18:00:00-04:00",
+                                "end_at": "2026-09-15T19:00:00-04:00",
+                                "timezone": "America/Toronto",
+                            },
+                            "kind": "event",
                             "requires_study_intent": True,
                         },
                     }
@@ -2757,12 +3410,18 @@ async def test_course_event_semantic_failure_allows_one_title_repair() -> None:
                 tool_calls=[
                     {
                         "id": "create-2",
-                        "name": "create_course_event",
+                        "name": "create_action_item",
                         "args": {
+                            "domain": "academic",
                             "course_id": "course-1",
                             "title": "Review filters",
-                            "starts_at": "2026-09-15T18:00:00",
-                            "duration_minutes": 60,
+                            "temporal": {
+                                "precision": "datetime",
+                                "start_at": "2026-09-15T18:00:00-04:00",
+                                "end_at": "2026-09-15T19:00:00-04:00",
+                                "timezone": "America/Toronto",
+                            },
+                            "kind": "event",
                             "requires_study_intent": True,
                         },
                     }
@@ -2868,7 +3527,7 @@ async def test_assessment_search_answers_with_owner_local_times() -> None:
     )
 
     class Catalog:
-        def search_assessments(self, args, *, as_of, timezone, owner_scope):
+        def search_calendar_items(self, args, *, as_of, timezone, owner_scope):
             return _assessment_search_result(assessments, args, timezone=timezone)
 
     gateway = _Gateway(
@@ -2878,8 +3537,12 @@ async def test_assessment_search_answers_with_owner_local_times() -> None:
                 tool_calls=[
                     {
                         "id": "search-1",
-                        "name": "search_assessments",
-                        "args": {"query": "download analysis notes insertion sort"},
+                        "name": "search_calendar_items",
+                        "args": {
+                            "view": "all_items",
+                            "temporal": {"scope": "all"},
+                            "query": "download analysis notes insertion sort",
+                        },
                     }
                 ],
             ),
@@ -2900,17 +3563,15 @@ async def test_assessment_search_answers_with_owner_local_times() -> None:
     assert result.status == "handled"
     assert delivery.responses == [
         "I'll check those calendar entries.",
-        (
-            "Download Analysis Software and Study Notes is due Saturday, September 12. "
-            "Review insertion sort starts Tuesday, September 15 at 6:00 PM."
-        ),
+        "Here are the matching academic items:\n"
+        "- ECE 250: Download Analysis Software and Study Notes — "
+        "Saturday, September 12, 2026 at 11:59 PM [incomplete; source: course]\n"
+        "- ECE 250: Review insertion sort — Tuesday, September 15, 2026 at 6:00 PM "
+        "[incomplete; source: course]",
     ]
-    model_context = "\n".join(str(message.content) for message in gateway.inputs[1])
-    assert "2026-09-12T23:59:00-04:00" in model_context
-    assert "2026-09-15T18:00:00-04:00" in model_context
-    assert model_context.count('"due_at_timezone":"America/Toronto"') == 2
-    assert "2026-09-13T03:59:00Z" not in model_context
-    assert "2026-09-15T22:00:00Z" not in model_context
+    assert len(gateway.inputs) == 1
+    assert "2026-09-13T03:59:00Z" not in delivery.responses[-1]
+    assert "2026-09-15T22:00:00Z" not in delivery.responses[-1]
 
 
 @pytest.mark.asyncio
@@ -2932,12 +3593,18 @@ async def test_course_event_rejects_model_supplied_utc_timestamp() -> None:
                 tool_calls=[
                     {
                         "id": "create-1",
-                        "name": "create_course_event",
+                        "name": "create_action_item",
                         "args": {
+                            "domain": "academic",
                             "course_id": "course-1",
                             "title": "Review filters",
-                            "starts_at": "2026-09-15T18:00:00Z",
-                            "duration_minutes": 60,
+                            "temporal": {
+                                "precision": "datetime",
+                                "start_at": "2026-09-15T18:00:00Z",
+                                "end_at": "2026-09-15T19:00:00Z",
+                                "timezone": "UTC",
+                            },
+                            "kind": "event",
                             "requires_study_intent": True,
                         },
                     }
@@ -2954,7 +3621,10 @@ async def test_course_event_rejects_model_supplied_utc_timestamp() -> None:
     assert result.status == "handled"
     assert store.proposals == []
     assert delivery.confirmations == []
-    assert "A tool call failed. I will adjust and continue." in delivery.responses
+    assert any(
+        "datetime temporal values must use the owner's timezone" in item
+        for item in delivery.responses
+    )
     assert delivery.responses[-1] == "I need to retry with a local wall-clock time."
 
 
@@ -2977,12 +3647,17 @@ async def test_new_assessment_rejects_past_year_from_model() -> None:
                 tool_calls=[
                     {
                         "id": "create-1",
-                        "name": "create_assessment",
+                        "name": "create_action_item",
                         "args": {
+                            "domain": "academic",
                             "course_id": "course-1",
                             "title": "Quiz",
-                            "due_at": "2025-09-19T23:59:00",
-                            "assessment_type": "quiz",
+                            "temporal": {
+                                "precision": "datetime",
+                                "start_at": "2025-09-19T23:59:00-04:00",
+                                "timezone": "America/Toronto",
+                            },
+                            "kind": "quiz",
                         },
                     }
                 ],
@@ -3128,8 +3803,12 @@ async def test_notion_sync_happens_before_first_catalog_search_once() -> None:
                 tool_calls=[
                     {
                         "id": "search-assessments",
-                        "name": "search_assessments",
-                        "args": {"query": "Lab 2"},
+                        "name": "search_calendar_items",
+                        "args": {
+                            "view": "all_items",
+                            "temporal": {"scope": "all"},
+                            "query": "Lab 2",
+                        },
                     }
                 ],
             ),
@@ -3148,8 +3827,8 @@ async def test_notion_sync_happens_before_first_catalog_search_once() -> None:
 
     assert result.status == "handled"
     assert syncer.calls == 1
-    assert events == ["sync", "search_courses", "search_assessments"]
-    assert "I checked the current catalog." in delivery.responses
+    assert events == ["sync", "search_courses", "search_calendar_items"]
+    assert "I found no matching academic items in the requested scope." in delivery.responses
 
 
 @pytest.mark.parametrize(
@@ -3200,6 +3879,74 @@ async def test_catalog_sync_failure_is_truthful_and_does_not_search_stale_rows(
 
 
 @pytest.mark.asyncio
+async def test_broad_course_search_partial_keeps_usable_sources() -> None:
+    gateway = _Gateway(
+        [
+            AIMessage(
+                content="I will check usable course sources.",
+                tool_calls=[
+                    {
+                        "id": "search-courses",
+                        "name": "search_courses",
+                        "args": {"query": "ECE 202"},
+                    }
+                ],
+            ),
+            AIMessage(content="I found ECE 202 from the usable sources."),
+        ]
+    )
+    store = _Store()
+    delivery = _Delivery()
+    events: list[str] = []
+    syncer = _Syncer(events, status="partial", unavailable_roles=(AcademicCalendarRole.MISC,))
+    catalog = _Catalog(events)
+
+    result = await _handler(gateway, store, delivery, catalog=catalog, syncer=syncer)(
+        _message("list ECE 202")
+    )
+
+    assert result.status == "handled"
+    assert events == ["sync", "search_courses"]
+    assert delivery.responses[-1] == "I found ECE 202 from the usable sources."
+
+
+@pytest.mark.asyncio
+async def test_explicit_unavailable_course_search_returns_trusted_empty_payload() -> None:
+    class Catalog(_Catalog):
+        def search_courses(self, *_args, **_kwargs):
+            raise AssertionError("unavailable explicit role must not search cached rows")
+
+    gateway = _Gateway(
+        [
+            AIMessage(
+                content="I will check misc sources.",
+                tool_calls=[
+                    {
+                        "id": "search-misc",
+                        "name": "search_courses",
+                        "args": {"query": "", "roles": ["misc"]},
+                    }
+                ],
+            ),
+            AIMessage(content="The misc academic source is unavailable right now."),
+        ]
+    )
+    delivery = _Delivery()
+
+    result = await _handler(
+        gateway,
+        _Store(),
+        delivery,
+        catalog=Catalog(),
+        syncer=_Syncer(status="partial", unavailable_roles=(AcademicCalendarRole.MISC,)),
+    )(_message("list misc course sources"))
+
+    assert result.status == "handled"
+    assert len(gateway.inputs) == 2
+    assert delivery.responses[-1] == "The misc academic source is unavailable right now."
+
+
+@pytest.mark.asyncio
 async def test_tool_calls_and_results_are_visible_and_notion_create_waits_for_review() -> None:
     gateway = _Gateway(
         [
@@ -3218,12 +3965,17 @@ async def test_tool_calls_and_results_are_visible_and_notion_create_waits_for_re
                 tool_calls=[
                     {
                         "id": "create-1",
-                        "name": "create_assessment",
+                        "name": "create_action_item",
                         "args": {
+                            "domain": "academic",
                             "course_id": "course-1",
                             "title": "Lab 2",
-                            "due_at": "2026-09-12T17:00:00",
-                            "assessment_type": "assignment",
+                            "temporal": {
+                                "precision": "datetime",
+                                "start_at": "2026-09-12T17:00:00-04:00",
+                                "timezone": "America/Toronto",
+                            },
+                            "kind": "assignment",
                         },
                     }
                 ],
@@ -3243,7 +3995,7 @@ async def test_tool_calls_and_results_are_visible_and_notion_create_waits_for_re
     assert result.status == "handled"
     assert len(store.proposals) == 1
     assert len(delivery.confirmations) == 1
-    assert store.proposals[0].changes[0].field == "create_assessment"
+    assert store.proposals[0].changes[0].field == "create_action_item"
     transcript = "\n".join(delivery.responses)
     assert "I will check your courses." in transcript
     assert "I can prepare that addition." in transcript
@@ -3251,7 +4003,7 @@ async def test_tool_calls_and_results_are_visible_and_notion_create_waits_for_re
     assert "Tool result ·" not in transcript
     assert '"course_code":"ECE 202"' not in transcript
     assert '"review":"required"' not in transcript
-    assert "The addition is ready for your review." in transcript
+    assert "I prepared the requested change for review. Please confirm it below." in transcript
     assert events.index("confirmation") < events.index("progress:proposal_ready")
 
 
@@ -3278,7 +4030,7 @@ async def test_retry_final_response_is_not_suppressed_by_prior_streamed_events()
 
     with pytest.raises(RuntimeError, match="connector_transient"):
         await _handler(first_gateway, store, delivery)(
-            _message("<@444444444444444444> what assignments are due next week?")
+            _message("<@444444444444444444> list ECE 202")
         )
 
     assert delivery.response_keys == [
@@ -3290,7 +4042,7 @@ async def test_retry_final_response_is_not_suppressed_by_prior_streamed_events()
         _Gateway([AIMessage(content="Second attempt final answer.")]),
         store,
         delivery,
-    )(_message("<@444444444444444444> what assignments are due next week?"))
+    )(_message("<@444444444444444444> list ECE 202"))
 
     assert second.status == "handled"
     assert delivery.responses[-1] == "Second attempt final answer."
@@ -3298,7 +4050,7 @@ async def test_retry_final_response_is_not_suppressed_by_prior_streamed_events()
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("final_turn", [11, 50])
+@pytest.mark.parametrize("final_turn", [11])
 async def test_native_handler_can_answer_after_ten_turns(final_turn: int) -> None:
     calls = [
         AIMessage(
@@ -3333,12 +4085,17 @@ async def test_turn_limit_discards_accumulated_notion_proposal() -> None:
             tool_calls=[
                 {
                     "id": "create-1",
-                    "name": "create_assessment",
+                    "name": "create_action_item",
                     "args": {
+                        "domain": "academic",
                         "course_id": "course-1",
                         "title": "Lab 2",
-                        "due_at": "2026-09-12T17:00:00-04:00",
-                        "assessment_type": "assignment",
+                        "temporal": {
+                            "precision": "datetime",
+                            "start_at": "2026-09-12T17:00:00-04:00",
+                            "timezone": "America/Toronto",
+                        },
+                        "kind": "assignment",
                     },
                 }
             ],
@@ -3366,7 +4123,7 @@ async def test_turn_limit_discards_accumulated_notion_proposal() -> None:
     )
 
     assert result.status == "failed"
-    assert len(gateway.inputs) == 50
+    assert len(gateway.inputs) == 12
     assert store.proposals == []
     assert delivery.confirmations == []
     assert delivery.responses[-1] == (
@@ -3388,7 +4145,7 @@ async def test_pdf_attach_requires_current_turn_assessment_and_owner_scoped_inta
     )
 
     class Catalog:
-        def search_assessments(self, args, *, as_of, timezone, owner_scope):
+        def search_calendar_items(self, args, *, as_of, timezone, owner_scope):
             return _assessment_search_result((assessment,), args, timezone=timezone)
 
     state = _AcademicToolState(
@@ -3402,7 +4159,7 @@ async def test_pdf_attach_requires_current_turn_assessment_and_owner_scoped_inta
     )
     tools = {tool.name: tool for tool in state.tools()}
 
-    with pytest.raises(ToolExecutionError, match="search_assessments"):
+    with pytest.raises(ToolExecutionError, match="search_calendar_items"):
         await tools["attach_material_to_assessment"].handler(
             {
                 "assessment_id": assessment.assessment_id,
@@ -3410,7 +4167,9 @@ async def test_pdf_attach_requires_current_turn_assessment_and_owner_scoped_inta
             }
         )
 
-    await tools["search_assessments"].handler({"query": "ECE 222 A2"})
+    await tools["search_calendar_items"].handler(
+        {"view": "all_items", "temporal": {"scope": "all"}, "query": "ECE 222 A2"}
+    )
     result = await tools["attach_material_to_assessment"].handler(
         {
             "assessment_id": assessment.assessment_id,
@@ -3439,7 +4198,7 @@ async def test_assessment_material_empty_semantic_result_does_not_fall_back_to_l
     class Catalog:
         lexical_called = False
 
-        def search_assessments(self, args, *, as_of, timezone, owner_scope):
+        def search_calendar_items(self, args, *, as_of, timezone, owner_scope):
             return _assessment_search_result((assessment,), args, timezone=timezone)
 
         async def search_semantic_assessment_materials(self, assessment_id, query, *, limit):
@@ -3461,7 +4220,9 @@ async def test_assessment_material_empty_semantic_result_does_not_fall_back_to_l
     )
     tools = {tool.name: tool for tool in state.tools()}
 
-    await tools["search_assessments"].handler({"query": "ECE 222 A2"})
+    await tools["search_calendar_items"].handler(
+        {"view": "all_items", "temporal": {"scope": "all"}, "query": "ECE 222 A2"}
+    )
     rows = await tools["search_assessment_materials"].handler(
         {"assessment_id": "assessment-1", "query": "recursion"}
     )
@@ -3483,7 +4244,7 @@ async def test_assessment_material_semantic_unavailable_is_safe_tool_error() -> 
     )
 
     class Catalog:
-        def search_assessments(self, args, *, as_of, timezone, owner_scope):
+        def search_calendar_items(self, args, *, as_of, timezone, owner_scope):
             return _assessment_search_result((assessment,), args, timezone=timezone)
 
         async def search_semantic_assessment_materials(self, *_args, **_kwargs):
@@ -3500,7 +4261,9 @@ async def test_assessment_material_semantic_unavailable_is_safe_tool_error() -> 
     )
     tools = {tool.name: tool for tool in state.tools()}
 
-    await tools["search_assessments"].handler({"query": "ECE 222 A2"})
+    await tools["search_calendar_items"].handler(
+        {"view": "all_items", "temporal": {"scope": "all"}, "query": "ECE 222 A2"}
+    )
     with pytest.raises(ToolExecutionError, match="semantic retrieval is unavailable"):
         await tools["search_assessment_materials"].handler(
             {"assessment_id": "assessment-1", "query": "recursion"}
