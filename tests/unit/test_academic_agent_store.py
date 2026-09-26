@@ -967,3 +967,64 @@ def test_update_assessment_validation_preserves_existing_range_and_all_day_preci
     assert changes[0].due_at == new_start
     assert changes[0].ends_at == new_start + timedelta(days=2)
     assert changes[0].is_all_day is True
+
+
+def test_next_week_includes_date_only_and_late_timed_items_on_its_last_day() -> None:
+    store, course_id, _assessment_id = _store()
+    for notion_id, title, due_at, is_all_day in (
+        ("sun-before", "Sunday before", datetime(2026, 9, 27, 0, tzinfo=UTC), True),
+        ("mon-first", "Monday first", datetime(2026, 9, 28, 0, tzinfo=UTC), True),
+        ("sun-last", "Sunday last", datetime(2026, 10, 4, 0, tzinfo=UTC), True),
+        ("sun-late", "Sunday late timed", datetime(2026, 10, 5, 3, 30, tzinfo=UTC), False),
+        ("mon-after", "Monday after", datetime(2026, 10, 5, 0, tzinfo=UTC), True),
+    ):
+        _add_assessment(
+            store,
+            course_id=course_id,
+            source_id="source123",
+            notion_id=notion_id,
+            title=title,
+            due_at=due_at,
+            is_all_day=is_all_day,
+        )
+
+    result = store.search_calendar_items(
+        AcademicCalendarItemQueryArgs(
+            view=CalendarItemView.ALL_ITEMS,
+            course_id=course_id,
+            temporal=TemporalQuery(scope=TemporalScope.NEXT_WEEK),
+            query="next week",
+            limit=20,
+        ),
+        as_of=datetime(2026, 9, 26, 18, tzinfo=UTC),
+        timezone="America/Toronto",
+        owner_scope="owner:channel:next-week",
+    )
+
+    titles = {item.title for item in result.results}
+    assert {"Monday first", "Sunday last", "Sunday late timed"} <= titles
+    assert not {"Sunday before", "Monday after"} & titles
+    assert result.envelope.applied_filters.temporal.start_local_date == date(2026, 9, 28)
+    assert result.envelope.applied_filters.temporal.end_local_date_exclusive == date(2026, 10, 5)
+
+
+def test_assessment_search_does_not_infer_temporal_scope_from_query_words() -> None:
+    store, course_id, _assessment_id = _store()
+    _add_assessment(
+        store,
+        course_id=course_id,
+        source_id="source123",
+        notion_id="next-week-item",
+        title="Next week lab",
+        due_at=datetime(2026, 9, 30, 16, tzinfo=UTC),
+    )
+
+    result = store.search_assessments(
+        AcademicAssessmentQueryArgs(query="due next week", course_id=course_id),
+        as_of=datetime(2026, 9, 26, 18, tzinfo=UTC),
+        timezone="America/Toronto",
+        owner_scope="owner:channel:no-keyword-scope",
+    )
+
+    assert result.envelope.applied_filters.temporal.scope == "all"
+    assert "Next week lab" in {item.title for item in result.results}

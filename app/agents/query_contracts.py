@@ -13,6 +13,7 @@ from typing import TypeVar, cast
 from zoneinfo import ZoneInfo
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
+from pydantic.json_schema import SkipJsonSchema
 
 DEFAULT_UPCOMING_DAYS = 14
 MAX_DATE_RANGE_DAYS = 31
@@ -28,6 +29,9 @@ class TemporalScope(StrEnum):
     TODAY = "today"
     TOMORROW = "tomorrow"
     THIS_WEEK = "this_week"
+    NEXT_WEEK = "next_week"
+    THIS_MONTH = "this_month"
+    NEXT_MONTH = "next_month"
     UPCOMING = "upcoming"
     OVERDUE = "overdue"
     DATE_RANGE = "date_range"
@@ -68,10 +72,32 @@ class QueryResultKind(StrEnum):
 class TemporalQuery(QueryContractModel):
     """Model-selected intent; the host resolves it against the immutable request time."""
 
-    scope: TemporalScope = TemporalScope.ALL
-    start_at: datetime | None = None
-    end_at: datetime | None = None
-    upcoming_days: int = Field(default=DEFAULT_UPCOMING_DAYS, ge=1, le=MAX_DATE_RANGE_DAYS)
+    # The model names a period and never does calendar arithmetic: named scopes cover common
+    # relative periods, and date_range takes inclusive owner-local calendar dates.
+
+    scope: TemporalScope = Field(
+        default=TemporalScope.ALL,
+        description=(
+            "Owner-local period. Weeks run Monday-Sunday; months are whole calendar months."
+        ),
+    )
+    start_date: date | None = Field(
+        default=None,
+        description="date_range only: first local day, inclusive.",
+    )
+    end_date: date | None = Field(
+        default=None,
+        description="date_range only: last local day, inclusive.",
+    )
+    # Legacy aware-instant date_range form: still accepted, hidden from the model schema.
+    start_at: SkipJsonSchema[datetime | None] = None
+    end_at: SkipJsonSchema[datetime | None] = None
+    upcoming_days: int = Field(
+        default=DEFAULT_UPCOMING_DAYS,
+        ge=1,
+        le=MAX_DATE_RANGE_DAYS,
+        description="upcoming only: days ahead.",
+    )
 
     @field_validator("start_at", "end_at")
     @classmethod
@@ -82,16 +108,33 @@ class TemporalQuery(QueryContractModel):
 
     @model_validator(mode="after")
     def validate_scope_fields(self) -> TemporalQuery:
-        has_range = self.start_at is not None or self.end_at is not None
+        has_dates = self.start_date is not None or self.end_date is not None
+        has_instants = self.start_at is not None or self.end_at is not None
         if self.scope is TemporalScope.DATE_RANGE:
-            if self.start_at is None or self.end_at is None:
-                raise ValueError("date_range requires start_at and end_at")
-            if self.end_at <= self.start_at:
-                raise ValueError("date_range end_at must be after start_at")
-            if self.end_at - self.start_at > timedelta(days=MAX_DATE_RANGE_DAYS):
-                raise ValueError(f"date_range may not exceed {MAX_DATE_RANGE_DAYS} days")
-        elif has_range:
-            raise ValueError("start_at and end_at are valid only for date_range")
+            if has_dates and has_instants:
+                raise ValueError(
+                    "date_range takes either start_date/end_date or start_at/end_at, not both"
+                )
+            if has_instants:
+                if self.start_at is None or self.end_at is None:
+                    raise ValueError("date_range requires start_at and end_at together")
+                if self.end_at <= self.start_at:
+                    raise ValueError("date_range end_at must be after start_at")
+                if self.end_at - self.start_at > timedelta(days=MAX_DATE_RANGE_DAYS):
+                    raise ValueError(f"date_range may not exceed {MAX_DATE_RANGE_DAYS} days")
+            else:
+                if self.start_date is None or self.end_date is None:
+                    raise ValueError(
+                        "date_range requires start_date and end_date (inclusive YYYY-MM-DD)"
+                    )
+                if self.end_date < self.start_date:
+                    raise ValueError("date_range end_date must be on or after start_date")
+                if (self.end_date - self.start_date).days >= MAX_DATE_RANGE_DAYS:
+                    raise ValueError(f"date_range may not exceed {MAX_DATE_RANGE_DAYS} days")
+        elif has_dates or has_instants:
+            raise ValueError(
+                "start_date, end_date, start_at and end_at are valid only for date_range"
+            )
         if self.scope is not TemporalScope.UPCOMING and self.upcoming_days != DEFAULT_UPCOMING_DAYS:
             raise ValueError("upcoming_days is valid only for upcoming")
         return self
@@ -204,53 +247,164 @@ def resolve_temporal_window(
     request_time: datetime,
     timezone: ZoneInfo | str,
 ) -> ResolvedTemporalWindow:
-    """Resolve relative intent once, using the original trusted request timestamp."""
+    """Resolve relative intent once, using the original trusted request timestamp.
+
+    Calendar-day bounds are always computed from owner-local dates and never by truncating
+    instants, so date-only items on a range's last day are included.
+    """
 
     if request_time.tzinfo is None or request_time.utcoffset() is None:
         raise ValueError("request_time must be timezone-aware")
-    zone = timezone if isinstance(timezone, ZoneInfo) else ZoneInfo(timezone)
+    zone = _zone(timezone)
     local_now = request_time.astimezone(zone)
     today = local_now.date()
 
-    def local_midnight(day: date) -> datetime:
-        return datetime.combine(day, time.min, tzinfo=zone)
-
-    start: datetime | None
-    end: datetime | None
-    start_date: date | None
-    end_date: date | None
     if query.scope is TemporalScope.ALL:
-        start = end = None
-        start_date = end_date = None
-    elif query.scope is TemporalScope.TODAY:
-        start_date, end_date = today, today + timedelta(days=1)
-        start, end = local_midnight(start_date), local_midnight(end_date)
-    elif query.scope is TemporalScope.TOMORROW:
-        start_date, end_date = today + timedelta(days=1), today + timedelta(days=2)
-        start, end = local_midnight(start_date), local_midnight(end_date)
-    elif query.scope is TemporalScope.THIS_WEEK:
-        start_date = today - timedelta(days=today.weekday())
-        end_date = start_date + timedelta(days=7)
-        start, end = local_midnight(start_date), local_midnight(end_date)
-    elif query.scope is TemporalScope.UPCOMING:
-        start_date, end_date = today, today + timedelta(days=query.upcoming_days + 1)
-        start, end = local_now, local_midnight(end_date)
-    elif query.scope is TemporalScope.OVERDUE:
-        start_date, end_date = None, today
-        start, end = None, local_now
-    else:
-        assert query.start_at is not None
+        return ResolvedTemporalWindow(scope=query.scope)
+    if query.scope is TemporalScope.OVERDUE:
+        return ResolvedTemporalWindow(
+            scope=query.scope,
+            end_at=local_now,
+            end_local_date_exclusive=today,
+        )
+    if query.scope is TemporalScope.UPCOMING:
+        end_date = today + timedelta(days=query.upcoming_days + 1)
+        return ResolvedTemporalWindow(
+            scope=query.scope,
+            start_at=local_now,
+            end_at=_local_midnight(end_date, zone),
+            start_local_date=today,
+            end_local_date_exclusive=end_date,
+        )
+    if query.scope is TemporalScope.DATE_RANGE and query.start_at is not None:
         assert query.end_at is not None
         start = query.start_at.astimezone(zone)
         end = query.end_at.astimezone(zone)
-        start_date, end_date = start.date(), end.date()
-    return ResolvedTemporalWindow(
+        # A local-midnight end is an exclusive boundary; any later end time includes that day.
+        end_date = end.date() if end.time() == time.min else end.date() + timedelta(days=1)
+        return ResolvedTemporalWindow(
+            scope=query.scope,
+            start_at=start,
+            end_at=end,
+            start_local_date=start.date(),
+            end_local_date_exclusive=end_date,
+        )
+
+    start_date: date
+    end_date_exclusive: date
+    if query.scope is TemporalScope.TODAY:
+        start_date, end_date_exclusive = today, today + timedelta(days=1)
+    elif query.scope is TemporalScope.TOMORROW:
+        start_date, end_date_exclusive = today + timedelta(days=1), today + timedelta(days=2)
+    elif query.scope is TemporalScope.THIS_WEEK:
+        start_date = today - timedelta(days=today.weekday())
+        end_date_exclusive = start_date + timedelta(days=7)
+    elif query.scope is TemporalScope.NEXT_WEEK:
+        start_date = today - timedelta(days=today.weekday()) + timedelta(days=7)
+        end_date_exclusive = start_date + timedelta(days=7)
+    elif query.scope is TemporalScope.THIS_MONTH:
+        start_date = today.replace(day=1)
+        end_date_exclusive = _first_of_next_month(start_date)
+    elif query.scope is TemporalScope.NEXT_MONTH:
+        start_date = _first_of_next_month(today)
+        end_date_exclusive = _first_of_next_month(start_date)
+    else:
+        assert query.start_date is not None
+        assert query.end_date is not None
+        start_date, end_date_exclusive = query.start_date, query.end_date + timedelta(days=1)
+    return resolve_local_date_range(
+        start_date,
+        end_date_exclusive - timedelta(days=1),
+        timezone=zone,
         scope=query.scope,
-        start_at=start,
-        end_at=end,
-        start_local_date=start_date,
-        end_local_date_exclusive=end_date,
     )
+
+
+def resolve_local_date_range(
+    start_date: date,
+    end_date: date,
+    *,
+    timezone: ZoneInfo | str,
+    scope: TemporalScope = TemporalScope.DATE_RANGE,
+) -> ResolvedTemporalWindow:
+    """Resolve an inclusive owner-local calendar-date range to local-midnight bounds."""
+
+    if end_date < start_date:
+        raise ValueError("end_date must be on or after start_date")
+    zone = _zone(timezone)
+    end_date_exclusive = end_date + timedelta(days=1)
+    return ResolvedTemporalWindow(
+        scope=scope,
+        start_at=_local_midnight(start_date, zone),
+        end_at=_local_midnight(end_date_exclusive, zone),
+        start_local_date=start_date,
+        end_local_date_exclusive=end_date_exclusive,
+    )
+
+
+def describe_temporal_window(window: ResolvedTemporalWindow) -> str | None:
+    """Return a short owner-facing label for the calendar days a window covers."""
+
+    start = window.start_local_date
+    end_exclusive = window.end_local_date_exclusive
+    if start is None and end_exclusive is None:
+        return None
+    if start is None:
+        assert end_exclusive is not None
+        return f"before {_day_label(end_exclusive, with_year=True)}"
+    if end_exclusive is None:
+        return f"from {_day_label(start, with_year=True)}"
+    last = end_exclusive - timedelta(days=1)
+    if last <= start:
+        return _day_label(start, with_year=True)
+    return (
+        f"{_day_label(start, with_year=start.year != last.year)} through "
+        f"{_day_label(last, with_year=True)}"
+    )
+
+
+def owner_calendar_context(
+    request_time: datetime,
+    timezone: ZoneInfo | str,
+    *,
+    days: int = 14,
+) -> str:
+    """Host-computed calendar facts so the model looks dates up instead of computing them."""
+
+    if request_time.tzinfo is None or request_time.utcoffset() is None:
+        raise ValueError("request_time must be timezone-aware")
+    zone = _zone(timezone)
+    local_now = request_time.astimezone(zone)
+    today = local_now.date()
+    week_start = today - timedelta(days=today.weekday())
+    next_week_start = week_start + timedelta(days=7)
+    upcoming = ", ".join(
+        f"{day:%a} {day.isoformat()}" for day in (today + timedelta(days=i) for i in range(days))
+    )
+    return (
+        f"Today is {today:%A}; now is {local_now.isoformat(timespec='seconds')} "
+        f"({zone.key}). This week is Mon {week_start.isoformat()} through Sun "
+        f"{(week_start + timedelta(days=6)).isoformat()}. Next week is Mon "
+        f"{next_week_start.isoformat()} through Sun "
+        f"{(next_week_start + timedelta(days=6)).isoformat()}. "
+        f"Next {days} days: {upcoming}."
+    )
+
+
+def _zone(timezone: ZoneInfo | str) -> ZoneInfo:
+    return timezone if isinstance(timezone, ZoneInfo) else ZoneInfo(timezone)
+
+
+def _local_midnight(day: date, zone: ZoneInfo) -> datetime:
+    return datetime.combine(day, time.min, tzinfo=zone)
+
+
+def _first_of_next_month(day: date) -> date:
+    return date(day.year + (day.month == 12), day.month % 12 + 1, 1)
+
+
+def _day_label(day: date, *, with_year: bool) -> str:
+    return f"{day:%a %b} {day.day}, {day.year}" if with_year else f"{day:%a %b} {day.day}"
 
 
 class CursorCodec:
@@ -354,7 +508,10 @@ __all__ = [
     "SourceFreshness",
     "TemporalQuery",
     "TemporalScope",
+    "describe_temporal_window",
     "model_json_size",
+    "owner_calendar_context",
+    "resolve_local_date_range",
     "resolve_query_completeness",
     "resolve_temporal_window",
 ]

@@ -32,6 +32,7 @@ from app.agents.academic_planner.discord_harness import (
     _progress_for_harness_event,
     _proposal_has_inbound_material,
     _render_event,
+    _system_message,
     _validate_conversation_lifecycle,
 )
 from app.agents.academic_planner.nightly_conversation import (
@@ -577,6 +578,107 @@ async def test_calendar_item_query_allows_one_concrete_schema_repair() -> None:
         await tool.handler({"temporal": {"scope": "today"}})
     with pytest.raises(ToolExecutionError, match="repair limit reached"):
         await tool.handler({"view": "tasks", "temporal": {"scope": "not-a-scope"}})
+
+
+@pytest.mark.asyncio
+async def test_calendar_item_query_repair_error_names_scopes_and_today() -> None:
+    state = _AcademicToolState(
+        catalog=_Catalog(),
+        now=NOW,
+        timezone=ZoneInfo("America/Toronto"),
+        syncer=_Syncer(),
+    )
+    tool = {item.name: item for item in state.tools()}["search_calendar_items"]
+
+    with pytest.raises(ToolExecutionError) as error:
+        await tool.handler({"view": "tasks", "temporal": {"scope": "week_after"}})
+
+    message = str(error.value)
+    assert "next_week" in message
+    assert "Today is Wednesday 2026-09-09 in America/Toronto" in message
+    assert "inclusive local start_date and end_date" in message
+
+
+def test_system_message_gives_weekday_and_week_bounds() -> None:
+    content = _system_message(NOW, ZoneInfo("America/Toronto"))
+
+    assert "Today is Wednesday; now is 2026-09-09T10:00:00-04:00 (America/Toronto)" in content
+    assert "This week is Mon 2026-09-07 through Sun 2026-09-13" in content
+    assert "Next week is Mon 2026-09-14 through Sun 2026-09-20" in content
+    assert "Prefer a named temporal scope" in content
+
+
+def test_calendar_item_tool_schema_exposes_named_scopes_and_local_dates() -> None:
+    state = _AcademicToolState(
+        catalog=_Catalog(),
+        now=NOW,
+        timezone=ZoneInfo("America/Toronto"),
+        syncer=_Syncer(),
+    )
+    tool = {item.name: item for item in state.tools()}["search_calendar_items"]
+    definitions = tool.schema["function"]["parameters"]["$defs"]
+
+    assert {"next_week", "this_month", "next_month"} <= set(definitions["TemporalScope"]["enum"])
+    temporal = definitions["TemporalQuery"]["properties"]
+    assert temporal["start_date"]["anyOf"][0]["format"] == "date"
+    assert "start_at" not in temporal
+
+
+@pytest.mark.asyncio
+async def test_next_week_query_reports_resolved_window_to_model_and_owner() -> None:
+    task = AcademicAssessmentOption(
+        assessment_id="task-next-week",
+        course_id="course-1",
+        course_code="ECE 202",
+        title="Lab report",
+        due_at=datetime(2026, 9, 20, 4, tzinfo=UTC),
+        due_date_local=date(2026, 9, 20),
+        is_all_day=True,
+        assessment_type=AssessmentType.ASSIGNMENT,
+        source_area=AcademicCalendarRole.COURSE,
+    )
+
+    class Catalog(_Catalog):
+        def search_calendar_items(self, args, *, as_of, timezone, owner_scope):
+            assert args.temporal.scope.value == "next_week"
+            window = resolve_temporal_window(args.temporal, request_time=as_of, timezone=timezone)
+            envelope = _test_envelope((task,), query=args.query, timezone=timezone)
+            envelope = envelope.model_copy(
+                update={
+                    "applied_filters": envelope.applied_filters.model_copy(
+                        update={"temporal": window}
+                    )
+                }
+            )
+            return AcademicCalendarItemSearchResult(results=(task,), envelope=envelope)
+
+    state = _AcademicToolState(
+        catalog=Catalog(),
+        now=NOW,
+        timezone=ZoneInfo("America/Toronto"),
+        syncer=_Syncer(),
+    )
+    tool = {item.name: item for item in state.tools()}["search_calendar_items"]
+
+    payload = await tool.handler({"view": "tasks", "temporal": {"scope": "next_week"}})
+
+    assert payload["resolved_window"] == {
+        "scope": "next_week",
+        "from": "2026-09-14",
+        "through": "2026-09-20",
+        "label": "Mon Sep 14 through Sun Sep 20, 2026",
+    }
+    rendered = state.render_grounding(
+        TerminalGrounding(query_id=payload["query_id"], item_ids=("task-next-week",))
+    )
+    assert rendered.startswith(
+        "Here are the matching academic items for Mon Sep 14 through Sun Sep 20, 2026:\n"
+        "- ECE 202: Lab report — Sunday, September 20, 2026"
+    )
+    empty = state.render_grounding(TerminalGrounding(query_id=payload["query_id"], item_ids=()))
+    assert empty.startswith(
+        "I found no matching academic items for Mon Sep 14 through Sun Sep 20, 2026."
+    )
 
 
 class _IdempotentProposalStore(_Store):

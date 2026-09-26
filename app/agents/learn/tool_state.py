@@ -52,6 +52,7 @@ from app.agents.query_contracts import (
     SourceFreshness,
     TemporalScope,
     model_json_size,
+    resolve_local_date_range,
 )
 from app.connectors.learn_bridge import (
     LearnBridgeConnector,
@@ -83,8 +84,8 @@ class _SearchLearnCoursesArgs(_Args):
 
 class _GetLearnScheduledItemsArgs(_Args):
     course_ids: tuple[str, ...] = Field(min_length=1, max_length=20)
-    start_date: date
-    end_date: date
+    start_date: date = Field(description="First owner-local calendar day, inclusive (YYYY-MM-DD).")
+    end_date: date = Field(description="Last owner-local calendar day, inclusive (YYYY-MM-DD).")
     limit: int = Field(default=10, ge=1, le=MAX_QUERY_PAGE_SIZE)
     cursor: str | None = Field(default=None, max_length=2_000)
 
@@ -775,14 +776,7 @@ def _resolved_date_window(
     end_date: date,
     timezone: ZoneInfo,
 ) -> ResolvedTemporalWindow:
-    start_at, end_at = _date_window(start_date, timezone, end_date=end_date)
-    return ResolvedTemporalWindow(
-        scope=TemporalScope.DATE_RANGE,
-        start_at=start_at,
-        end_at=end_at,
-        start_local_date=start_date,
-        end_local_date_exclusive=end_date + timedelta(days=1),
-    )
+    return resolve_local_date_range(start_date, end_date, timezone=timezone)
 
 
 def _resolved_datetime_window(

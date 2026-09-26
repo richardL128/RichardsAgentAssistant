@@ -112,6 +112,9 @@ from app.agents.query_contracts import (
     QueryResultKind,
     SourceFreshness,
     TemporalQuery,
+    TemporalScope,
+    describe_temporal_window,
+    owner_calendar_context,
     resolve_query_completeness,
     resolve_temporal_window,
 )
@@ -184,7 +187,9 @@ Use search_calendar_items for every dated academic, misc, or synchronized schedu
 Choose its semantic view: tasks for unfinished actionable work, schedule for classes, tutorials,
 appointments, and events, agenda for both, or all_items only for an explicitly broad request.
 Express dates only through the typed temporal field and completion only through its typed field;
-put residual subject text in query. If the intended view is ambiguous, ask one concise question.
+put residual subject text in query. Prefer a named temporal scope; otherwise use date_range with
+inclusive local start_date and end_date read from the calendar below. If the intended view is
+ambiguous, ask one concise question.
 Phrases such as what must get done, what is due, to-dos, or what is on the owner's plate express
 the tasks view; a schedule request expresses schedule, and a full-agenda request expresses agenda.
 These examples guide semantic interpretation only. Leave roles empty for a broad owner request;
@@ -2758,9 +2763,13 @@ class _AcademicToolState:
             first = exc.errors(include_url=False)[0]
             location = ".".join(str(item) for item in first.get("loc", ())) or "query"
             diagnostic = str(first.get("msg", "invalid value"))[:200]
+            today = self._now.astimezone(self._timezone).date()
             raise ToolExecutionError(
                 f"calendar item query is invalid at {location}: {diagnostic}; repair the "
-                "structured arguments once"
+                "structured arguments once. Valid temporal scopes: "
+                + ", ".join(scope.value for scope in TemporalScope)
+                + f". Today is {today:%A} {today.isoformat()} in {self._timezone.key}; "
+                "date_range takes inclusive local start_date and end_date (YYYY-MM-DD)."
             ) from exc
         requested_roles = set(args.roles)
         if args.course_id is not None and args.course_id in self._courses:
@@ -2782,6 +2791,9 @@ class _AcademicToolState:
             payload["items"] = []
             payload["result_count"] = 0
             payload["freshness"] = freshness
+            payload["resolved_window"] = _resolved_window_for_model(
+                envelope.applied_filters.temporal
+            )
             return payload
         if self._catalog is None:
             raise ToolExecutionError("The academic catalog is unavailable.")
@@ -2818,6 +2830,9 @@ class _AcademicToolState:
         payload["items"] = rendered_items
         payload["result_count"] = len(rendered_items)
         payload["freshness"] = freshness
+        payload["resolved_window"] = _resolved_window_for_model(
+            trusted_envelope.applied_filters.temporal
+        )
         self._query_envelopes[trusted_envelope.query_id] = trusted_envelope
         return payload
 
@@ -3704,16 +3719,26 @@ class _AcademicToolState:
                     f"{'s' if invalid_count != 1 else ''}."
                 )
             return "\n".join(lines)
+        window_label = describe_temporal_window(envelope.applied_filters.temporal)
         if not items:
             lines = [
                 (
-                    "I found no matching academic items in the available requested sources."
+                    "I found no matching academic items in the available requested sources"
+                    + (f" for {window_label}." if window_label else ".")
                     if envelope.completeness is CompletenessState.PARTIAL
-                    else "I found no matching academic items in the requested scope."
+                    else (
+                        f"I found no matching academic items for {window_label}."
+                        if window_label
+                        else "I found no matching academic items in the requested scope."
+                    )
                 )
             ]
         else:
-            lines = ["Here are the matching academic items:"]
+            lines = [
+                f"Here are the matching academic items for {window_label}:"
+                if window_label
+                else "Here are the matching academic items:"
+            ]
             for item in items:
                 if item.due_date_local is None and item.due_at is not None:
                     local_due = item.due_at.astimezone(self._timezone)
@@ -4819,12 +4844,11 @@ def _temporal_range(value: TemporalValue, timezone: ZoneInfo) -> tuple[datetime,
 
 
 def _system_message(now: datetime, timezone: ZoneInfo) -> str:
-    local_now = now.astimezone(timezone)
     return (
         _SYSTEM_MESSAGE
-        + f"\nThe owner's timezone is {timezone.key}. The current local date and time is "
-        + local_now.isoformat(timespec="seconds")
-        + ". For create_action_item and update_action_item, send temporal as the shared "
+        + "\n"
+        + owner_calendar_context(now, timezone)
+        + " For create_action_item and update_action_item, send temporal as the shared "
         + "discriminated object: precision=date with start_date, or precision=datetime with "
         + f"timezone={timezone.key} and timezone-aware start_at/end_at. "
         + "For earliest_start_at, send the intended local wall-clock date and time without Z "
@@ -4833,6 +4857,18 @@ def _system_message(now: datetime, timezone: ZoneInfo) -> str:
         + "report their displayed calendar date and clock time without converting them again. "
         + "Resolve dates without a year to the next matching date that is not in the past."
     )
+
+
+def _resolved_window_for_model(window: Any) -> dict[str, object]:
+    """Tell the model exactly which owner-local days the host searched."""
+
+    end_exclusive = window.end_local_date_exclusive
+    return {
+        "scope": window.scope.value,
+        "from": window.start_local_date.isoformat() if window.start_local_date else None,
+        "through": (end_exclusive - timedelta(days=1)).isoformat() if end_exclusive else None,
+        "label": describe_temporal_window(window),
+    }
 
 
 def _assessment_result_for_model(

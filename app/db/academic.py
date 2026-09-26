@@ -4880,15 +4880,9 @@ class SQLAlchemyAcademicPlannerStore:
         if args.course_id is not None and selected_course_id is None:
             raise ValueError("course_id is invalid")
         query_as_of = _utc(as_of, "as_of")
-        scope = (
-            _normalize_academic_temporal_scope(args.temporal.scope, args.query)
-            if semantic_view is None
-            else args.temporal.scope
-        )
         zone = ZoneInfo(timezone)
-        temporal = args.temporal.model_copy(update={"scope": scope})
         window = resolve_temporal_window(
-            temporal,
+            args.temporal,
             request_time=query_as_of,
             timezone=timezone,
         )
@@ -7952,9 +7946,12 @@ def _academic_query_terms(value: str) -> tuple[str, ...]:
         "in",
         "is",
         "me",
+        "month",
         "my",
+        "next",
         "of",
         "on",
+        "overdue",
         "the",
         "this",
         "to",
@@ -7968,6 +7965,7 @@ def _academic_query_terms(value: str) -> tuple[str, ...]:
         "up",
         "upcoming",
         "week",
+        "weekend",
         "what",
         "when",
     }
@@ -7978,25 +7976,6 @@ def _academic_query_terms(value: str) -> tuple[str, ...]:
         if raw not in terms:
             terms.append(raw)
     return tuple(terms[:8])
-
-
-def _normalize_academic_temporal_scope(scope: Any, query: str) -> Any:
-    if getattr(scope, "value", scope) != "all":
-        return scope
-    words = set(re.findall(r"[a-z0-9]+", query.casefold()))
-    from app.agents.query_contracts import TemporalScope
-
-    if {"today", "todays"} & words:
-        return TemporalScope.TODAY
-    if "tomorrow" in words:
-        return TemporalScope.TOMORROW
-    if "overdue" in words:
-        return TemporalScope.OVERDUE
-    if "upcoming" in words or ({"coming", "up"} <= words):
-        return TemporalScope.UPCOMING
-    if "week" in words and ("this" in words or "due" in words):
-        return TemporalScope.THIS_WEEK
-    return scope
 
 
 def _canonical_action_item_domain_values(domains: Iterable[Any]) -> tuple[str, ...]:
