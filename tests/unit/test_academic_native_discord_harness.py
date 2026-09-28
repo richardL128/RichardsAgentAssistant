@@ -948,7 +948,7 @@ async def test_incident_todos_today_recovers_plain_text_from_trusted_task_query(
     assert delivery.responses[-1] == (
         "Here are the matching academic items:\n"
         "- misc: Submit parking form — Wednesday, September 9, 2026 at 2:00 PM "
-        "[incomplete; source: misc]"
+        "[domain: misc; status: incomplete; context: misc · task]"
     )
     assert "model-written guess" not in delivery.responses[-1]
     assert len(gateway.inputs) == 1
@@ -3124,7 +3124,7 @@ async def test_system_message_supplies_current_owner_local_time() -> None:
     assert "Follow explicit response-format requests exactly" in system_content
     assert "Keep calculations, scratch work, and" in system_content
     assert "do not call academic tools" in system_content
-    assert "course-event tools" in system_content
+    assert "create_action_item with domain=academic only when the item" in system_content
     assert "study-session tools" not in system_content
 
 
@@ -3667,9 +3667,10 @@ async def test_assessment_search_answers_with_owner_local_times() -> None:
         "I'll check those calendar entries.",
         "Here are the matching academic items:\n"
         "- ECE 250: Download Analysis Software and Study Notes — "
-        "Saturday, September 12, 2026 at 11:59 PM [incomplete; source: course]\n"
+        "Saturday, September 12, 2026 at 11:59 PM "
+        "[domain: course; status: incomplete; context: ECE 250 · event]\n"
         "- ECE 250: Review insertion sort — Tuesday, September 15, 2026 at 6:00 PM "
-        "[incomplete; source: course]",
+        "[domain: course; status: incomplete; context: ECE 250 · event]",
     ]
     assert len(gateway.inputs) == 1
     assert "2026-09-13T03:59:00Z" not in delivery.responses[-1]

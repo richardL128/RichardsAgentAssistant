@@ -18,7 +18,7 @@ from uuid import UUID
 from langchain_core.messages import AIMessage, BaseMessage, HumanMessage, SystemMessage, ToolMessage
 from pydantic import BaseModel, ValidationError
 
-from app.llm.contracts import GatewayFailure
+from app.llm.contracts import GatewayFailure, ReasoningSink
 
 type HarnessEventKind = Literal[
     "assistant_text",
@@ -168,6 +168,18 @@ class AgentHarnessGateway(Protocol):
         self,
         messages: Sequence[BaseMessage],
         tools: Sequence[Mapping[str, Any]],
+    ) -> AIMessage: ...
+
+
+class ReasoningStreamingGateway(Protocol):
+    """Gateway that can stream model reasoning to a display-only sink."""
+
+    async def invoke_tools(
+        self,
+        messages: Sequence[BaseMessage],
+        tools: Sequence[Mapping[str, Any]],
+        *,
+        on_reasoning: ReasoningSink | None = None,
     ) -> AIMessage: ...
 
 
@@ -391,6 +403,7 @@ async def run_native_tool_loop(
     lifecycle_renderer: LifecycleRenderer | None = None,
     pre_model_context_hook: PreModelContextHook | None = None,
     post_tool_lifecycle_resolver: PostToolLifecycleResolver | None = None,
+    reasoning_sink: ReasoningSink | None = None,
     _model_pending_elapsed_seconds: Sequence[float] = MODEL_PENDING_ELAPSED_SECONDS,
     _model_pending_repeat_seconds: float = MODEL_PENDING_REPEAT_SECONDS,
 ) -> AgentHarnessResult:
@@ -410,6 +423,7 @@ async def run_native_tool_loop(
             lifecycle_renderer=lifecycle_renderer,
             pre_model_context_hook=pre_model_context_hook,
             post_tool_lifecycle_resolver=post_tool_lifecycle_resolver,
+            reasoning_sink=reasoning_sink,
             _model_pending_elapsed_seconds=_model_pending_elapsed_seconds,
             _model_pending_repeat_seconds=_model_pending_repeat_seconds,
         )
@@ -453,6 +467,7 @@ async def _run_native_tool_loop_impl(
     lifecycle_renderer: LifecycleRenderer | None = None,
     pre_model_context_hook: PreModelContextHook | None = None,
     post_tool_lifecycle_resolver: PostToolLifecycleResolver | None = None,
+    reasoning_sink: ReasoningSink | None = None,
     _model_pending_elapsed_seconds: Sequence[float] = MODEL_PENDING_ELAPSED_SECONDS,
     _model_pending_repeat_seconds: float = MODEL_PENDING_REPEAT_SECONDS,
 ) -> AgentHarnessResult:
@@ -518,6 +533,7 @@ async def _run_native_tool_loop_impl(
             turn=turn,
             turn_limit=turn_limit,
             event_sink=event_sink,
+            reasoning_sink=reasoning_sink,
             pending_elapsed_seconds=_model_pending_elapsed_seconds,
             pending_repeat_seconds=_model_pending_repeat_seconds,
             pending_event_budget=pending_event_budget,
@@ -956,18 +972,27 @@ async def _invoke_model_turn(
     turn: int,
     turn_limit: int,
     event_sink: EventSink | None,
+    reasoning_sink: ReasoningSink | None,
     pending_elapsed_seconds: Sequence[float],
     pending_repeat_seconds: float,
     pending_event_budget: _PendingEventBudget,
 ) -> AIMessage:
-    if event_sink is None:
+    async def invoke() -> AIMessage:
+        # Reasoning is display-only and best-effort, so it bypasses _emit, which
+        # would turn a sink failure into a harness failure.
+        if reasoning_sink is not None and _accepts_reasoning_sink(gateway):
+            streaming = cast(ReasoningStreamingGateway, gateway)
+            return await streaming.invoke_tools(messages, tools, on_reasoning=reasoning_sink)
         return await gateway.invoke_tools(messages, tools)
+
+    if event_sink is None:
+        return await invoke()
 
     await _emit(
         event_sink,
         AgentHarnessEvent(kind="model_turn_started", turn=turn, turn_limit=turn_limit),
     )
-    invocation = asyncio.create_task(gateway.invoke_tools(messages, tools))
+    invocation = asyncio.create_task(invoke())
     previous_elapsed_seconds = 0.0
     try:
         for elapsed_seconds in _pending_elapsed_schedule(
@@ -1008,6 +1033,16 @@ async def _invoke_model_turn(
             with suppress(asyncio.CancelledError):
                 await invocation
         raise
+
+
+def _accepts_reasoning_sink(gateway: AgentHarnessGateway) -> bool:
+    try:
+        parameters = inspect.signature(gateway.invoke_tools).parameters
+    except (TypeError, ValueError):
+        return False
+    return "on_reasoning" in parameters or any(
+        parameter.kind is inspect.Parameter.VAR_KEYWORD for parameter in parameters.values()
+    )
 
 
 def _pending_elapsed_schedule(

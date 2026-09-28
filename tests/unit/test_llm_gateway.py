@@ -7,7 +7,13 @@ from collections.abc import Sequence
 from typing import Any, cast
 
 import pytest
-from langchain_core.messages import AIMessage, BaseMessage, HumanMessage, SystemMessage
+from langchain_core.messages import (
+    AIMessage,
+    AIMessageChunk,
+    BaseMessage,
+    HumanMessage,
+    SystemMessage,
+)
 from pydantic import BaseModel, ValidationError, model_validator
 
 from app.core.config import Settings
@@ -70,6 +76,41 @@ class NativeFakeChatModel:
         if self.delay:
             await asyncio.sleep(self.delay)
         return next(self.responses)
+
+
+class StreamingFakeChatModel(NativeFakeChatModel):
+    def __init__(self, chunks: Sequence[AIMessageChunk]) -> None:
+        super().__init__([])
+        self.chunks = list(chunks)
+        self.stream_kwargs: list[dict[str, object]] = []
+
+    async def astream(self, messages: Sequence[object], **kwargs: object) -> Any:
+        self.messages.append(list(messages))
+        self.stream_kwargs.append(dict(kwargs))
+        for chunk in self.chunks:
+            yield chunk
+
+
+def _reasoning_chunks() -> list[AIMessageChunk]:
+    return [
+        AIMessageChunk(content="", additional_kwargs={"reasoning_content": "The user wants "}),
+        AIMessageChunk(content="", additional_kwargs={"reasoning_content": "their courses."}),
+        AIMessageChunk(
+            content="",
+            tool_call_chunks=[
+                {
+                    "name": "search_courses",
+                    "args": '{"query": "math"}',
+                    "id": "call-1",
+                    "index": 0,
+                }
+            ],
+        ),
+        AIMessageChunk(
+            content="",
+            usage_metadata={"input_tokens": 11, "output_tokens": 7, "total_tokens": 18},
+        ),
+    ]
 
 
 @pytest.mark.asyncio
@@ -451,3 +492,88 @@ async def test_invoke_tools_raises_typed_gateway_failure() -> None:
     assert exc.retryable is True
     assert exc.phase == "native_invocation"
     assert exc.diagnostic == "Model request timed out."
+
+
+@pytest.mark.asyncio
+async def test_reasoning_sink_streams_deltas_and_strips_reasoning_from_result() -> None:
+    fake = StreamingFakeChatModel(_reasoning_chunks())
+    gateway = LLMGateway(Settings(), chat_model=fake)
+    deltas: list[str] = []
+
+    async def sink(delta: str) -> None:
+        deltas.append(delta)
+
+    message = await gateway.invoke_tools(
+        [HumanMessage(content="what courses?")],
+        [{"type": "function", "function": {"name": "search_courses", "parameters": {}}}],
+        on_reasoning=sink,
+    )
+
+    assert deltas == ["The user wants ", "their courses."]
+    assert [call["name"] for call in message.tool_calls] == ["search_courses"]
+    assert message.tool_calls[0]["args"] == {"query": "math"}
+    assert "reasoning_content" not in message.additional_kwargs
+    assert fake.bound_tools
+    assert fake.kwargs == []
+    kwargs = fake.stream_kwargs[0]
+    assert kwargs["reasoning"] is True
+    options = cast(dict[str, object], kwargs["options"])
+    assert options["num_predict"] == Settings().discord_thinking_max_output_tokens
+
+
+@pytest.mark.asyncio
+async def test_reasoning_stream_records_distinct_config_and_reported_tokens() -> None:
+    fake = StreamingFakeChatModel(_reasoning_chunks())
+    gateway = LLMGateway(Settings(), chat_model=fake)
+
+    async def sink(_delta: str) -> None:
+        return None
+
+    result = await gateway.invoke_native(
+        messages=[HumanMessage(content="what courses?")],
+        on_reasoning=sink,
+    )
+
+    assert result.status is InvocationStatus.VALID
+    assert result.reported_input_tokens == 11
+    assert result.reported_output_tokens == 7
+    assert result.telemetry[0].config_version == gateway.native_reasoning_config_version
+    assert gateway.native_reasoning_config_version != gateway.native_config_version
+
+
+@pytest.mark.asyncio
+async def test_failing_reasoning_sink_does_not_fail_the_model_call() -> None:
+    fake = StreamingFakeChatModel(_reasoning_chunks())
+
+    async def sink(_delta: str) -> None:
+        raise RuntimeError("discord is down")
+
+    message = await LLMGateway(Settings(), chat_model=fake).invoke_tools(
+        [HumanMessage(content="what courses?")],
+        [],
+        on_reasoning=sink,
+    )
+
+    assert [call["name"] for call in message.tool_calls] == ["search_courses"]
+
+
+@pytest.mark.asyncio
+async def test_native_call_without_reasoning_sink_does_not_stream() -> None:
+    fake = StreamingFakeChatModel(_reasoning_chunks())
+    fake.responses = iter([AIMessage(content="done")])
+
+    message = await LLMGateway(Settings(), chat_model=fake).invoke_tools(
+        [HumanMessage(content="hi")],
+        [],
+    )
+
+    assert message.content == "done"
+    assert fake.stream_kwargs == []
+    assert "reasoning" not in fake.kwargs[0]
+
+
+def test_discord_thinking_output_budget_must_fit_context_window() -> None:
+    with pytest.raises(ValidationError, match="Discord thinking output tokens"):
+        Settings(discord_thinking_max_output_tokens=8_192)
+    with pytest.raises(ValidationError, match="Discord thinking output tokens"):
+        Settings(discord_thinking_max_output_tokens=1_024)

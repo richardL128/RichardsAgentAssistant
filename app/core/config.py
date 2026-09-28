@@ -129,6 +129,9 @@ class Settings(BaseSettings):
     discord_academic_authorized_user_ids: list[int] = Field(default_factory=lambda: list[int]())
     discord_academic_proactive_user_id: int | None = None
     discord_academic_message_content_enabled: bool = False
+    discord_stream_thinking: bool = False
+    discord_thinking_max_output_tokens: Annotated[int, Field(gt=0)] = 6_144
+    discord_thinking_edit_interval_seconds: Annotated[float, Field(ge=0.5, le=30)] = 1.5
     discord_handoff_max_body_bytes: Annotated[int, Field(gt=0, le=65_536)] = 4_096
     discord_handoff_max_clock_skew_seconds: Annotated[int, Field(gt=0, le=300)] = 60
     discord_handoff_request_timeout_seconds: Annotated[float, Field(gt=0, le=30)] = 10.0
@@ -380,6 +383,15 @@ class Settings(BaseSettings):
             )
         if self.conversation_recent_tail_max_tokens >= self.ollama_max_input_tokens:
             raise ValueError("conversation recent tail max tokens must be below max input tokens")
+        if not (
+            self.ollama_max_output_tokens
+            <= self.discord_thinking_max_output_tokens
+            <= self.ollama_num_ctx - self.ollama_max_input_tokens
+        ):
+            raise ValueError(
+                "Discord thinking output tokens must satisfy "
+                "max output <= thinking output <= context window - max input"
+            )
         if self.conversation_compaction_max_output_tokens > self.ollama_max_output_tokens:
             raise ValueError("conversation compaction output cannot exceed model output tokens")
         if (

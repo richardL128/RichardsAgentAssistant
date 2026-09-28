@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Awaitable, Callable
 from datetime import datetime
 from enum import StrEnum
 from typing import Literal
@@ -9,6 +10,9 @@ from uuid import UUID
 
 from langchain_core.messages import AIMessage
 from pydantic import BaseModel, ConfigDict, Field
+
+type ReasoningSink = Callable[[str], Awaitable[None]]
+"""Best-effort receiver for streamed model reasoning deltas."""
 
 
 class InvocationStatus(StrEnum):

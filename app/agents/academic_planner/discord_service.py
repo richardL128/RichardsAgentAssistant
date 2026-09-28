@@ -303,6 +303,11 @@ def create_academic_discord_service(
         conversation_service=conversation_service,
         abort_check=abort_check,
         activity_sink=activity_sink,
+        thinking_edit_interval_seconds=(
+            app_settings.discord_thinking_edit_interval_seconds
+            if app_settings.discord_stream_thinking
+            else None
+        ),
     )
     return AcademicDiscordService(handler=handler, database=database)
 

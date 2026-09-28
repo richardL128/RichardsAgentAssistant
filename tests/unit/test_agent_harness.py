@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import asyncio
-from collections.abc import Mapping, Sequence
+from collections.abc import Awaitable, Callable, Mapping, Sequence
 
 import pytest
 from langchain_core.messages import (
@@ -1949,3 +1949,60 @@ async def test_model_turn_started_events_cover_the_native_fifty_turn_limit() -> 
     )
     assert events[-1].kind == "final_response"
     assert events[-1].turn == 50
+
+
+class ReasoningGateway(Gateway):
+    def __init__(self, responses: Sequence[AIMessage], thoughts: Sequence[str]) -> None:
+        super().__init__(responses)
+        self.thoughts = list(thoughts)
+
+    async def invoke_tools(
+        self,
+        messages: Sequence[BaseMessage],
+        tools: Sequence[Mapping[str, object]],
+        *,
+        on_reasoning: Callable[[str], Awaitable[None]] | None = None,
+    ) -> AIMessage:
+        if on_reasoning is not None:
+            for thought in self.thoughts:
+                await on_reasoning(thought)
+        return await super().invoke_tools(messages, tools)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("with_event_sink", [True, False])
+async def test_reasoning_sink_reaches_streaming_gateway(with_event_sink: bool) -> None:
+    gateway = ReasoningGateway([AIMessage(content="Answer.")], ["Consider ", "the question."])
+    thoughts: list[str] = []
+    events: list[AgentHarnessEvent] = []
+
+    async def sink(delta: str) -> None:
+        thoughts.append(delta)
+
+    result = await run_native_tool_loop(
+        gateway=gateway,
+        user_input="question",
+        event_sink=(lambda event: collect(events, event)) if with_event_sink else None,
+        reasoning_sink=sink,
+    )
+
+    assert result.status == "completed"
+    assert thoughts == ["Consider ", "the question."]
+    assert result.final_response == "Answer."
+
+
+@pytest.mark.asyncio
+async def test_reasoning_sink_is_not_passed_to_gateway_without_support() -> None:
+    gateway = Gateway([AIMessage(content="Answer.")])
+
+    async def sink(_delta: str) -> None:
+        raise AssertionError("plain gateways cannot stream reasoning")
+
+    result = await run_native_tool_loop(
+        gateway=gateway,
+        user_input="question",
+        reasoning_sink=sink,
+    )
+
+    assert result.status == "completed"
+    assert result.final_response == "Answer."

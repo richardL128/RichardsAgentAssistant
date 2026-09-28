@@ -7,12 +7,17 @@ import hashlib
 import inspect
 import json
 import time
-from collections.abc import Mapping, Sequence
+from collections.abc import AsyncIterator, Callable, Mapping, Sequence
 from datetime import UTC, datetime
 from typing import Any, Literal, TypeVar, cast
 from uuid import UUID, uuid4
 
-from langchain_core.messages import AIMessage, BaseMessage
+from langchain_core.messages import (
+    AIMessage,
+    AIMessageChunk,
+    BaseMessage,
+    message_chunk_to_message,
+)
 from langchain_ollama import ChatOllama
 from pydantic import BaseModel, ValidationError
 
@@ -23,6 +28,7 @@ from app.llm.contracts import (
     InvocationStatus,
     ModelCallTelemetry,
     NativeInvocationResult,
+    ReasoningSink,
 )
 from app.llm.parsing import (
     estimate_tokens,
@@ -67,6 +73,10 @@ class LLMGateway:
         self.model_identity = self._model_identity()
         self.config_version = self._config_version()
         self.native_config_version = self._config_version(native=True)
+        self.native_reasoning_config_version = self._config_version(
+            native=True,
+            reasoning_stream=True,
+        )
 
     async def invoke_structured(
         self,
@@ -166,8 +176,14 @@ class LLMGateway:
         *,
         messages: Sequence[BaseMessage],
         tools: Sequence[Mapping[str, Any]] = (),
+        on_reasoning: ReasoningSink | None = None,
     ) -> NativeInvocationResult:
-        """Invoke the chat model with native messages and optional tool schemas."""
+        """Invoke the chat model with native messages and optional tool schemas.
+
+        When ``on_reasoning`` is supplied the call enables model reasoning,
+        streams the response, and forwards each reasoning delta to the sink.
+        Reasoning is never returned in the output message.
+        """
 
         request_id = uuid4()
         input_fingerprint = self._native_input_fingerprint(messages, tools)
@@ -189,6 +205,7 @@ class LLMGateway:
             tools=tools,
             input_fingerprint=input_fingerprint,
             telemetry=telemetry,
+            on_reasoning=on_reasoning,
         )
         if outcome.error_code is not None:
             return self._native_result(
@@ -233,10 +250,16 @@ class LLMGateway:
         self,
         messages: Sequence[BaseMessage],
         tools: Sequence[Mapping[str, Any]],
+        *,
+        on_reasoning: ReasoningSink | None = None,
     ) -> AIMessage:
         """Harness-facing native invocation with safe failure propagation."""
 
-        result = await self.invoke_native(messages=messages, tools=tools)
+        result = await self.invoke_native(
+            messages=messages,
+            tools=tools,
+            on_reasoning=on_reasoning,
+        )
         if result.output is None:
             code = result.error_code or "model_error"
             if code == "input_token_budget_exceeded":
@@ -343,6 +366,7 @@ class LLMGateway:
         tools: Sequence[Mapping[str, Any]],
         input_fingerprint: str,
         telemetry: list[ModelCallTelemetry],
+        on_reasoning: ReasoningSink | None = None,
     ) -> _NativeCallOutcome:
         started_at = datetime.now(UTC)
         started_monotonic = time.monotonic()
@@ -364,8 +388,12 @@ class LLMGateway:
                 _active_model_calls += 1
                 _max_active_model_calls = max(_max_active_model_calls, _active_model_calls)
                 try:
-                    response = await asyncio.wait_for(
-                        self._native_ainvoke(messages, tools),
+                    response: Any = await asyncio.wait_for(
+                        (
+                            self._native_ainvoke(messages, tools)
+                            if on_reasoning is None
+                            else self._native_astream_reasoning(messages, tools, on_reasoning)
+                        ),
                         timeout=self.settings.ollama_timeout_seconds,
                     )
                 finally:
@@ -388,7 +416,11 @@ class LLMGateway:
                 request_id=request_id,
                 attempt=attempt,
                 model_identity=self.model_identity,
-                config_version=self.native_config_version,
+                config_version=(
+                    self.native_config_version
+                    if on_reasoning is None
+                    else self.native_reasoning_config_version
+                ),
                 started_at=started_at,
                 finished_at=finished_at,
                 model_started_at=model_started_at,
@@ -440,12 +472,7 @@ class LLMGateway:
         messages: Sequence[BaseMessage],
         tools: Sequence[Mapping[str, Any]],
     ) -> Any:
-        model = self._native_model
-        if tools:
-            binder = getattr(model, "bind_tools", None)
-            if binder is None or not callable(binder):
-                raise TypeError("chat model does not provide bind_tools")
-            model = binder([dict(tool) for tool in tools])
+        model = self._bound_native_model(tools)
         invoker = getattr(model, "ainvoke", None)
         if invoker is None or not callable(invoker):
             raise TypeError("chat model does not provide ainvoke")
@@ -463,6 +490,55 @@ class LLMGateway:
         if inspect.isawaitable(result):
             return await result
         return result
+
+    async def _native_astream_reasoning(
+        self,
+        messages: Sequence[BaseMessage],
+        tools: Sequence[Mapping[str, Any]],
+        on_reasoning: ReasoningSink,
+    ) -> AIMessage:
+        model = self._bound_native_model(tools)
+        streamer = getattr(model, "astream", None)
+        if streamer is None or not callable(streamer):
+            raise TypeError("chat model does not provide astream")
+        stream = cast(Callable[..., AsyncIterator[object]], streamer)(
+            list(messages),
+            reasoning=True,
+            keep_alive=f"{self.settings.ollama_model_keep_alive_seconds}s",
+            options={
+                "num_ctx": self.settings.ollama_num_ctx,
+                "num_batch": self.settings.ollama_num_batch,
+                "num_predict": self.settings.discord_thinking_max_output_tokens,
+                "temperature": 0.0,
+                "seed": self.settings.ollama_seed,
+            },
+        )
+        accumulated: AIMessageChunk | None = None
+        async for chunk in stream:
+            if not isinstance(chunk, AIMessageChunk):
+                raise TypeError("chat model stream yielded a non-AI chunk")
+            delta = chunk.additional_kwargs.get("reasoning_content")
+            if isinstance(delta, str) and delta:
+                await _forward_reasoning(on_reasoning, delta)
+            accumulated = chunk if accumulated is None else accumulated + chunk
+        if accumulated is None:
+            raise ValueError("chat model stream produced no chunks")
+        message = message_chunk_to_message(accumulated)
+        if not isinstance(message, AIMessage):
+            raise TypeError("chat model stream did not produce an AI message")
+        # Reasoning is display-only: keep it out of transcripts and later context.
+        additional = dict(message.additional_kwargs)
+        additional.pop("reasoning_content", None)
+        return message.model_copy(update={"additional_kwargs": additional})
+
+    def _bound_native_model(self, tools: Sequence[Mapping[str, Any]]) -> Any:
+        model = self._native_model
+        if tools:
+            binder = getattr(model, "bind_tools", None)
+            if binder is None or not callable(binder):
+                raise TypeError("chat model does not provide bind_tools")
+            model = binder([dict(tool) for tool in tools])
+        return model
 
     def _build_chat_model(self) -> ChatOllama:
         return ChatOllama(
@@ -495,7 +571,7 @@ class LLMGateway:
         digest = self.settings.ollama_model_digest
         return f"{self.settings.ollama_model}@{digest}" if digest else self.settings.ollama_model
 
-    def _config_version(self, *, native: bool = False) -> str:
+    def _config_version(self, *, native: bool = False, reasoning_stream: bool = False) -> str:
         config = {
             "base_url": self.settings.ollama_url,
             "model": self.settings.ollama_model,
@@ -514,6 +590,10 @@ class LLMGateway:
             "temperature": 0.0,
             "seed": self.settings.ollama_seed,
         }
+        if reasoning_stream:
+            config["reasoning_stream"] = True
+            config["reasoning"] = True
+            config["max_output_tokens"] = self.settings.discord_thinking_max_output_tokens
         if not native:
             config["structured_output_transport"] = self.settings.ollama_structured_output_transport
             config["format"] = "json"
@@ -636,6 +716,17 @@ class LLMGateway:
             error_code=error_code,
             error_diagnostic=error_diagnostic,
         )
+
+
+async def _forward_reasoning(sink: ReasoningSink, delta: str) -> None:
+    """Deliver one reasoning delta; display failures never fail the model call."""
+
+    try:
+        await sink(delta)
+    except asyncio.CancelledError:
+        raise
+    except Exception:
+        return
 
 
 def _reported_input_tokens(telemetry: Sequence[ModelCallTelemetry]) -> int | None:

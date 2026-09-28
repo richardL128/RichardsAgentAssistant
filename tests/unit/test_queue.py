@@ -428,6 +428,13 @@ async def test_shared_services_periodic_persists_the_aggregate_health(
         return healthy("ollama")
 
     monkeypatch.setattr(tasks, "check_ollama", healthy_ollama)
+
+    async def healthy_connector_liveness(
+        _settings: Settings, _client: httpx.AsyncClient, *, now: datetime
+    ) -> tuple[HealthCheck, ...]:
+        return (healthy("github"), healthy("notion_schema_preflight"))
+
+    monkeypatch.setattr(tasks, "check_connector_liveness", healthy_connector_liveness)
     timestamp = int(datetime(2026, 9, 4, 12, 0, tzinfo=UTC).timestamp())
 
     try:

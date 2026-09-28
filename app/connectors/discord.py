@@ -6,6 +6,7 @@ import asyncio
 import hashlib
 import math
 import re
+import time
 from collections.abc import Awaitable, Callable, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import UTC, date, datetime
@@ -31,6 +32,7 @@ from app.core.errors import (
     permanent_error,
     transient_error,
 )
+from app.core.redaction import redact_text
 from app.db.code_review import review_idempotency_key
 from app.db.models import Delivery, DeliveryStatus, RunStatus
 from app.db.repositories import DeliveryRepository, RunRepository, utc_now
@@ -148,6 +150,15 @@ def _discord_nonce(delivery_id: UUID) -> str:
     """Encode a delivery UUID within Discord's 25-character nonce limit."""
 
     return delivery_id.hex[:_DISCORD_NONCE_LIMIT]
+
+
+_DISCORD_THINKING_BUFFER_LIMIT = 6_000
+_DISCORD_THINKING_MIN_CHARS = 80
+_THINKING_BLANK_LINES_RE = re.compile(r"\n[ \t]*(?:\n[ \t]*)+")
+# Characters that would open Discord spoilers, code, or emphasis spans.
+_THINKING_MARKDOWN_RE = re.compile(r"[|`*_~]")
+# Line-leading markers for headings, subtext, quotes, and lists.
+_THINKING_LINE_MARKER_RE = re.compile(r"(?m)^([ \t]*)([#>\-+])")
 
 
 def _bounded_discord_content(content: str) -> str:
@@ -1497,6 +1508,7 @@ class DiscordAcademicResponseDelivery:
         attempt_number: int = 1,
         attempt_limit: int = 3,
         edit_every_n_updates: int = 1,
+        thinking_edit_interval_seconds: float | None = None,
     ) -> DiscordAcademicProgressReporter:
         return DiscordAcademicProgressReporter(
             delivery=self,
@@ -1505,6 +1517,7 @@ class DiscordAcademicResponseDelivery:
             attempt_number=attempt_number,
             attempt_limit=attempt_limit,
             edit_every_n_updates=edit_every_n_updates,
+            thinking_edit_interval_seconds=thinking_edit_interval_seconds,
         )
 
     async def adopt_progress(
@@ -1707,9 +1720,13 @@ class DiscordAcademicProgressReporter:
         attempt_number: int = 1,
         attempt_limit: int = 3,
         edit_every_n_updates: int = 1,
+        thinking_edit_interval_seconds: float | None = None,
+        clock: Callable[[], float] = time.monotonic,
     ) -> None:
         if edit_every_n_updates < 1:
             raise ValueError("edit_every_n_updates must be positive")
+        if thinking_edit_interval_seconds is not None and thinking_edit_interval_seconds < 0:
+            raise ValueError("thinking_edit_interval_seconds cannot be negative")
         self._delivery = delivery
         self._root_event_id = root_event_id
         self._existing_message_id = existing_message_id
@@ -1725,10 +1742,40 @@ class DiscordAcademicProgressReporter:
         self._pending_updates = 0
         self._disabled = False
         self._terminal = False
+        # Streamed model reasoning, shown under the stages. None disables it.
+        self._thinking_interval = thinking_edit_interval_seconds
+        self._clock = clock
+        self._thinking = ""
+        self._thinking_turn: int | None = None
+        self._thinking_dirty = False
+        self._last_edit_at: float | None = None
+        self._thinking_flush: asyncio.Task[None] | None = None
 
     @property
     def handle(self) -> DiscordAcademicProgressHandle | None:
         return self._handle
+
+    async def stream_thinking(self, delta: str) -> None:
+        """Buffer one reasoning delta and schedule a throttled edit.
+
+        This never awaits Discord, so a slow or rate-limited edit cannot stall
+        the model stream that feeds it.
+        """
+
+        if self._thinking_interval is None or self._disabled or self._terminal or not delta:
+            return
+        turn = self._current_model_turn()
+        if turn is not None and turn != self._thinking_turn:
+            if self._thinking and self._thinking_turn is not None:
+                self._thinking += f"\n\n(turn {turn})\n"
+            self._thinking_turn = turn
+        self._thinking = (self._thinking + delta)[-_DISCORD_THINKING_BUFFER_LIMIT:]
+        self._thinking_dirty = True
+        if self._thinking_flush is None or self._thinking_flush.done():
+            delay = 0.0
+            if self._last_edit_at is not None:
+                delay = max(0.0, self._last_edit_at + self._thinking_interval - self._clock())
+            self._thinking_flush = asyncio.create_task(self._flush_thinking_after(delay))
 
     async def start(
         self,
@@ -1816,6 +1863,33 @@ class DiscordAcademicProgressReporter:
         async with self._lock:
             await self._flush_locked()
 
+    async def _flush_thinking_after(self, delay: float) -> None:
+        if delay > 0:
+            await asyncio.sleep(delay)
+        async with self._lock:
+            if self._disabled or self._terminal or self._handle is None or not self._thinking_dirty:
+                return
+            self._thinking_dirty = False
+            self._last_edit_at = self._clock()
+            try:
+                await self._delivery.edit_progress(self._handle, content=self._render_locked())
+            except Exception:
+                # Thinking is best-effort; a failed edit must not stop stage updates.
+                return
+
+    def _current_model_turn(self) -> int | None:
+        event = self._active_event
+        if event is None or event.phase not in {"model_turn_started", "model_turn_pending"}:
+            return self._thinking_turn
+        return event.model_turn_number
+
+    def _render_locked(self) -> str:
+        return _render_progress_content(
+            self._rendered_stages(),
+            thinking=self._thinking if self._thinking_interval is not None else "",
+            final=self._terminal,
+        )
+
     async def _start_locked(
         self,
         event: DiscordAcademicProgressEvent | Mapping[str, object] | object | None,
@@ -1841,7 +1915,7 @@ class DiscordAcademicProgressReporter:
             else:
                 self._handle = await self._delivery.start_progress(
                     root_event_id=self._root_event_id,
-                    content=_render_progress_content(self._rendered_stages()),
+                    content=self._render_locked(),
                 )
         except (LifeAgentError, ValueError):
             self._disabled = True
@@ -1891,11 +1965,13 @@ class DiscordAcademicProgressReporter:
     async def _flush_locked(self) -> None:
         if self._disabled or self._handle is None or not self._pending_updates:
             return
+        if self._terminal and self._thinking_flush is not None:
+            self._thinking_flush.cancel()
+            self._thinking_flush = None
+        self._thinking_dirty = False
+        self._last_edit_at = self._clock()
         try:
-            await self._delivery.edit_progress(
-                self._handle,
-                content=_render_progress_content(self._rendered_stages()),
-            )
+            await self._delivery.edit_progress(self._handle, content=self._render_locked())
             self._pending_updates = 0
         except (LifeAgentError, ValueError):
             self._disabled = True
@@ -2176,9 +2252,66 @@ def _is_stale_progress_update(
     return active.phase not in {"model_turn", "model_turn_started", "model_turn_pending"}
 
 
-def _render_progress_content(stages: Sequence[str]) -> str:
-    content = "\n".join(f"- {stage}" for stage in stages)
-    return _bounded_discord_content(content or "- Waking Qwen.")
+def _render_progress_content(
+    stages: Sequence[str],
+    *,
+    thinking: str = "",
+    final: bool = False,
+) -> str:
+    """Render stages first, then as much recent thinking as still fits.
+
+    Live thinking is block-quoted; once the turn is over it is kept behind a
+    spoiler so the finished message stays compact.
+    """
+
+    content = "\n".join(f"- {stage}" for stage in stages) or "- Waking Qwen."
+    text = _sanitize_thinking(thinking)
+    if not text:
+        return _bounded_discord_content(content)
+    header = "\n\n**Thinking**\n"
+    budget = _DISCORD_CONTENT_LIMIT - len(content) - len(header)
+    if budget < _DISCORD_THINKING_MIN_CHARS:
+        return _bounded_discord_content(content)
+
+    def render(tail: str) -> str:
+        if not tail:
+            return ""
+        if final:
+            return f"||{tail}||"
+        return "\n".join(f"> {line}" for line in tail.splitlines())
+
+    rendered = render(text)
+    keep = len(text)
+    while len(rendered) > budget and keep > 0:
+        keep -= len(rendered) - budget
+        rendered = render(_thinking_tail(text, keep))
+    if not rendered.strip():
+        return _bounded_discord_content(content)
+    return _bounded_discord_content(f"{content}{header}{rendered}")
+
+
+def _sanitize_thinking(text: str) -> str:
+    cleaned = redact_text(text).replace("\r", "")
+    cleaned = _THINKING_BLANK_LINES_RE.sub("\n", cleaned).strip()
+    cleaned = cleaned.replace("\\", "\\\\")
+    cleaned = _THINKING_MARKDOWN_RE.sub(lambda match: "\\" + match.group(0), cleaned)
+    return _THINKING_LINE_MARKER_RE.sub(
+        lambda match: match.group(1) + "\\" + match.group(2), cleaned
+    )
+
+
+def _thinking_tail(text: str, keep: int) -> str:
+    """Keep the last ``keep`` characters, starting on a whitespace boundary."""
+
+    if keep <= 1:
+        return ""
+    if keep >= len(text):
+        return text
+    tail = text[-(keep - 1) :]
+    boundary = re.search(r"\s", tail)
+    if boundary is not None:
+        tail = tail[boundary.end() :]
+    return "…" + tail.lstrip()
 
 
 def _message_id_from_delivery(delivery: Delivery) -> str | None:

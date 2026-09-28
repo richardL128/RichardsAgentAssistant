@@ -123,6 +123,7 @@ from app.connectors.discord_gateway import (
     DiscordMessageCallbackResult,
 )
 from app.db.job_interviews import JobInterviewRepository
+from app.llm.contracts import ReasoningSink
 
 _PROPOSAL_NAMESPACE = uuid.UUID("6f7240e2-48d0-44bd-b9bf-a8bd8d9adccc")
 _NIGHTLY_PROPOSAL_NAMESPACE = uuid.UUID("d7d36258-66a5-4adf-8cf4-12555b56fc02")
@@ -913,6 +914,7 @@ class NativeAcademicDiscordHandler:
         activity_sink: ActivitySink | None = None,
         model_pending_elapsed_seconds: Sequence[float] = (8.0, 20.0, 45.0),
         model_pending_repeat_seconds: float = 30.0,
+        thinking_edit_interval_seconds: float | None = None,
     ) -> None:
         if catalog_sync_timeout_seconds <= 0:
             raise ValueError("catalog_sync_timeout_seconds must be positive")
@@ -925,6 +927,7 @@ class NativeAcademicDiscordHandler:
         self._writer_provider = writer_provider
         self._ollama_runtime = ollama_runtime
         self._agent_gateway = agent_gateway
+        self._thinking_edit_interval_seconds = thinking_edit_interval_seconds
         self._agent_catalog = agent_catalog
         self._assistant_user_id = assistant_user_id
         self._catalog_syncer = catalog_syncer
@@ -1521,6 +1524,7 @@ class NativeAcademicDiscordHandler:
                     states=grounding_states,
                 ),
                 max_turns=12,
+                reasoning_sink=self._reasoning_sink(reporter),
                 _model_pending_elapsed_seconds=self._model_pending_elapsed_seconds,
                 _model_pending_repeat_seconds=self._model_pending_repeat_seconds,
             )
@@ -1956,6 +1960,7 @@ class NativeAcademicDiscordHandler:
                 lifecycle_renderer=lambda lifecycle, _messages: state.render_lifecycle(lifecycle),
                 post_tool_lifecycle_resolver=state.resolve_post_tool_lifecycle,
                 max_turns=4,
+                reasoning_sink=self._reasoning_sink(reporter),
                 _model_pending_elapsed_seconds=self._model_pending_elapsed_seconds,
                 _model_pending_repeat_seconds=self._model_pending_repeat_seconds,
             )
@@ -2110,6 +2115,16 @@ class NativeAcademicDiscordHandler:
             content,
         ).strip()
 
+    def _reasoning_sink(self, reporter: _ProgressReporter | None) -> ReasoningSink | None:
+        """Stream model thinking into the progress message when enabled."""
+
+        if self._thinking_edit_interval_seconds is None or reporter is None:
+            return None
+        stream_thinking = getattr(reporter, "stream_thinking", None)
+        if not callable(stream_thinking):
+            return None
+        return cast(ReasoningSink, stream_thinking)
+
     def _create_progress_reporter(
         self,
         message: DiscordAcademicMessageCreate,
@@ -2125,6 +2140,8 @@ class NativeAcademicDiscordHandler:
             "attempt_limit": 3,
             "edit_every_n_updates": 1,
         }
+        if self._thinking_edit_interval_seconds is not None:
+            kwargs["thinking_edit_interval_seconds"] = self._thinking_edit_interval_seconds
         if message.progress_message_id is not None:
             kwargs["existing_message_id"] = message.progress_message_id
         try:
